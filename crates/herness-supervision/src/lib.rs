@@ -19,8 +19,10 @@ pub mod error;
 pub mod evidence;
 pub mod freshness;
 pub mod ids;
+pub mod operations;
 pub mod ports;
 pub mod profiles;
+pub mod recovery;
 pub mod state;
 pub mod supervisor;
 pub mod verification;
@@ -73,6 +75,10 @@ pub use ids::{
     BudgetRequestId, CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId,
     RunGroupId, SupervisionId, SupervisionKeyKind, SupervisionRequestId, SupervisionScopedId,
 };
+pub use operations::{
+    HumanOperation, OperationBudgetPort, OperationPorts, OperationResult, OperationRuntimePort,
+    SupervisionChange, SupervisionOperationRequest, execute_operation,
+};
 pub use ports::{
     AssessmentPort, BudgetStorePort, ClockPort, EvidenceStorePort, StoredBudgetRecord,
     SupervisionFeature, SupervisionStorePort, unsupported,
@@ -83,10 +89,19 @@ pub use profiles::{
     ProfileBinding, ProfileCatalog, ProfileEntry, ProfileInputs, ProfilePurpose, ProfileThresholds,
     ProfileUnavailable, ProfileVersion, ProviderKind, RubricVersion, reject_run_model_substitution,
 };
+pub use recovery::{
+    HistoryOnlyReason, HistoryOnlyRequest, ManagedProcessState, QuitSupervisionMark,
+    QuitSupervisionReport, RecoveryBlockReason, RecoveryBudgetRead, RecoveryBudgetReport,
+    RecoveryCheckpoint, RecoveryDisposition, RecoveryFactsPort, RecoveryOperation,
+    RecoveryReconciliation, RecoveryReport, RecoveryRequestAttempt, RecoveryRuntimePort,
+    RecoveryService, RecoverySideEffects, RecoverySnapshot, RecoveryStopState, UnresolvedRequest,
+    UnresolvedRequestKind, VersionMismatch, mark_active_supervision_for_quit,
+};
 pub use state::{
-    AppliedDecision, AssessmentApplication, CancelCause, CompletionBlocker, CompletionSnapshot,
-    DecisionInvalidation, HumanAction, InvalidatedDecision, StaleCompletion, StopCause,
-    SupervisionFailure, SupervisionReason, SupervisionRecord, SupervisionState,
+    AppliedDecision, AssessmentApplication, CancelCause, ChangeKind, CompletionBlocker,
+    CompletionSnapshot, DecisionInvalidation, HumanAction, InvalidatedDecision, StaleCompletion,
+    StopCause, SupervisionChangeRecord, SupervisionFailure, SupervisionReason, SupervisionRecord,
+    SupervisionState,
 };
 pub use verification::{
     GatewayVerification, VerificationBoundary, VerificationBoundaryOutcome,

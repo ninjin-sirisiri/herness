@@ -666,3 +666,44 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 実provider・実credential・実Keychain・実Tauriは使わず、mock成功を実接続の受入へ流用しない。Task 15の復旧、Task 16のUI/profile選択、Task 17のfixtures/受入はこのTaskに含めない。
+
+## Task 15で追加した復旧・明示操作
+
+### 読取り専用の復旧
+
+- `herness-supervision`の`RecoveryService::recover`は、`SupervisionStorePort`を拡張した`RecoveryFactsPort`から、監督record・model requestのintent/observation・未解決H1操作・checkpoint有無を一つの読み取りtransactionで取得し、H1のrun状態・`RecoveryMode`・管理下process・停止確認・現在の許可contextをfakeまたは実hostから読む。`BudgetStorePort`相当の`RecoveryBudgetRead`から予算を読む。model要求、run開始、tool実行、自動再開は行わない。
+- 復旧報告は状態・理由、未解決要求（intent-only / send-started / terminal-observed-state-not-saved / send-unknown）、未解決操作、管理下process、checkpoint、同じprocessかrestoredか、予算使用量・未解決charge・policy版、version不一致、必要な人間操作、stale completion、副作用0のcounterを持つ。
+- intentのみの要求を「未送信」と決めない。send-started、送信結果不明、provider完了後のstate未保存も人間の照合待ちにする。既に保存済みの完了observationは履歴だけとして返し、現在の状態へ適用しない。
+- `RecoveryService::reconcile`はlocal stateだけを扱う。version/profile/consent/limit不一致、未解決要求・操作・process・停止未確認・checkpoint・予算chargeがあれば`waiting_human`へ遷移し、古い判定を`invalidatedDecisions`へ移す。stale completionはcommand journalの同じ要求IDで1回だけ通知する。run・model要求・自動再開は行わない。
+
+### 明示的な人間操作
+
+- `execute_operation`はhost所有request ID、revision CAS、command journalを使う。stop/cancelはH1の協調停止portだけを使い、未確認なら`stopped(stopUnconfirmed)`にする。取消しは履歴・run group・成果物・証拠を削除しない。停止未確認の間はresume/reassessを拒否する。
+- resume/reassessは`stopped`/`waiting_human`だけを対象に、復旧報告（未解決要求・操作・process、checkpoint、停止、許可context、予算、version）を通った場合だけ許可する。resumeは旧run/input/承認を再生せず新しいrunの準備状態へ戻す。消費済み予算は維持する。
+- 条件・profile・consent・上限の変更は人間操作だけで、停止確認後に適用する。条件はapproved versionを要求し、旧判定を履歴へ移す。変更前後の`BudgetUsage`と版を`changeLog`へ残す。上限versionはdurable ledgerへ反映し、消費済みrunを下回る上限は拒否する。
+
+### Storeとquit接続
+
+- schema 8の既存tableを使い、`Store::recovery_snapshot`と`supervision_records_for_project`がread-onlyでrecord・要求・未解決操作・checkpointを返す。migrationは追加していない。crash前（行なし）、intent保存後（observationなし）、SendStarted後、provider完了・state保存前、state保存後は、行の有無・observation・record stateの組合せで区別できる。
+- `src-tauri/src/lifecycle/supervision_quit.rs`の`mark_supervision_for_quit`はStoreと停止結果mapだけを受け取り、Tauri windowなしで呼べる。active recordを`stopped(recoveryReconciliation)`または未確認なら`stopped(stopUnconfirmed)`へCASで記録し、同じrevisionの再呼出しは何もしない。既存H1のquit grace・stop・checkpoint保存は変更しない。
+
+### Task 15のテスト
+
+`tests/supervision/tests/recovery.rs`は実`herness-store`の一時DBを二つのhandleで開き、fake H1 runtimeと実`BudgetLedger`だけを使う。provider・credential・Keychain・Tauri・外部processは使わない。
+
+- intent保存前、intent-only、SendStarted後、provider完了・state保存前、state保存後の5通りで、復旧が要求0・run 0・tool 0・自動再開0を報告し、未解決/waiting_human/回復可能を正しく分類する。
+- stop未確認とcancel競合はterminal遷移1回、run group保持、追加runなしを確認する。未解決操作・管理process・checkpoint欠落はresumeを拒否し、解消後の明示resumeが成功して消費済みrun数を維持する。
+- 古い条件・profile・consent・limitは`waiting_human`と判定失効になり、遅延完了observationは履歴だけになる。未知の金額予約はunresolvedのままcountingで、completed staleは1回だけ通知して新しいrunを作らない。
+- stop/resume/reassessの重複request IDは同じ結果を返し、CAS競合は停止も状態変更も起こさない。quit hookはactive recordをmarkし、再open後の復旧は自動実行しない。
+
+Task 15の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test recovery --locked
+cargo test -p herness-desktop --lib lifecycle::supervision_quit --locked
+cargo check --workspace --all-targets --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+実provider・実credential・実Keychain・実Tauri windowは使わない。Task 16の監督UI・実store/quit composition、Task 17のfixtures、Task 18の受入はこのTaskに含めない。

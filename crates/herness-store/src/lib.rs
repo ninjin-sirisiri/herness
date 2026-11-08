@@ -21,4 +21,6 @@ pub use error::{ConfigViolation, StoreError};
 pub use herness_core::{
     FileObservation, OperationEvidence, OperationOutcome, OperationRecord, OperationResult,
 };
-pub use store::{CheckpointRecord, ModelRequestRecord, Store, SupervisedStateRecord};
+pub use store::{
+    CheckpointRecord, ModelRequestRecord, Store, StoreRecoverySnapshot, SupervisedStateRecord,
+};

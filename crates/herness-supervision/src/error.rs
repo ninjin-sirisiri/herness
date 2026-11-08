@@ -175,6 +175,11 @@ pub enum SupervisionError {
         /// Capability label.
         feature: String,
     },
+    /// Explicit resume or reassessment is blocked by unreconciled state.
+    NotResumable {
+        /// Structured blockers. No side effect was performed.
+        reasons: Vec<crate::recovery::RecoveryBlockReason>,
+    },
     /// Durable storage could not complete the operation.
     StorageFailure {
         /// Sanitized description; never contains stored content.
@@ -315,6 +320,12 @@ impl fmt::Display for SupervisionError {
                 write!(
                     f,
                     "supervision feature {feature} is not implemented by this build"
+                )
+            }
+            Self::NotResumable { reasons } => {
+                write!(
+                    f,
+                    "supervision is not resumable without reconciliation: {reasons:?}"
                 )
             }
             Self::StorageFailure { detail } => {

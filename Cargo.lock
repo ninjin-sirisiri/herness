@@ -1330,6 +1330,7 @@ dependencies = [
  "herness-core",
  "herness-engine-pi",
  "herness-store",
+ "herness-supervision",
  "security-framework",
  "security-framework-sys",
  "serde",

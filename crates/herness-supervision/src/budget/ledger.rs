@@ -297,6 +297,15 @@ impl BudgetLedgerRecord {
         self.money.get(&attempt)
     }
 
+    /// Replaces the finite policy snapshot and version.
+    ///
+    /// Used only by an explicit human limit change. The caller validates that
+    /// the new version is newer and that consumed runs still fit.
+    pub(crate) fn replace_policy(&mut self, policy: BudgetPolicy, policy_version: u64) {
+        self.policy = policy;
+        self.policy_version = policy_version;
+    }
+
     /// Reservations whose usage or result is still unresolved.
     pub fn unresolved_charges(&self) -> Vec<MoneyReservation> {
         self.money
@@ -926,6 +935,41 @@ impl<S: BudgetStorePort, C: BudgetClockPort> BudgetLedger<S, C> {
     /// Excludes application-stopped time.
     pub fn app_stop(&mut self) -> Result<(), SupervisionError> {
         self.set_clock_state(BudgetClockState::AppStopped)
+    }
+
+    /// Changes the finite policy and its durable version after a human change.
+    ///
+    /// The new version must be strictly newer. A policy that would put already
+    /// consumed runs above the new maximum is rejected, so the ledger invariant
+    /// keeps holding. Consumed active seconds and money are never reset.
+    pub fn change_policy(
+        &mut self,
+        policy: BudgetPolicy,
+        policy_version: u64,
+    ) -> Result<(), SupervisionError> {
+        policy.validate()?;
+        if policy_version == 0 {
+            return Err(SupervisionError::BudgetInvalid {
+                field: "budget.policyVersion".to_owned(),
+                detail: "the policy version must be positive".to_owned(),
+            });
+        }
+        self.mutate(|record, _| {
+            if policy_version <= record.policy_version() {
+                return Err(SupervisionError::BudgetInvalid {
+                    field: "budget.policyVersion".to_owned(),
+                    detail: "a changed policy version must be newer".to_owned(),
+                });
+            }
+            if record.usage().runs_started > policy.max_total_runs() {
+                return Err(SupervisionError::BudgetInvalid {
+                    field: "budget.additionalRuns".to_owned(),
+                    detail: "the new run limit is below the already consumed run count".to_owned(),
+                });
+            }
+            record.replace_policy(policy.clone(), policy_version);
+            Ok(())
+        })
     }
 
     /// Reserves one run count without consuming it.

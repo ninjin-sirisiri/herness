@@ -11,7 +11,7 @@ use herness_core::contracts::{ContractVersion, ProjectId, RunId, Timestamp};
 
 use crate::approval::ApprovalActor;
 use crate::assessment::{AssessmentResult, ConditionVerdict};
-use crate::budget::BudgetLimit;
+use crate::budget::{BudgetLimit, BudgetUsage};
 use crate::conditions::ConditionVersion;
 use crate::consent::ConsentBinding;
 use crate::contract::{RunGroup, SupervisionContract};
@@ -524,6 +524,8 @@ pub enum DecisionInvalidation {
     ProfileChanged,
     /// The disclosure consent changed or was revoked.
     ConsentChanged,
+    /// The finite budget policy or its version changed.
+    LimitsChanged,
 }
 
 /// A decision preserved only as history after a version change.
@@ -543,6 +545,114 @@ impl InvalidatedDecision {
     /// Why it no longer applies.
     pub const fn invalidation(&self) -> DecisionInvalidation {
         self.invalidation
+    }
+}
+
+/// Kind of an explicit supervision version/limit change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// Completion conditions and required checks.
+    Conditions,
+    /// Evidence target version.
+    Target,
+    /// Assessment or permission profile.
+    Profile,
+    /// Disclosure consent.
+    Consent,
+    /// Finite budget policy or its version.
+    Budget,
+    /// Execution scope / permission description.
+    Permissions,
+}
+
+impl ChangeKind {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conditions => "conditions",
+            Self::Target => "target",
+            Self::Profile => "profile",
+            Self::Consent => "consent",
+            Self::Budget => "budget",
+            Self::Permissions => "permissions",
+        }
+    }
+}
+
+/// One explicit version/limit change preserved with the record.
+///
+/// The before/after fields are opaque, non-secret host labels. Budget usage is
+/// copied before and after so a later reader can see that consumed budget was
+/// never reset by the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SupervisionChangeRecord {
+    kind: ChangeKind,
+    actor: ApprovalActor,
+    before: String,
+    after: String,
+    budget_before: BudgetUsage,
+    budget_after: BudgetUsage,
+    changed_at: Timestamp,
+}
+
+impl SupervisionChangeRecord {
+    /// Creates one recorded change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: ChangeKind,
+        actor: ApprovalActor,
+        before: impl Into<String>,
+        after: impl Into<String>,
+        budget_before: BudgetUsage,
+        budget_after: BudgetUsage,
+        changed_at: Timestamp,
+    ) -> Self {
+        Self {
+            kind,
+            actor,
+            before: before.into(),
+            after: after.into(),
+            budget_before,
+            budget_after,
+            changed_at,
+        }
+    }
+
+    /// Kind of change.
+    pub const fn kind(&self) -> ChangeKind {
+        self.kind
+    }
+
+    /// Actor that requested the change.
+    pub fn actor(&self) -> &ApprovalActor {
+        &self.actor
+    }
+
+    /// Non-secret before label.
+    pub fn before(&self) -> &str {
+        &self.before
+    }
+
+    /// Non-secret after label.
+    pub fn after(&self) -> &str {
+        &self.after
+    }
+
+    /// Budget usage before the change.
+    pub const fn budget_before(&self) -> BudgetUsage {
+        self.budget_before
+    }
+
+    /// Budget usage after the change.
+    pub const fn budget_after(&self) -> BudgetUsage {
+        self.budget_after
+    }
+
+    /// When the change was committed.
+    pub const fn changed_at(&self) -> Timestamp {
+        self.changed_at
     }
 }
 
@@ -583,6 +693,8 @@ pub struct SupervisionRecord {
     completion_stale: Option<StaleCompletion>,
     #[serde(default)]
     supervisor: SupervisorState,
+    #[serde(default)]
+    change_log: Vec<SupervisionChangeRecord>,
 }
 
 impl SupervisionRecord {
@@ -615,6 +727,7 @@ impl SupervisionRecord {
             completion: None,
             completion_stale: None,
             supervisor: SupervisorState::default(),
+            change_log: Vec::new(),
         }
     }
 
@@ -711,6 +824,33 @@ impl SupervisionRecord {
     /// Additive deterministic supervisor bookkeeping.
     pub const fn supervisor(&self) -> &SupervisorState {
         &self.supervisor
+    }
+
+    /// Explicit version and limit changes preserved in order.
+    pub fn change_log(&self) -> &[SupervisionChangeRecord] {
+        &self.change_log
+    }
+
+    /// Appends one explicit change record.
+    pub(crate) fn push_change(&mut self, change: SupervisionChangeRecord) {
+        self.change_log.push(change);
+    }
+
+    /// Marks recovery as waiting for a human without adopting a newer version.
+    ///
+    /// Applied decisions are moved to invalidated history when a version,
+    /// profile, consent, or limit mismatch made them inapplicable. The current
+    /// record versions stay unchanged until an explicit human operation
+    /// approves the new version.
+    pub fn mark_recovery_waiting(
+        &mut self,
+        action: HumanAction,
+        invalidation: Option<DecisionInvalidation>,
+    ) -> Result<(), SupervisionError> {
+        if let Some(invalidation) = invalidation {
+            self.invalidate_all(invalidation);
+        }
+        self.wait_for_human(action)
     }
 
     pub(crate) fn supervisor_mut(&mut self) -> &mut SupervisorState {
@@ -1201,6 +1341,51 @@ impl SupervisionRecord {
         };
         self.completion = Some(snapshot);
         self.completion_stale = None;
+        Ok(())
+    }
+
+    /// Resets controller bookkeeping for an explicit human resume.
+    ///
+    /// The record becomes ready for a new run. Old run/input identifiers and
+    /// prepared deficiencies are cleared so no previous input or approval is
+    /// replayed. Consumed budget and evaluation history stay untouched.
+    pub(crate) fn reset_for_resume(&mut self) {
+        self.set_state(SupervisionState::Ready, SupervisionReason::AwaitingStart)
+            .expect("ready/awaiting_start is a valid pair");
+        let state = self.supervisor_mut();
+        state.phase = crate::supervisor::SupervisorPhase::Idle;
+        state.current_run = None;
+        state.current_input = None;
+        state.current_budget_request = None;
+        state.continuation_of = None;
+        state.pending_deficiency = None;
+        state.cycle_checks_done.clear();
+        state.cycle_assessed.clear();
+        state.pending_assessment = None;
+        state.stagnation_cycles = 0;
+        state.cycle_baseline = None;
+        state.last_target_digest = None;
+    }
+
+    /// Resets controller bookkeeping for an explicit human reassessment.
+    ///
+    /// Verification starts again from the current conditions and target. The
+    /// previous run is not resumed and no input is replayed.
+    pub(crate) fn reset_for_reassess(&mut self) -> Result<(), SupervisionError> {
+        self.begin_verification(self.required_checks.clone())?;
+        let state = self.supervisor_mut();
+        state.phase = crate::supervisor::SupervisorPhase::Evaluating;
+        state.current_run = None;
+        state.current_input = None;
+        state.current_budget_request = None;
+        state.continuation_of = None;
+        state.pending_deficiency = None;
+        state.cycle_checks_done.clear();
+        state.cycle_assessed.clear();
+        state.pending_assessment = None;
+        state.last_target_digest = None;
+        state.stagnation_cycles = 0;
+        state.cycle_baseline = None;
         Ok(())
     }
 

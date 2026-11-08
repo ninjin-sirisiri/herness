@@ -24,8 +24,9 @@ use herness_core::{
 };
 use herness_supervision::{
     BudgetLedgerRecord, BudgetStorePort, CommandResult, EvidenceId, EvidenceRecord,
-    EvidenceStorePort, MoneyReservationState, StoredBudgetRecord, SupervisionError, SupervisionId,
-    SupervisionRecord, SupervisionRequestId, SupervisionStorePort,
+    EvidenceStorePort, MoneyReservationState, RecoveryBudgetRead, RecoveryFactsPort,
+    RecoveryOperation, RecoveryRequestAttempt, RecoverySnapshot, StoredBudgetRecord,
+    SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId, SupervisionStorePort,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -104,6 +105,50 @@ impl ModelRequestRecord {
     /// When the current observation was first persisted.
     pub const fn observed_at(&self) -> Option<Timestamp> {
         self.observed_at
+    }
+}
+
+/// One read-consistent recovery view from the durable store.
+///
+/// The values come from one deferred read transaction. They contain no
+/// provider body or credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRecoverySnapshot {
+    records: Vec<SupervisionRecord>,
+    requests: Vec<RecoveryRequestAttempt>,
+    unresolved_operations: Vec<RecoveryOperation>,
+    checkpoints: std::collections::BTreeMap<RunId, bool>,
+}
+
+impl StoreRecoverySnapshot {
+    /// Supervision records for the project.
+    pub fn records(&self) -> &[SupervisionRecord] {
+        &self.records
+    }
+
+    /// Durable model-request attempts.
+    pub fn requests(&self) -> &[RecoveryRequestAttempt] {
+        &self.requests
+    }
+
+    /// Unresolved H1 operations.
+    pub fn unresolved_operations(&self) -> &[RecoveryOperation] {
+        &self.unresolved_operations
+    }
+
+    /// Checkpoint presence by run. A missing key means no observed run.
+    pub fn checkpoints(&self) -> &std::collections::BTreeMap<RunId, bool> {
+        &self.checkpoints
+    }
+
+    /// Converts into the supervision recovery snapshot shape.
+    pub fn into_recovery_snapshot(self) -> RecoverySnapshot {
+        RecoverySnapshot::new(
+            self.records,
+            self.requests,
+            self.unresolved_operations,
+            self.checkpoints,
+        )
     }
 }
 
@@ -1046,6 +1091,148 @@ impl Store {
         Ok(revision)
     }
 
+    /// Lists every supervision record for a project in stable ID order.
+    ///
+    /// This is a read-only startup/window-reopen query. It never starts a run
+    /// or applies a stored intent.
+    pub fn supervision_records_for_project(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<SupervisionRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT supervision_id, payload FROM supervision_records
+             WHERE project_id = ?1
+             ORDER BY supervision_id ASC",
+        )?;
+        let mut rows = statement.query([project.to_string()])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            let supervision_id: String = row.get(0)?;
+            let payload: Vec<u8> = row.get(1)?;
+            let supervision_id: SupervisionId = supervision_id
+                .parse()
+                .map_err(|_| StoreError::corrupt("invalid supervision record id"))?;
+            let record = decode_supervision(&payload, *project, supervision_id)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Reads one consistent, read-only recovery view for a project.
+    ///
+    /// The query groups supervision records, model-request intents and
+    /// observations, unresolved H1 operations, and checkpoint presence under one
+    /// deferred transaction. It mutates nothing, sends nothing, executes
+    /// nothing, and never turns an intent into an assumed pre-send failure. The
+    /// caller distinguishes a crash before intent (no row), intent-only (row
+    /// without observation), send-started, terminal-before-state-save (terminal
+    /// observation with a non-terminal record state), and state-saved (terminal
+    /// observation with the record already advanced) from these values.
+    pub fn recovery_snapshot(
+        &self,
+        project: &ProjectId,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let records = {
+            let mut statement = transaction.prepare(
+                "SELECT supervision_id, payload FROM supervision_records
+                 WHERE project_id = ?1
+                 ORDER BY supervision_id ASC",
+            )?;
+            let mut rows = statement.query([project.to_string()])?;
+            let mut records = Vec::new();
+            while let Some(row) = rows.next()? {
+                let supervision_id: String = row.get(0)?;
+                let payload: Vec<u8> = row.get(1)?;
+                let supervision_id: SupervisionId = supervision_id
+                    .parse()
+                    .map_err(|_| StoreError::corrupt("invalid supervision record id"))?;
+                records.push(decode_supervision(&payload, *project, supervision_id)?);
+            }
+            records
+        };
+
+        let requests = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {REQUEST_COLUMNS} FROM model_requests
+                 WHERE project_id = ?1
+                 ORDER BY recorded_at ASC, attempt_id ASC"
+            ))?;
+            let mut rows = statement.query([project.to_string()])?;
+            let mut requests = Vec::new();
+            while let Some(row) = rows.next()? {
+                let record = model_request_record_from_row(row)?;
+                let intent = record.intent();
+                let run_id = intent.subject().run().map(|run| run.run_id());
+                let activity_kind = intent
+                    .subject()
+                    .host_activity()
+                    .map(|activity| activity.activity_kind().to_string());
+                requests.push(RecoveryRequestAttempt::new(
+                    intent.request_id(),
+                    intent.attempt_id(),
+                    run_id,
+                    activity_kind,
+                    intent.purpose().as_str(),
+                    record.recorded_at(),
+                    record.observation().cloned(),
+                    record.observed_at(),
+                ));
+            }
+            requests
+        };
+
+        let unresolved_operations = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {OPERATION_COLUMNS} FROM operations
+                 WHERE project_id = ?1 AND (outcome IS NULL OR outcome = 'unverifiable')
+                 ORDER BY recorded_at ASC, operation_id ASC"
+            ))?;
+            let mut rows = statement.query([project.to_string()])?;
+            let mut operations = Vec::new();
+            while let Some(row) = rows.next()? {
+                let record = operation_record_from_row(row)?;
+                if !record.is_unresolved() {
+                    continue;
+                }
+                let operation = record.intent().operation();
+                operations.push(RecoveryOperation::new(
+                    operation.operation_id().to_string(),
+                    operation.run_id(),
+                    operation.tool().as_str(),
+                ));
+            }
+            operations
+        };
+
+        let mut checkpoints = std::collections::BTreeMap::new();
+        {
+            let mut statement = transaction.prepare(
+                "SELECT run_id FROM checkpoints
+                 WHERE project_id = ?1
+                 ORDER BY run_id ASC",
+            )?;
+            let mut rows = statement.query([project.to_string()])?;
+            while let Some(row) = rows.next()? {
+                let run_id: String = row.get(0)?;
+                let run: RunId = parse_core(&run_id, "checkpoint run id")?;
+                checkpoints.insert(run, true);
+            }
+            for record in &records {
+                for run in record.run_group().runs() {
+                    checkpoints.entry(*run).or_insert(false);
+                }
+            }
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(StoreRecoverySnapshot {
+            records,
+            requests,
+            unresolved_operations,
+            checkpoints,
+        })
+    }
+
     /// Reads one recorded command result.
     pub fn supervision_command_result(
         &self,
@@ -1562,6 +1749,27 @@ impl SupervisionStorePort for Store {
             result,
         )
         .map_err(Into::into)
+    }
+}
+
+impl RecoveryFactsPort for Store {
+    fn recovery_snapshot(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<RecoverySnapshot, SupervisionError> {
+        Store::recovery_snapshot(self, &project_id)
+            .map(StoreRecoverySnapshot::into_recovery_snapshot)
+            .map_err(Into::into)
+    }
+}
+
+impl RecoveryBudgetRead for Store {
+    fn load_recovery_budget(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<StoredBudgetRecord>, SupervisionError> {
+        Store::load_budget_record(self, project_id, supervision_id).map_err(Into::into)
     }
 }
 

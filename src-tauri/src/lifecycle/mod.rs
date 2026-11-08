@@ -10,6 +10,7 @@
 //! and human choice.
 
 pub mod quit;
+pub mod supervision_quit;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
