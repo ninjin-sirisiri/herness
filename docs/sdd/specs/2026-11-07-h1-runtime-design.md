@@ -4,6 +4,8 @@
 
 **Status:** 2026-11-08に利用者が設計と基盤選定を承認。その後実装をmainへ統合したが、[受入記録](../../research/2026-11-08-h1-acceptance.md)ではOpenAI・Anthropic APIキー経路が未確認で、H1受入は未完了。H2の設計開始は別途指示されたが、未確認項目の免除ではない。
 
+**H2接続拡張:** Shared contractの「H2 integration additions」は追加の設計案としてレビュー待ち。既存H1の承認と、追加契約の承認を区別する。
+
 **Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。
 
 本specは[ロードマップ](2026-11-07-herness-roadmap.md)のH1を扱う。用語は[CONTEXT.md](../../../CONTEXT.md)、選定の証拠と限界は[spike結果](../../research/2026-11-07-pi-rust-spike.md)を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。
@@ -118,7 +120,7 @@ H3は、本specの永続化済み変更通知と許可境界を利用し、全�
 
 ### Events and audit
 
-イベントは`contractVersion`、project・agent・session・runのID、必要時の操作ID、project内で単調増加する`sequence`、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。
+既存version 1のrunイベントは`contractVersion`、project・agent・session・runのID、必要時の操作ID、project内で単調増加する`sequence`、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。H2接続で必要なversion 2の追加案はH2 integration additionsに定める。
 
 変更・許可・状態遷移は欠落なく追跡できるようにする。streamの表示用deltaはまとめてもよいが、再接続時にはcheckpointと最後のsequenceから整合を回復できなければならない。通知の再配送を操作の再実行として扱わない。
 
@@ -134,6 +136,21 @@ H2はrunの安定状態と検証証拠を消費するが、`idle`や正常終了
 - シェルは管理下のprocess groupと停止経路を持つ。ただし意図的に切り離されたプロセスまで捕捉できるという保証はしない。停止を確認できない状態を「すべて停止済み」と表示しない。
 - 再起動時は保存状態を復元するだけで、勝手に実行・再送信しない。人間の再開操作で現在の資格情報・許可を確認する。過去の承認を復元しただけで再利用しない。
 - 実行意図が残り、結果の永続化がない操作は、保存済みの差分・版・toolの照合結果から判断する。証拠が不足したまま成功・未適用と決めず、照合待ちに留める。
+
+### H2 integration additions
+
+この節は[承認済みH2 spec](2026-11-08-h2-supervision-design.md)のH1 integration prerequisitesを実行境界の正本へ具体化する追加案であり、本節のレビュー完了まではH2の実装planを確定しない。H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。
+
+1. **追加runと入力の対応:** hostは直前run、同じagent/session、現在の許可、入力IDを指定する継続境界を提供する。前runが安定し未解決操作がない場合だけ、新run IDを作り、同じ会話・制約を保持して入力を送る。追加runの全tool・checkpoint・eventは新runへ結び付け、古い承認は流用しない。入力の受理・開始・完結を入力IDで対応付け、作成直後のidleを入力完結と扱わない。会話を保持できなければ実行せず、能力不足を返す。
+2. **復旧のgate:** paused/interrupted runの再開は、未確定操作、管理下process、接続・権限・保存形式の照合を先に行う。同一process内・再起動後の双方を扱い、SDKが未完了応答を安全に再開できない場合は再開不可とする。未送信と決め付けて同じ入力・toolを再実行したり、会話を捨てて別sessionへ移したりしない。人間待ちからは人間の再開操作を必要とする。
+3. **唯一のtool許可経路:** hostが確定したrunのgrant上限、現在のpolicy参照、評価器への参照、停止・deadline制御をPiの実tool経路まで渡す。adapterが広いgrantを再構成しない。hostとadapterのうち指定された一方だけが実行し、最終引数・policy・grant・停止状態を副作用直前に照合する。評価の待機はhost全体の監視・停止を占有せず、失敗・取消し・timeoutでは実行しない。H2の60秒等の値はH2が所有する。
+4. **モデル要求のgateと観測:** SDKからの自動的な次要求を含む各外部モデル要求に、host所有の要求ID、接続ID、用途、runまたはhost activity参照、attempt IDを付ける。送信前のgateで同意・予算予約・deadlineを検査し、その意図を永続化してから送る。接続前失敗・送信開始・完結・取消し・送信結果不明、利用可能なinput/output/cache token数と実model IDを返す。欠落した使用量は0でなくunknownとし、H2がopaque checkpointを解析して補わない。gateはH1所有のportとして注入でき、H1単独の利用でH2型を必要としない。gate拒否・保存失敗では送信せず、gateを迂回する通信を残さない。
+5. **host所有の監視:** 実行中の全projectのengineイベント、入力の完結、管理下process、停止・deadlineをRust hostで処理する。WebViewのpollはsnapshot・購読の取得だけとし、実行を進める条件にしない。window閉鎖・非選択projectでも同じ保証を持ち、quitは既存の停止・保存規則に従う。
+6. **判定用の接続能力:** 接続のprovider・認証方式とendpoint class・入力能力を区別する。既存接続の経路は維持し、TypeSafeのAPIキー接続とJev System One、OpenAI APIキーのDecisionsを判定専用の能力として追加する。判定専用接続をagent実行へ渡したら送信前に拒否し、ChatGPTログインをDecisionsへ流用しない。秘密の保存・更新・origin制約は既存のH1境界に従い、用途別profile・送信同意・問いはH2が所有する。
+7. **version 2のevent envelope:** project、sequence、時刻、kind、payloadに加え、subjectをrun参照またはhost activity参照のいずれかとする。run参照には実在するagent/session/run IDを要求し、host activity参照にはprojectに束縛したkindと安定IDを要求する。run作成前のH2イベントはhost activityを使い、架空のrunを作らない。操作IDは対応するrun参照にだけ付ける。H2の監督状態はH2 payloadで表し、H1のrun状態へ追加しない。全subjectで同じproject sequenceと保存後通知を使う。
+8. **互換とmigration:** 新規書込みの公開契約はversion 2、eventの既知の読込み版は1・2とする。version 1は明示的な互換decoderでrun参照として読み、保存済みのID・sequence・payloadを保持する。host-stateは既存format 1・2を読めるformat 3へ進め、DB schema 3からの変更は4以降の順序付きtransactional migrationで行う。H2の状態・要求意図・予算・通知にも比較更新と原子的な保存境界を提供する。既存履歴・接続・承認記録・checkpointを削除せず、過去の承認を有効化し直さない。未知のDB・host-state・event・SDK形式は書込み前に拒否する。migration失敗時は旧DBを保持し、成功後の旧アプリによるdowngradeや自動的なDB再作成は認めない。SDK checkpointの版変換はadapterだけが行い、変換不能なら再開不可を返す。
+
+この追加の受入では、version 1の履歴とschema 3のDB fixture、migration途中のfault、実Pi＋loopback modelによる会話保持・入力ID対応・grantと評価器・使用量・再開照合、windowなしの監視を検証する。既存H1の未確認接続を、この追加のmock検証で確認済みに変えない。
 
 ## Data flow
 
@@ -163,7 +180,7 @@ H2はrunの安定状態と検証証拠を消費するが、`idle`や正常終了
 
 | 項目 | 初期値・制約 |
 | --- | --- |
-| 公開する契約の版 | 1。未知の版を黙って解釈しない |
+| 公開する契約の版 | 既存実装は1。H2接続拡張の追加案は新規書込み2・event読込み1と2。未知の版を黙って解釈しない |
 | rationale / purpose | trim後に空でない、最大1,000 Unicode文字 |
 | 履歴ページ | 既定100件、上限500件 |
 | 通常終了の停止猶予 | 10秒。その後は人間に待機継続・強制終了を確認 |
