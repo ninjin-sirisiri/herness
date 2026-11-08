@@ -5,7 +5,7 @@
 //! not interpret SDK internals.
 
 use crate::contracts::checkpoint::Checkpoint;
-use crate::contracts::errors::CoreError;
+use crate::contracts::errors::{ArgumentViolation, CoreError};
 use crate::contracts::events::{Event, EventDraft};
 use crate::contracts::history::{HistoryPage, HistoryQuery};
 use crate::contracts::ids::{OperationId, ProjectId, RunId};
@@ -35,7 +35,14 @@ impl CheckpointCommit {
             }
         }
         for event in &events {
-            let found = event.run_id();
+            let Some(found) = event.run_id() else {
+                return Err(CoreError::InvalidEvent {
+                    field: "subject".to_owned(),
+                    violation: ArgumentViolation::Invalid {
+                        detail: "a host activity event cannot join a run checkpoint".to_owned(),
+                    },
+                });
+            };
             if found != expected {
                 return Err(CoreError::MismatchedRun { expected, found });
             }

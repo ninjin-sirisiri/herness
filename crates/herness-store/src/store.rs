@@ -15,10 +15,10 @@ use std::time::Duration;
 use herness_core::{
     AbsolutePath, Checkpoint, CheckpointCommit, CheckpointFormatVersion, CheckpointPayload,
     CommitReceipt, ContractVersion, CoreError, Event, EventDraft, EventKind, EventPayload,
-    FrozenOperation, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery, OperationEvidence,
-    OperationId, OperationIntent, OperationOutcome, OperationRecord, OperationResult,
-    PermissionMode, PolicyVersion, ProjectId, RunId, RuntimeStore, StorePort, Timestamp,
-    ToolArguments, ToolName,
+    EventSubject, FrozenOperation, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery,
+    OperationEvidence, OperationId, OperationIntent, OperationOutcome, OperationRecord,
+    OperationResult, PermissionMode, PolicyVersion, ProjectId, RunId, RunSubject, RuntimeStore,
+    StorePort, Timestamp, ToolArguments, ToolName,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -349,7 +349,10 @@ impl Store {
                     found: event.project_id(),
                 });
             }
-            if event.run_id() != intent.run_id() {
+            let Some(event_run) = event.run_id() else {
+                return Err(StoreError::UnsupportedHostActivityEvent);
+            };
+            if event_run != intent.run_id() {
                 return Err(StoreError::corrupt(
                     "operation result event belongs to another run",
                 ));
@@ -775,17 +778,20 @@ fn append_events(
     let next_sequence = next_sequence(transaction, project)?;
     let mut events = Vec::with_capacity(drafts.len());
     for (index, draft) in drafts.iter().enumerate() {
+        let Some(run_subject) = draft.run_subject() else {
+            return Err(StoreError::UnsupportedHostActivityEvent);
+        };
         let offset =
             u64::try_from(index).map_err(|_| StoreError::corrupt("event index overflow"))?;
         let sequence = next_sequence
             .checked_add(offset)
             .ok_or_else(|| StoreError::corrupt("project sequence overflow"))?;
-        events.push(
-            draft
-                .clone()
-                .into_event(sequence)
-                .map_err(|error| StoreError::corrupt(format!("event draft: {error}")))?,
-        );
+        let event = draft
+            .clone()
+            .into_event(sequence)
+            .map_err(|error| StoreError::corrupt(format!("event draft: {error}")))?;
+        debug_assert_eq!(event.run_subject(), Some(run_subject));
+        events.push(event);
     }
 
     if !events.is_empty() {
@@ -795,13 +801,16 @@ fn append_events(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for event in &events {
+            let run = event
+                .run_subject()
+                .ok_or(StoreError::UnsupportedHostActivityEvent)?;
             statement.execute(params![
                 event.project_id().to_string(),
                 sequence_to_sql(event.sequence())?,
                 i64::from(event.contract_version().get()),
-                event.agent_id().to_string(),
-                event.session_id().to_string(),
-                event.run_id().to_string(),
+                run.agent_id().to_string(),
+                run.session_id().to_string(),
+                run.run_id().to_string(),
                 event.operation_id().map(|operation| operation.to_string()),
                 event.kind().as_str(),
                 i64::try_from(event.occurred_at().as_unix_millis())
@@ -978,19 +987,32 @@ fn event_from_row(row: &rusqlite::Row<'_>, project: ProjectId) -> Result<Event, 
     let occurred_at = timestamp_from_sql(occurred_at, "event timestamp")?;
     let payload: EventPayload = serde_json::from_str(&payload_text).map_err(StoreError::codec)?;
 
-    Event::new(
-        contract_version,
-        project,
-        agent,
-        session,
-        run,
-        operation,
-        sequence,
-        kind,
-        occurred_at,
-        payload,
-    )
-    .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
+    if contract_version == ContractVersion::V1 {
+        Event::from_v1(
+            project,
+            agent,
+            session,
+            run,
+            operation,
+            sequence,
+            kind,
+            occurred_at,
+            payload,
+        )
+        .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
+    } else {
+        let subject = RunSubject::new(project, agent, session, run)
+            .map_err(|error| StoreError::corrupt(format!("event row subject: {error}")))?;
+        Event::new(
+            EventSubject::Run(subject),
+            operation,
+            sequence,
+            kind,
+            occurred_at,
+            payload,
+        )
+        .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
+    }
 }
 
 fn timestamp_from_sql(value: i64, field: &str) -> Result<Timestamp, StoreError> {

@@ -11,6 +11,8 @@ use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
 use crate::tools::{ToolArguments, ToolName};
 
+pub use crate::contracts::request::StopReason;
+
 /// Request to start one run in an independent engine session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineStart {
@@ -91,17 +93,6 @@ impl EngineStart {
 pub enum EngineInput {
     /// A user or host text message.
     Text(String),
-}
-
-/// Reason a run stop was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StopReason {
-    /// The user requested the stop.
-    UserRequest,
-    /// The application is shutting down.
-    ApplicationQuit,
-    /// Policy or approval requires the run to stop.
-    Policy,
 }
 
 /// Result of a stop request. Unconfirmed stops are never reported as stopped.

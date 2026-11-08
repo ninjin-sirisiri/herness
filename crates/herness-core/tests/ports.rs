@@ -54,6 +54,34 @@ impl Fixture {
         .unwrap()
     }
 
+    fn input(&self) -> InputId {
+        InputId::new(self.project)
+    }
+
+    fn request(&self) -> RequestId {
+        RequestId::new(self.project)
+    }
+
+    fn attempt(&self) -> AttemptId {
+        AttemptId::new(self.project)
+    }
+
+    fn run_subject(&self) -> RunSubject {
+        RunSubject::new(self.project, self.agent, self.session, self.run).unwrap()
+    }
+
+    fn host_activity_draft(&self) -> EventDraft {
+        EventDraft::for_host_activity(
+            self.project,
+            EventKind::new("supervision").unwrap(),
+            HostActivityId::new(self.project),
+            EventKind::new("supervision.created").unwrap(),
+            Timestamp::from_unix_millis(1_700_000_000_000),
+            EventPayload::new(serde_json::json!({ "revision": 1 })),
+        )
+        .unwrap()
+    }
+
     fn draft(&self, kind: &str) -> EventDraft {
         EventDraft::new(
             self.project,
@@ -389,4 +417,104 @@ fn secret_values_are_redacted_and_runtime_errors_are_sanitized() {
     let encoded = serde_json::to_string(&error).unwrap();
     assert!(!encoded.contains("canary"));
     assert!(encoded.contains("expired"));
+}
+
+struct UnimplementedGate;
+
+impl ModelRequestGatePort for UnimplementedGate {}
+
+struct UnimplementedContinuation;
+
+impl ContinuationPort for UnimplementedContinuation {}
+
+struct UnimplementedControl;
+
+impl StopDeadlinePort for UnimplementedControl {}
+
+#[test]
+fn unimplemented_port_features_report_explicit_unsupported_errors() {
+    let fixture = Fixture::new();
+
+    let intent = RequestGateIntent::new(
+        fixture.request(),
+        fixture.attempt(),
+        fixture.connection,
+        RequestPurpose::new("completion-assessment").unwrap(),
+        EventSubject::Run(fixture.run_subject()),
+        StopDeadlineControl::proceed(),
+    )
+    .unwrap();
+    let mut gate = UnimplementedGate;
+    assert_eq!(
+        gate.admit(&intent).unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestGate
+        }
+    );
+
+    let observation = ModelRequestObservation::new(
+        fixture.request(),
+        fixture.attempt(),
+        RequestOutcome::PreflightFailed,
+        Some(ProviderFailureKind::Network),
+        None,
+        TokenUsage::unknown(),
+    )
+    .unwrap();
+    assert_eq!(
+        gate.observe(&observation).unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestObservation
+        }
+    );
+
+    let continuation = ContinuationRequest::new(
+        fixture.project,
+        fixture.input(),
+        fixture.run,
+        RunId::new(fixture.project),
+        fixture.agent,
+        fixture.session,
+        PermissionMode::Configured,
+        PolicyVersion::INITIAL,
+    )
+    .unwrap();
+    let mut continuation_port = UnimplementedContinuation;
+    assert_eq!(
+        continuation_port.continue_run(&continuation).unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::Continuation
+        }
+    );
+    assert_eq!(
+        continuation_port
+            .input_progress(&fixture.input())
+            .unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::InputCorrespondence
+        }
+    );
+
+    let control = UnimplementedControl;
+    assert_eq!(
+        control.control(&fixture.run).unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::StopDeadlineControl
+        }
+    );
+}
+
+#[test]
+fn checkpoint_commit_rejects_a_host_activity_event_explicitly() {
+    let fixture = Fixture::new();
+    let error = CheckpointCommit::new(
+        fixture.checkpoint(),
+        None,
+        vec![fixture.host_activity_draft()],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CoreError::InvalidEvent { ref field, .. } if field == "subject"
+    ));
 }

@@ -303,6 +303,14 @@ pub(crate) fn model_for(
                 .ok_or_else(engine_invalid_response)?
                 .as_url(),
         ),
+        // TypeSafe System One is assessment-only. Reaching an agent-run model
+        // builder is a refusal, never a silent provider switch.
+        Provider::TypeSafe => {
+            return Err(provider_failure(
+                Provider::TypeSafe,
+                ProviderFailureKind::Refused,
+            ));
+        }
     };
     Ok(Model {
         id: settings.model().to_owned(),

@@ -88,6 +88,11 @@ pub enum Provider {
     /// A user-specified OpenAI-compatible endpoint.
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    /// TypeSafe System One assessment provider (Jev).
+    ///
+    /// This provider is assessment-only and never starts an agent run.
+    #[serde(rename = "typesafe")]
+    TypeSafe,
 }
 
 impl fmt::Display for Provider {
@@ -96,6 +101,7 @@ impl fmt::Display for Provider {
             Self::OpenAi => f.write_str("openai"),
             Self::Anthropic => f.write_str("anthropic"),
             Self::OpenAiCompatible => f.write_str("openai_compatible"),
+            Self::TypeSafe => f.write_str("typesafe"),
         }
     }
 }
@@ -215,5 +221,283 @@ impl<'de> Deserialize<'de> for ConnectionInfo {
             wire.status,
         )
         .map_err(de::Error::custom)
+    }
+}
+
+/// Wire endpoint class of a connection.
+///
+/// The class identifies the request shape independently of the provider and
+/// authentication method. Assessment-only classes must never reach an agent
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointClass {
+    /// OpenAI Responses API.
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    /// Anthropic Messages API.
+    AnthropicMessages,
+    /// OpenAI-compatible chat-completions endpoint.
+    #[serde(rename = "openai_completions")]
+    OpenAiCompletions,
+    /// TypeSafe System One assessment endpoint.
+    #[serde(rename = "typesafe_system_one")]
+    TypeSafeSystemOne,
+    /// OpenAI Decisions assessment endpoint.
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+}
+
+impl EndpointClass {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiCompletions => "openai_completions",
+            Self::TypeSafeSystemOne => "typesafe_system_one",
+            Self::OpenAiDecisions => "openai_decisions",
+        }
+    }
+
+    /// Whether this endpoint class is assessment-only.
+    pub const fn is_assessment_only(self) -> bool {
+        matches!(self, Self::TypeSafeSystemOne | Self::OpenAiDecisions)
+    }
+}
+
+/// One input modality a connection can receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputModality {
+    /// Text, code, diffs, and logs.
+    Text,
+    /// Image bytes.
+    Image,
+}
+
+/// Input capabilities declared for one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputCapabilities {
+    text: bool,
+    image: bool,
+}
+
+impl InputCapabilities {
+    /// Declares which input modalities are available.
+    pub const fn new(text: bool, image: bool) -> Self {
+        Self { text, image }
+    }
+
+    /// Text-only connection.
+    pub const fn text_only() -> Self {
+        Self {
+            text: true,
+            image: false,
+        }
+    }
+
+    /// Text and image connection.
+    pub const fn text_and_image() -> Self {
+        Self {
+            text: true,
+            image: true,
+        }
+    }
+
+    /// Whether text input is available.
+    pub const fn supports_text(self) -> bool {
+        self.text
+    }
+
+    /// Whether image input is available.
+    pub const fn supports_image(self) -> bool {
+        self.image
+    }
+
+    /// Whether the connection accepts `modality`.
+    pub const fn supports(self, modality: InputModality) -> bool {
+        match modality {
+            InputModality::Text => self.text,
+            InputModality::Image => self.image,
+        }
+    }
+}
+
+/// How a connection may be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionUsage {
+    /// The connection may run an agent and may also be used for assessment.
+    AgentExecution,
+    /// The connection is assessment-only and must be rejected before an agent
+    /// run sends any request.
+    AssessmentOnly,
+}
+
+impl ConnectionUsage {
+    /// Whether agent execution is permitted.
+    pub const fn allows_agent_execution(self) -> bool {
+        matches!(self, Self::AgentExecution)
+    }
+
+    /// Whether assessment requests are permitted.
+    pub const fn allows_assessment(self) -> bool {
+        matches!(self, Self::AgentExecution | Self::AssessmentOnly)
+    }
+}
+
+/// Non-secret capabilities of one connection.
+///
+/// This value contains no api key, OAuth token, authorization header, or
+/// provider response body. It distinguishes normal agent execution from
+/// assessment-only TypeSafe/Jev System One and OpenAI Decisions connections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionCapabilities {
+    connection_id: ConnectionId,
+    provider: Provider,
+    auth_method: AuthMethod,
+    endpoint_class: EndpointClass,
+    input: InputCapabilities,
+    usage: ConnectionUsage,
+}
+
+impl ConnectionCapabilities {
+    /// Creates validated non-secret capabilities for one connection.
+    pub fn new(
+        connection_id: ConnectionId,
+        provider: Provider,
+        auth_method: AuthMethod,
+        endpoint_class: EndpointClass,
+        input: InputCapabilities,
+        usage: ConnectionUsage,
+    ) -> Result<Self, CoreError> {
+        let expected_provider = match endpoint_class {
+            EndpointClass::OpenAiResponses => Provider::OpenAi,
+            EndpointClass::AnthropicMessages => Provider::Anthropic,
+            EndpointClass::OpenAiCompletions => Provider::OpenAiCompatible,
+            EndpointClass::TypeSafeSystemOne => Provider::TypeSafe,
+            EndpointClass::OpenAiDecisions => Provider::OpenAi,
+        };
+        if provider != expected_provider {
+            return Err(invalid_capability(
+                "endpointClass",
+                "endpoint class does not match the connection provider",
+            ));
+        }
+
+        if endpoint_class == EndpointClass::OpenAiDecisions && auth_method != AuthMethod::ApiKey {
+            return Err(invalid_capability(
+                "authMethod",
+                "OpenAI Decisions requires an API key; ChatGPT login is not accepted",
+            ));
+        }
+        if provider == Provider::TypeSafe && auth_method != AuthMethod::ApiKey {
+            return Err(invalid_capability(
+                "authMethod",
+                "TypeSafe System One requires an API key",
+            ));
+        }
+        if endpoint_class.is_assessment_only() && usage != ConnectionUsage::AssessmentOnly {
+            return Err(invalid_capability(
+                "usage",
+                "assessment-only endpoints cannot be used for agent execution",
+            ));
+        }
+        if !endpoint_class.is_assessment_only() && usage == ConnectionUsage::AssessmentOnly {
+            return Err(invalid_capability(
+                "usage",
+                "an agent endpoint cannot be declared assessment-only",
+            ));
+        }
+
+        Ok(Self {
+            connection_id,
+            provider,
+            auth_method,
+            endpoint_class,
+            input,
+            usage,
+        })
+    }
+
+    /// Connection identifier.
+    pub const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    /// Provider kind.
+    pub const fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    /// Authentication method.
+    pub const fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
+
+    /// Endpoint class.
+    pub const fn endpoint_class(&self) -> EndpointClass {
+        self.endpoint_class
+    }
+
+    /// Declared input capabilities.
+    pub const fn input(&self) -> InputCapabilities {
+        self.input
+    }
+
+    /// Intended connection usage.
+    pub const fn usage(&self) -> ConnectionUsage {
+        self.usage
+    }
+
+    /// Whether this connection may start or continue an agent run.
+    pub const fn allows_agent_execution(&self) -> bool {
+        self.usage.allows_agent_execution()
+    }
+
+    /// Whether this connection may carry assessment requests.
+    pub const fn allows_assessment(&self) -> bool {
+        self.usage.allows_assessment()
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectionCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            connection_id: ConnectionId,
+            provider: Provider,
+            auth_method: AuthMethod,
+            endpoint_class: EndpointClass,
+            input: InputCapabilities,
+            usage: ConnectionUsage,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.connection_id,
+            wire.provider,
+            wire.auth_method,
+            wire.endpoint_class,
+            wire.input,
+            wire.usage,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+fn invalid_capability(field: &str, detail: &str) -> CoreError {
+    CoreError::InvalidValue {
+        field: field.to_owned(),
+        violation: ArgumentViolation::Invalid {
+            detail: detail.to_owned(),
+        },
     }
 }

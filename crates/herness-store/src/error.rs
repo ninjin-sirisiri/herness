@@ -78,6 +78,11 @@ pub enum StoreError {
         /// Contract version found in the event row.
         found: u32,
     },
+    /// A host-activity event was offered to a run-only storage path.
+    ///
+    /// Schema 3 has no representation for a subject without a run. The event
+    /// must not be dropped or given a fabricated run identifier.
+    UnsupportedHostActivityEvent,
     /// A checkpoint commit repeats an operation id that is already recorded.
     DuplicateOperation {
         /// Operation id already present in the store.
@@ -176,6 +181,9 @@ impl fmt::Display for StoreError {
                 f,
                 "stored event contract version {found} is not supported by contract version {CONTRACT_VERSION}"
             ),
+            Self::UnsupportedHostActivityEvent => {
+                f.write_str("host activity events require a store schema with activity subjects")
+            }
             Self::DuplicateOperation { operation } => {
                 write!(f, "operation {operation} is already recorded")
             }
@@ -229,6 +237,9 @@ impl From<StoreError> for CoreError {
             StoreError::UnsupportedContractVersion { found } => CoreError::UnknownContractVersion {
                 found,
                 expected: CONTRACT_VERSION,
+            },
+            StoreError::UnsupportedHostActivityEvent => CoreError::UnsupportedPortFeature {
+                feature: herness_core::PortFeature::HostActivityEvents,
             },
             StoreError::UnsupportedSchemaVersion { .. }
             | StoreError::UnsupportedCheckpointFormat { .. } => CoreError::StoreUnavailable {

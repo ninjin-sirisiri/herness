@@ -117,6 +117,14 @@ pub enum CoreError {
         /// Validation failure.
         violation: ArgumentViolation,
     },
+    /// A port feature is not implemented by this build.
+    ///
+    /// Callers must treat this as unavailable. It is never a success and the
+    /// work it would authorize must not proceed.
+    UnsupportedPortFeature {
+        /// Port feature that is missing.
+        feature: PortFeature,
+    },
     /// A checkpoint commit referred to events or an operation from another run.
     MismatchedRun {
         /// Run that owns the transaction.
@@ -238,6 +246,41 @@ pub enum PathViolation {
     NotAbsolute,
     /// The path contained a NUL byte.
     ContainsNul,
+}
+
+/// A host-owned port feature that this build does not implement yet.
+///
+/// Returning this value is the explicit alternative to a fabricated empty
+/// success. Later phases replace individual variants as the capability lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortFeature {
+    /// Starting a new run that continues a previous conversation.
+    Continuation,
+    /// Correlating input acceptance, start, and completion.
+    InputCorrespondence,
+    /// Admitting an external model request before send.
+    RequestGate,
+    /// Recording a terminal model request observation and its usage.
+    RequestObservation,
+    /// Reading current stop and deadline control for a run.
+    StopDeadlineControl,
+    /// Persisting events for host activities that have no run.
+    HostActivityEvents,
+}
+
+impl PortFeature {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuation => "continuation",
+            Self::InputCorrespondence => "input_correspondence",
+            Self::RequestGate => "request_gate",
+            Self::RequestObservation => "request_observation",
+            Self::StopDeadlineControl => "stop_deadline_control",
+            Self::HostActivityEvents => "host_activity_events",
+        }
+    }
 }
 
 /// Sanitized permission evaluator failure kinds.
@@ -600,6 +643,9 @@ impl fmt::Display for CoreError {
             }
             Self::InvalidEvent { field, violation } => {
                 write!(f, "invalid event field {field:?}: {violation}")
+            }
+            Self::UnsupportedPortFeature { feature } => {
+                write!(f, "port feature {} is not supported", feature.as_str())
             }
             Self::MismatchedRun { expected, found } => {
                 write!(f, "run {found} does not match transaction run {expected}")

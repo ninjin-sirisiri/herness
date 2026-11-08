@@ -143,7 +143,7 @@ impl EnginePort for FakeEngine {
                 <Store as StorePort>::history(&store, HistoryQuery::first(start.project_id()))
                     .map_err(ErrorForTest::core)?;
             page.events().iter().any(|event| {
-                event.run_id() == start.run_id() && event.kind().as_str() == "run.started"
+                event.run_id() == Some(start.run_id()) && event.kind().as_str() == "run.started"
             })
         };
         let mut state = self.state.lock().expect("engine lock");

@@ -504,7 +504,7 @@ fn unknown_checkpoint_and_event_versions_are_errors_not_dropped_rows() {
 
     {
         let conn = raw(&harness.database_path());
-        conn.execute("UPDATE events SET contract_version = 2", [])
+        conn.execute("UPDATE events SET contract_version = 3", [])
             .unwrap();
     }
     {
@@ -515,8 +515,8 @@ fn unknown_checkpoint_and_event_versions_are_errors_not_dropped_rows() {
         assert_eq!(
             error,
             CoreError::UnknownContractVersion {
-                found: 2,
-                expected: 1
+                found: 3,
+                expected: 2
             }
         );
     }

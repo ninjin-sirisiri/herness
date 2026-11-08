@@ -60,9 +60,10 @@ pub struct ConnectionSettings {
 impl ConnectionSettings {
     /// Creates validated non-secret connection settings.
     ///
-    /// * OpenAI, Anthropic, and ChatGPT-login connections use their built-in
-    ///   endpoint; a custom endpoint is rejected. A ChatGPT OAuth connection is
-    ///   represented by [`Provider::OpenAi`] with [`AuthMethod::ChatGptLogin`].
+    /// * OpenAI, Anthropic, ChatGPT-login, and TypeSafe System One connections
+    ///   use their built-in endpoint; a custom endpoint is rejected. A ChatGPT
+    ///   OAuth connection is represented by [`Provider::OpenAi`] with
+    ///   [`AuthMethod::ChatGptLogin`].
     /// * OpenAI-compatible connections require an explicit endpoint and an API
     ///   key.
     /// * Remote plain HTTP requires `insecure_remote_http` to be
@@ -94,7 +95,7 @@ impl ConnectionSettings {
                 let endpoint = endpoint.ok_or(ConnectionError::EndpointRequired)?;
                 Some(endpoint)
             }
-            Provider::OpenAi | Provider::Anthropic => {
+            Provider::OpenAi | Provider::Anthropic | Provider::TypeSafe => {
                 if endpoint.is_some() {
                     return Err(ConnectionError::EndpointNotAllowed { provider });
                 }

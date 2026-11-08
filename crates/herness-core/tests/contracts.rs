@@ -27,6 +27,26 @@ impl Fixture {
         OperationId::new(self.project)
     }
 
+    fn input(&self) -> InputId {
+        InputId::new(self.project)
+    }
+
+    fn request(&self) -> RequestId {
+        RequestId::new(self.project)
+    }
+
+    fn attempt(&self) -> AttemptId {
+        AttemptId::new(self.project)
+    }
+
+    fn activity(&self) -> HostActivityId {
+        HostActivityId::new(self.project)
+    }
+
+    fn run_subject(&self) -> RunSubject {
+        RunSubject::new(self.project, self.agent, self.session, self.run).unwrap()
+    }
+
     fn draft(&self, kind: &str, payload: serde_json::Value) -> EventDraft {
         EventDraft::new(
             self.project,
@@ -71,34 +91,47 @@ impl Fixture {
 }
 
 #[test]
-fn contract_version_is_one_and_rejects_unknown_versions() {
-    assert_eq!(CONTRACT_VERSION, 1);
-    assert_eq!(ContractVersion::CURRENT.get(), 1);
-    assert_eq!(ContractVersion::try_from(1), Ok(ContractVersion::CURRENT));
+fn contract_version_writes_two_and_reads_one_and_two() {
+    assert_eq!(CONTRACT_VERSION, 2);
+    assert_eq!(OLDEST_READABLE_CONTRACT_VERSION, 1);
+    assert_eq!(ContractVersion::CURRENT.get(), 2);
+    assert_eq!(ContractVersion::try_from(1), Ok(ContractVersion::V1));
+    assert_eq!(ContractVersion::try_from(2), Ok(ContractVersion::CURRENT));
     assert_eq!(
-        ContractVersion::try_from(2),
+        ContractVersion::READABLE,
+        [ContractVersion::V1, ContractVersion::V2]
+    );
+    assert!(ContractVersion::V1.is_readable());
+    assert!(ContractVersion::V2.is_readable());
+    assert_eq!(
+        ContractVersion::try_from(3),
         Err(CoreError::UnknownContractVersion {
-            found: 2,
-            expected: 1
+            found: 3,
+            expected: 2
         })
     );
     assert_eq!(
         ContractVersion::try_from(0),
         Err(CoreError::UnknownContractVersion {
             found: 0,
-            expected: 1
+            expected: 2
         })
     );
-    assert_eq!("1".parse::<ContractVersion>(), Ok(ContractVersion::CURRENT));
+    assert_eq!("1".parse::<ContractVersion>(), Ok(ContractVersion::V1));
+    assert_eq!("2".parse::<ContractVersion>(), Ok(ContractVersion::CURRENT));
     assert!(matches!(
-        "2".parse::<ContractVersion>(),
-        Err(CoreError::UnknownContractVersion { found: 2, .. })
+        "3".parse::<ContractVersion>(),
+        Err(CoreError::UnknownContractVersion { found: 3, .. })
     ));
     assert!(matches!(
         "not-a-version".parse::<ContractVersion>(),
         Err(CoreError::InvalidContractVersion { .. })
     ));
-    assert!(serde_json::from_str::<ContractVersion>("2").is_err());
+    assert_eq!(
+        serde_json::from_str::<ContractVersion>("1").unwrap(),
+        ContractVersion::V1
+    );
+    assert!(serde_json::from_str::<ContractVersion>("3").is_err());
 }
 
 #[test]
@@ -118,9 +151,7 @@ fn event_roundtrip_is_camel_case_and_rejects_unknown_version() {
         BTreeSet::from([
             "contractVersion",
             "projectId",
-            "agentId",
-            "sessionId",
-            "runId",
+            "subject",
             "operationId",
             "sequence",
             "kind",
@@ -128,22 +159,238 @@ fn event_roundtrip_is_camel_case_and_rejects_unknown_version() {
             "payload",
         ])
     );
-    assert_eq!(value["contractVersion"], 1);
+    assert_eq!(value["contractVersion"], 2);
     assert_eq!(value["sequence"], 7);
+    assert_eq!(value["subject"]["type"], "run");
+    assert_eq!(value["subject"]["projectId"], fixture.project.to_string());
+    assert_eq!(value["subject"]["agentId"], fixture.agent.to_string());
+    assert_eq!(value["subject"]["sessionId"], fixture.session.to_string());
+    assert_eq!(value["subject"]["runId"], fixture.run.to_string());
 
     let decoded: Event = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(decoded, event);
     assert_eq!(decoded.contract_version(), ContractVersion::CURRENT);
     assert_eq!(decoded.sequence(), 7);
     assert_eq!(decoded.kind().as_str(), "run.state_changed");
+    assert_eq!(decoded.run_id(), Some(fixture.run));
 
     let mut future = value;
-    future["contractVersion"] = json!(2);
+    future["contractVersion"] = json!(3);
     let error = serde_json::from_value::<Event>(future).unwrap_err();
     assert!(
-        error.to_string().contains("unsupported contract version 2"),
+        error.to_string().contains("unsupported contract version 3"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn version_1_event_decodes_as_a_run_subject_and_round_trips() {
+    let fixture = Fixture::new();
+    let operation = fixture.operation();
+    let version_1 = json!({
+        "contractVersion": 1,
+        "projectId": fixture.project.to_string(),
+        "agentId": fixture.agent.to_string(),
+        "sessionId": fixture.session.to_string(),
+        "runId": fixture.run.to_string(),
+        "operationId": operation.to_string(),
+        "sequence": 9,
+        "kind": "run.state_changed",
+        "occurredAt": 1_700_000_000_000u64,
+        "payload": { "state": "idle" },
+    });
+
+    let decoded: Event = serde_json::from_value(version_1).unwrap();
+    assert_eq!(decoded.contract_version(), ContractVersion::V1);
+    assert_eq!(decoded.project_id(), fixture.project);
+    assert_eq!(decoded.agent_id(), Some(fixture.agent));
+    assert_eq!(decoded.session_id(), Some(fixture.session));
+    assert_eq!(decoded.run_id(), Some(fixture.run));
+    assert_eq!(decoded.operation_id(), Some(operation));
+    assert_eq!(decoded.sequence(), 9);
+    assert_eq!(decoded.kind().as_str(), "run.state_changed");
+    assert_eq!(decoded.payload().as_value(), &json!({ "state": "idle" }));
+
+    let direct = Event::from_v1(
+        fixture.project,
+        fixture.agent,
+        fixture.session,
+        fixture.run,
+        Some(operation),
+        9,
+        EventKind::new("run.state_changed").unwrap(),
+        Timestamp::from_unix_millis(1_700_000_000_000),
+        EventPayload::new(json!({ "state": "idle" })),
+    )
+    .unwrap();
+    assert_eq!(direct, decoded);
+
+    let encoded = serde_json::to_value(&decoded).unwrap();
+    assert_eq!(encoded["contractVersion"], 1);
+    assert_eq!(encoded["projectId"], fixture.project.to_string());
+    assert_eq!(encoded["agentId"], fixture.agent.to_string());
+    assert_eq!(encoded["sessionId"], fixture.session.to_string());
+    assert_eq!(encoded["runId"], fixture.run.to_string());
+    assert_eq!(encoded["operationId"], operation.to_string());
+    assert_eq!(encoded["sequence"], 9);
+    assert!(
+        encoded.get("subject").is_none(),
+        "version 1 must not gain a version 2 subject"
+    );
+    let round_tripped: Event = serde_json::from_value(encoded).unwrap();
+    assert_eq!(round_tripped, decoded);
+}
+
+#[test]
+fn event_subjects_reject_mixing_and_cross_project_operations() {
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+
+    let mut mixed = serde_json::to_value(fixture.event()).unwrap();
+    mixed["runId"] = json!(fixture.run.to_string());
+    let error = serde_json::from_value::<Event>(mixed).unwrap_err();
+    assert!(
+        error.to_string().contains("must use subject"),
+        "unexpected error: {error}"
+    );
+
+    let mut version_1_with_subject = json!({
+        "contractVersion": 1,
+        "projectId": fixture.project.to_string(),
+        "agentId": fixture.agent.to_string(),
+        "sessionId": fixture.session.to_string(),
+        "runId": fixture.run.to_string(),
+        "sequence": 1,
+        "kind": "run.started",
+        "occurredAt": 1u64,
+        "payload": {},
+        "subject": {
+            "type": "run",
+            "projectId": fixture.project.to_string(),
+            "agentId": fixture.agent.to_string(),
+            "sessionId": fixture.session.to_string(),
+            "runId": fixture.run.to_string(),
+        },
+    });
+    let error = serde_json::from_value::<Event>(version_1_with_subject.clone()).unwrap_err();
+    assert!(
+        error.to_string().contains("do not carry a subject"),
+        "unexpected error: {error}"
+    );
+
+    version_1_with_subject["contractVersion"] = json!(2);
+    let error = serde_json::from_value::<Event>(version_1_with_subject).unwrap_err();
+    assert!(
+        error.to_string().contains("must use subject"),
+        "unexpected error: {error}"
+    );
+
+    let cross_project_operation = EventDraft::new(
+        fixture.project,
+        fixture.agent,
+        fixture.session,
+        fixture.run,
+        Some(other.operation()),
+        EventKind::new("operation.requested").unwrap(),
+        Timestamp::from_unix_millis(1),
+        EventPayload::new(json!({})),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cross_project_operation,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Operation,
+            ..
+        }
+    ));
+
+    let cross_project_subject = Event::new(
+        EventSubject::Run(fixture.run_subject()),
+        Some(other.operation()),
+        1,
+        EventKind::new("operation.requested").unwrap(),
+        Timestamp::from_unix_millis(1),
+        EventPayload::new(json!({})),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cross_project_subject,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Operation,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn host_activity_subject_is_project_bound_and_has_no_run_or_operation() {
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let activity_id = fixture.activity();
+    let activity = EventDraft::for_host_activity(
+        fixture.project,
+        EventKind::new("supervision").unwrap(),
+        activity_id,
+        EventKind::new("supervision.created").unwrap(),
+        Timestamp::from_unix_millis(1_700_000_000_000),
+        EventPayload::new(json!({ "revision": 1 })),
+    )
+    .unwrap();
+    assert_eq!(activity.project_id(), fixture.project);
+    assert_eq!(activity.run_id(), None);
+    assert_eq!(activity.agent_id(), None);
+    assert_eq!(activity.session_id(), None);
+    assert_eq!(activity.operation_id(), None);
+
+    let event = activity.into_event(11).unwrap();
+    assert_eq!(event.contract_version(), ContractVersion::CURRENT);
+    assert_eq!(event.project_id(), fixture.project);
+    let EventSubject::HostActivity(subject) = event.subject() else {
+        panic!("expected a host activity subject");
+    };
+    assert_eq!(subject.project_id(), fixture.project);
+    assert_eq!(subject.activity_kind().as_str(), "supervision");
+    assert_eq!(subject.activity_id(), activity_id);
+
+    let value = serde_json::to_value(&event).unwrap();
+    assert_eq!(value["contractVersion"], 2);
+    assert_eq!(value["subject"]["type"], "hostActivity");
+    assert_eq!(value["subject"]["activityKind"], "supervision");
+    assert_eq!(value["subject"]["activityId"], activity_id.to_string());
+    assert!(value["subject"].get("runId").is_none());
+    assert!(value.get("agentId").is_none());
+    assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+
+    let cross_project = EventDraft::for_host_activity(
+        fixture.project,
+        EventKind::new("supervision").unwrap(),
+        HostActivityId::new(other.project),
+        EventKind::new("supervision.created").unwrap(),
+        Timestamp::from_unix_millis(1),
+        EventPayload::new(json!({})),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cross_project,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Activity,
+            ..
+        }
+    ));
+
+    let with_operation = Event::new(
+        event.subject().clone(),
+        Some(fixture.operation()),
+        12,
+        EventKind::new("supervision.created").unwrap(),
+        Timestamp::from_unix_millis(1),
+        EventPayload::new(json!({})),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        with_operation,
+        CoreError::InvalidEvent { field, .. } if field == "operationId"
+    ));
 }
 
 #[test]
@@ -230,6 +477,242 @@ fn run_states_match_the_spec_and_idle_is_not_completion() {
             assert!(!state.is_idle());
         }
     }
+}
+
+#[test]
+fn input_idle_evidence_separates_startup_idle_from_completed_input() {
+    let fixture = Fixture::new();
+    let input = fixture.input();
+    assert_eq!(input.project_id(), fixture.project);
+
+    let startup = IdleEvidence::startup();
+    assert_eq!(startup, IdleEvidence::StartupIdle);
+    assert!(!startup.is_input_completed());
+    assert_eq!(startup.input_id(), None);
+    assert!(RunState::Idle.is_idle(), "idle remains an engine fact");
+
+    let accepted = InputProgress::new(input, InputPhase::Accepted);
+    let started = InputProgress::new(input, InputPhase::Started);
+    let completed = InputProgress::new(input, InputPhase::Completed);
+    assert!(!accepted.is_completed());
+    assert!(!started.is_completed());
+    assert!(completed.is_completed());
+
+    let accepted_idle = IdleEvidence::from_progress(accepted);
+    let started_idle = IdleEvidence::from_progress(started);
+    let completed_idle = IdleEvidence::from_progress(completed);
+    assert!(!accepted_idle.is_input_completed());
+    assert!(!started_idle.is_input_completed());
+    assert!(completed_idle.is_input_completed());
+    assert_eq!(completed_idle.input_id(), Some(input));
+    assert_eq!(accepted_idle.input_id(), Some(input));
+
+    let cancelled = IdleEvidence::from_progress(InputProgress::new(input, InputPhase::Cancelled));
+    let failed = IdleEvidence::from_progress(InputProgress::new(input, InputPhase::Failed));
+    assert!(!cancelled.is_input_completed());
+    assert!(!failed.is_input_completed());
+
+    let encoded = serde_json::to_value(completed_idle).unwrap();
+    assert_eq!(encoded["kind"], "input_completed");
+    assert_eq!(
+        serde_json::from_value::<IdleEvidence>(encoded).unwrap(),
+        completed_idle
+    );
+}
+
+#[test]
+fn continuation_request_requires_a_new_run_and_matching_project() {
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let input = fixture.input();
+    let previous = fixture.run;
+    let next = RunId::new(fixture.project);
+    let policy = PolicyVersion::new(2).unwrap();
+    let request = ContinuationRequest::new(
+        fixture.project,
+        input,
+        previous,
+        next,
+        fixture.agent,
+        fixture.session,
+        PermissionMode::Automatic,
+        policy,
+    )
+    .unwrap();
+    assert_eq!(request.input_id(), input);
+    assert_eq!(request.previous_run_id(), previous);
+    assert_eq!(request.run_id(), next);
+    assert_eq!(request.permission_mode(), PermissionMode::Automatic);
+    assert_eq!(request.policy_version(), policy);
+
+    let encoded = serde_json::to_value(request).unwrap();
+    assert_eq!(encoded["inputId"], input.to_string());
+    assert_eq!(
+        serde_json::from_value::<ContinuationRequest>(encoded).unwrap(),
+        request
+    );
+
+    let same_run = ContinuationRequest::new(
+        fixture.project,
+        input,
+        previous,
+        previous,
+        fixture.agent,
+        fixture.session,
+        PermissionMode::Configured,
+        PolicyVersion::INITIAL,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        same_run,
+        CoreError::InvalidValue { ref field, .. } if field == "runId"
+    ));
+
+    let cross_project = ContinuationRequest::new(
+        fixture.project,
+        InputId::new(other.project),
+        previous,
+        next,
+        fixture.agent,
+        fixture.session,
+        PermissionMode::Configured,
+        PolicyVersion::INITIAL,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cross_project,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Input,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn token_usage_missing_is_unknown_and_never_zero() {
+    let unknown = TokenUsage::unknown();
+    assert_eq!(unknown.input_tokens(), TokenCount::Unknown);
+    assert_eq!(unknown.output_tokens(), TokenCount::Unknown);
+    assert_eq!(unknown.cache_read_tokens(), TokenCount::Unknown);
+    assert_eq!(unknown.cache_write_tokens(), TokenCount::Unknown);
+    assert_eq!(unknown.input_tokens().reported(), None);
+    assert!(unknown.is_unknown());
+    assert_eq!(TokenUsage::default(), unknown);
+
+    let encoded = serde_json::to_value(unknown).unwrap();
+    assert_eq!(encoded["inputTokens"], "unknown");
+    assert_eq!(encoded["outputTokens"], "unknown");
+    assert_eq!(
+        serde_json::from_value::<TokenUsage>(encoded).unwrap(),
+        unknown
+    );
+
+    let known_zero = TokenUsage::new(
+        TokenCount::known(0),
+        TokenCount::unknown(),
+        TokenCount::unknown(),
+        TokenCount::unknown(),
+    );
+    assert_eq!(known_zero.input_tokens().reported(), Some(0));
+    assert!(!known_zero.is_unknown());
+
+    let fixture = Fixture::new();
+    let observation = ModelRequestObservation::new(
+        fixture.request(),
+        fixture.attempt(),
+        RequestOutcome::Completed,
+        None,
+        Some(ModelId::new("gpt-6-luna").unwrap()),
+        TokenUsage::unknown(),
+    )
+    .unwrap();
+    assert!(observation.usage().is_unknown());
+    let encoded = serde_json::to_value(&observation).unwrap();
+    assert_eq!(encoded["usage"]["inputTokens"], "unknown");
+    assert_eq!(encoded["modelId"], "gpt-6-luna");
+    assert_eq!(
+        serde_json::from_value::<ModelRequestObservation>(encoded).unwrap(),
+        observation
+    );
+
+    let missing_failure = ModelRequestObservation::new(
+        fixture.request(),
+        fixture.attempt(),
+        RequestOutcome::PreflightFailed,
+        None,
+        None,
+        TokenUsage::unknown(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        missing_failure,
+        CoreError::InvalidValue { ref field, .. } if field == "failure"
+    ));
+
+    let preflight_usage = ModelRequestObservation::new(
+        fixture.request(),
+        fixture.attempt(),
+        RequestOutcome::PreflightFailed,
+        Some(ProviderFailureKind::Network),
+        None,
+        TokenUsage::new(
+            TokenCount::known(1),
+            TokenCount::unknown(),
+            TokenCount::unknown(),
+            TokenCount::unknown(),
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        preflight_usage,
+        CoreError::InvalidValue { ref field, .. } if field == "usage"
+    ));
+}
+
+#[test]
+fn request_gate_intent_is_project_bound_and_reports_stop_deadline() {
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let subject = EventSubject::Run(fixture.run_subject());
+    let intent = RequestGateIntent::new(
+        fixture.request(),
+        fixture.attempt(),
+        ConnectionId::new(),
+        RequestPurpose::new("completion-assessment").unwrap(),
+        subject,
+        StopDeadlineControl::proceed(),
+    )
+    .unwrap();
+    assert_eq!(intent.request_id().project_id(), fixture.project);
+    assert_eq!(intent.attempt_id().project_id(), fixture.project);
+    assert_eq!(intent.purpose().as_str(), "completion-assessment");
+    assert!(intent.control().permits_send());
+    assert!(!StopDeadlineControl::stopped(StopReason::Policy).permits_send());
+    assert!(!StopDeadlineControl::deadline().permits_send());
+    assert_eq!(
+        StopDeadlineControl::stopped(StopReason::UserRequest).stop_reason(),
+        Some(StopReason::UserRequest)
+    );
+
+    let cross_project = RequestGateIntent::new(
+        fixture.request(),
+        AttemptId::new(other.project),
+        ConnectionId::new(),
+        RequestPurpose::new("permission-evaluation").unwrap(),
+        EventSubject::Run(fixture.run_subject()),
+        StopDeadlineControl::proceed(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cross_project,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Attempt,
+            ..
+        }
+    ));
+
+    assert!(RequestPurpose::new("  ").is_err());
+    assert!(ModelId::new("  ").is_err());
 }
 
 #[test]
@@ -622,6 +1105,130 @@ fn connection_info_contains_no_secret_material() {
 }
 
 #[test]
+fn connection_capabilities_separate_assessment_only_connections() {
+    let openai = ConnectionCapabilities::new(
+        ConnectionId::new(),
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_and_image(),
+        ConnectionUsage::AgentExecution,
+    )
+    .unwrap();
+    assert!(openai.allows_agent_execution());
+    assert!(openai.allows_assessment());
+    assert!(openai.input().supports(InputModality::Text));
+    assert!(openai.input().supports(InputModality::Image));
+
+    let jev = ConnectionCapabilities::new(
+        ConnectionId::new(),
+        Provider::TypeSafe,
+        AuthMethod::ApiKey,
+        EndpointClass::TypeSafeSystemOne,
+        InputCapabilities::text_only(),
+        ConnectionUsage::AssessmentOnly,
+    )
+    .unwrap();
+    assert_eq!(jev.provider(), Provider::TypeSafe);
+    assert_eq!(jev.endpoint_class(), EndpointClass::TypeSafeSystemOne);
+    assert!(!jev.allows_agent_execution());
+    assert!(jev.allows_assessment());
+    assert!(!jev.input().supports(InputModality::Image));
+
+    let decisions = ConnectionCapabilities::new(
+        ConnectionId::new(),
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        EndpointClass::OpenAiDecisions,
+        InputCapabilities::text_only(),
+        ConnectionUsage::AssessmentOnly,
+    )
+    .unwrap();
+    assert!(!decisions.allows_agent_execution());
+    assert!(decisions.allows_assessment());
+
+    assert!(
+        ConnectionCapabilities::new(
+            ConnectionId::new(),
+            Provider::TypeSafe,
+            AuthMethod::ApiKey,
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+            ConnectionUsage::AgentExecution,
+        )
+        .is_err(),
+        "Jev System One must never run as an agent connection"
+    );
+    assert!(
+        ConnectionCapabilities::new(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            AuthMethod::ChatGptLogin,
+            EndpointClass::OpenAiDecisions,
+            InputCapabilities::text_only(),
+            ConnectionUsage::AssessmentOnly,
+        )
+        .is_err(),
+        "ChatGPT login must not flow to OpenAI Decisions"
+    );
+    assert!(
+        ConnectionCapabilities::new(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            AuthMethod::ApiKey,
+            EndpointClass::OpenAiDecisions,
+            InputCapabilities::text_only(),
+            ConnectionUsage::AgentExecution,
+        )
+        .is_err()
+    );
+    assert!(
+        ConnectionCapabilities::new(
+            ConnectionId::new(),
+            Provider::Anthropic,
+            AuthMethod::ApiKey,
+            EndpointClass::OpenAiResponses,
+            InputCapabilities::text_only(),
+            ConnectionUsage::AgentExecution,
+        )
+        .is_err()
+    );
+
+    let value = serde_json::to_value(&jev).unwrap();
+    let keys: BTreeSet<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "connectionId",
+            "provider",
+            "authMethod",
+            "endpointClass",
+            "input",
+            "usage",
+        ])
+    );
+    assert_eq!(value["provider"], "typesafe");
+    assert_eq!(value["endpointClass"], "typesafe_system_one");
+    assert_eq!(value["usage"], "assessment_only");
+    let encoded = value.to_string().to_ascii_lowercase();
+    for forbidden in ["token", "secret", "authorization"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "leaked {forbidden}: {encoded}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_value::<ConnectionCapabilities>(value).unwrap(),
+        jev
+    );
+}
+
+#[test]
 fn checkpoint_payload_is_versioned_opaque_and_redacted() {
     let fixture = Fixture::new();
     let payload = CheckpointPayload::new(vec![0x00, 0xff, 0x10]);
@@ -656,13 +1263,13 @@ fn checkpoint_payload_is_versioned_opaque_and_redacted() {
 #[test]
 fn structured_errors_serialize_without_provider_bodies() {
     let error = CoreError::UnknownContractVersion {
-        found: 2,
-        expected: 1,
+        found: 3,
+        expected: 2,
     };
     let value = serde_json::to_value(&error).unwrap();
     assert_eq!(value["kind"], "unknown_contract_version");
-    assert_eq!(value["found"], 2);
-    assert!(error.to_string().contains("version 2"));
+    assert_eq!(value["found"], 3);
+    assert!(error.to_string().contains("version 3"));
 
     let first = Fixture::new();
     let second = Fixture::new();
