@@ -1309,6 +1309,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1405,6 +1406,7 @@ dependencies = [
 name = "herness-supervision-tests"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "herness-assessment",
  "herness-core",
  "herness-store",

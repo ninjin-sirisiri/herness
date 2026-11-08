@@ -13,27 +13,35 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use herness_assessment::{
     AssessmentEndpoints, AssessmentError, AssessmentErrorKind, AssessmentRequest,
     AssessmentTransport, CancelToken, EvidenceDocument, ImageInput, ImageSource,
-    InconclusiveReason, LlmAssessment, LlmAssessmentAdapter, RetryPolicy, TransportControl,
+    InconclusiveReason, JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment,
+    JevAssessmentAdapter, JevRejection, JevUsage, LlmAssessment, LlmAssessmentAdapter, RetryPolicy,
+    TransportControl, jev_question_id,
 };
 use herness_core::{
     AuthMethod, ConnectionAdmin, ConnectionCapabilities, ConnectionCapabilityDeclaration,
-    ConnectionDirectory, ConnectionError, ConnectionId, ConnectionSettings, ConnectionUsage,
-    CoreError, CredentialAvailability, CredentialKind, CredentialPort, Endpoint, EndpointClass,
-    InputCapabilities, Provider, ResolvedCredential, SecretString,
+    ConnectionDirectory, ConnectionError, ConnectionId, ConnectionSettings, ConnectionStatus,
+    ConnectionUsage, CoreError, CredentialAvailability, CredentialKind, CredentialPort, Endpoint,
+    EndpointClass, InputCapabilities, ModelId, Provider, ResolvedCredential, SecretString,
 };
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentRequest as SupervisionAssessmentRequest, ConditionVerdict,
+    RationaleOrigin,
 };
+use herness_supervision::conditions::ConditionVersion;
+use herness_supervision::evidence::TargetVersion;
 use herness_supervision::ids::{ConditionId, EvidenceId};
 use herness_supervision::profiles::{
-    AssessmentProfile, ProfileEntry, ProfileInputs, ProfileThresholds, ProviderKind,
+    AdapterVersion, AssessmentProfile, ProfileEntry, ProfileInputs, ProfilePurpose,
+    ProfileThresholds, ProfileVersion, ProviderKind, RubricVersion,
 };
 use herness_supervision_tests::{
-    FixedClock, Ids, assessment_request, ids, llm_completion_profile_for, llm_profile_entry,
-    other_project, project,
+    FixedClock, Ids, assessment_request, ids, jev_assessment_request, jev_choice_answer,
+    jev_completion_profile_for, jev_completion_profile_with_inputs, jev_profile_entry,
+    jev_system_one_response, llm_completion_profile_for, llm_profile_entry, other_project, project,
 };
 use serde_json::json;
 
@@ -379,6 +387,7 @@ fn reason_phrase(status: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
+        529 => "Site is Overloaded",
         _ => "Status",
     }
 }
@@ -407,11 +416,15 @@ fn settings(
 }
 
 fn jev(admin: &ConnectionAdmin, input: InputCapabilities) -> ConnectionSettings {
+    jev_named(admin, JEV_MODEL, input)
+}
+
+fn jev_named(admin: &ConnectionAdmin, model: &str, input: InputCapabilities) -> ConnectionSettings {
     settings(
         admin,
         Provider::TypeSafe,
         AuthMethod::ApiKey,
-        JEV_MODEL,
+        model,
         None,
         EndpointClass::TypeSafeSystemOne,
         input,
@@ -2899,4 +2912,1347 @@ fn llm_adapter_maps_anthropic_and_chat_envelope_failures() {
             .expect("assessment");
         assert_insufficient(&assessment, InconclusiveReason::MultipleAnswers);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Jev System One condition assessment adapter (Task 11)
+// ---------------------------------------------------------------------------
+
+const JEV_REASONING_CANARY: &str = "jev-internal-reasoning-canary-4f1a";
+const JEV_PNG_280_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAARgAAAEYCAIAAAAI7H7bAAACPElEQVR42u3TMQ0AAAzDsPIn3YLYsceGECkpcBYJwEhgJDASYCQwEhgJjAQYCYwERgIjAUYCI4GRwEiAkcBIYCQwEmAkMBIYCYwEGAmMBEYCjARGAiOBkQAjgZHASGAkwEhgJDASGAkwEhgJjARGAowERgIjgZEAI4GRwEhgJMBIYCQwEmAkMBIYCYwEGAmMBEYCIwFGAiOBkcBIgJHASGAkMBJgJDASGAmMBBgJjARGAiMBRgIjgZEAI4GRwEhgJMBIYCQwEhgJMBIYCYwERgKMBEYCI4GRACOBkcBIYCTASGAkMBJgJDASGAmMBBgJjARGAiMBRgIjgZHASICRwEhgJDASYCQwEhgJjAQYCYwERgIjAUYCI4GRACOBkcBIYCTASGAkMBIYCTASGAmMBEYCjARGAiOBkQAjgZHASGAkwEhgJDASGAkwEhgJjAQYCYwERgIjAUYCI4GRwEiAkcBIYCQwEmAkMBIYCYwEGAmMBEYCIwFGAiOBkQAjgZHASGAkwEhgJDASGAkwEhgJjARGAowERgIjgZEAI4GRwEhgJMBIYCQwEmAkMBIYCYwEGAmMBEYCIwFGAiOBkcBIgJHASGAkMBJgJDASGAmMBBgJjARGAiMBRgIjgZHASICRwEhgJMBIYCQwEhgJMBIYCYwERgKMBEYCI4GRACOBkcBIYCTASGAkMBIYCTASGAmMBEaSAIwERgIjAUYCI4GRwEiAkcBIYCQwEmAkMBIYCYwEGAmMBEYCIwFGgg8DR8le3v+LcucAAAAASUVORK5CYII=";
+const JEV_PNG_100_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAAnUlEQVR42u3QMQEAAAwCIPuX1gr79kAEUs6iQJYsWbJkyVIgS5YsWbJkKZAlS5YsWbIUyJIlS5YsWQpkyZIlS5YsBbJkyZIlS5YCWbJkyZIlS4EsWbJkyZKlQJYsWbJkyVIgS5YsWbJkKZAlS5YsWbIUyJIlS5YsWQpkyZIlS5YsBbJkyZIlS5YCWbJkyZIlS4EsWbJkyZKlQJasbwMtw8Gd7V+EwwAAAABJRU5ErkJggg==";
+
+fn jev_png(width: u32) -> Vec<u8> {
+    let encoded = match width {
+        280 => JEV_PNG_280_BASE64,
+        100 => JEV_PNG_100_BASE64,
+        _ => panic!("no fixture PNG for {width}"),
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("fixture PNG")
+}
+
+struct JevFixture {
+    profile: AssessmentProfile,
+    entry: ProfileEntry,
+    request: SupervisionAssessmentRequest,
+}
+
+fn jev_fixture(
+    model: &str,
+    input: InputCapabilities,
+    profile_version: u64,
+    required: ProfileInputs,
+) -> (ConnectionAdmin, JevFixture) {
+    let admin = ConnectionAdmin::new();
+    let settings = jev_named(&admin, model, input);
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = jev_completion_profile_with_inputs(
+        project,
+        settings.connection_id(),
+        model,
+        profile_version,
+        required,
+    );
+    let entry = jev_profile_entry(&settings, profile.clone());
+    let request = jev_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    (
+        admin,
+        JevFixture {
+            profile,
+            entry,
+            request,
+        },
+    )
+}
+
+fn jev_adapter(
+    credentials: Arc<dyn CredentialPort + Send + Sync>,
+    directory: ConnectionDirectory,
+    typesafe: &MockServer,
+    other: &MockServer,
+) -> JevAssessmentAdapter {
+    let endpoints =
+        AssessmentEndpoints::for_loopback(typesafe.url(), other.openai_base(), other.url())
+            .expect("loopback endpoints");
+    let transport = AssessmentTransport::new(credentials, directory, endpoints)
+        .expect("transport")
+        .with_retry_policy(RetryPolicy::with_base_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ]));
+    JevAssessmentAdapter::new(transport, Arc::new(FixedClock))
+}
+
+fn jev_text_documents(fixture_ids: Ids) -> Vec<EvidenceDocument> {
+    vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ]
+}
+
+fn jev_image_documents(fixture_ids: Ids, png: &[u8]) -> Vec<EvidenceDocument> {
+    vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/png", png.to_vec())
+            .expect("image evidence"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ]
+}
+
+fn jev_response(
+    question_id: &str,
+    choice: &str,
+    met: f64,
+    unmet: f64,
+    insufficient: f64,
+    confidence: f64,
+) -> serde_json::Value {
+    jev_system_one_response(
+        JEV_REQUEST_MODEL,
+        question_id,
+        jev_choice_answer(choice, met, unmet, insufficient, confidence),
+    )
+}
+
+fn jev_choice_verdict(choice: &str) -> ConditionVerdict {
+    match choice {
+        "met" => ConditionVerdict::Met,
+        "unmet" => ConditionVerdict::Unmet,
+        "insufficient" => ConditionVerdict::Insufficient,
+        _ => panic!("unknown fixture choice {choice}"),
+    }
+}
+
+fn assert_jev_rejected(assessment: &JevAssessment, reason: JevRejection) {
+    assert_eq!(assessment.rejection(), Some(reason));
+    assert_eq!(
+        assessment.result().reported_verdict(),
+        ConditionVerdict::Insufficient
+    );
+    assert_eq!(
+        assessment.adopted_verdict(ProfileThresholds::decisions()),
+        None
+    );
+    match assessment.result().outcome() {
+        AssessmentOutcome::NormalLlm { verdict, .. } => {
+            assert_eq!(*verdict, ConditionVerdict::Insufficient);
+        }
+        _ => panic!("a rejected Jev answer used a fabricated Decision outcome"),
+    }
+}
+
+#[test]
+fn jev_adapter_sends_fixed_model_tool_less_choice_request_and_parses_met() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        "jev-latest",
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    server.push(MockResponse::json(
+        200,
+        jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.82),
+    ));
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = jev_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+
+    assert!(assessment.rejection().is_none());
+    assert_eq!(assessment.attempts(), 1);
+    assert_eq!(assessment.usage(), Some(JevUsage::new(120, 12)));
+    let result = assessment.result();
+    assert_eq!(result.reported_verdict(), ConditionVerdict::Met);
+    assert_eq!(
+        assessment.adopted_verdict(fixture.profile.thresholds()),
+        Some(ConditionVerdict::Met)
+    );
+    assert_eq!(
+        result.evidence(),
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b]
+    );
+    assert_eq!(result.rationale_origin(), RationaleOrigin::Host);
+    assert!(result.rationale().starts_with("Host note:"));
+    assert!(!result.rationale().contains(EVIDENCE_A_MARKER));
+    assert_eq!(result.provenance().provider(), Provider::TypeSafe);
+    assert_eq!(result.provenance().provider_kind(), ProviderKind::Jev);
+    assert_eq!(result.provenance().model().as_str(), "jev-latest");
+    assert_eq!(
+        result
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some(JEV_REQUEST_MODEL)
+    );
+    match result.outcome() {
+        AssessmentOutcome::Decision {
+            selected,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(*selected, ConditionVerdict::Met);
+            assert_eq!(probabilities.met(), 0.96);
+            assert_eq!(probabilities.unmet(), 0.03);
+            assert_eq!(probabilities.insufficient(), 0.01);
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.82);
+            assert_eq!(confidence.scale(), JEV_CONFIDENCE_SCALE);
+            assert!(!confidence.is_probability());
+        }
+        _ => panic!("expected a Decision outcome"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/systemone");
+    assert_eq!(
+        requests[0].header("authorization"),
+        Some(format!("Bearer {CANARY}").as_str())
+    );
+    assert_eq!(requests[0].header("content-type"), Some("application/json"));
+    assert_eq!(requests[0].header("typesafe-danger-zone-images"), None);
+    let body = requests[0].json_body();
+    assert_tool_less(&body);
+    assert_eq!(body["model"].as_str(), Some(JEV_REQUEST_MODEL));
+    let question = &body["questions"][question_id.as_str()];
+    assert_eq!(question["type"].as_str(), Some("choice"));
+    assert!(
+        question["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains(fixture.request.rubric()))
+    );
+    let criteria = question["criteria"].as_object().expect("criteria");
+    assert_eq!(criteria.len(), 3);
+    for key in ["met", "unmet", "insufficient"] {
+        assert!(criteria.contains_key(key), "missing criterion {key}");
+    }
+    let serialized = body.to_string();
+    assert!(serialized.contains(EVIDENCE_A_MARKER));
+    assert!(serialized.contains(EVIDENCE_B_MARKER));
+    assert!(!serialized.contains(UNRELATED_EVIDENCE_MARKER));
+    assert!(!serialized.contains(CONVERSATION_CANARY));
+    assert!(body.get("assets").is_none());
+    assert_eq!(credentials.calls(), 1);
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn jev_adapter_accepts_choice_verdicts_and_threshold_boundaries() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    let cases = [
+        (
+            "unmet",
+            0.04,
+            0.95,
+            0.01,
+            0.8,
+            Some(ConditionVerdict::Unmet),
+        ),
+        ("insufficient", 0.01, 0.01, 0.98, 0.9, None),
+        ("met", 0.94, 0.05, 0.01, 0.99, None),
+        ("met", 0.96, 0.03, 0.01, 0.1, Some(ConditionVerdict::Met)),
+        ("met", 0.95, 0.04, 0.01, 0.5, Some(ConditionVerdict::Met)),
+        ("met", 0.4, 0.3, 0.3, 0.99, None),
+    ];
+    for (choice, met, unmet, insufficient, confidence, _) in cases {
+        server.push(MockResponse::json(
+            200,
+            jev_response(&question_id, choice, met, unmet, insufficient, confidence),
+        ));
+    }
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    for (choice, _, _, _, _, expected) in cases {
+        let assessment = adapter
+            .assess(
+                &fixture.request,
+                &fixture.entry,
+                &jev_text_documents(fixture_ids),
+                TransportControl::default(),
+            )
+            .expect("assessment");
+        assert!(assessment.rejection().is_none(), "{choice}");
+        assert_eq!(
+            assessment.result().reported_verdict(),
+            jev_choice_verdict(choice)
+        );
+        assert_eq!(
+            assessment.adopted_verdict(fixture.profile.thresholds()),
+            expected,
+            "{choice} {expected:?}"
+        );
+    }
+    assert_eq!(server.count(), cases.len());
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn jev_adapter_rejects_invalid_answers_as_insufficient() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    let valid = || jev_choice_answer("met", 0.96, 0.03, 0.01, 0.9);
+    let body = |answer: serde_json::Value| {
+        jev_system_one_response(JEV_REQUEST_MODEL, &question_id, answer)
+    };
+    let mut cases: Vec<(Vec<u8>, JevRejection)> = Vec::new();
+    let mut push = |value: serde_json::Value, reason| {
+        cases.push((serde_json::to_vec(&value).expect("case body"), reason));
+    };
+
+    push(
+        json!({"model": JEV_REQUEST_MODEL, "answers": {}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        JevRejection::MissingAnswer,
+    );
+    push(
+        json!({"model": JEV_REQUEST_MODEL, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        JevRejection::MissingAnswer,
+    );
+    push(
+        json!({"model": JEV_REQUEST_MODEL, "answers": {"other": valid()}}),
+        JevRejection::UnknownAnswer,
+    );
+    let mut two_answers = serde_json::Map::new();
+    two_answers.insert(question_id.clone(), valid());
+    two_answers.insert("other".to_owned(), valid());
+    push(
+        json!({"model": JEV_REQUEST_MODEL, "answers": two_answers}),
+        JevRejection::UnknownAnswer,
+    );
+
+    let mut answer = valid();
+    answer["type"] = json!("noul");
+    push(body(answer), JevRejection::WrongAnswerType);
+    push(body(json!({"type": "refusal"})), JevRejection::Refusal);
+    let mut answer = valid();
+    answer.as_object_mut().unwrap().remove("choice");
+    push(body(answer), JevRejection::InvalidChoice);
+    let mut answer = valid();
+    answer["choice"] = json!("maybe");
+    push(body(answer), JevRejection::InvalidChoice);
+    let mut answer = valid();
+    answer.as_object_mut().unwrap().remove("confidence");
+    push(body(answer), JevRejection::InvalidConfidence);
+    let mut answer = valid();
+    answer["confidence"] = json!(1.5);
+    push(body(answer), JevRejection::InvalidConfidence);
+    let mut answer = valid();
+    answer.as_object_mut().unwrap().remove("probabilities");
+    push(body(answer), JevRejection::MissingProbabilities);
+    let mut answer = valid();
+    answer["probabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unmet");
+    push(body(answer), JevRejection::MissingProbabilities);
+    let mut answer = valid();
+    answer["probabilities"]["other"] = json!(0.0);
+    push(body(answer), JevRejection::ExtraProbabilities);
+    let mut answer = valid();
+    answer["probabilities"]["met"] = json!(-0.01);
+    push(body(answer), JevRejection::InvalidProbability);
+    let mut answer = valid();
+    answer["probabilities"]["met"] = json!(1.01);
+    push(body(answer), JevRejection::InvalidProbability);
+    let mut answer = valid();
+    answer["probabilities"]["met"] = json!("NaN");
+    push(body(answer), JevRejection::InvalidProbability);
+    let mut answer = valid();
+    answer["probabilities"] = json!({"met": 0.98, "unmet": 0.01, "insufficient": 0.02});
+    push(body(answer), JevRejection::ProbabilitySum);
+    let mut answer = valid();
+    answer["probabilities"] = json!({"met": 0.2, "unmet": 0.7, "insufficient": 0.1});
+    push(body(answer), JevRejection::SelectionNotMaximum);
+    let mut answer = valid();
+    answer["probabilities"] = json!("not-an-object");
+    push(body(answer), JevRejection::SchemaViolation);
+    push(
+        jev_system_one_response(JEV_REQUEST_MODEL, "q", json!(7)),
+        JevRejection::SchemaViolation,
+    );
+    push(
+        jev_system_one_response("jev-latest", &question_id, valid()),
+        JevRejection::ModelMismatch,
+    );
+    push(
+        jev_system_one_response("jev-1.13.0", &question_id, valid()),
+        JevRejection::ModelMismatch,
+    );
+    let mut answers = serde_json::Map::new();
+    answers.insert(question_id.clone(), valid());
+    push(json!({"answers": answers}), JevRejection::ModelMismatch);
+    push(
+        json!({"error": {"type": "provider", "message": "fixture failure"}}),
+        JevRejection::ProviderFailure,
+    );
+    cases.push((b"{not-json".to_vec(), JevRejection::InvalidJson));
+
+    let answer = serde_json::to_string(&valid()).expect("answer");
+    cases.push((
+        format!(
+            r#"{{"model":"{JEV_REQUEST_MODEL}","answers":{{"{question_id}":{answer},"{question_id}":{answer}}}}}"#
+        )
+        .into_bytes(),
+        JevRejection::DuplicateAnswer,
+    ));
+    cases.push((
+        format!(
+            r#"{{"model":"{JEV_REQUEST_MODEL}","answers":{{"{question_id}":{{"type":"choice","choice":"met","confidence":0.9,"probabilities":{{"met":0.96,"met":0.96,"unmet":0.03,"insufficient":0.01}}}}}}}}"#
+        )
+        .into_bytes(),
+        JevRejection::DuplicateProbability,
+    ));
+
+    for (case, _) in &cases {
+        server.push(MockResponse::body(200, case.clone()));
+    }
+    let case_count = cases.len();
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    for (_, reason) in cases {
+        let assessment = adapter
+            .assess(
+                &fixture.request,
+                &fixture.entry,
+                &jev_text_documents(fixture_ids),
+                TransportControl::default(),
+            )
+            .expect("assessment");
+        assert_jev_rejected(&assessment, reason);
+        assert_eq!(assessment.attempts(), 1);
+    }
+    assert_eq!(server.count(), case_count);
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn jev_adapter_retains_native_confidence_without_fabricating_rationale() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    let mut answer = jev_choice_answer("met", 0.97, 0.02, 0.01, 0.73);
+    answer["rationale"] = json!(JEV_REASONING_CANARY);
+    let mut response = jev_system_one_response(JEV_REQUEST_MODEL, &question_id, answer);
+    response["thinking"] = json!(JEV_REASONING_CANARY);
+    server.push(MockResponse::json(200, response));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(assessment.rejection().is_none());
+    match assessment.result().outcome() {
+        AssessmentOutcome::Decision { confidence, .. } => {
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.73);
+            assert!(!confidence.is_probability());
+        }
+        _ => panic!("expected a Decision outcome"),
+    }
+    let result = assessment.result();
+    assert_eq!(result.rationale_origin(), RationaleOrigin::Host);
+    assert!(result.rationale().starts_with("Host note:"));
+    assert!(!result.rationale().contains(JEV_REASONING_CANARY));
+    assert!(
+        !serde_json::to_string(result)
+            .expect("result JSON")
+            .contains(JEV_REASONING_CANARY)
+    );
+    assert!(!format!("{assessment:?}").contains(JEV_REASONING_CANARY));
+
+    // A valid confidence is retained separately even when the distribution is
+    // rejected; it never turns the rejection into an adopted verdict.
+    let mut answer = jev_choice_answer("met", 0.2, 0.7, 0.1, 0.66);
+    answer["rationale"] = json!(JEV_REASONING_CANARY);
+    server.push(MockResponse::json(
+        200,
+        jev_system_one_response(JEV_REQUEST_MODEL, &question_id, answer),
+    ));
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_jev_rejected(&assessment, JevRejection::SelectionNotMaximum);
+    match assessment.result().outcome() {
+        AssessmentOutcome::NormalLlm { confidence, .. } => {
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.66);
+        }
+        _ => panic!("expected the verdict-only rejection shape"),
+    }
+    assert!(!format!("{assessment:?}").contains(JEV_REASONING_CANARY));
+}
+
+#[test]
+fn jev_adapter_requires_image_capability_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let png = jev_png(280);
+
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = jev_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn jev_adapter_sends_only_approved_image_assets_and_danger_zone_header() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    let png = jev_png(280);
+    server.push(MockResponse::json(
+        200,
+        jev_response(&question_id, "met", 0.97, 0.02, 0.01, 0.8),
+    ));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(assessment.rejection().is_none());
+    assert_eq!(
+        assessment.result().evidence(),
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b]
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].header("typesafe-danger-zone-images"),
+        Some("true")
+    );
+    let body = requests[0].json_body();
+    assert_tool_less(&body);
+    let assets = body["assets"].as_object().expect("image assets");
+    assert_eq!(assets.len(), 1);
+    let (reference, asset) = assets.iter().next().expect("image asset reference");
+    assert_eq!(asset["type"].as_str(), Some("image"));
+    assert_eq!(asset["format"].as_str(), Some("png"));
+    assert_eq!(asset["data_base64"].as_str(), Some(JEV_PNG_280_BASE64));
+    let serialized = body.to_string();
+    assert!(
+        !assets.contains_key(&fixture_ids.evidence_a.local_id().to_string()),
+        "the asset reference must not repeat the evidence UUID"
+    );
+    assert!(serialized.contains(&fixture_ids.evidence_a.to_string()));
+    assert_eq!(
+        serialized.matches(reference.as_str()).count(),
+        2,
+        "the reference must appear once as the asset key and once in state"
+    );
+    assert!(!serialized.contains("http://"));
+    assert!(!serialized.contains("https://"));
+    assert!(!serialized.contains("data:image"));
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn jev_adapter_refuses_oversized_or_unsupported_evidence_without_truncation() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = jev_adapter(credentials.clone(), admin.directory(), &server, &other);
+
+    let too_large = vec![0_u8; 16 * 1024 * 1024 + 1];
+    let documents = vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/png", too_large)
+            .expect("oversized image document"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InputTooLarge);
+    assert_eq!(server.count(), 0);
+
+    let documents = jev_image_documents(fixture_ids, &jev_png(100));
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+
+    let documents = vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/webp", vec![1, 2, 3, 4])
+            .expect("webp image document"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, "x".repeat(40_000))
+            .expect("oversized text document"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InputTooLarge);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+}
+
+#[test]
+fn jev_adapter_retries_429_and_529_and_honors_retry_after() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = jev_question_id(&fixture.request);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server
+        .push(MockResponse::json(429, json!({"error": "rate limited"})).header("retry-after", "0"));
+    server.push(MockResponse::json(529, json!({"error": "overloaded"})).header("retry-after", "0"));
+    server.push(MockResponse::json(
+        200,
+        jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+    ));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("retried assessment");
+    assert_eq!(assessment.attempts(), 3);
+    assert_eq!(server.count(), 3);
+    assert_eq!(other.count(), 0);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    for _ in 0..3 {
+        server.push(MockResponse::status(529));
+    }
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ServerFailure);
+    assert_eq!(error.status(), Some(529));
+    assert_eq!(error.attempts(), 3);
+    assert!(error.is_retry_exhausted());
+    assert_eq!(server.count(), 3);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server
+        .push(MockResponse::json(529, json!({"error": "overloaded"})).header("retry-after", "30"));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default().with_remaining(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::RetryAfterBeyondDeadline);
+    assert_eq!(error.attempts(), 1);
+    assert_eq!(server.count(), 1);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server.push(MockResponse::status(529));
+    server.push(MockResponse::json(
+        200,
+        jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+    ));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("529 retry");
+    assert_eq!(assessment.attempts(), 2);
+    assert_eq!(server.count(), 2);
+}
+
+#[test]
+fn jev_adapter_does_not_retry_an_ambiguous_timeout() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    server.push(
+        MockResponse::json(
+            200,
+            jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+        )
+        .delay(Duration::from_secs(2)),
+    );
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let started = Instant::now();
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default().with_remaining(Duration::from_millis(100)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::SendResultUnknown);
+    assert_eq!(error.attempts(), 1);
+    assert!(!error.is_retryable());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.count(), 1, "an ambiguous timeout was retried");
+}
+
+#[test]
+fn jev_adapter_keeps_secret_canaries_out_of_errors_and_debug() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    for _ in 0..3 {
+        server.push(MockResponse::body(
+            500,
+            format!("{{\"error\":\"{CANARY}\",\"detail\":\"{CANARY_B}\"}}"),
+        ));
+    }
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let request_debug = format!("{:?}", fixture.request);
+    assert!(!request_debug.contains(CANARY_B));
+    let evidence_debug = format!("{:?}", jev_text_documents(fixture_ids));
+    assert!(!evidence_debug.contains(EVIDENCE_A_MARKER));
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ServerFailure);
+    for rendered in [format!("{error:?}"), error.to_string()] {
+        assert!(!rendered.contains(CANARY), "secret in error: {rendered}");
+        assert!(!rendered.contains(CANARY_B), "body in error: {rendered}");
+    }
+    assert!(
+        server.requests()[0]
+            .header("authorization")
+            .is_some_and(|value| value.contains(CANARY))
+    );
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = jev_question_id(&fixture.request);
+    let mut body = jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    body["provider_note"] = json!(CANARY_B);
+    server.push(MockResponse::json(200, body));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(!format!("{assessment:?}").contains(CANARY_B));
+    assert!(
+        !serde_json::to_string(assessment.result())
+            .expect("result JSON")
+            .contains(CANARY_B)
+    );
+}
+
+#[test]
+fn jev_adapter_does_not_reuse_evaluations_across_model_or_profile_versions() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        "jev-latest",
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = jev_question_id(&fixture.request);
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server.push(MockResponse::json(
+        200,
+        jev_response(&question_id, "met", 0.97, 0.02, 0.01, 0.8),
+    ));
+    server.push(MockResponse::json(
+        200,
+        jev_system_one_response(
+            "jev-latest",
+            &question_id,
+            jev_choice_answer("met", 0.97, 0.02, 0.01, 0.8),
+        ),
+    ));
+    server.push(MockResponse::json(
+        200,
+        jev_system_one_response(
+            "jev-1.13.0",
+            &question_id,
+            jev_choice_answer("met", 0.97, 0.02, 0.01, 0.8),
+        ),
+    ));
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    let result = assessment.result();
+    assert_eq!(result.reported_verdict(), ConditionVerdict::Met);
+    assert_eq!(
+        result
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some(JEV_REQUEST_MODEL)
+    );
+    assert!(result.applies_to(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        fixture.profile.binding(),
+    ));
+    assert!(result.supports_completion(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        fixture.profile.binding(),
+        fixture.profile.thresholds(),
+    ));
+
+    let profile_v2 = jev_completion_profile_for(
+        project,
+        fixture.entry.profile().connection(),
+        "jev-latest",
+        2,
+    );
+    assert!(!result.applies_to(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        profile_v2.binding(),
+    ));
+    assert!(!result.supports_completion(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        profile_v2.binding(),
+        profile_v2.thresholds(),
+    ));
+
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_jev_rejected(&assessment, JevRejection::ModelMismatch);
+    assert_eq!(
+        assessment
+            .result()
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some("jev-latest")
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_jev_rejected(&assessment, JevRejection::ModelMismatch);
+    assert_eq!(
+        assessment
+            .result()
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some("jev-1.13.0")
+    );
+    assert_eq!(server.count(), 3);
+    for request in server.requests() {
+        assert_eq!(
+            request.json_body()["model"].as_str(),
+            Some(JEV_REQUEST_MODEL)
+        );
+    }
+}
+
+#[test]
+fn jev_adapter_rejects_wrong_provider_or_purpose_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let admin = ConnectionAdmin::new();
+    let settings = jev_named(&admin, JEV_MODEL, InputCapabilities::text_only());
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+
+    let llm_profile = llm_completion_profile_for(
+        project,
+        settings.connection_id(),
+        JEV_MODEL,
+        ProfileInputs::text_only(),
+    );
+    let llm_entry = llm_profile_entry(&settings, llm_profile.clone(), false);
+    let llm_request = assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &llm_profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    let error = adapter
+        .assess(
+            &llm_request,
+            &llm_entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CapabilityMismatch);
+    assert_eq!(server.count(), 0);
+
+    let permission_profile = AssessmentProfile::new(
+        fixture_ids.permission_profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Permission,
+        ProviderKind::Jev,
+        settings.connection_id(),
+        ModelId::new(JEV_MODEL).expect("model"),
+        AdapterVersion::new("fixture-jev-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-jev-rubric-1").expect("rubric"),
+        ProfileInputs::text_only(),
+        ProfileThresholds::decisions(),
+    )
+    .expect("permission profile");
+    let permission_entry = jev_profile_entry(&settings, permission_profile.clone());
+    let permission_request = SupervisionAssessmentRequest::new(
+        fixture_ids.decision,
+        fixture_ids.supervision,
+        fixture_ids.condition_a,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "fixture permission rubric",
+        permission_profile.binding(),
+        AdapterVersion::new("fixture-jev-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-jev-rubric-1").expect("rubric"),
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    )
+    .expect("permission request");
+    let error = adapter
+        .assess(
+            &permission_request,
+            &permission_entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let second = jev_named(&admin, JEV_MODEL, InputCapabilities::text_only());
+    let stale_entry = ProfileEntry::new(
+        fixture.profile.clone(),
+        second.capabilities().expect("connection capabilities"),
+        ConnectionStatus::Available,
+        false,
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &stale_entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn jev_adapter_rejects_evidence_scope_mismatches_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = jev_adapter(credentials.clone(), admin.directory(), &server, &other);
+
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &[
+                EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER)
+                    .expect("evidence a"),
+            ],
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+
+    let extra_id = EvidenceId::from_parts(project, uuid::Uuid::new_v4());
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(extra_id, "extra evidence").expect("extra evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+
+    let other_id = EvidenceId::from_parts(other_project(), uuid::Uuid::new_v4());
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(other_id, "cross-project evidence").expect("cross-project evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CrossProjectReference);
+
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(fixture_ids.evidence_a, "duplicate evidence")
+            .expect("duplicate evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+}
+
+#[test]
+fn jev_adapter_parses_usage_without_inventing_zero() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = jev_question_id(&fixture.request);
+    let server = MockServer::start();
+    let other = MockServer::start();
+
+    let mut missing = jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    missing.as_object_mut().unwrap().remove("usage");
+    server.push(MockResponse::json(200, missing));
+    let mut malformed = jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    malformed["usage"] = json!({"input_tokens": "120", "output_tokens": 12});
+    server.push(MockResponse::json(200, malformed));
+    let mut zero = jev_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    zero["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
+    server.push(MockResponse::json(200, zero));
+
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let missing_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(missing_usage.usage(), None);
+    let malformed_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(malformed_usage.usage(), None);
+    let zero_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(zero_usage.usage(), Some(JevUsage::new(0, 0)));
+    assert_eq!(server.count(), 3);
+    assert_eq!(other.count(), 0);
 }

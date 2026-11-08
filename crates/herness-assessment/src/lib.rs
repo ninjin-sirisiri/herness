@@ -15,7 +15,9 @@
 //! * caller-provided image bytes only,
 //! * sanitized errors that never contain a credential, authorization header,
 //!   request body, or raw provider response body,
-//! * a strict normal-LLM condition schema with explicit inconclusive reasons.
+//! * a strict normal-LLM condition schema with explicit inconclusive reasons,
+//! * a Jev System One choice adapter with fixed-model, distribution, native
+//!   confidence, image, and input-limit validation.
 //!
 //! Money reservation and billing/cost records belong to the upper H2 request
 //! gate and budget ledger. The transport neither reserves nor records money.
@@ -23,10 +25,15 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod jev;
 pub mod llm;
 pub mod transport;
 
 pub use error::{AssessmentError, AssessmentErrorKind};
+pub use jev::{
+    JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment, JevAssessmentAdapter, JevRejection,
+    JevUsage, jev_question_id,
+};
 pub use llm::{
     EvidenceContent, EvidenceDocument, InconclusiveReason, LlmAssessment, LlmAssessmentAdapter,
 };

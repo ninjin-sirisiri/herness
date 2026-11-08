@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult, ConditionVerdict,
+    RationaleOrigin,
 };
 use herness_supervision::error::SupervisionError;
 use herness_supervision::ids::EvidenceId;
@@ -332,6 +333,11 @@ impl LlmAssessmentAdapter {
                     Some(reason),
                 ),
             };
+        let rationale_origin = if rejection.is_some() {
+            RationaleOrigin::Host
+        } else {
+            RationaleOrigin::Model
+        };
         let result = AssessmentResult::new(
             request,
             cited,
@@ -344,7 +350,8 @@ impl LlmAssessmentAdapter {
             provenance,
             self.clock.now(),
         )
-        .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?;
+        .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?
+        .with_rationale_origin(rationale_origin);
         Ok(LlmAssessment { result, rejection })
     }
 }

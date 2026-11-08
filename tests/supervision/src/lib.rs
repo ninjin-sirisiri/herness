@@ -372,6 +372,117 @@ pub fn llm_profile_entry(
     )
 }
 
+/// Jev completion profile at `version` with the fixture adapter/rubric.
+pub fn jev_completion_profile_for(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+) -> AssessmentProfile {
+    jev_completion_profile_with_inputs(
+        project,
+        connection,
+        model,
+        version,
+        ProfileInputs::text_only(),
+    )
+}
+
+/// Jev completion profile with explicit required inputs.
+pub fn jev_completion_profile_with_inputs(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(version).expect("version"),
+        ProfilePurpose::Completion,
+        ProviderKind::Jev,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-jev-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-jev-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::decisions(),
+    )
+    .expect("jev completion profile")
+}
+
+/// Profile entry for a Jev profile and its registered connection.
+pub fn jev_profile_entry(
+    settings: &ConnectionSettings,
+    profile: AssessmentProfile,
+) -> ProfileEntry {
+    ProfileEntry::new(
+        profile,
+        settings.capabilities().expect("connection capabilities"),
+        ConnectionStatus::Available,
+        false,
+    )
+}
+
+/// A per-condition Jev assessment request.
+pub fn jev_assessment_request(
+    project: ProjectId,
+    condition: ConditionId,
+    profile: &AssessmentProfile,
+    evidence_ids: Vec<EvidenceId>,
+) -> AssessmentRequest {
+    let ids = ids(project);
+    AssessmentRequest::new(
+        ids.decision,
+        ids.supervision,
+        condition,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "The fixture condition is met when the recorded check passes.",
+        profile.binding(),
+        AdapterVersion::new("fixture-jev-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-jev-rubric-1").expect("rubric"),
+        evidence_ids,
+    )
+    .expect("jev assessment request")
+}
+
+/// Synthetic Jev choice answer.
+pub fn jev_choice_answer(
+    choice: &str,
+    met: f64,
+    unmet: f64,
+    insufficient: f64,
+    confidence: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "choice",
+        "choice": choice,
+        "confidence": confidence,
+        "probabilities": {
+            "met": met,
+            "unmet": unmet,
+            "insufficient": insufficient,
+        },
+    })
+}
+
+/// Synthetic System One response with one answer and usage.
+pub fn jev_system_one_response(
+    model: &str,
+    question_id: &str,
+    answer: serde_json::Value,
+) -> serde_json::Value {
+    let mut answers = serde_json::Map::new();
+    answers.insert(question_id.to_owned(), answer);
+    serde_json::json!({
+        "model": model,
+        "answers": serde_json::Value::Object(answers),
+        "usage": {"input_tokens": 120, "output_tokens": 12},
+    })
+}
+
 /// Completion profile entry whose profile and connection match.
 pub fn completion_entry(
     project: ProjectId,
@@ -632,6 +743,7 @@ pub fn decision_result(
             selected,
             probabilities: ConditionProbabilities::new(met, unmet, insufficient)
                 .expect("distribution"),
+            confidence: None,
         },
         AssessmentProvenance::new(
             Provider::OpenAi,

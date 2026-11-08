@@ -7,7 +7,7 @@ use herness_core::contracts::{
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentProvenance, AssessmentResult, ConditionProbabilities,
     ConditionVerdict, NativeConfidence, PermissionAssessment, PermissionProbabilities,
-    PermissionVerdict,
+    PermissionVerdict, RationaleOrigin,
 };
 use herness_supervision::conditions::ConditionVersion;
 use herness_supervision::error::SupervisionError;
@@ -476,4 +476,103 @@ fn fixture_catalog_resolves_jev_and_decisions_connections() {
         true,
     );
     entry.validate().expect("valid Decisions profile");
+}
+
+#[test]
+fn decision_confidence_and_rationale_provenance_are_additive_and_not_adoption_inputs() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = permission_profile(project);
+    let request = assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a],
+    );
+    let result = AssessmentResult::new(
+        &request,
+        vec![fixture_ids.evidence_a],
+        "The fixture distribution supports the recorded verdict.",
+        None,
+        AssessmentOutcome::Decision {
+            selected: ConditionVerdict::Met,
+            probabilities: ConditionProbabilities::new(0.96, 0.03, 0.01).expect("distribution"),
+            confidence: Some(
+                NativeConfidence::new(0.2, "fixture-derived-scale").expect("confidence"),
+            ),
+        },
+        AssessmentProvenance::new(
+            Provider::OpenAi,
+            ProviderKind::Decisions,
+            ModelId::new("synthetic-decision-judge").expect("model"),
+            request.adapter_version().clone(),
+            request.rubric_version().clone(),
+        )
+        .expect("provenance")
+        .with_reported_model(ModelId::new("gpt-6-luna").expect("reported model")),
+        now(),
+    )
+    .expect("result")
+    .with_rationale_origin(RationaleOrigin::Host);
+
+    assert_eq!(
+        result.adopted_verdict(ProfileThresholds::decisions()),
+        Some(ConditionVerdict::Met)
+    );
+    assert_eq!(
+        result
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some("gpt-6-luna")
+    );
+    assert_eq!(result.rationale_origin(), RationaleOrigin::Host);
+
+    // The derived confidence is not the selected probability: a high
+    // confidence does not rescue a below-threshold distribution.
+    let below = AssessmentResult::new(
+        &request,
+        vec![fixture_ids.evidence_a],
+        "The fixture distribution is below the completion threshold.",
+        None,
+        AssessmentOutcome::Decision {
+            selected: ConditionVerdict::Met,
+            probabilities: ConditionProbabilities::new(0.94, 0.05, 0.01).expect("distribution"),
+            confidence: Some(
+                NativeConfidence::new(0.99, "fixture-derived-scale").expect("confidence"),
+            ),
+        },
+        AssessmentProvenance::new(
+            Provider::OpenAi,
+            ProviderKind::Decisions,
+            ModelId::new("synthetic-decision-judge").expect("model"),
+            request.adapter_version().clone(),
+            request.rubric_version().clone(),
+        )
+        .expect("provenance"),
+        now(),
+    )
+    .expect("result");
+    assert_eq!(below.adopted_verdict(ProfileThresholds::decisions()), None);
+
+    // Old payloads without the additive fields still decode. The default
+    // rationale origin is unspecified rather than silently treated as model
+    // prose.
+    let mut value = serde_json::to_value(&result).expect("result JSON");
+    value.as_object_mut().unwrap().remove("rationaleOrigin");
+    value["provenance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reportedModel");
+    value["outcome"]
+        .as_object_mut()
+        .unwrap()
+        .remove("confidence");
+    let decoded: AssessmentResult = serde_json::from_value(value).expect("legacy result JSON");
+    assert_eq!(decoded.rationale_origin(), RationaleOrigin::Unspecified);
+    assert_eq!(decoded.provenance().reported_model(), None);
+    match decoded.outcome() {
+        AssessmentOutcome::Decision { confidence, .. } => assert_eq!(*confidence, None),
+        _ => panic!("expected Decision"),
+    }
 }

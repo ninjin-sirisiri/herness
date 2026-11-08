@@ -221,11 +221,11 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 ### herness-assessment transport
 
-- Task 7時点の `crates/herness-assessment` は `herness-core` の `ConnectionDirectory` と `CredentialPort` だけを再利用し、store・budget・Tauri・provider固有wire schemaを持たなかった。Task 10が通常LLM adapterを追加し、Jev/Decisionsのbody schemaはTask 11〜12が所有する。
+- Task 7時点の `crates/herness-assessment` は `herness-core` の `ConnectionDirectory` と `CredentialPort` だけを再利用し、store・budget・Tauri・provider固有wire schemaを持たなかった。Task 10が通常LLM adapter、Task 11がJev System One adapterを追加し、Decisionsのbody schemaはTask 12が所有する。
 - `AssessmentRequest` のbodyはtoolを含まないJSON objectに限る。top-level `tools` / `tool_choice` とexternal image参照（`image_url`等）は送信前に明示エラーにし、黙って削除しない。transport自身もtoolを追加しない。
 - `TransportControl` のtimeoutは60秒と残りrun deadlineの短い方。`CancelToken` の取消しはin-flight要求とretry待機を打ち切り、再送しない。
 - credentialは各attemptの送信直前に既存 `CredentialPort` から解決し、設定されたexact originへだけ付ける。redirectは一切followせず、H1の `redirect_auth_decision` でcross-originを分類する。cross-origin redirect・credential付きURL・external image URLはエラー。
-- retryは429、transient 5xx（500/502/503/504）、送信前のconnection failureだけ。同一connectionで最大2回追加し、既定待機は1秒・2秒＋最大250ms jitter。`Retry-After` は残りdeadlineに収まる場合だけ使い、収まらなければ `RetryAfterBeyondDeadline` で止める。timeout/送信不明、認証失敗、invalid response、redirect、拒否・低確度の成功応答は再送しない。provider/model/connection fallbackはない。
+- retryは429、transient 5xx（500/502/503/504/529）、送信前のconnection failureだけ。同一connectionで最大2回追加し、既定待機は1秒・2秒＋最大250ms jitter。`Retry-After` は残りdeadlineに収まる場合だけ使い、収まらなければ `RetryAfterBeyondDeadline` で止める。timeout/送信不明、認証失敗、invalid response、redirect、拒否・低確度の成功応答は再送しない。provider/model/connection fallbackはない。529はJev overloadedの一時障害として同じ再試行対象に含める。
 - 必要text/image modalityは送信前に `ConnectionCapabilities` と照合する。画像は `ImageInput` のcaller-provided bytesだけをinline data URLまたはAnthropicのbase64 sourceとして送り、外部URLはfetchも送信もしない。Task 10のdata URL許可は外部参照を許可しない。
 - `AssessmentError` はHTTP status・attempt数・retry分類だけを持ち、secret・Authorization・request body・raw provider bodyを含まない。`AssessmentRequest` / `AssessmentResponse` のDebugもbodyを表示しない。
 - transportは金額予約・cost/billing記録・永続化を行わない。usage/model metadataはadapterが返却bodyから解釈し、予約と記録は上位H2 request gate / Task 9 ledgerが所有する。
@@ -336,6 +336,56 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 - providerのreasoning textを保存せず、`AssessmentOutcome::NormalLlm` にprobabilityやcalibrated confidenceを作らないこと。
 
 実provider・実credential・実Keychain・実ChatGPTログインは使わず、接続成功も主張しない。
+
+## Task 11で追加したJev条件別choice評価adapter
+
+### 公式文書の再確認記録
+
+- 2026-11-08に次の公開文書を確認した: <https://docs.typesafe.ai/api/system-one.md>、<https://docs.typesafe.ai/models.md>、<https://docs.typesafe.ai/confidence.md>、<https://docs.typesafe.ai/images.md>、<https://docs.typesafe.ai/api/errors.md>。
+- 認証付き要求、`GET /v1/models`、実Jev/TypeSafeへの送信、model一覧取得は行っていない。文書の確認は実接続の成功を意味しない。
+- 固定versioned IDは `jev-1.14.0`。`jev-latest` / `jev-preview` は移動するaliasであり、要求にはversioned IDを使う。応答の `model` が要求IDと一致しない場合は再利用しない。
+
+### adapter境界とrequest
+
+- `crates/herness-assessment/src/jev/` は `JevAssessmentAdapter::new(transport, clock)` と `assess(&AssessmentRequest, &ProfileEntry, &[EvidenceDocument], TransportControl)` を提供する。通常LLMと同じ `EvidenceDocument` だけを受け取り、会話・repository・file・shellを自分で読まない。
+- endpointは `POST /v1/systemone`、認証はAPIキーの `Authorization: Bearer <API_KEY>`。profileの接続が `Provider::TypeSafe` + `EndpointClass::TypeSafeSystemOne` + APIキー + `AssessmentOnly` でなければ送信前に `CapabilityMismatch` にする。別provider/model/connectionへのfallbackはない。
+- requestの `model` は常に固定の `jev-1.14.0`。profileのmodel（aliasを含む）はprovenanceの `model` に、応答が返したversioned IDは `reportedModel` に記録する。応答の `model` が要求した固定IDと一致しない場合は `insufficient` にする。
+- 質問IDは `AssessmentRequest` の `DecisionId` から導出し、同じ要求の再試行では同じ名前、別の評価では別の名前になる。`questions` はそのIDの1件だけを持ち、`type` は `choice`、`instructions` は呼出し元のrubric、`criteria` は `met` / `unmet` / `insufficient` の3件だけを持つ。
+- `state` は呼出し元が渡した証拠文書だけを含む。文書ID・kind・text、または画像のasset参照だけを入れ、全会話・全repository・file一覧・shell出力を追加しない。`tools` / `tool_choice` は送らない。
+- 画像はPNG/JPEGのcaller bytesだけを、要求ごとに生成するopaqueなUUIDをkeyにした `assets` の `data_base64` として送る。`state` にはその参照を置き、外部URLはfetchも送信もしない。画像を含むTypeSafe System One要求にだけ `TypeSafe-Danger-Zone-Images: true` を付ける。
+
+### 応答検証と採用
+
+- 応答は次をすべて満たす場合だけ `AssessmentOutcome::Decision` として扱う: `model` が `jev-1.14.0` と完全一致、質問IDのanswerがちょうど1件、`type == "choice"`、`choice` が3 criteriaのいずれか、`probabilities` が同じ3 keyだけ、各確率が有限で0〜1、合計が1から0.001以内、選択choiceが最大確率、`confidence` が有限で0〜1。
+- 次はすべて `insufficient` にし、`met` / `unmet` にしない: 不正JSON、envelope不一致、必須field欠落、answer欠落、未知質問、重複質問（raw JSONの重複keyを含む）、複数回答、wrong type、refusal、provider error、未知/重複/欠落/範囲外/合計外の確率、選択と分布の不一致、response modelのalias/version drift、confidence不正。
+- 拒否時は分布を捏造せず、verdict-onlyの `NormalLlm { verdict: Insufficient, confidence }` に正規化する。Jevはrationaleを返さないため、rationaleは `Host note:` で始まるhost所有の説明にし、`AssessmentResult::rationaleOrigin = host` を記録する。providerの未知fieldやthinking風の文章は保存しない。
+- 採用は選択されたmet/unmetの確率がprofileのcompletion threshold（既定0.95）以上の場合だけ。0.95未満、`insufficient`、拒否は `adopted_verdict` が `None` になる。native confidenceは `AssessmentOutcome::Decision.confidence` または拒否時の `NormalLlm.confidence` に `NativeConfidence` として別保存し、確率・採用判定には使わない。
+- additive contractは `AssessmentOutcome::Decision.confidence`、`AssessmentResult.rationaleOrigin`、`AssessmentProvenance.reportedModel`。いずれもserde default付きで、旧payloadは `None` / `unspecified` として読める。
+
+### 能力・入力上限
+
+- text入力とassessment-only APIキー接続を必須にする。画像証拠またはprofileの画像要求に対して接続が画像非対応なら `UnsupportedModality` を返し、HTTPを送らない。
+- 画像はPNG/JPEG still imageだけ。1画像16 MiB以下、幅・高さ280〜1568 px、画素数78,400〜2,458,624、request body 32 MiB以下を検査する。全画像の decoded bytesは16 MiBを上限とする保守的なローカル制限にし、APNG（`acTL`）や不完全なPNG、SOFのないJPEGは拒否する。
+- text証拠は24,000 bytes、rubricと固定instructionを含むrequest textは32,000 bytesを上限とする。いずれかを超える場合は送信前に `InputTooLarge` を返す。必要証拠を切り捨てたり、切り捨てた内容で成功にしたりしない。
+- 証拠ID集合はrequestと完全一致させる。欠落・余分・重複は `InvalidEvidence`、project外は `CrossProjectReference`、画像形式・寸法不正は `InvalidEvidence`、容量超過は `InputTooLarge`。いずれもHTTPとcredential解決の前に返す。
+
+### transportの529対応
+
+- `AssessmentErrorKind::ServerFailure` の再試行対象にHTTP 529を追加した。429と同じく同一connectionで最大2回追加再試行し、`Retry-After` が残りdeadlineに収まる場合だけ待機に使う。timeout/送信不明は引き続き再送しない。
+- `AssessmentOutcome::Decision` の `confidence`、`AssessmentResult` の `rationaleOrigin`、provenanceの `reportedModel` は既存のTask 10結果とfixtureを壊さないserde defaultを持つ。
+
+### Task 11のテスト
+
+`tests/supervision/tests/adapters.rs` はloopback mockとin-memory credentialだけで次を確認する。
+
+- 固定model・`/v1/systemone`・toolなしbody・質問ID・3 criteria・stateが指定証拠だけであること、met/unmet/insufficientの受理、選択・確率・confidence・usageの解析。
+- 分布の欠落/余分key、範囲外、非数値、合計外、選択が最大でない場合、answer欠落、未知/重複質問、wrong type、refusal、response modelのalias/version mismatch、低確率が採用されないこと。
+- native confidenceを確率と別に保持し、rationaleを捏造せずhost所有の注記にすること。alias/profile version変更後に旧評価を再利用しないこと。
+- text-only接続への画像証拠がHTTP 0件の能力エラーになること、対応接続ではdanger-zone headerとbase64 assetsだけを送り外部URLを取得しないこと、過大・不正画像や過大textを切り捨てず送信前に拒否すること。
+- 429と529の再試行、529枯渇、`Retry-After` がdeadlineを超える場合、送信不明timeoutの再送0、secret canaryがerror/Debug/resultに出ないこと。
+- `tests/supervision/tests/profiles.rs` はadditive fieldのround-tripと、native confidenceが採用確率を代用しないことを確認する。
+
+実Jev/TypeSafeへの接続、APIキー、`GET /v1/models`、実課金要求は行わず、接続成功を主張しない。
 
 ## テストコマンド
 
@@ -474,3 +524,19 @@ Task 10の追加確認:
 - `cargo test -p herness-supervision-tests --test adapters --locked` はloopback mockだけで、4経路のtoolなし要求、native structured outputの有無、strict schema拒否、証拠ID結付け、能力不足時のHTTP 0件、fallbackなし、secret canary非表示を確認する。
 - `cargo test -p herness-runtime-tests --test connections --locked` はTask 7で追加した接続能力登録・既存H1接続設定の回帰を確認する。
 - 実OpenAI・Anthropic・OpenAI互換・ChatGPTログインへの接続成功は主張しない。これらは別途許可された実接続検証まで未確認である。
+
+Task 11の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-assessment --locked
+cargo test -p herness-supervision-tests --test adapters --locked
+cargo test -p herness-supervision-tests --test profiles --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 11の追加確認:
+
+- `cargo test -p herness-assessment --locked` はJev wireの正常分布、選択最大の検査、重複質問/確率keyの拒否、usage欠落をunknownとして扱うこと、既存transportの529分類・timeout cap・retry既定値・tool宣言拒否を確認する。
+- `cargo test -p herness-supervision-tests --test adapters --locked` はloopback mockだけで、固定 `jev-1.14.0`、`POST /v1/systemone`、toolなし、質問ID、3 criteria、state範囲、全拒否理由、0.95境界、native confidence分離、画像header/assets、入力上限、429/529/Retry-After、送信不明timeoutの再送0、secret canary非表示、alias/version非再利用を確認する。
+- `cargo test -p herness-supervision-tests --test profiles --locked` は `Decision.confidence`、`rationaleOrigin`、`reportedModel` のadditive round-tripと、native confidenceが採用判定に使われないことを確認する。
+- 実Jev/TypeSafeへの接続成功は主張しない。認証付き要求・model一覧・実送信は別途許可された実接続検証まで未確認である。

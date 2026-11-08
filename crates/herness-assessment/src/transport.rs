@@ -51,6 +51,7 @@ const MAX_MODEL_CHARS: usize = 256;
 const BASE_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 const DEFAULT_JITTER_MAX: Duration = Duration::from_millis(250);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const TYPESAFE_DANGER_ZONE_IMAGES: &str = "TypeSafe-Danger-Zone-Images";
 
 /// Cooperative cancellation handle shared with one assessment request.
 ///
@@ -838,6 +839,11 @@ impl TransportInner {
             .url_for(capabilities.endpoint_class(), &settings)?;
         let origin = Origin::from_endpoint(&endpoint);
         let auth = AuthHeader::for_capabilities(&capabilities);
+        // System One images are opt-in. The header is attached only for a
+        // TypeSafe System One request that actually carries caller-provided
+        // image bytes, never for text-only requests.
+        let danger_zone_images = capabilities.endpoint_class() == EndpointClass::TypeSafeSystemOne
+            && !request.images().is_empty();
         let expected_kind = match capabilities.auth_method() {
             AuthMethod::ApiKey => CredentialKind::ApiKey,
             AuthMethod::ChatGptLogin => CredentialKind::OAuthToken,
@@ -916,6 +922,7 @@ impl TransportInner {
                     credential.expose_secret(),
                     control.cancel_token(),
                     deadline,
+                    danger_zone_images,
                 )
                 .await;
             match result {
@@ -979,6 +986,7 @@ impl TransportInner {
         secret: &str,
         cancel: &CancelToken,
         deadline: Instant,
+        danger_zone_images: bool,
     ) -> Result<AssessmentResponse, AssessmentError> {
         let body = serde_json::to_vec(request.body.value())
             .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidRequest))?;
@@ -988,6 +996,11 @@ impl TransportInner {
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .body(body);
+        let builder = if danger_zone_images {
+            builder.header(TYPESAFE_DANGER_ZONE_IMAGES, "true")
+        } else {
+            builder
+        };
         let builder = auth.apply(builder, secret)?;
 
         let attempt =
@@ -1014,7 +1027,7 @@ impl TransportInner {
                         .with_status(status)
                         .with_retry_after(response_retry_after(response.headers())));
                 }
-                if matches!(status, 500 | 502 | 503 | 504) {
+                if matches!(status, 500 | 502 | 503 | 504 | 529) {
                     return Err(AssessmentError::new(AssessmentErrorKind::ServerFailure)
                         .with_status(status)
                         .with_retry_after(response_retry_after(response.headers())));

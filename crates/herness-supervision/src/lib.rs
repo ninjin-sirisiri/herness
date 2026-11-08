@@ -29,7 +29,7 @@ pub use approval::{ApprovalActor, ApprovalBasis, ConditionApproval, OwnerApprova
 pub use assessment::{
     AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
     ConditionProbabilities, ConditionVerdict, NativeConfidence, PermissionAssessment,
-    PermissionProbabilities, PermissionVerdict,
+    PermissionProbabilities, PermissionVerdict, RationaleOrigin,
 };
 pub use budget::gate::{BudgetRequestGate, RequestBudgetEstimator};
 pub use budget::ledger::{

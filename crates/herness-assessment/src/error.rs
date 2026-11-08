@@ -24,6 +24,9 @@ pub enum AssessmentErrorKind {
     /// A caller-supplied evidence document is missing, duplicated, or outside
     /// the exact evidence set of the request.
     InvalidEvidence,
+    /// The evidence required for an assessment would exceed the provider's
+    /// known input limits. Evidence is never truncated into a passing answer.
+    InputTooLarge,
     /// An evidence document belongs to another project.
     CrossProjectReference,
     /// The request, profile, and connection do not describe the same fixed
@@ -157,7 +160,7 @@ impl AssessmentError {
             AssessmentErrorKind::RateLimited => true,
             AssessmentErrorKind::ConnectionFailed => true,
             AssessmentErrorKind::ServerFailure => {
-                matches!(self.status, Some(500 | 502 | 503 | 504))
+                matches!(self.status, Some(500 | 502 | 503 | 504 | 529))
             }
             _ => false,
         }
@@ -182,6 +185,9 @@ impl fmt::Display for AssessmentError {
             }
             AssessmentErrorKind::InvalidEvidence => {
                 "the supplied evidence does not match the assessment request"
+            }
+            AssessmentErrorKind::InputTooLarge => {
+                "the assessment evidence exceeds the provider's accepted input limits"
             }
             AssessmentErrorKind::CrossProjectReference => {
                 "the supplied evidence belongs to another project"
@@ -250,7 +256,7 @@ mod tests {
                 .with_status(429)
                 .is_retryable()
         );
-        for status in [500, 502, 503, 504] {
+        for status in [500, 502, 503, 504, 529] {
             assert!(
                 AssessmentError::new(AssessmentErrorKind::ServerFailure)
                     .with_status(status)
@@ -271,6 +277,8 @@ mod tests {
             AssessmentErrorKind::SendResultUnknown,
             AssessmentErrorKind::AuthenticationFailed,
             AssessmentErrorKind::InvalidResponse,
+            AssessmentErrorKind::InvalidEvidence,
+            AssessmentErrorKind::InputTooLarge,
             AssessmentErrorKind::Cancelled,
             AssessmentErrorKind::CrossOriginRedirect,
         ] {

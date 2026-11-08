@@ -164,6 +164,23 @@ impl ConditionProbabilities {
     }
 }
 
+/// Origin of the short rationale stored with an assessment result.
+///
+/// Older results that predate this field deserialize as
+/// [`RationaleOrigin::Unspecified`]; they never silently become model prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RationaleOrigin {
+    /// The rationale text was provided by the model/provider answer.
+    Model,
+    /// The rationale is a host-owned note because the provider returned no
+    /// usable rationale. It must never be presented as model reasoning.
+    Host,
+    /// The origin was not recorded by an older or fixture-created result.
+    #[default]
+    Unspecified,
+}
+
 /// Result shape reported by the assessment channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -181,13 +198,19 @@ pub enum AssessmentOutcome {
         #[serde(default)]
         confidence: Option<NativeConfidence>,
     },
-    /// A Jev or Decisions response returns a selected choice and the complete
-    /// probability distribution.
+    /// A Jev or Decisions response returns a selected choice, the complete
+    /// probability distribution, and the provider-native confidence when one
+    /// was reported.
     Decision {
         /// Selected choice.
         selected: ConditionVerdict,
         /// Complete distribution over all choices.
         probabilities: ConditionProbabilities,
+        /// Provider-native confidence retained separately from the
+        /// probabilities. Adoption uses the selected probability, never this
+        /// value.
+        #[serde(default)]
+        confidence: Option<NativeConfidence>,
     },
 }
 
@@ -333,6 +356,8 @@ pub struct AssessmentProvenance {
     provider: Provider,
     provider_kind: ProviderKind,
     model: ModelId,
+    #[serde(default)]
+    reported_model: Option<ModelId>,
     adapter_version: AdapterVersion,
     rubric_version: RubricVersion,
 }
@@ -361,9 +386,26 @@ impl AssessmentProvenance {
             provider,
             provider_kind,
             model,
+            reported_model: None,
             adapter_version,
             rubric_version,
         })
+    }
+
+    /// Records the model identifier actually reported by the provider.
+    ///
+    /// The configured [`Self::model`] keeps the profile alias or fixed ID. A
+    /// provider that reports a different version from the requested fixed ID
+    /// still records that reported value for audit, but the adapter must
+    /// reject the evaluation as non-reusable.
+    pub fn with_reported_model(mut self, model: ModelId) -> Self {
+        self.reported_model = Some(model);
+        self
+    }
+
+    /// Provider-reported model identifier, when one was recorded.
+    pub fn reported_model(&self) -> Option<&ModelId> {
+        self.reported_model.as_ref()
     }
 
     /// Provider.
@@ -405,6 +447,8 @@ pub struct AssessmentResult {
     profile: ProfileBinding,
     evidence: Vec<EvidenceId>,
     rationale: String,
+    #[serde(default)]
+    rationale_origin: RationaleOrigin,
     #[serde(default)]
     uncertainty: Option<String>,
     outcome: AssessmentOutcome,
@@ -472,11 +516,22 @@ impl AssessmentResult {
             profile: request.profile,
             evidence,
             rationale: rationale.to_owned(),
+            rationale_origin: RationaleOrigin::Unspecified,
             uncertainty,
             outcome,
             provenance,
             decided_at,
         })
+    }
+
+    /// Marks where the stored rationale text came from.
+    ///
+    /// A host-owned note must not be presented as model reasoning. This
+    /// builder is additive; older results without the field remain
+    /// [`RationaleOrigin::Unspecified`].
+    pub fn with_rationale_origin(mut self, origin: RationaleOrigin) -> Self {
+        self.rationale_origin = origin;
+        self
     }
 
     /// Decision identifier.
@@ -522,6 +577,11 @@ impl AssessmentResult {
     /// Short model rationale, distinguished from internal reasoning.
     pub fn rationale(&self) -> &str {
         &self.rationale
+    }
+
+    /// Origin of the stored rationale text.
+    pub const fn rationale_origin(&self) -> RationaleOrigin {
+        self.rationale_origin
     }
 
     /// Model-reported uncertainty.
@@ -582,6 +642,7 @@ impl AssessmentResult {
             AssessmentOutcome::Decision {
                 selected,
                 probabilities,
+                ..
             } => {
                 let threshold = match selected {
                     ConditionVerdict::Met => thresholds.completion_met()?,
