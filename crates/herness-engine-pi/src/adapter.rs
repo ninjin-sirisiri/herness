@@ -16,12 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use herness_core::{
-    AbsolutePath, AuthMethod, BashExecutor, ConnectionDirectory, ConnectionId, ConversationFailure,
-    CoreError, CredentialPort, EngineEvent, EngineInput, EnginePort, EngineStart,
-    EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput, FrozenOperation, GrantScope,
-    NativeFileTools, OperationId, PermissionOutcome, PermissionPolicy, ProcessSupervisor,
-    ProjectRoot, Provider, ProviderFailureKind, RunId, RunState, ShellFailure, StopReason,
-    StopReport, StorePort, SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
+    AbsolutePath, AuthMethod, BashExecutor, BoundedPermissionEvaluator, ConnectionDirectory,
+    ConnectionId, ConversationFailure, CoreError, CredentialPort, EngineEvent, EngineInput,
+    EnginePort, EngineStart, EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput,
+    FrozenOperation, NativeFileTools, OperationId, PermissionOutcome, PermissionPolicy,
+    ProcessSupervisor, ProjectRoot, Provider, ProviderFailureKind, RunId, RunPermissionContext,
+    RunState, ShellFailure, StopReason, StopReport, StorePort, SystemLauncher, ToolArguments,
+    ToolExecutor, ToolGateway, ToolName,
 };
 use pi_embedded::SessionStatus;
 use pi_embedded::{
@@ -107,6 +108,8 @@ pub struct PiEngine<S: StorePort + Send + 'static> {
     file_locks: Arc<FileLockRegistry>,
     catalog: Arc<ChatGptCatalog>,
     runs: HashMap<RunId, Arc<RunContext<S>>>,
+    /// Permission contexts installed before a resume rebuilds a run.
+    pending_permissions: HashMap<RunId, RunPermissionContext>,
 }
 
 impl<S: StorePort + Send + 'static> PiEngine<S> {
@@ -139,14 +142,17 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             file_locks: Arc::new(FileLockRegistry::new()),
             catalog,
             runs: HashMap::new(),
+            pending_permissions: HashMap::new(),
         })
     }
 
-    /// Replaces the permission policy used by subsequent tool re-checks.
+    /// Replaces the adapter's legacy policy snapshot.
     ///
-    /// The host must build the policy through `PolicyAdmin` so its version is
-    /// newer. An authorization issued for an older version is rejected when the
-    /// gateway re-checks it.
+    /// Tool authorization uses the host-resolved [`RunPermissionContext`] on
+    /// each run, not this value. The method remains for existing composition
+    /// code. New hosts must supply the run context through
+    /// [`EngineStart::with_permission`] or [`EnginePort::set_run_permission`];
+    /// an absent context never authorizes a tool.
     pub fn replace_policy(&self, policy: PermissionPolicy) {
         *self
             .policy
@@ -187,11 +193,20 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         start: EngineStart,
         restore: Option<EngineCheckpoint>,
         kind: RestoreKind,
+        permission: Option<RunPermissionContext>,
     ) -> Result<Arc<RunContext<S>>, CoreError> {
         let settings = self
             .directory
             .get(start.connection())
             .map_err(|_| engine_unavailable())?;
+        if let Some(permission) = &permission
+            && permission.run_id() != start.run_id()
+        {
+            return Err(CoreError::MismatchedRun {
+                expected: start.run_id(),
+                found: permission.run_id(),
+            });
+        }
         if settings.auth_method() == AuthMethod::ChatGptLogin && restore.is_none() {
             // The catalog is checked when a run starts. Restoring a saved run
             // must not make a network request or re-resolve a model choice.
@@ -250,10 +265,9 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         let gateway = ToolGateway::new(HostExecutors { files, shell });
         let tools = Arc::new(ToolRuntime {
             run_id: start.run_id(),
-            project_id: start.project_id(),
             cwd: start.cwd().clone(),
             requested_work: start.instructions().to_owned(),
-            policy: Arc::clone(&self.policy),
+            permission: RwLock::new(permission),
             gateway: Mutex::new(gateway),
             store: store.clone(),
             queue: queue.clone(),
@@ -507,12 +521,23 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         herness_core::ToolExecutionAuthority::Adapter
     }
 
+    fn set_run_permission(&mut self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        let run = permission.run_id();
+        if let Some(context) = self.runs.get(&run) {
+            context.tools.set_permission(permission)?;
+        } else {
+            self.pending_permissions.insert(run, permission);
+        }
+        Ok(())
+    }
+
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError> {
         let run_id = start.run_id();
         if self.runs.contains_key(&run_id) {
             return Err(engine_invalid_response());
         }
-        let context = self.build_run(start, None, RestoreKind::Create)?;
+        let permission = start.permission().cloned();
+        let context = self.build_run(start, None, RestoreKind::Create, permission)?;
         self.runs.insert(run_id, context.clone());
         context
             .queue
@@ -530,7 +555,8 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         if self.runs.contains_key(&run_id) {
             return Err(engine_invalid_response());
         }
-        let context = self.build_run(start, Some(parsed), RestoreKind::Continuation)?;
+        let permission = start.permission().cloned();
+        let context = self.build_run(start, Some(parsed), RestoreKind::Continuation, permission)?;
         self.runs.insert(run_id, context);
         Ok(())
     }
@@ -576,7 +602,7 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         Ok(())
     }
 
-    fn request_stop(&mut self, run: &RunId, _reason: StopReason) -> Result<StopReport, CoreError> {
+    fn request_stop(&mut self, run: &RunId, reason: StopReason) -> Result<StopReport, CoreError> {
         let Some(context) = self.runs.get(run).cloned() else {
             return Ok(StopReport::NotRunning);
         };
@@ -587,6 +613,11 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             return Ok(StopReport::NotRunning);
         }
         context.tools.stopping.store(true, Ordering::SeqCst);
+        if let Some(permission) = context.tools.permission() {
+            // Wake a pending evaluator wait immediately; the SDK cancellation
+            // below may take longer than the bounded evaluation wait.
+            permission.control().request_stop(reason);
+        }
         // Refuse new managed processes and signal existing groups before the
         // SDK cancellation is waited on. `stop_all` owns the bounded grace and
         // SIGKILL escalation so this synchronous stop can actually return even
@@ -629,9 +660,12 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         if self.runs.contains_key(run) {
             // The live session was confirmed stopped and has no unfinished
             // invocation. Reuse it without restoring a second session, sending
-            // input, or executing a tool.
+            // input, or executing a tool. Its permission context was installed
+            // by `set_run_permission` before this call.
+            self.pending_permissions.remove(run);
             return Ok(());
         }
+        let permission = self.pending_permissions.remove(run);
         let meta = parsed.meta.clone();
         let start = EngineStart::new(
             meta.project_id,
@@ -642,7 +676,7 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             meta.cwd.clone(),
             meta.instructions.clone(),
         )?;
-        let context = self.build_run(start, Some(parsed), RestoreKind::Resume)?;
+        let context = self.build_run(start, Some(parsed), RestoreKind::Resume, permission)?;
         self.runs.insert(*run, context);
         Ok(())
     }
@@ -679,10 +713,13 @@ struct RunContext<S> {
 
 struct ToolRuntime<S> {
     run_id: RunId,
-    project_id: herness_core::ProjectId,
     cwd: AbsolutePath,
     requested_work: String,
-    policy: Arc<RwLock<PermissionPolicy>>,
+    /// Host-resolved grant, policy, evaluator, and stop/deadline control.
+    ///
+    /// `None` means the host did not supply a run permission context. The tool
+    /// path then refuses to authorize; it never constructs a wide grant.
+    permission: RwLock<Option<RunPermissionContext>>,
     gateway: Mutex<ToolGateway<HostExecutors<S>>>,
     store: EngineStore<S>,
     queue: EventQueue,
@@ -691,6 +728,27 @@ struct ToolRuntime<S> {
 }
 
 impl<S: StorePort + Send + 'static> ToolRuntime<S> {
+    fn set_permission(&self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        if permission.run_id() != self.run_id {
+            return Err(CoreError::MismatchedRun {
+                expected: self.run_id,
+                found: permission.run_id(),
+            });
+        }
+        *self
+            .permission
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(permission);
+        Ok(())
+    }
+
+    fn permission(&self) -> Option<RunPermissionContext> {
+        self.permission
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn tools(self: &Arc<Self>) -> Vec<Arc<dyn EmbeddedTool>> {
         vec![
             self.make_tool(ToolName::Read),
@@ -754,15 +812,31 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 "tool cancelled before execution".to_owned(),
             ));
         }
+        let Some(permission) = self.permission() else {
+            // The host did not install a per-run grant/policy/evaluator/control.
+            // Never substitute a wide grant or a default evaluator.
+            return Err(HostToolFailure::Known(
+                "host run permission context is unavailable; the tool was not authorized"
+                    .to_owned(),
+            ));
+        };
+        let control = permission.control().clone();
+        if !control.permits_side_effect() {
+            return Err(HostToolFailure::Known(
+                "tool stopped or run deadline reached before authorization".to_owned(),
+            ));
+        }
         let arguments = parse_arguments(tool, args)?;
-        // Read the current human policy for each invocation. An authorization
-        // from an older policy version is rejected at the final re-check.
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let grant = GrantScope::for_run(self.project_id, &policy);
+
+        // Use the host's current policy and the exact stored grant. A grant
+        // from an older policy version is stale and cannot authorize new work.
+        let policy = permission.policy().snapshot();
+        let grant = permission.grant().clone();
+        if grant.policy_version() != policy.version() || grant.mode() != policy.mode() {
+            return Err(HostToolFailure::Known(
+                "run permission grant no longer matches the current policy".to_owned(),
+            ));
+        }
         let operation = FrozenOperation::new(
             stable_operation_id(self.run_id, invocation_id),
             self.run_id,
@@ -777,18 +851,28 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
             .gateway
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The evaluator call is bounded by the run deadline and aborts when the
+        // host requests a stop. A timeout or cancellation becomes a human wait
+        // and never an allow.
+        let mut evaluator =
+            BoundedPermissionEvaluator::new(permission.evaluator().cloned(), control.clone());
         let outcome = gateway
             .authorize(
                 &policy,
                 &grant,
                 &operation,
                 &EvaluationContext::new(self.requested_work.clone(), Vec::new()),
-                None,
+                Some(&mut evaluator),
             )
             .map_err(|error| HostToolFailure::Known(sanitized_detail(&error)))?;
         let authorization = match outcome {
             PermissionOutcome::Allow { authorization } => authorization,
             PermissionOutcome::Deny { .. } => {
+                if !control.permits_side_effect() || cancel.is_cancelled() {
+                    return Err(HostToolFailure::Known(
+                        "tool cancelled before execution".to_owned(),
+                    ));
+                }
                 self.store
                     .commit_tool_audit(&operation, ENGINE_TOOL_DENIED_EVENT_KIND, "policy_denied")
                     .map_err(|_| {
@@ -799,6 +883,25 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 ));
             }
             PermissionOutcome::AwaitingApproval { .. } => {
+                if !control.permits_side_effect()
+                    || cancel.is_cancelled()
+                    || self.stopping.load(Ordering::SeqCst)
+                {
+                    // The evaluator timed out or was cancelled because the run
+                    // stopped; never surface this as a fresh human approval.
+                    return Err(HostToolFailure::Known(
+                        "tool cancelled before execution".to_owned(),
+                    ));
+                }
+                let current_policy = permission.policy().snapshot();
+                if current_policy.version() != operation.policy_version()
+                    || current_policy.mode() != operation.permission_mode()
+                {
+                    return Err(HostToolFailure::Known(
+                        "permission policy changed before approval; re-evaluate the tool"
+                            .to_owned(),
+                    ));
+                }
                 self.store
                     .commit_tool_audit(
                         &operation,
@@ -824,16 +927,29 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 "tool cancelled before execution".to_owned(),
             ));
         }
-        // Re-read the policy immediately before execution. A policy change
-        // between authorization and execution invalidates the old decision.
-        let current_policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if current_policy.version() != operation.policy_version() {
+        // Re-check the current policy, grant, final arguments, and stop/deadline
+        // immediately before the side effect. Any change in the meantime makes
+        // the unused decision stale and the executor is not reached.
+        let current_policy = permission.policy().snapshot();
+        if current_policy.version() != operation.policy_version()
+            || current_policy.mode() != operation.permission_mode()
+        {
             return Err(HostToolFailure::Known(
-                "permission policy changed before execution; re-evaluate the tool".to_owned(),
+                "permission policy changed during evaluation; re-evaluate the tool".to_owned(),
+            ));
+        }
+        let current_grant = permission.grant();
+        if current_grant.policy_version() != current_policy.version()
+            || current_grant.mode() != current_policy.mode()
+            || !current_grant.permits(&operation)
+        {
+            return Err(HostToolFailure::Known(
+                "run permission grant changed during evaluation; re-evaluate the tool".to_owned(),
+            ));
+        }
+        if !control.permits_side_effect() {
+            return Err(HostToolFailure::Known(
+                "tool stopped or run deadline reached before execution".to_owned(),
             ));
         }
         // The executor behind the gateway records the operation intent and

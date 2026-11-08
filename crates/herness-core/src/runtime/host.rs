@@ -42,10 +42,12 @@ use crate::contracts::run::RunState;
 use crate::contracts::time::Timestamp;
 use crate::permissions::{
     EvaluationContext, EvaluatorAvailability, GrantScope, PermissionMode, PermissionPolicy,
-    PermissionRule, PolicyAdmin,
+    PermissionRule, PolicyAdmin, RunControl, RunPermissionContext, SharedPolicy,
 };
 use crate::ports::engine::{EngineEvent, EngineInput, EnginePort, EngineStart, StopReport};
-use crate::ports::{ContinuationPort, PermissionEvaluatorPort, RuntimeStore};
+use crate::ports::{
+    ContinuationPort, PermissionEvaluatorPort, RuntimeStore, SharedPermissionEvaluator,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 use crate::runtime::state::{
@@ -69,7 +71,7 @@ pub struct RuntimeDependencies<S, E, T> {
     credentials: Arc<dyn crate::ports::CredentialPort + Send + Sync>,
     directory: ConnectionDirectory,
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
+    evaluator: Option<SharedPermissionEvaluator>,
     capabilities: HostCapabilities,
     toolchain: ToolchainConfig,
     executor: T,
@@ -100,12 +102,25 @@ impl<S, E, T> RuntimeDependencies<S, E, T> {
     }
 
     /// Supplies the H2 evaluator. Without an available evaluator, automatic
-    /// mode is refused.
+    /// mode is refused. The evaluator is wrapped in the same shared instance
+    /// that every engine run receives, so the host and adapter cannot evaluate
+    /// with two different evaluators.
     #[must_use]
     pub fn with_evaluator(
         mut self,
         evaluator: Box<dyn PermissionEvaluatorPort + Send + Sync>,
     ) -> Self {
+        self.evaluator = Some(SharedPermissionEvaluator::new(evaluator));
+        self
+    }
+
+    /// Supplies an already shared evaluator instance.
+    ///
+    /// This is the composition constructor when the trusted host has already
+    /// created the evaluator for another component, such as a prepared engine
+    /// adapter.
+    #[must_use]
+    pub fn with_shared_evaluator(mut self, evaluator: SharedPermissionEvaluator) -> Self {
         self.evaluator = Some(evaluator);
         self
     }
@@ -185,11 +200,16 @@ where
     credentials: Arc<dyn crate::ports::CredentialPort + Send + Sync>,
     directory: ConnectionDirectory,
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
+    evaluator: Option<SharedPermissionEvaluator>,
     capabilities: HostCapabilities,
     toolchain: ToolchainDetector,
     gateway: ToolGateway<T>,
     state: HostState,
+    /// Shared current policy handle given to every adapter run context.
+    shared_policy: SharedPolicy,
+    /// Per-run stop/deadline controls. They are in-process only; a restored run
+    /// receives fresh control state when a human resumes it.
+    run_controls: BTreeMap<RunId, RunControl>,
     /// True after an explicit quit began. New runs, inputs, approvals, and
     /// resumes are refused until the process restarts.
     shutting_down: bool,
@@ -229,6 +249,9 @@ where
             executor,
         } = dependencies;
 
+        let shared_policy = SharedPolicy::new(policy.policy().clone());
+        let policy = policy.with_shared(shared_policy.clone());
+
         let state = {
             let store_guard = lock_store(&store)?;
             match store_guard
@@ -251,6 +274,8 @@ where
             toolchain: ToolchainDetector::new(toolchain),
             gateway: ToolGateway::new(executor),
             state,
+            shared_policy,
+            run_controls: BTreeMap::new(),
             shutting_down: false,
             deferred_continuations: BTreeMap::new(),
             process_runs: BTreeSet::new(),
@@ -543,6 +568,9 @@ where
         let mut forced = Vec::with_capacity(active.len());
         for (project, run, _) in active {
             let record = self.run_record(project, run)?.clone();
+            if let Some(control) = self.run_controls.get(&run) {
+                control.request_stop(crate::ports::engine::StopReason::ApplicationQuit);
+            }
             self.gateway.service_mut().invalidate_run(run);
             let mut next = self.state.clone();
             if let Some(project_record) = next.projects_mut().get_mut(&project) {
@@ -675,6 +703,70 @@ where
     /// This is intentionally not reachable from a tool or model request.
     pub fn policy_admin_mut(&mut self) -> &mut PolicyAdmin {
         &mut self.policy
+    }
+
+    /// Shared current policy handle used by adapter run contexts.
+    ///
+    /// This is a read-only handle. Policy mutation stays on
+    /// [`Self::policy_admin_mut`].
+    pub fn policy_handle(&self) -> SharedPolicy {
+        self.shared_policy.clone()
+    }
+
+    /// Sets or clears the absolute deadline for one run.
+    ///
+    /// The deadline is checked by the real tool path immediately before a side
+    /// effect and bounds a pending permission evaluation. It is not persisted;
+    /// a restored run receives fresh control state when a human resumes it.
+    pub fn set_run_deadline(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), RuntimeError> {
+        self.run_record(project, run)?;
+        let control = self.run_controls.entry(run).or_default().clone();
+        control.set_deadline(deadline);
+        Ok(())
+    }
+
+    fn run_permission_context(
+        &self,
+        project: ProjectId,
+        run: RunId,
+        grant: &GrantScope,
+        control: RunControl,
+    ) -> Result<RunPermissionContext, RuntimeError> {
+        RunPermissionContext::new(
+            project,
+            run,
+            grant.clone(),
+            self.shared_policy.clone(),
+            self.evaluator.clone(),
+            control,
+        )
+        .map_err(|error| RuntimeError::PermissionContextStale {
+            detail: error.to_string(),
+        })
+    }
+
+    /// Installs a run permission context for an adapter that executes tools
+    /// internally. The host is the only caller; a host-authority engine needs
+    /// no context because the runtime gateway remains the executor.
+    fn install_run_permission(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        grant: &GrantScope,
+    ) -> Result<(), RuntimeError> {
+        if self.engine.tool_execution_authority() != crate::ports::ToolExecutionAuthority::Adapter {
+            return Ok(());
+        }
+        let control = self.run_controls.get(&run).cloned().unwrap_or_default();
+        let context = self.run_permission_context(project, run, grant, control)?;
+        self.engine
+            .set_run_permission(context)
+            .map_err(RuntimeError::engine)
     }
 
     /// Host capability report.
@@ -929,6 +1021,8 @@ where
         };
 
         let run_id = RunId::new(project);
+        let control = RunControl::new();
+        let permission = self.run_permission_context(project, run_id, &grant, control.clone())?;
         let start = EngineStart::new(
             project,
             agent,
@@ -938,7 +1032,9 @@ where
             project_record.path.clone(),
             instructions.into(),
         )
-        .map_err(RuntimeError::engine)?;
+        .map_err(RuntimeError::engine)?
+        .with_permission(permission);
+        self.run_controls.insert(run_id, control);
 
         let now = Timestamp::now();
         let record = RunRecord {
@@ -1400,6 +1496,9 @@ where
                     reason: ConversationFailure::MissingCheckpoint,
                 })?
         };
+        let control = RunControl::new();
+        let permission =
+            self.run_permission_context(project, request.run_id(), &grant, control.clone())?;
         let start = EngineStart::new(
             project,
             request.agent_id(),
@@ -1409,7 +1508,9 @@ where
             project_record.path.clone(),
             previous.instructions.clone(),
         )
-        .map_err(RuntimeError::engine)?;
+        .map_err(RuntimeError::engine)?
+        .with_permission(permission);
+        self.run_controls.insert(request.run_id(), control);
         self.engine
             .check_continuation(&start, &checkpoint)
             .map_err(|error| continuation_error(previous_run, error))?;
@@ -1612,6 +1713,11 @@ where
         reason: crate::ports::engine::StopReason,
     ) -> Result<StopOutcome, RuntimeError> {
         let record = self.run_record(project, run)?.clone();
+        if let Some(control) = self.run_controls.get(&run) {
+            // Make a pending permission evaluation stop waiting before the SDK
+            // cancellation is requested. The control is shared with the adapter.
+            control.request_stop(reason);
+        }
         if record.state == RunState::Failed {
             return Err(RuntimeError::InvalidRunTransition {
                 from: record.state,
@@ -1767,6 +1873,14 @@ where
         self.engine
             .check_resume(&run, &checkpoint)
             .map_err(|error| resume_error(run, error))?;
+
+        // An explicit human resume clears only the stop flag; a run deadline
+        // remains in force. The adapter receives the same grant and the current
+        // shared policy/evaluator before the run is marked running.
+        let control = self.run_controls.get(&run).cloned().unwrap_or_default();
+        control.reset_stop();
+        self.run_controls.insert(run, control);
+        self.install_run_permission(project, run, &grant)?;
 
         self.gateway.service_mut().invalidate_run(run);
         self.deferred_continuations.remove(&run);
@@ -2138,7 +2252,9 @@ where
                 &grant,
                 &operation,
                 &EvaluationContext::new(record.instructions.clone(), Vec::new()),
-                self.evaluator.as_deref_mut(),
+                self.evaluator
+                    .as_mut()
+                    .map(|evaluator| evaluator as &mut (dyn PermissionEvaluatorPort + Send + Sync)),
             )
             .map_err(RuntimeError::store)?;
 
@@ -2323,7 +2439,9 @@ where
                 &grant,
                 &operation,
                 &EvaluationContext::new(record.instructions.clone(), Vec::new()),
-                self.evaluator.as_deref_mut(),
+                self.evaluator
+                    .as_mut()
+                    .map(|evaluator| evaluator as &mut (dyn PermissionEvaluatorPort + Send + Sync)),
             )
             .map_err(RuntimeError::store)?;
         match outcome {

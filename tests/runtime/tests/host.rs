@@ -91,6 +91,7 @@ struct EngineState {
     checkpoint_calls: BTreeMap<RunId, usize>,
     events: BTreeMap<RunId, Vec<EngineEvent>>,
     start_observed_durable_event: Vec<bool>,
+    permissions: Vec<RunPermissionContext>,
 }
 
 impl EngineState {
@@ -103,6 +104,7 @@ impl EngineState {
         self.checkpoint_calls.clear();
         self.events.clear();
         self.start_observed_durable_event.clear();
+        self.permissions.clear();
     }
 
     fn request_count(&self) -> usize {
@@ -122,6 +124,7 @@ struct FakeEngine {
     reject_input: bool,
     continuation_failure: Option<ConversationFailure>,
     resume_failure: Option<ConversationFailure>,
+    authority: ToolExecutionAuthority,
 }
 
 impl FakeEngine {
@@ -133,6 +136,7 @@ impl FakeEngine {
         reject_input: bool,
         continuation_failure: Option<ConversationFailure>,
         resume_failure: Option<ConversationFailure>,
+        authority: ToolExecutionAuthority,
     ) -> Self {
         Self {
             state,
@@ -141,11 +145,16 @@ impl FakeEngine {
             reject_input,
             continuation_failure,
             resume_failure,
+            authority,
         }
     }
 }
 
 impl EnginePort for FakeEngine {
+    fn tool_execution_authority(&self) -> ToolExecutionAuthority {
+        self.authority
+    }
+
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError> {
         let durable = {
             let store = self.store.lock().expect("store lock");
@@ -157,6 +166,9 @@ impl EnginePort for FakeEngine {
             })
         };
         let mut state = self.state.lock().expect("engine lock");
+        if let Some(permission) = start.permission() {
+            state.permissions.push(permission.clone());
+        }
         state.starts.push(start);
         state.start_observed_durable_event.push(durable);
         Ok(())
@@ -173,11 +185,20 @@ impl EnginePort for FakeEngine {
                 reason,
             });
         }
+        let mut state = self.state.lock().expect("engine lock");
+        if let Some(permission) = start.permission() {
+            state.permissions.push(permission.clone());
+        }
+        state.continuations.push((start, previous));
+        Ok(())
+    }
+
+    fn set_run_permission(&mut self, permission: RunPermissionContext) -> Result<(), CoreError> {
         self.state
             .lock()
             .expect("engine lock")
-            .continuations
-            .push((start, previous));
+            .permissions
+            .push(permission);
         Ok(())
     }
 
@@ -408,6 +429,7 @@ struct Options {
     reject_input: bool,
     continuation_failure: Option<ConversationFailure>,
     resume_failure: Option<ConversationFailure>,
+    authority: ToolExecutionAuthority,
 }
 
 impl Default for Options {
@@ -421,6 +443,7 @@ impl Default for Options {
             reject_input: false,
             continuation_failure: None,
             resume_failure: None,
+            authority: ToolExecutionAuthority::Host,
         }
     }
 }
@@ -441,6 +464,7 @@ struct TestHost {
     reject_input: bool,
     continuation_failure: Option<ConversationFailure>,
     resume_failure: Option<ConversationFailure>,
+    authority: ToolExecutionAuthority,
     runtime: HostRuntime,
 }
 
@@ -484,6 +508,7 @@ impl TestHost {
             options.reject_input,
             options.continuation_failure,
             options.resume_failure,
+            options.authority,
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let executor = TestExecutor::new(Arc::clone(&store), Arc::clone(&calls));
@@ -519,6 +544,7 @@ impl TestHost {
             reject_input: options.reject_input,
             continuation_failure: options.continuation_failure,
             resume_failure: options.resume_failure,
+            authority: options.authority,
             runtime,
         }
     }
@@ -545,6 +571,7 @@ impl TestHost {
             self.reject_input,
             self.continuation_failure,
             self.resume_failure,
+            self.authority,
         );
         let executor = TestExecutor::new(Arc::clone(&self.store), Arc::clone(&self.calls));
         let deps = RuntimeDependencies::new(
@@ -2486,5 +2513,112 @@ fn resume_gate_distinguishes_same_process_and_restored_runs() {
             .unwrap()
             .state(),
         RunState::Paused
+    );
+}
+
+#[test]
+fn adapter_authority_receives_the_exact_run_grant_for_start_continuation_and_resume() {
+    let mut host = TestHost::with_options(Options {
+        authority: ToolExecutionAuthority::Adapter,
+        ..Options::default()
+    });
+    let (project, _) = host.open_both();
+    let parent = host
+        .runtime
+        .create_agent(
+            project,
+            AgentSpec::new("parent", "implementer", host.connection),
+        )
+        .expect("parent");
+    let allowed_root =
+        AbsolutePath::new(format!("{}/allowed", host.project_a.to_string_lossy())).expect("root");
+    let rule = PermissionRule::allow(
+        RuleTarget::FilePath {
+            tool: ToolName::Write,
+            root: allowed_root,
+        },
+        MatchMethod::PathPrefix,
+    )
+    .expect("rule");
+    let child = host
+        .runtime
+        .create_agent(
+            project,
+            AgentSpec::new("child", "implementer", host.connection)
+                .child_of(parent.agent_id())
+                .with_scope(vec![rule.clone()]),
+        )
+        .expect("child");
+
+    let run1 = host
+        .runtime
+        .start_run(project, child.agent_id(), "start")
+        .expect("run1");
+    let start_permission = host
+        .engine_state()
+        .permissions
+        .last()
+        .cloned()
+        .expect("start permission");
+    assert_eq!(start_permission.run_id(), run1.run_id());
+    assert_eq!(start_permission.project_id(), project);
+    assert_eq!(
+        start_permission.grant().grants(),
+        std::slice::from_ref(&rule)
+    );
+    assert_eq!(
+        start_permission.grant().policy_version(),
+        host.runtime.policy().version()
+    );
+    assert_eq!(
+        start_permission.grant().mode(),
+        host.runtime.policy().mode()
+    );
+
+    host.push_event(run1.run_id(), EngineEvent::StateChanged(RunState::Running));
+    host.runtime.poll_run(project, run1.run_id()).unwrap();
+    host.push_event(run1.run_id(), EngineEvent::StateChanged(RunState::Idle));
+    host.runtime.poll_run(project, run1.run_id()).unwrap();
+    store_fake_checkpoint(&host.store, run1.run_id());
+    let outcome = host
+        .runtime
+        .continue_run(project, run1.run_id(), "continue")
+        .expect("continuation");
+    let continuation_permission = host
+        .engine_state()
+        .permissions
+        .last()
+        .cloned()
+        .expect("continuation permission");
+    assert_eq!(continuation_permission.run_id(), outcome.run().run_id());
+    assert_eq!(
+        continuation_permission.grant().grants(),
+        start_permission.grant().grants()
+    );
+
+    let run2 = host
+        .runtime
+        .start_run(project, child.agent_id(), "stop and resume")
+        .expect("run2");
+    let stopped = host
+        .runtime
+        .stop_run(project, run2.run_id(), StopReason::UserRequest)
+        .expect("stop");
+    assert_eq!(stopped.run().state(), RunState::Paused);
+    let before_resume = host.engine_state().permissions.len();
+    host.runtime
+        .resume_run(project, run2.run_id())
+        .expect("resume");
+    let resume_permission = host
+        .engine_state()
+        .permissions
+        .last()
+        .cloned()
+        .expect("resume permission");
+    assert_eq!(host.engine_state().permissions.len(), before_resume + 1);
+    assert_eq!(resume_permission.run_id(), run2.run_id());
+    assert_eq!(
+        resume_permission.grant().grants(),
+        start_permission.grant().grants()
     );
 }

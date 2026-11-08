@@ -315,6 +315,9 @@ pub enum PortFeature {
     StopDeadlineControl,
     /// Persisting events for host activities that have no run.
     HostActivityEvents,
+    /// Installing the host-resolved grant, policy, evaluator, and stop control
+    /// for a run's real tool path.
+    RunPermission,
 }
 
 impl PortFeature {
@@ -327,6 +330,7 @@ impl PortFeature {
             Self::RequestObservation => "request_observation",
             Self::StopDeadlineControl => "stop_deadline_control",
             Self::HostActivityEvents => "host_activity_events",
+            Self::RunPermission => "run_permission",
         }
     }
 }

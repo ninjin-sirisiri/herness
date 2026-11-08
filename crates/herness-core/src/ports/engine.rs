@@ -9,12 +9,13 @@ use crate::contracts::errors::{CoreError, EngineFailureKind};
 use crate::contracts::ids::{AgentId, ProjectId, ProjectScope, RunId, SessionId};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
+use crate::permissions::RunPermissionContext;
 use crate::tools::{ToolArguments, ToolName};
 
 pub use crate::contracts::request::StopReason;
 
 /// Request to start one run in an independent engine session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineStart {
     project_id: ProjectId,
     agent_id: AgentId,
@@ -23,6 +24,7 @@ pub struct EngineStart {
     connection: ConnectionId,
     cwd: AbsolutePath,
     instructions: String,
+    permission: Option<RunPermissionContext>,
 }
 
 impl EngineStart {
@@ -49,7 +51,25 @@ impl EngineStart {
             connection,
             cwd,
             instructions: instructions.into(),
+            permission: None,
         })
+    }
+
+    /// Attaches the host-resolved permission context for this run.
+    ///
+    /// The value is built only by trusted host composition. An adapter that
+    /// executes tools internally must use exactly this grant, policy handle,
+    /// evaluator, and stop control; it must not construct a wide grant when the
+    /// value is absent.
+    #[must_use]
+    pub fn with_permission(mut self, permission: RunPermissionContext) -> Self {
+        self.permission = Some(permission);
+        self
+    }
+
+    /// Host-resolved permission context, when one was supplied.
+    pub const fn permission(&self) -> Option<&RunPermissionContext> {
+        self.permission.as_ref()
     }
 
     /// Project that owns the run.
@@ -169,6 +189,21 @@ pub trait EnginePort {
     /// observations and never executes the same operation again.
     fn tool_execution_authority(&self) -> ToolExecutionAuthority {
         ToolExecutionAuthority::Host
+    }
+
+    /// Installs the host-resolved permission context for a run that is resumed
+    /// or whose live session is reused.
+    ///
+    /// Start and continuation normally carry the context on [`EngineStart`].
+    /// Resume has no `EngineStart` at the host boundary, so the host installs
+    /// the same value here before calling [`Self::resume`]. An adapter that
+    /// executes tools internally must not fall back to a wide grant or to `None`
+    /// when this value is missing; it must refuse the tool authorization.
+    fn set_run_permission(&mut self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        let _ = permission;
+        Err(CoreError::UnsupportedPortFeature {
+            feature: crate::contracts::errors::PortFeature::RunPermission,
+        })
     }
 
     /// Starts an independent engine run.

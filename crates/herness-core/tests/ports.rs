@@ -518,3 +518,26 @@ fn checkpoint_commit_rejects_a_host_activity_event_explicitly() {
         CoreError::InvalidEvent { ref field, .. } if field == "subject"
     ));
 }
+
+#[test]
+fn set_run_permission_default_is_explicitly_unsupported() {
+    let fixture = Fixture::new();
+    let mut engine = FakeEngine::default();
+    let policy = PermissionPolicy::initial();
+    let grant = GrantScope::for_run(fixture.project, &policy);
+    let context = RunPermissionContext::new(
+        fixture.project,
+        fixture.run,
+        grant,
+        SharedPolicy::new(policy),
+        None,
+        RunControl::new(),
+    )
+    .expect("permission context");
+    assert_eq!(
+        engine.set_run_permission(context),
+        Err(CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RunPermission
+        })
+    );
+}

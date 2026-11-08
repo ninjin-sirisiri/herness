@@ -16,7 +16,7 @@ pub use engine::{
     EngineEvent, EngineInput, EnginePort, EngineStart, StopReason, StopReport,
     ToolExecutionAuthority,
 };
-pub use evaluator::{EvaluationRequest, PermissionEvaluatorPort};
+pub use evaluator::{EvaluationRequest, PermissionEvaluatorPort, SharedPermissionEvaluator};
 pub use request_gate::{ModelRequestGatePort, StopDeadlinePort};
 pub use runtime_store::RuntimeStore;
 pub use store::{CheckpointCommit, CommitReceipt, StorePort};

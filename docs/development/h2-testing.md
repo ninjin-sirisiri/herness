@@ -90,6 +90,31 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 `tests/runtime/tests/host.rs` はfake engineでhost側の受理・開始・完結、送信失敗、継続のrun/checkpoint/input対応、running・未解決操作・managed processの拒否、`same_process`/`restored`の復旧gateと`NotResumable`拒否を確認する。
 
+## Task 4で追加したgrant・評価器・停止制御の引継ぎ
+
+### hostが確定したrun permission context
+
+- `EngineStart::with_permission` はhostが解決した `RunPermissionContext` をstartと継続へ渡す。contextはrunの `GrantScope`（実際に保存したgrant）、現在policyの `SharedPolicy`、hostが選んだ `SharedPermissionEvaluator`、runの `RunControl` を持つ。
+- `EnginePort::set_run_permission` はresume前に同じcontextをインストールする。未実装のengineは `UnsupportedPortFeature { feature: run_permission }` を返し、広いgrantへfallbackしない。
+- Pi adapterのtool経路はcontextが無い場合に認可を拒否する。`GrantScope::for_run` を内部で再構成せず、`None` 評価器へfallbackしない。
+- 許可の順序はH1のまま（schema → 保護境界 → 明示deny → grant上限 → 明示ask → mode/評価器）。自動モードでも明示deny・askは評価器より先に処理する。
+- 評価は `BoundedPermissionEvaluator` がworker threadで実行し、runのdeadlineまたは既定60秒の早い方とstop要求で待機を打ち切る。timeout・停止・評価不能・busyは人間待ちとなり、実行しない。遅れて届いたallowは破棄する。
+- 副作用直前にpolicy version/mode、grantのproject・version・mode・対象、最終引数（gatewayのbinding）、stop・deadlineを再確認する。評価中のpolicy変更、引数変更、停止、deadline、古い判断ではexecutorを呼ばない。
+- `RuntimeDependencies::with_evaluator` は既存APIを維持し、内部で `SharedPermissionEvaluator` に包む。`with_shared_evaluator` で既に共有された同一instanceを注入できる。host runtimeとPi adapterは同じevaluator・同じpolicy handleを使う。
+- adapterが実行権限を持つ場合、hostは `ToolCall` frameを観測だけにし、同じ操作を実行しない。adapterがaskとして報告した操作だけがhostの承認recordになり、人間の承認後に一度だけ実行される。
+
+### Task 4のテスト
+
+`tests/runtime/tests/engine.rs` は実Pi＋loopback modelとbounded mock evaluatorで次を確認する。
+
+- 許可されたbashの副作用が1回だけ実行され、hostのexecutor呼出しは0回。`ToolCall` frameの二重実行がない。
+- 子agentのgrant外へのwriteは0回、grant内は1回。継続runとresume後も同じgrantが使われる。
+- 自動モードではhostの共有evaluatorが1回呼ばれ、modelが書いたrationaleは評価のauthority fieldに入らない。
+- 明示denyは評価器0回で実行0、明示askは評価器0回で人間待ちになり実行0。modelの指示文は優先順位を変えない。
+- 評価器unavailable、評価中の停止、deadline到達、評価中のpolicy変更、遅延したallowはすべてexecutor 0回。
+- host grantが無いstartは広いgrantへfallbackせず、toolを拒否する。
+
+`tests/runtime/tests/permissions.rs` はin-memoryで `BoundedPermissionEvaluator` のdeadline・stop・busy時の打切り、評価中のpolicy変更でallowがstaleになること、自動モードでもgrant上限が評価器より先に効くこと、明示deny/askがmodel指示で迂回されないことを確認する。
 
 ## テストコマンド
 
@@ -113,6 +138,14 @@ Task 3の受入で実行するコマンド:
 ```sh
 cargo test -p herness-runtime-tests --test engine --locked
 cargo test -p herness-runtime-tests --test host --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 4の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-runtime-tests --test permissions --locked
+cargo test -p herness-runtime-tests --test engine --locked
 cargo check --workspace --all-targets --locked
 ```
 

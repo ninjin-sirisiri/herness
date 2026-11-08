@@ -221,7 +221,7 @@ impl PermissionService {
         grant: &GrantScope,
         operation: &FrozenOperation,
         context: &EvaluationContext,
-        evaluator: Option<&mut (dyn PermissionEvaluatorPort + Send + Sync + 'static)>,
+        evaluator: Option<&mut (dyn PermissionEvaluatorPort + Send + Sync)>,
     ) -> Result<PermissionOutcome, CoreError> {
         operation.arguments().validate()?;
         if operation.policy_version() != policy.version() {
@@ -348,7 +348,7 @@ impl PermissionService {
         operation: &FrozenOperation,
         context: &EvaluationContext,
         binding: DecisionBinding,
-        evaluator: Option<&mut (dyn PermissionEvaluatorPort + Send + Sync + 'static)>,
+        evaluator: Option<&mut (dyn PermissionEvaluatorPort + Send + Sync)>,
     ) -> Result<PermissionOutcome, CoreError> {
         let Some(evaluator) = evaluator else {
             return Ok(self.record_pending(

@@ -27,11 +27,12 @@ pub use connections::{
 pub use contracts::*;
 pub use permissions::{
     ApprovalError, ApprovalRequest, ArgumentsDigest, Authorization, AutomaticModeCapability,
-    AutomaticModeUnavailableReason, DecisionBinding, DecisionStatus, DenialReason,
-    EvaluationContext, EvaluatorAvailability, EvaluatorFailure, GrantScope, GrantWidening,
-    HumanWaitReason, InvalidationReason, MatchMethod, PermissionDecision, PermissionMode,
-    PermissionOutcome, PermissionPolicy, PermissionRule, PermissionService, PolicyAdmin,
-    PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget, SimpleCommand,
+    AutomaticModeUnavailableReason, BoundedPermissionEvaluator, DEFAULT_EVALUATION_TIMEOUT,
+    DecisionBinding, DecisionStatus, DenialReason, EvaluationContext, EvaluatorAvailability,
+    EvaluatorFailure, GrantScope, GrantWidening, HumanWaitReason, InvalidationReason, MatchMethod,
+    PermissionDecision, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionRule,
+    PermissionService, PolicyAdmin, PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget,
+    RunControl, RunPermissionContext, SharedPolicy, SimpleCommand,
 };
 pub use ports::*;
 pub use skills::{
