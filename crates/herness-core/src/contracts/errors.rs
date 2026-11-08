@@ -281,6 +281,9 @@ pub enum CredentialFailureKind {
     /// The stored credential payload could not be decoded or had the wrong
     /// kind for the connection's authentication method.
     InvalidCredentialData,
+    /// A validated ChatGPT login lacks the plan-usage scope. The account is
+    /// authenticated but cannot be used for inference.
+    PlanScopeMissing,
 }
 
 /// Sanitized store failure kinds.

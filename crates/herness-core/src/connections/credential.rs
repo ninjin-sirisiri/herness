@@ -21,7 +21,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 use crate::contracts::connection::{AuthMethod, ConnectionId, ConnectionInfo, ConnectionStatus};
 use crate::contracts::errors::{CoreError, CredentialFailureKind};
@@ -37,10 +38,26 @@ use super::registry::{ConnectionDirectory, ConnectionSettings};
 pub const VAULT_SERVICE: &str = "com.herness.credentials";
 
 /// Version of the credential payload stored in the vault.
-pub const CREDENTIAL_FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 adds the retained ID token, granted scopes, verified account
+/// subject, and issued client ID to OAuth token sets. Version 1 payloads remain
+/// readable, but are never reinterpreted as carrying those fields.
+pub const CREDENTIAL_FORMAT_VERSION: u32 = 2;
+
+/// Scope that authorizes use of a user's ChatGPT plan through the OAuth flow.
+pub const CHATGPT_PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
+
+/// First-time dynamic registration client sent to the authorization endpoint.
+///
+/// This value is an entrypoint, not an issued client ID. It must never be
+/// stored as the connection's registration or sent to the token endpoint.
+pub const CHATGPT_DYNAMIC_AGENT_CLIENT: &str = "dynamic_agent_client";
 
 /// Longest accepted vault account key, in Unicode scalar values.
 const MAX_VAULT_ACCOUNT_CHARS: usize = 256;
+
+/// Longest accepted issued ChatGPT client ID in a vault account key.
+const MAX_ISSUED_CLIENT_ID_CHARS: usize = 96;
 
 /// Opaque reference to one credential item.
 ///
@@ -96,9 +113,69 @@ impl VaultAccount {
         Self(reference.0.clone())
     }
 
+    /// Derives a per-account vault key for one issued ChatGPT client ID and
+    /// verified ID-token subject.
+    ///
+    /// The issued client ID and account identity are the separation boundary:
+    /// two registrations never share a vault item, even on the same connection.
+    /// The subject is hashed so the key stays bounded and free of control
+    /// characters; the full identity remains in the validated token set.
+    pub fn for_chatgpt_account(
+        connection: ConnectionId,
+        issued_client_id: &str,
+        subject: &str,
+    ) -> Result<Self, ConnectionError> {
+        if !valid_issued_client_id(issued_client_id)
+            || subject.is_empty()
+            || subject.chars().any(char::is_control)
+        {
+            return Err(ConnectionError::InvalidCredentialAccount);
+        }
+        let digest = Sha256::digest(subject.as_bytes());
+        let subject_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let value =
+            format!("connection/{connection}/chatgpt_login/{issued_client_id}/{subject_hex}");
+        Self::new(value).map_err(|_| ConnectionError::InvalidCredentialAccount)
+    }
+
+    /// Whether this account key is an account-scoped ChatGPT key for the
+    /// connection.
+    pub fn is_chatgpt_account_for(&self, connection: ConnectionId) -> bool {
+        self.0
+            .starts_with(&format!("connection/{connection}/chatgpt_login/"))
+    }
+
     /// Account key string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn valid_issued_client_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ISSUED_CLIENT_ID_CHARS
+        && value != CHATGPT_DYNAMIC_AGENT_CLIENT
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+impl Serialize for VaultAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for VaultAccount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -126,19 +203,43 @@ pub trait CredentialVault: Send + Sync {
     fn delete(&self, account: &VaultAccount) -> Result<(), VaultFailure>;
 }
 
+/// Additional non-access-token fields of an OAuth token set.
+///
+/// The retained ID token is a bearer credential and is redacted from debug
+/// output. The verified subject, issued client ID, and email are account
+/// metadata; they are not printed with the token set.
+#[derive(Default)]
+pub struct OAuthTokenSetDetails {
+    /// Retained ID token used only as `id_token_hint` on a later sign-in.
+    pub id_token: Option<SecretString>,
+    /// Scopes granted by the provider. Empty means no scope list was
+    /// recorded; `plan_usage` decides when it is present.
+    pub granted_scopes: Vec<String>,
+    /// Explicit result of checking the ChatGPT plan scope. `None` means the
+    /// record predates the account flow, so the scope list decides.
+    pub plan_usage: Option<bool>,
+    /// Verified ID-token subject.
+    pub account_subject: Option<String>,
+    /// Issued ChatGPT client ID bound to this account.
+    pub issued_client_id: Option<String>,
+    /// Email hint from the validated ID token, if present.
+    pub account_email: Option<String>,
+}
+
 /// A complete OAuth token set kept in the vault.
 ///
 /// The access token is the per-request secret. The refresh token, when present,
 /// allows a human-authorized refresh to replace the whole set atomically. No
-/// field is serializable or printable in cleartext.
+/// secret field is serializable or printable in cleartext.
 pub struct OAuthTokenSet {
     access_token: SecretString,
     refresh_token: Option<SecretString>,
     expires_at: Option<Timestamp>,
+    details: OAuthTokenSetDetails,
 }
 
 impl OAuthTokenSet {
-    /// Creates a token set.
+    /// Creates a token set without ChatGPT account metadata.
     pub const fn new(
         access_token: SecretString,
         refresh_token: Option<SecretString>,
@@ -148,6 +249,30 @@ impl OAuthTokenSet {
             access_token,
             refresh_token,
             expires_at,
+            details: OAuthTokenSetDetails {
+                id_token: None,
+                granted_scopes: Vec::new(),
+                plan_usage: None,
+                account_subject: None,
+                issued_client_id: None,
+                account_email: None,
+            },
+        }
+    }
+
+    /// Creates a token set with retained ID token and verified account
+    /// metadata.
+    pub fn with_details(
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+        expires_at: Option<Timestamp>,
+        details: OAuthTokenSetDetails,
+    ) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            expires_at,
+            details,
         }
     }
 
@@ -159,6 +284,54 @@ impl OAuthTokenSet {
     /// Refresh token secret, if the provider issued one.
     pub fn refresh_token(&self) -> Option<&SecretString> {
         self.refresh_token.as_ref()
+    }
+
+    /// Retained ID token secret, if one was stored for `id_token_hint`.
+    pub fn id_token(&self) -> Option<&SecretString> {
+        self.details.id_token.as_ref()
+    }
+
+    /// Granted scopes, in provider order.
+    pub fn granted_scopes(&self) -> &[String] {
+        &self.details.granted_scopes
+    }
+
+    /// Whether the provider granted the requested scope.
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.details
+            .granted_scopes
+            .iter()
+            .any(|granted| granted == scope)
+    }
+
+    /// Whether a non-empty ChatGPT scope set includes plan usage.
+    ///
+    /// An empty scope list means the record predates the ChatGPT account flow
+    /// or came from a non-plan fixture; it is not treated as a plan denial.
+    pub fn plan_scope_satisfied(&self) -> bool {
+        self.details.plan_usage.unwrap_or_else(|| {
+            self.details.granted_scopes.is_empty() || self.has_scope(CHATGPT_PLAN_SCOPE)
+        })
+    }
+
+    /// Explicit plan-scope result, when the account flow recorded one.
+    pub const fn plan_usage(&self) -> Option<bool> {
+        self.details.plan_usage
+    }
+
+    /// Verified ID-token subject, if this is a ChatGPT account credential.
+    pub fn account_subject(&self) -> Option<&str> {
+        self.details.account_subject.as_deref()
+    }
+
+    /// Issued ChatGPT client ID bound to this token set.
+    pub fn issued_client_id(&self) -> Option<&str> {
+        self.details.issued_client_id.as_deref()
+    }
+
+    /// Email hint from the validated ID token.
+    pub fn account_email(&self) -> Option<&str> {
+        self.details.account_email.as_deref()
     }
 
     /// Expiry timestamp, if known.
@@ -187,7 +360,22 @@ impl fmt::Debug for OAuthTokenSet {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "id_token",
+                &self.details.id_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("expires_at", &self.expires_at)
+            .field("granted_scopes", &self.details.granted_scopes)
+            .field("plan_usage", &self.details.plan_usage)
+            .field(
+                "account_subject",
+                &self.details.account_subject.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("issued_client_id", &self.details.issued_client_id)
+            .field(
+                "account_email",
+                &self.details.account_email.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -273,6 +461,9 @@ impl ConnectionState {
             Self::Available => ConnectionStatus::Available,
             Self::LoginRequired => ConnectionStatus::LoginRequired,
             Self::AuthRequired => ConnectionStatus::AuthRequired,
+            Self::Unavailable {
+                failure: CredentialFailureKind::PlanScopeMissing,
+            } => ConnectionStatus::AuthRequired,
             Self::Unavailable { .. } => ConnectionStatus::Unavailable,
         }
     }
@@ -403,6 +594,87 @@ impl<V: CredentialVault> CredentialAdmin<V> {
     ) -> Result<(), CoreError> {
         self.save(connection, CredentialMaterial::OAuthTokenSet(token_set))
     }
+
+    /// Saves a validated ChatGPT account token set under its account-scoped
+    /// vault key without changing which account is selected.
+    ///
+    /// The caller must have validated the ID token and account identity before
+    /// calling this method. Selection is a separate settings update, so a
+    /// failed save never replaces the active account.
+    pub fn save_chatgpt_account_token_set(
+        &self,
+        connection: ConnectionId,
+        account: &VaultAccount,
+        token_set: OAuthTokenSet,
+    ) -> Result<(), CoreError> {
+        let settings = self.account_settings(connection, account)?;
+        if settings.auth_method() != AuthMethod::ChatGptLogin {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            ));
+        }
+        let gate = self.inner.gate(connection);
+        let _guard = gate
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let settings = self.account_settings(connection, account)?;
+        if settings.auth_method() != AuthMethod::ChatGptLogin {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            ));
+        }
+        let encoded = encode_oauth_token_set(&token_set);
+        self.inner.vault.set(account, &encoded).map_err(|failure| {
+            credential_unavailable(connection, failure.credential_failure_kind())
+        })?;
+        gate.version.fetch_add(1, Ordering::SeqCst);
+        *gate
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Ok(())
+    }
+
+    /// Removes one account-scoped ChatGPT token set from the vault.
+    ///
+    /// A missing item is treated as already removed. The non-secret account
+    /// registration mapping is owned by the caller and is not deleted here.
+    pub fn remove_chatgpt_account(
+        &self,
+        connection: ConnectionId,
+        account: &VaultAccount,
+    ) -> Result<(), CoreError> {
+        let settings = self.account_settings(connection, account)?;
+        if settings.auth_method() != AuthMethod::ChatGptLogin {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            ));
+        }
+        let gate = self.inner.gate(connection);
+        let _guard = gate
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.inner.vault.delete(account) {
+            Ok(()) | Err(VaultFailure::MissingItem) => {}
+            Err(failure) => {
+                return Err(credential_unavailable(
+                    connection,
+                    failure.credential_failure_kind(),
+                ));
+            }
+        }
+        gate.version.fetch_add(1, Ordering::SeqCst);
+        *gate
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Ok(())
+    }
 }
 
 impl<V: CredentialVault> Clone for CredentialAdmin<V> {
@@ -435,7 +707,7 @@ impl<V: CredentialVault> CredentialWriter for CredentialAdmin<V> {
                 CredentialFailureKind::InvalidCredentialData,
             ));
         }
-        let account = VaultAccount::from_credential_ref(settings.credential_ref());
+        let account = settings.vault_account();
         let encoded = encode_credential(&credential);
         self.inner
             .vault
@@ -460,7 +732,7 @@ impl<V: CredentialVault> CredentialWriter for CredentialAdmin<V> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = self.settings(connection)?;
-        let account = VaultAccount::from_credential_ref(settings.credential_ref());
+        let account = settings.vault_account();
         match self.inner.vault.delete(&account) {
             Ok(()) | Err(VaultFailure::MissingItem) => {}
             Err(failure) => {
@@ -486,6 +758,23 @@ impl<V: CredentialVault> CredentialAdmin<V> {
             .directory
             .get(connection)
             .map_err(|_| credential_unavailable(connection, CredentialFailureKind::NotConfigured))
+    }
+
+    fn account_settings(
+        &self,
+        connection: ConnectionId,
+        account: &VaultAccount,
+    ) -> Result<ConnectionSettings, CoreError> {
+        let settings = self.settings(connection)?;
+        if settings.auth_method() != AuthMethod::ChatGptLogin
+            || !account.is_chatgpt_account_for(connection)
+        {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            ));
+        }
+        Ok(settings)
     }
 }
 
@@ -516,7 +805,7 @@ impl<V: CredentialVault> CredentialBroker<V> {
         now: Timestamp,
     ) -> Result<ConnectionState, CoreError> {
         let settings = self.settings(connection)?;
-        let account = VaultAccount::from_credential_ref(settings.credential_ref());
+        let account = settings.vault_account();
         let bytes = match self.inner.vault.get(&account) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
@@ -544,6 +833,10 @@ impl<V: CredentialVault> CredentialBroker<V> {
             (AuthMethod::ChatGptLogin, StoredCredential::OAuthTokenSet(set)) => {
                 if set.is_expired_at(now) {
                     ConnectionState::AuthRequired
+                } else if !set.plan_scope_satisfied() {
+                    ConnectionState::Unavailable {
+                        failure: CredentialFailureKind::PlanScopeMissing,
+                    }
                 } else {
                     ConnectionState::Available
                 }
@@ -552,6 +845,60 @@ impl<V: CredentialVault> CredentialBroker<V> {
                 failure: CredentialFailureKind::InvalidCredentialData,
             },
         })
+    }
+
+    /// Reads the currently selected token set without refreshing it.
+    ///
+    /// This is for the host-owned engine adapter, which needs retained account
+    /// metadata and scopes. It does not replace [`Self::resolve_at`] for making
+    /// a request, and it never returns an API key.
+    pub fn token_set_at(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<OAuthTokenSet>, CoreError> {
+        let settings = self.settings(connection)?;
+        self.account_token_set_at(connection, &settings.vault_account())
+    }
+
+    /// Reads one account-scoped token set without refreshing it.
+    pub fn account_token_set_at(
+        &self,
+        connection: ConnectionId,
+        account: &VaultAccount,
+    ) -> Result<Option<OAuthTokenSet>, CoreError> {
+        let settings = self.settings(connection)?;
+        if settings.auth_method() != AuthMethod::ChatGptLogin
+            || !account.is_chatgpt_account_for(connection)
+        {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            ));
+        }
+        let gate = self.inner.gate(connection);
+        let _guard = gate
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = match self.inner.vault.get(account) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(failure) => {
+                return Err(credential_unavailable(
+                    connection,
+                    failure.credential_failure_kind(),
+                ));
+            }
+        };
+        match decode_credential(&bytes).map_err(|()| {
+            credential_unavailable(connection, CredentialFailureKind::InvalidCredentialData)
+        })? {
+            StoredCredential::OAuthTokenSet(token_set) => Ok(Some(token_set)),
+            StoredCredential::ApiKey(_) => Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::InvalidCredentialData,
+            )),
+        }
     }
 
     /// Public non-secret connection view including its current status.
@@ -588,7 +935,7 @@ impl<V: CredentialVault> CredentialBroker<V> {
             return Err(credential_unavailable(connection, kind));
         }
 
-        let account = VaultAccount::from_credential_ref(settings.credential_ref());
+        let account = settings.vault_account();
         let bytes = match self.inner.vault.get(&account) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Err(CoreError::AuthenticationRequired { connection }),
@@ -609,6 +956,12 @@ impl<V: CredentialVault> CredentialBroker<V> {
             }
             (AuthMethod::ChatGptLogin, StoredCredential::OAuthTokenSet(token_set)) => {
                 if !token_set.is_expired_at(now) {
+                    if !token_set.plan_scope_satisfied() {
+                        return Err(credential_unavailable(
+                            connection,
+                            CredentialFailureKind::PlanScopeMissing,
+                        ));
+                    }
                     return Ok(ResolvedCredential::new(
                         CredentialKind::OAuthToken,
                         token_set.into_access_token(),
@@ -753,12 +1106,27 @@ struct CredentialWire {
     refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at_unix_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    granted_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_usage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issued_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_email: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CredentialWireKind {
     ApiKey,
+    /// Version 1 payloads used the serde-generated `o_auth_token_set` spelling.
+    /// Keep it readable while new payloads use the documented spelling.
+    #[serde(rename = "oauth_token_set", alias = "o_auth_token_set")]
     OAuthTokenSet,
 }
 
@@ -771,6 +1139,12 @@ fn encode_credential(credential: &CredentialMaterial) -> Vec<u8> {
             access_token: None,
             refresh_token: None,
             expires_at_unix_millis: None,
+            id_token: None,
+            granted_scopes: Vec::new(),
+            plan_usage: None,
+            account_subject: None,
+            issued_client_id: None,
+            account_email: None,
         },
         CredentialMaterial::OAuthTokenSet(token_set) => oauth_wire(token_set),
     };
@@ -793,19 +1167,42 @@ fn oauth_wire(token_set: &OAuthTokenSet) -> CredentialWire {
             .as_ref()
             .map(|token| token.expose_secret().to_owned()),
         expires_at_unix_millis: token_set.expires_at.map(Timestamp::as_unix_millis),
+        id_token: token_set
+            .details
+            .id_token
+            .as_ref()
+            .map(|token| token.expose_secret().to_owned()),
+        granted_scopes: token_set.details.granted_scopes.clone(),
+        plan_usage: token_set.details.plan_usage,
+        account_subject: token_set.details.account_subject.clone(),
+        issued_client_id: token_set.details.issued_client_id.clone(),
+        account_email: token_set.details.account_email.clone(),
     }
 }
 
 fn decode_credential(bytes: &[u8]) -> Result<StoredCredential, ()> {
     let wire: CredentialWire = serde_json::from_slice(bytes).map_err(|_| ())?;
-    if wire.format != CREDENTIAL_FORMAT_VERSION {
-        return Err(());
+    let has_account_fields = wire.id_token.is_some()
+        || !wire.granted_scopes.is_empty()
+        || wire.plan_usage.is_some()
+        || wire.account_subject.is_some()
+        || wire.issued_client_id.is_some()
+        || wire.account_email.is_some();
+    match wire.format {
+        1 => {
+            if has_account_fields {
+                return Err(());
+            }
+        }
+        2 => {}
+        _ => return Err(()),
     }
     match wire.kind {
         CredentialWireKind::ApiKey => {
             if wire.access_token.is_some()
                 || wire.refresh_token.is_some()
                 || wire.expires_at_unix_millis.is_some()
+                || has_account_fields
             {
                 return Err(());
             }
@@ -824,12 +1221,56 @@ fn decode_credential(bytes: &[u8]) -> Result<StoredCredential, ()> {
                 Some(value) => Some(SecretString::new(value).map_err(|_| ())?),
                 None => None,
             };
-            Ok(StoredCredential::OAuthTokenSet(OAuthTokenSet::new(
-                access_token,
-                refresh_token,
-                wire.expires_at_unix_millis.map(Timestamp::from_unix_millis),
-            )))
+            let id_token = match wire.id_token {
+                Some(value) => Some(SecretString::new(value).map_err(|_| ())?),
+                None => None,
+            };
+            let granted_scopes = wire
+                .granted_scopes
+                .into_iter()
+                .map(|scope| {
+                    if scope.trim().is_empty()
+                        || scope.chars().any(char::is_control)
+                        || scope.chars().any(char::is_whitespace)
+                    {
+                        Err(())
+                    } else {
+                        Ok(scope)
+                    }
+                })
+                .collect::<Result<Vec<_>, ()>>()?;
+            let account_subject = optional_metadata(wire.account_subject)?;
+            let issued_client_id = optional_metadata(wire.issued_client_id)?;
+            if issued_client_id
+                .as_deref()
+                .is_some_and(|client| !valid_issued_client_id(client))
+            {
+                return Err(());
+            }
+            let account_email = optional_metadata(wire.account_email)?;
+            Ok(StoredCredential::OAuthTokenSet(
+                OAuthTokenSet::with_details(
+                    access_token,
+                    refresh_token,
+                    wire.expires_at_unix_millis.map(Timestamp::from_unix_millis),
+                    OAuthTokenSetDetails {
+                        id_token,
+                        granted_scopes,
+                        plan_usage: wire.plan_usage,
+                        account_subject,
+                        issued_client_id,
+                        account_email,
+                    },
+                ),
+            ))
         }
+    }
+}
+
+fn optional_metadata(value: Option<String>) -> Result<Option<String>, ()> {
+    match value {
+        Some(value) if value.trim().is_empty() || value.chars().any(char::is_control) => Err(()),
+        other => Ok(other),
     }
 }
 
@@ -858,6 +1299,91 @@ mod tests {
             }
             StoredCredential::OAuthTokenSet(_) => panic!("wrong credential kind"),
         }
+    }
+
+    #[test]
+    fn chatgpt_account_keys_separate_client_and_subject() {
+        let connection = ConnectionId::new();
+        let first =
+            VaultAccount::for_chatgpt_account(connection, "oaiapp_one", "subject-one").unwrap();
+        let same =
+            VaultAccount::for_chatgpt_account(connection, "oaiapp_one", "subject-one").unwrap();
+        let other_subject =
+            VaultAccount::for_chatgpt_account(connection, "oaiapp_one", "subject-two").unwrap();
+        let other_client =
+            VaultAccount::for_chatgpt_account(connection, "oaiapp_two", "subject-one").unwrap();
+        assert_eq!(first, same);
+        assert_ne!(first, other_subject);
+        assert_ne!(first, other_client);
+        assert!(first.is_chatgpt_account_for(connection));
+        assert!(!first.is_chatgpt_account_for(ConnectionId::new()));
+        assert_eq!(
+            VaultAccount::for_chatgpt_account(connection, CHATGPT_DYNAMIC_AGENT_CLIENT, "s")
+                .unwrap_err(),
+            ConnectionError::InvalidCredentialAccount
+        );
+    }
+
+    #[test]
+    fn oauth_token_set_v2_round_trips_and_redacts_account_secrets() {
+        let token_set = OAuthTokenSet::with_details(
+            SecretString::new("access-canary").unwrap(),
+            Some(SecretString::new("refresh-canary").unwrap()),
+            Some(Timestamp::from_unix_millis(4_000_000_000_000)),
+            OAuthTokenSetDetails {
+                id_token: Some(SecretString::new("id-canary").unwrap()),
+                granted_scopes: vec!["openid".to_owned(), CHATGPT_PLAN_SCOPE.to_owned()],
+                plan_usage: Some(true),
+                account_subject: Some("subject-canary".to_owned()),
+                issued_client_id: Some("oaiapp_one".to_owned()),
+                account_email: Some("email-canary@example.com".to_owned()),
+            },
+        );
+        let debug = format!("{token_set:?}");
+        assert!(!debug.contains("access-canary"));
+        assert!(!debug.contains("refresh-canary"));
+        assert!(!debug.contains("id-canary"));
+        assert!(!debug.contains("subject-canary"));
+        assert!(!debug.contains("email-canary"));
+        assert!(token_set.plan_scope_satisfied());
+
+        let encoded = encode_credential(&CredentialMaterial::OAuthTokenSet(token_set));
+        match decode_credential(&encoded).unwrap() {
+            StoredCredential::OAuthTokenSet(decoded) => {
+                assert_eq!(decoded.access_token().expose_secret(), "access-canary");
+                assert_eq!(decoded.id_token().unwrap().expose_secret(), "id-canary");
+                assert_eq!(decoded.account_subject(), Some("subject-canary"));
+                assert_eq!(decoded.issued_client_id(), Some("oaiapp_one"));
+                assert!(decoded.plan_scope_satisfied());
+            }
+            StoredCredential::ApiKey(_) => panic!("wrong credential kind"),
+        }
+
+        let without_plan = OAuthTokenSet::with_details(
+            SecretString::new("access").unwrap(),
+            None,
+            None,
+            OAuthTokenSetDetails {
+                granted_scopes: vec!["openid".to_owned()],
+                ..OAuthTokenSetDetails::default()
+            },
+        );
+        assert!(!without_plan.plan_scope_satisfied());
+    }
+
+    #[test]
+    fn v1_oauth_records_remain_readable_but_cannot_carry_v2_account_fields() {
+        let v1 = br#"{"format":1,"kind":"o_auth_token_set","access_token":"a","refresh_token":"r","expires_at_unix_millis":4000}"#;
+        match decode_credential(v1).unwrap() {
+            StoredCredential::OAuthTokenSet(set) => {
+                assert_eq!(set.access_token().expose_secret(), "a");
+                assert!(set.id_token().is_none());
+                assert!(set.granted_scopes().is_empty());
+            }
+            StoredCredential::ApiKey(_) => panic!("wrong credential kind"),
+        }
+        let mixed = br#"{"format":1,"kind":"oauth_token_set","access_token":"a","granted_scopes":["openid"]}"#;
+        assert!(decode_credential(mixed).is_err());
     }
 
     #[test]

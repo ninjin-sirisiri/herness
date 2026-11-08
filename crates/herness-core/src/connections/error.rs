@@ -107,6 +107,9 @@ pub enum ConnectionError {
     /// A vault account key was empty, too long, or contained control
     /// characters.
     InvalidVaultAccount,
+    /// A ChatGPT account credential key did not belong to the connection or
+    /// used an invalid client/account component.
+    InvalidCredentialAccount,
     /// The connection registry could not be read or written because its
     /// internal lock was poisoned. The host must report this rather than invent
     /// settings.
@@ -145,6 +148,9 @@ impl fmt::Display for ConnectionError {
                 f.write_str("stored credential reference does not match the connection")
             }
             Self::InvalidVaultAccount => f.write_str("invalid credential vault account key"),
+            Self::InvalidCredentialAccount => {
+                f.write_str("credential account does not belong to this ChatGPT connection")
+            }
             Self::RegistryUnavailable => f.write_str("connection registry is unavailable"),
         }
     }

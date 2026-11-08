@@ -13,7 +13,10 @@ workspace = true
 herness-core = { path = "../../crates/herness-core" }
 
 [dev-dependencies]
+base64 = "0.22.1"
+herness-engine-pi = { path = "../../crates/herness-engine-pi" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+ring = "0.17.14"
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -43,6 +43,7 @@ cargo test -p herness-runtime-tests --test files --locked
 cargo test -p herness-runtime-tests --test shell --locked
 cargo test -p herness-runtime-tests --test skills --locked
 cargo test -p herness-runtime-tests --test connections --locked
+cargo test -p herness-runtime-tests --test oauth --locked
 cargo test -p herness-desktop --lib --locked
 cargo fmt --all -- --check
 ```
@@ -127,6 +128,26 @@ cargo test --workspace --locked
 - **status:** `ConnectionStatus` に `AuthRequired` を追加した。`Available` / `LoginRequired` / `AuthRequired` / `Unavailable` を公開し、`ConnectionState::Unavailable { failure }` はsanitized `CredentialFailureKind` だけを持つ。`ConnectionInfo` の既存field（connectionId, provider, model, authMethod, status）は変えない。
 - **redaction:** `redact_url` はuserinfo・query・fragmentを落とし、不正URLはechoしない。`redact_header(s)` はAuthorization・Proxy-Authorization・Cookie・Set-Cookie・API key headerを `[REDACTED]` にする。`redact_known_secrets` / `redact_error` は合成errorのdetailに混入した既知secretを除去する。
 - **test:** `tests/runtime/tests/connections.rs` はfake vaultだけを使い、real Keychain・network・real credentialを参照しない。canaryがDB・checkpoint・event・fake vault以外のfileへ出ないこと、keychain denial/lock/update failureでfileが作られないこと、2接続間の非fallback、同一・別接続のrefresh分離、期限切れtokenの非公開、redirect origin表を確認する。`herness-desktop` のunit testはbackend fakeでOSStatus変換とround-tripを確認する。実KeychainはTask 13の許可された検証まで実行しない。
+
+## Task 8で固定したChatGPT OAuthと利用条件gate
+
+実装は `crates/herness-engine-pi/src/auth/`、testは `tests/runtime/tests/oauth.rs`、確認記録は [ChatGPT auth research](../research/2026-11-08-h1-chatgpt-auth.md)。`herness-engine-pi`をworkspace memberへ追加したが、Task 9のpi crateはまだ依存に加えていない。
+
+- **確認とgate:** 2026-11-08に公式overview・sign-in・accounts/sessions・models/inferenceを再確認した。公式はChatGPT plan usageをopen-source / locally hosted app向けとし、paid/remotely hostedはinterest formへ案内する。hernessはlocally hosted・未公開・非商用だがlicense未決定なので、許可するのは`TermsGate::LocalUnpublishedUse`だけ。`ChatGptAuthConfig::new`の既定gateは`Closed(ConditionsUnconfirmed)`で、hostが研究記録を確認してlocal unpublished useを明示した場合だけ開く。公開・配布・license選択・商用提供・remote hosting・申請は行わず、`TermsGate::Closed`ではlogin attemptを開始しない。実login・実model接続・実credential作成は未確認で、Task 13の別途許可まで行わない。
+- **依存:** engine crateのauth依存は`herness-core`、`base64`、`ring`、`serde`、`serde_json`、`sha2`、`uuid`だけ。HTTP client・async runtime・pi crateはTask 9まで追加しない。`ring`はID tokenのRS256/ES256署名検証とPKCE用乱数・合成RSA/EC署名鍵のtestにだけ使う。`unsafe`は自crateに書かない。
+- **endpoint:** authorizeは`https://auth.openai.com/api/accounts/authorize`、tokenは`https://auth.openai.com/api/accounts/oauth/token`、issuerは`https://auth.openai.com`、resourceは`https://api.openai.com/v1`。JWKSとrevocation endpointはTask 8では取得しない（注入境界のみ）。実URL・key rotation・discoveryはTask 9/13で確認する。
+- **host ID:** 初回sign-in前に`urn:uuid:<UUIDv4>`を生成し、injectable `HostIdStore`へ保存する。`FileHostIdStore`はapp-data fileへ`0600`・temp file + renameで書く。値はsecretではなく、同じstoreで再起動しても再利用し、別storeでは別値になる。公式推奨のJWK thumbprint URIはoptionalかつprivate key possession未検証のため採用しない。
+- **client registration:** 初回は`client_id=dynamic_agent_client`、`agent_name_hint`、`ext_agent_host_id`を送る。callbackのissued `client_id`（例 `oaiapp_...`）を保存し、以降はissued client IDだけを使う。`dynamic_agent_client`を保存・exchangeせず、callbackで返っても`InvalidIssuedClientId`にする。再認可は`agent_name_hint`を省略し、保持ID tokenを`id_token_hint`、検証済みemailを`login_hint`に使える。callbackのclient IDが選択中と違えば`ClientMismatch`で拒否し、既存accountを置換しない。
+- **listenerとattempt:** `CallbackListener`はbrowserを開く前に`127.0.0.1`へbindする。scheme/host/pathは`http://127.0.0.1:<port>/auth/callback`で固定し、portだけが変わる。`localhost`を使わず、port競合時はephemeral portへfallbackする。attemptごとにfresh state・nonce・PKCE verifier（S256 challenge）を作り、一つのcallbackだけを受け付ける。同じattemptの再完了は`CallbackReplay`、cancelはlistenerを閉じて`Cancelled`を返し、codeをexchangeしない。stateはcallback処理の最初に検証する。
+- **token exchange:** `TokenTransport::exchange`へissued client ID、code、verifier、authorizeと同一のredirect URI、resourceを渡す。form-encoded `authorization_code` grantでclient secretは送らない（実transportはTask 9）。`invalid_grant`は`Transport` failureとして保存せず停止する。
+- **ID token:** `JwkSet`のRSA（RS256）またはEC P-256（ES256）keyで署名を検証する。issuer、issued client IDと一致するaudience、expiry（60秒skew）、attemptのnonce、非空`sub`を検証する。`sub`をaccount identityとし、emailをworkspace identifierにしない。署名・issuer・audience・expiry・nonceの各拒否testは保存・選択が0件のまま終わる。
+- **scope gate:** token responseのgranted scopeを保存し、`chatgpt.tokens.use.direct`がある場合だけplan usageを有効にする。scopeが無い/欠ける場合はID tokenが有効でも`AuthenticatedWithoutPlan`とし、connectionを選択せず`LoginRequired`のままにする。`OAuthTokenSet`の`plan_usage: Option<bool>`が明示されたgateで、scope stringが空でもplan使用可と誤判定しない。
+- **credential分離:** `VaultAccount`は`connection/<connectionId>/chatgpt_login/<issuedClientId>/<subjectのSHA-256>`でaccountごとに分かれる。`ConnectionSettings`は非secretの`vaultAccount`選択を持ち、`select_chatgpt_account`は同じconnectionのChatGPT account keyだけを受け付ける。新しいloginはID token検証・token保存が成功した後だけ選択し、失敗時は既存accountのmaterialと選択を保つ。二つのaccountは同じconnectionでも別vault itemになり、上書きしない。
+- **保存形式:** `CREDENTIAL_FORMAT_VERSION`を2へ上げ、`OAuthTokenSet`へ`id_token`、granted scopes、plan_usage、verified subject、issued client ID、emailを追加した。v1 payloadは引き続き読めるがv2 account fieldを持てない。secretは`SecretString`のままで、Debugはaccess/refresh/ID token・subject・emailを`[REDACTED]`にする。Keychain以外の平文保存は行わない。
+- **refresh:** Task 7のconnection別gateと`CredentialBroker`を使う。`ChatGptRefresher`はissued client ID（`dynamic_agent_client`不可）・refresh token・resourceで`refresh_token` grantを送り、返却されたaccess、expiry、scope、回転refresh tokenを一つの`OAuthTokenSet`へまとめる。ID tokenが返ればnonceなしで署名・issuer・audience・expiryを再検証し、subjectが変われば失敗する。plan scopeを失うrefreshは`PlanScopeMissing`で停止し、旧materialを置き換えない。同一connectionの同時resolveは最大1回だけrefreshする。
+- **sign-out:** refresh tokenがあれば`TokenTransport::revoke`を呼ぶが、OIDC discoveryはTask 8では未取得なので結果は`NotAttempted` / `RequestAcceptedUnverified` / `FailedUnverified`のいずれかで、provider側のrevokeをconfirmedと表示しない。vault上のaccess/refresh/ID tokenを削除し、選択中なら`vaultAccount`をclearする。issued client ID・host ID・非secret account mappingは次回sign-in用に保持する。削除失敗は`Vault` errorで成功と表示しない。
+- **redaction:** `AuthorizationUrl`のDebugはscheme/host/pathだけを残しquery（state・nonce・PKCE・`id_token_hint`）を落とす。`PendingAuthorization`、`TokenExchangeRequest`、`RefreshRequest`、`RevokeRequest`、`TokenResponse`、`OAuthTokenSet`のDebugはcode・verifier・tokenを出さない。canary testでauthorization URL、Debug、errorにsecretが現れないことを確認する。
+- **test:** `cargo test -p herness-runtime-tests --test oauth --locked`。loopback listenerと合成RSA/EC署名鍵だけを使い、正常系、state/nonce/署名/issuer/audience/expiry拒否、plan scope欠落、callback再送、issued client ID欠落、`dynamic_agent_client`拒否、client不一致、port競合、cancel、2 account分離、同時refreshと回転、refresh失敗、保存失敗、sign-out/revoke未確認、canary redaction、host ID再利用を確認する。実OpenAI hostへのrequestは0件。
 
 ## Task 1で固定した契約と検証
 

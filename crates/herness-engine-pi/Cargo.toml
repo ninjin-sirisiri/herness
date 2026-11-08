@@ -1,0 +1,19 @@
+[package]
+name = "herness-engine-pi"
+description = "Engine adapter boundary for herness. Task 8 adds the host-owned ChatGPT OAuth flow; Task 9 pins the pi-rust engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+herness-core = { path = "../herness-core" }
+ring = "0.17.14"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/herness-core",
+    "crates/herness-engine-pi",
     "crates/herness-store",
     "src-tauri",
     "tests/runtime",

@@ -21,7 +21,7 @@ use crate::contracts::connection::{
 };
 use crate::contracts::errors::CoreError;
 
-use super::credential::CredentialRef;
+use super::credential::{CredentialRef, VaultAccount};
 use super::endpoint::Endpoint;
 use super::error::ConnectionError;
 
@@ -49,6 +49,10 @@ pub struct ConnectionSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<Endpoint>,
     credential_ref: CredentialRef,
+    /// Selected account-scoped vault key for a ChatGPT connection. `None`
+    /// means the connection-level credential reference is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vault_account: Option<VaultAccount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     insecure_http_acknowledged: Option<InsecureRemoteHttp>,
 }
@@ -117,6 +121,7 @@ impl ConnectionSettings {
             auth_method,
             endpoint,
             credential_ref: CredentialRef::for_connection(connection_id, auth_method),
+            vault_account: None,
             insecure_http_acknowledged,
         })
     }
@@ -152,6 +157,42 @@ impl ConnectionSettings {
         &self.credential_ref
     }
 
+    /// Vault account used for the currently selected ChatGPT account, if any.
+    pub fn vault_account(&self) -> VaultAccount {
+        self.vault_account
+            .clone()
+            .unwrap_or_else(|| VaultAccount::from_credential_ref(&self.credential_ref))
+    }
+
+    /// Selected account-scoped ChatGPT vault key, if this connection has one.
+    pub fn selected_chatgpt_account(&self) -> Option<&VaultAccount> {
+        self.vault_account.as_ref()
+    }
+
+    /// Returns a copy of these settings with the selected ChatGPT account
+    /// changed.
+    ///
+    /// The account key must be a ChatGPT account key for this exact connection;
+    /// any other value is rejected rather than written into settings.
+    pub fn select_chatgpt_account(&self, account: VaultAccount) -> Result<Self, ConnectionError> {
+        if self.auth_method != AuthMethod::ChatGptLogin
+            || !account.is_chatgpt_account_for(self.connection_id)
+        {
+            return Err(ConnectionError::InvalidCredentialAccount);
+        }
+        let mut settings = self.clone();
+        settings.vault_account = Some(account);
+        Ok(settings)
+    }
+
+    /// Returns a copy of these settings with no account-scoped ChatGPT
+    /// credential selected.
+    pub fn clear_chatgpt_account(&self) -> Self {
+        let mut settings = self.clone();
+        settings.vault_account = None;
+        settings
+    }
+
     /// Recorded remote plain-HTTP danger acknowledgment, if required.
     pub const fn insecure_http_acknowledged(&self) -> Option<InsecureRemoteHttp> {
         self.insecure_http_acknowledged
@@ -183,6 +224,8 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
             auth_method: AuthMethod,
             endpoint: Option<Endpoint>,
             credential_ref: CredentialRef,
+            #[serde(default)]
+            vault_account: Option<VaultAccount>,
             insecure_http_acknowledged: Option<InsecureRemoteHttp>,
         }
 
@@ -201,6 +244,12 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
                 ConnectionError::CredentialReferenceMismatch,
             ));
         }
+        let settings = match wire.vault_account {
+            Some(account) => settings
+                .select_chatgpt_account(account)
+                .map_err(de::Error::custom)?,
+            None => settings,
+        };
         Ok(settings)
     }
 }
@@ -452,6 +501,57 @@ mod tests {
         assert_eq!(
             settings.insecure_http_acknowledged(),
             Some(InsecureRemoteHttp::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn chatgpt_account_selection_is_connection_scoped_and_round_trips() {
+        let connection = ConnectionId::new();
+        let settings = ConnectionSettings::new(
+            connection,
+            Provider::OpenAi,
+            "gpt-5",
+            AuthMethod::ChatGptLogin,
+            None,
+            None,
+        )
+        .unwrap();
+        let account =
+            VaultAccount::for_chatgpt_account(connection, "oaiapp_one", "subject-one").unwrap();
+        let selected = settings.select_chatgpt_account(account.clone()).unwrap();
+        assert_eq!(selected.selected_chatgpt_account(), Some(&account));
+        assert_eq!(selected.vault_account(), account);
+
+        let other_connection = ConnectionId::new();
+        let other =
+            VaultAccount::for_chatgpt_account(other_connection, "oaiapp_one", "subject-one")
+                .unwrap();
+        assert_eq!(
+            settings.select_chatgpt_account(other).unwrap_err(),
+            ConnectionError::InvalidCredentialAccount
+        );
+
+        let api_key = ConnectionSettings::new(
+            connection,
+            Provider::OpenAi,
+            "gpt-5",
+            AuthMethod::ApiKey,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            api_key.select_chatgpt_account(account.clone()).unwrap_err(),
+            ConnectionError::InvalidCredentialAccount
+        );
+
+        let json = serde_json::to_value(&selected).unwrap();
+        assert_eq!(json["vaultAccount"], account.as_str());
+        let decoded: ConnectionSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, selected);
+        assert_eq!(
+            decoded.clear_chatgpt_account().vault_account().as_str(),
+            settings.credential_ref().as_str()
         );
     }
 

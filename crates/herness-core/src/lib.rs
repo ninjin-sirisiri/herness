@@ -14,13 +14,14 @@ pub mod skills;
 pub mod tools;
 
 pub use connections::{
-    CREDENTIAL_FORMAT_VERSION, ConnectionAdmin, ConnectionDirectory, ConnectionError,
-    ConnectionSettings, ConnectionState, CredentialAdmin, CredentialBroker, CredentialMaterial,
-    CredentialRef, CredentialRefresher, CredentialService, CredentialVault, CredentialWriter,
-    Endpoint, EndpointViolation, HttpScheme, InsecureRemoteHttp, MAX_REDACTED_URL_CHARS,
-    OAuthTokenSet, Origin, REDACTED, RedirectAuthDecision, RedirectDropReason, VAULT_SERVICE,
-    VaultAccount, VaultFailure, redact_error, redact_header, redact_headers, redact_known_secrets,
-    redact_url, redirect_auth_decision,
+    CHATGPT_DYNAMIC_AGENT_CLIENT, CHATGPT_PLAN_SCOPE, CREDENTIAL_FORMAT_VERSION, ConnectionAdmin,
+    ConnectionDirectory, ConnectionError, ConnectionSettings, ConnectionState, CredentialAdmin,
+    CredentialBroker, CredentialMaterial, CredentialRef, CredentialRefresher, CredentialService,
+    CredentialVault, CredentialWriter, Endpoint, EndpointViolation, HttpScheme, InsecureRemoteHttp,
+    MAX_REDACTED_URL_CHARS, OAuthTokenSet, OAuthTokenSetDetails, Origin, REDACTED,
+    RedirectAuthDecision, RedirectDropReason, VAULT_SERVICE, VaultAccount, VaultFailure,
+    redact_error, redact_header, redact_headers, redact_known_secrets, redact_url,
+    redirect_auth_decision,
 };
 pub use contracts::*;
 pub use permissions::{
