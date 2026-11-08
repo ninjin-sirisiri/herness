@@ -17,8 +17,9 @@ pub mod version;
 
 pub use checkpoint::{Checkpoint, CheckpointFormatVersion, CheckpointPayload};
 pub use connection::{
-    AuthMethod, ConnectionCapabilities, ConnectionId, ConnectionInfo, ConnectionStatus,
-    ConnectionUsage, EndpointClass, InputCapabilities, InputModality, Provider,
+    AuthMethod, ConnectionCapabilities, ConnectionCapabilityDeclaration, ConnectionId,
+    ConnectionInfo, ConnectionStatus, ConnectionUsage, EndpointClass, InputCapabilities,
+    InputModality, Provider,
 };
 pub use errors::{
     ArgumentViolation, ConversationFailure, CoreError, CredentialFailureKind, EngineFailureKind,

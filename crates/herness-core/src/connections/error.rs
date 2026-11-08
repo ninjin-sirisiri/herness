@@ -110,6 +110,17 @@ pub enum ConnectionError {
     /// A ChatGPT account credential key did not belong to the connection or
     /// used an invalid client/account component.
     InvalidCredentialAccount,
+    /// A stored or requested capability declaration did not match the provider,
+    /// authentication method, endpoint class, or usage rules.
+    CapabilityDeclarationRejected {
+        /// Sanitized structured reason.
+        detail: String,
+    },
+    /// The connection is assessment-only and cannot start an agent run.
+    AgentExecutionNotAllowed {
+        /// Connection that was rejected.
+        connection: ConnectionId,
+    },
     /// The connection registry could not be read or written because its
     /// internal lock was poisoned. The host must report this rather than invent
     /// settings.
@@ -151,6 +162,13 @@ impl fmt::Display for ConnectionError {
             Self::InvalidCredentialAccount => {
                 f.write_str("credential account does not belong to this ChatGPT connection")
             }
+            Self::CapabilityDeclarationRejected { detail } => {
+                write!(f, "invalid connection capability declaration: {detail}")
+            }
+            Self::AgentExecutionNotAllowed { connection } => write!(
+                f,
+                "connection {connection} is assessment-only and cannot start an agent run"
+            ),
             Self::RegistryUnavailable => f.write_str("connection registry is unavailable"),
         }
     }

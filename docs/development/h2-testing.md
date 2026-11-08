@@ -209,6 +209,37 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 - 固定profile versionと異なるversionのunusable、project外profileの拒否、Jev/Decisions接続の一致。
 
 
+## Task 7で追加した判定接続能力とtoolなしtransport
+
+### 接続能力の登録
+
+- `ConnectionSettings` は任意の非secret `ConnectionCapabilityDeclaration`（`endpointClass` と `input`）を保持する。宣言がない既存設定はH1のprovider既定（OpenAI Responses / Anthropic Messages / OpenAI互換completions、textのみ、agent実行可）として読む。未知のendpoint class・未知fieldは推測せず拒否する。
+- 宣言は `ConnectionSettings::new_with_capabilities` または `with_capabilities` で付ける。usageはendpoint classから導出し、宣言でagent実行とassessment専用を矛盾させられない。
+- TypeSafeは常に `TypeSafeSystemOne` + `AssessmentOnly`。OpenAI Decisionsは `Provider::OpenAi` + API key + `OpenAiDecisions` + `AssessmentOnly` で、ChatGPTログインを拒否する。TypeSafe/Decisionsにcustom/foreign endpointは付けられず、custom endpointは従来どおりOpenAI互換だけが持てる。
+- `ConnectionDirectory::capabilities` / `list_capabilities` が有効な `ConnectionCapabilities` を返し、`agent_execution_capabilities` はassessment専用接続を `AgentExecutionNotAllowed` で拒否する。`herness-engine-pi` のagent model構築も同じcapabilityを検査し、Jev/Decisionsへagent要求を送らない。
+- 新しい設定を登録・更新する既存H1経路は変更しない。接続を別provider/model/originへ暗黙に付け替える処理はない。
+
+### herness-assessment transport
+
+- `crates/herness-assessment` は `herness-core` の `ConnectionDirectory` と `CredentialPort` だけを再利用し、store・budget・Tauri・provider固有wire schemaを持たない。Jev/Decisionsのbody schemaと通常LLM adapterはTask 10〜12が所有する。
+- `AssessmentRequest` のbodyはtoolを含まないJSON objectに限る。top-level `tools` / `tool_choice` とexternal image参照（`image_url`等）は送信前に明示エラーにし、黙って削除しない。transport自身もtoolを追加しない。
+- `TransportControl` のtimeoutは60秒と残りrun deadlineの短い方。`CancelToken` の取消しはin-flight要求とretry待機を打ち切り、再送しない。
+- credentialは各attemptの送信直前に既存 `CredentialPort` から解決し、設定されたexact originへだけ付ける。redirectは一切followせず、H1の `redirect_auth_decision` でcross-originを分類する。cross-origin redirect・credential付きURL・external image URLはエラー。
+- retryは429、transient 5xx（500/502/503/504）、送信前のconnection failureだけ。同一connectionで最大2回追加し、既定待機は1秒・2秒＋最大250ms jitter。`Retry-After` は残りdeadlineに収まる場合だけ使い、収まらなければ `RetryAfterBeyondDeadline` で止める。timeout/送信不明、認証失敗、invalid response、redirect、拒否・低確度の成功応答は再送しない。provider/model/connection fallbackはない。
+- 必要text/image modalityは送信前に `ConnectionCapabilities` と照合する。画像は `ImageInput` のcaller-provided bytesだけで、URLはfetchも送信もしない。
+- `AssessmentError` はHTTP status・attempt数・retry分類だけを持ち、secret・Authorization・request body・raw provider bodyを含まない。`AssessmentRequest` / `AssessmentResponse` のDebugもbodyを表示しない。
+- transportは金額予約・cost/billing記録・永続化を行わない。usage/model metadataはadapterが返却bodyから解釈し、予約と記録は上位H2 request gate / Task 9 ledgerが所有する。
+
+### Task 7のテスト
+
+`tests/supervision/tests/adapters.rs` はloopback HTTP mockとin-memory credentialだけで次を確認する。
+
+- assessment専用のTypeSafe/Decisions接続がagent実行に使えないこと、ChatGPTログインのDecisionsとcustom/foreign originの拒否、capability/inputの登録。
+- toolを含まないbody（`tools`/`tool_choice`なし）、60秒capと短い残りdeadline、in-flight取消しで再送0、429のRetry-After、transient 5xxの最大2回retryと枯渇、auth failure / invalid responseの再送0、送信不明timeoutのretry 0、送信前connection failureのretry。
+- cross-origin redirectがAuthorizationを受け取らないこと、secret canaryがerror/Debugに出ないこと、image URL拒否と対応接続でのimage bytes受理、同一connectionだけのretry、金額/cost記録を作らないこと。
+
+`tests/runtime/tests/connections.rs` は既存H1回帰に加え、legacy settingsの互換decode、宣言付き設定のround-trip、未知capability formの拒否、directory経由の能力公開とagent実行拒否を確認する。実provider・実Keychain・実Jev/Decisions接続はこのTaskでは未確認とする。
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -258,6 +289,22 @@ cargo test -p herness-supervision-tests --test contracts --locked
 cargo test -p herness-supervision-tests --test profiles --locked
 cargo check --workspace --all-targets --locked
 ```
+
+Task 7の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-assessment --locked
+cargo test -p herness-supervision-tests --test adapters --locked
+cargo test -p herness-runtime-tests --test connections --locked
+cargo test -p herness-engine-pi --lib --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 7の追加確認:
+
+- `cargo test -p herness-assessment --locked` はtimeout cap、retry既定値、tool宣言の拒否、external image参照の拒否、Debugのbody/secret非表示、loopback endpoint制約を確認する。
+- `adapters.rs` はloopback mockだけを使い、429/5xx/Retry-After、最大2回retry、送信不明timeoutの再送0、取消し、cross-origin redirectのAuthorization不転送、secret canary、image bytes/URL、同一connection retry、billing非関与を確認する。
+- 実Jev/Decisions/OpenAIへの接続成功は主張しない。これらは別途許可された実接続検証まで未確認である。
 
 `tests/runtime/tests/store.rs`は次を確認する。
 

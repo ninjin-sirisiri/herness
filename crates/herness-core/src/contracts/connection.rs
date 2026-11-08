@@ -348,6 +348,52 @@ impl ConnectionUsage {
     }
 }
 
+/// Non-secret capability declaration stored with connection settings.
+///
+/// A declaration selects the endpoint class and input modalities explicitly.
+/// The usage is derived from the endpoint class: assessment endpoint classes
+/// are always [`ConnectionUsage::AssessmentOnly`] and agent endpoint classes
+/// are always [`ConnectionUsage::AgentExecution`]. This keeps a settings file
+/// from declaring an assessment endpoint usable for an agent run.
+///
+/// The declaration contains no api key, OAuth token, authorization header, or
+/// provider response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionCapabilityDeclaration {
+    endpoint_class: EndpointClass,
+    input: InputCapabilities,
+}
+
+impl ConnectionCapabilityDeclaration {
+    /// Declares an endpoint class and the input modalities it accepts.
+    pub const fn new(endpoint_class: EndpointClass, input: InputCapabilities) -> Self {
+        Self {
+            endpoint_class,
+            input,
+        }
+    }
+
+    /// Declared endpoint class.
+    pub const fn endpoint_class(self) -> EndpointClass {
+        self.endpoint_class
+    }
+
+    /// Declared input capabilities.
+    pub const fn input(self) -> InputCapabilities {
+        self.input
+    }
+
+    /// Usage implied by the endpoint class.
+    pub const fn usage(self) -> ConnectionUsage {
+        if self.endpoint_class.is_assessment_only() {
+            ConnectionUsage::AssessmentOnly
+        } else {
+            ConnectionUsage::AgentExecution
+        }
+    }
+}
+
 /// Non-secret capabilities of one connection.
 ///
 /// This value contains no api key, OAuth token, authorization header, or

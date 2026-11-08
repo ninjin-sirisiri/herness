@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+herness-assessment = { path = "../../crates/herness-assessment" }
 herness-core = { path = "../../crates/herness-core" }
 herness-supervision = { path = "../../crates/herness-supervision" }
 serde_json.workspace = true

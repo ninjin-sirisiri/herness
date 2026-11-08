@@ -19,6 +19,7 @@ mod redact;
 mod redirect;
 mod registry;
 
+pub use crate::contracts::connection::ConnectionCapabilityDeclaration;
 pub use credential::{
     CHATGPT_DYNAMIC_AGENT_CLIENT, CHATGPT_PLAN_SCOPE, CREDENTIAL_FORMAT_VERSION, ConnectionState,
     CredentialAdmin, CredentialBroker, CredentialMaterial, CredentialRef, CredentialRefresher,

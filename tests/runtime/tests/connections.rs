@@ -267,6 +267,172 @@ fn required_provider_kinds_have_non_secret_settings_and_status() {
 }
 
 #[test]
+fn assessment_connection_capabilities_are_registered_and_round_trip() {
+    let harness = Harness::new();
+    let directory = harness.admin.directory();
+
+    let jev = harness.add(
+        ConnectionSettings::new(
+            ConnectionId::new(),
+            Provider::TypeSafe,
+            "jev-1.14.0",
+            AuthMethod::ApiKey,
+            None,
+            None,
+        )
+        .expect("valid legacy TypeSafe settings"),
+    );
+    let jev_capabilities = directory.capabilities(jev.connection_id()).unwrap();
+    assert_eq!(
+        jev_capabilities.endpoint_class(),
+        EndpointClass::TypeSafeSystemOne
+    );
+    assert_eq!(jev_capabilities.usage(), ConnectionUsage::AssessmentOnly);
+    assert!(!jev_capabilities.allows_agent_execution());
+    assert_eq!(
+        directory
+            .agent_execution_capabilities(jev.connection_id())
+            .unwrap_err(),
+        ConnectionError::AgentExecutionNotAllowed {
+            connection: jev.connection_id()
+        }
+    );
+
+    let decisions = harness.add(
+        ConnectionSettings::new_with_capabilities(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            "gpt-6-luna",
+            AuthMethod::ApiKey,
+            None,
+            None,
+            ConnectionCapabilityDeclaration::new(
+                EndpointClass::OpenAiDecisions,
+                InputCapabilities::text_and_image(),
+            ),
+        )
+        .expect("valid Decisions settings"),
+    );
+    let decisions_capabilities = directory.capabilities(decisions.connection_id()).unwrap();
+    assert_eq!(
+        decisions_capabilities.endpoint_class(),
+        EndpointClass::OpenAiDecisions
+    );
+    assert_eq!(
+        decisions_capabilities.usage(),
+        ConnectionUsage::AssessmentOnly
+    );
+    assert!(decisions_capabilities.input().supports_image());
+    assert_eq!(
+        directory
+            .agent_execution_capabilities(decisions.connection_id())
+            .unwrap_err(),
+        ConnectionError::AgentExecutionNotAllowed {
+            connection: decisions.connection_id()
+        }
+    );
+
+    let openai = harness.add(api_key_settings(Provider::OpenAi, "gpt-5"));
+    let openai_capabilities = directory.capabilities(openai.connection_id()).unwrap();
+    assert_eq!(
+        openai_capabilities.endpoint_class(),
+        EndpointClass::OpenAiResponses
+    );
+    assert_eq!(openai_capabilities.usage(), ConnectionUsage::AgentExecution);
+    assert!(openai_capabilities.allows_agent_execution());
+    assert_eq!(directory.list_capabilities().unwrap().len(), 3);
+
+    // The declaration is non-secret and round-trips with the settings.
+    let encoded = serde_json::to_value(&decisions).unwrap();
+    assert_eq!(encoded["capabilities"]["endpointClass"], "openai_decisions");
+    assert_eq!(encoded["capabilities"]["input"]["text"], true);
+    assert_eq!(encoded["capabilities"]["input"]["image"], true);
+    let encoded_text = encoded.to_string().to_ascii_lowercase();
+    for forbidden in ["token", "secret", "authorization"] {
+        assert!(!encoded_text.contains(forbidden), "leaked {forbidden}");
+    }
+    assert_eq!(
+        serde_json::from_value::<ConnectionSettings>(encoded.clone()).unwrap(),
+        decisions
+    );
+
+    // Settings written before H2 have no capability declaration. The absent
+    // field is an H1 row and keeps the H1 OpenAI agent endpoint; new
+    // assessment-only settings always write the declaration.
+    let mut legacy = encoded.clone();
+    legacy.as_object_mut().unwrap().remove("capabilities");
+    let decoded: ConnectionSettings = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        decoded.capabilities().unwrap().endpoint_class(),
+        EndpointClass::OpenAiResponses,
+        "legacy OpenAI settings keep the H1 agent endpoint"
+    );
+
+    // A newer/unknown capability form is rejected instead of guessed.
+    let mut unknown_field = encoded.clone();
+    unknown_field["capabilities"]["usage"] = serde_json::json!("agent_execution");
+    assert!(serde_json::from_value::<ConnectionSettings>(unknown_field).is_err());
+    let mut unknown_class = encoded;
+    unknown_class["capabilities"]["endpointClass"] = serde_json::json!("openai_newer_endpoint");
+    assert!(serde_json::from_value::<ConnectionSettings>(unknown_class).is_err());
+
+    // A foreign origin cannot be attached to TypeSafe or Decisions.
+    let custom = Endpoint::parse("http://127.0.0.1:8080/v1").unwrap();
+    assert!(matches!(
+        ConnectionSettings::new(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            "gpt-6-luna",
+            AuthMethod::ApiKey,
+            Some(custom.clone()),
+            None,
+        )
+        .unwrap_err(),
+        ConnectionError::EndpointNotAllowed {
+            provider: Provider::OpenAi
+        }
+    ));
+    assert!(matches!(
+        ConnectionSettings::new(
+            ConnectionId::new(),
+            Provider::TypeSafe,
+            "jev-1.14.0",
+            AuthMethod::ApiKey,
+            Some(custom),
+            None,
+        )
+        .unwrap_err(),
+        ConnectionError::EndpointNotAllowed {
+            provider: Provider::TypeSafe
+        }
+    ));
+
+    // Credentials in a URL are rejected by endpoint validation.
+    assert_eq!(
+        Endpoint::parse("https://user:pass@api.example.com/v1").unwrap_err(),
+        EndpointViolation::UserInfoNotAllowed
+    );
+
+    // Decisions never accept ChatGPT login.
+    assert!(matches!(
+        ConnectionSettings::new_with_capabilities(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            "gpt-6-luna",
+            AuthMethod::ChatGptLogin,
+            None,
+            None,
+            ConnectionCapabilityDeclaration::new(
+                EndpointClass::OpenAiDecisions,
+                InputCapabilities::text_only(),
+            ),
+        )
+        .unwrap_err(),
+        ConnectionError::CapabilityDeclarationRejected { .. }
+    ));
+}
+
+#[test]
 fn url_validation_and_remote_http_acknowledgment_are_enforced() {
     // Accepted forms.
     for value in [

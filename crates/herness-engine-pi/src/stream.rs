@@ -20,7 +20,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use herness_core::{
     AgentId, ArgumentViolation, AttemptId, AuthMethod, ConnectionDirectory, ConnectionId,
-    ConnectionSettings, CoreError, CredentialPort, Endpoint, EventSubject, ModelId,
+    ConnectionSettings, CoreError, CredentialPort, Endpoint, EndpointClass, EventSubject, ModelId,
     ModelRequestGatePort, ModelRequestObservation, Origin, ProjectId, Provider,
     ProviderFailureKind, RedirectAuthDecision, RequestGateIntent, RequestGateOutcome, RequestId,
     RequestOutcome, RequestPurpose, RunControl, RunId, RunSubject, SessionId, TokenCount,
@@ -288,18 +288,29 @@ pub(crate) fn model_for(
     settings: &ConnectionSettings,
     endpoints: &ProviderEndpoints,
 ) -> Result<Model, CoreError> {
-    let (api, provider, base_url) = match settings.provider() {
-        Provider::OpenAi => (
+    let capabilities = settings
+        .capabilities()
+        .map_err(|_| provider_failure(settings.provider(), ProviderFailureKind::Refused))?;
+    if !capabilities.allows_agent_execution() {
+        // An assessment-only connection must never start or continue an agent
+        // run, even when its provider has an agent wire format.
+        return Err(provider_failure(
+            capabilities.provider(),
+            ProviderFailureKind::Refused,
+        ));
+    }
+    let (api, provider, base_url) = match capabilities.endpoint_class() {
+        EndpointClass::OpenAiResponses => (
             "openai-responses",
             "openai",
             endpoints.openai_base().to_owned(),
         ),
-        Provider::Anthropic => (
+        EndpointClass::AnthropicMessages => (
             "anthropic-messages",
             "anthropic",
             endpoints.anthropic_base().to_owned(),
         ),
-        Provider::OpenAiCompatible => (
+        EndpointClass::OpenAiCompletions => (
             "openai-completions",
             "openai-compatible",
             settings
@@ -307,11 +318,11 @@ pub(crate) fn model_for(
                 .ok_or_else(engine_invalid_response)?
                 .as_url(),
         ),
-        // TypeSafe System One is assessment-only. Reaching an agent-run model
-        // builder is a refusal, never a silent provider switch.
-        Provider::TypeSafe => {
+        // TypeSafe System One and OpenAI Decisions are assessment-only. Any
+        // capability/usage mismatch is a refusal, never a silent switch.
+        EndpointClass::TypeSafeSystemOne | EndpointClass::OpenAiDecisions => {
             return Err(provider_failure(
-                Provider::TypeSafe,
+                capabilities.provider(),
                 ProviderFailureKind::Refused,
             ));
         }
@@ -877,6 +888,59 @@ mod tests {
             ProviderEndpoints::for_loopback("https://api.openai.com/v1", "http://127.0.0.1:1234")
                 .expect_err("remote override must be rejected");
         assert!(matches!(error, CoreError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn assessment_only_connections_never_build_an_agent_model() {
+        use herness_core::{
+            ConnectionCapabilityDeclaration, EndpointClass, InputCapabilities, Provider,
+        };
+
+        let endpoints =
+            ProviderEndpoints::for_loopback("http://127.0.0.1:18080/v1", "http://127.0.0.1:18081")
+                .unwrap();
+        let jev = ConnectionSettings::new(
+            ConnectionId::new(),
+            Provider::TypeSafe,
+            "jev-1.14.0",
+            AuthMethod::ApiKey,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            model_for(&jev, &endpoints).is_err(),
+            "Jev System One must not start an agent run"
+        );
+
+        let decisions = ConnectionSettings::new_with_capabilities(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            "gpt-6-luna",
+            AuthMethod::ApiKey,
+            None,
+            None,
+            ConnectionCapabilityDeclaration::new(
+                EndpointClass::OpenAiDecisions,
+                InputCapabilities::text_only(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            model_for(&decisions, &endpoints).is_err(),
+            "OpenAI Decisions must not start an agent run"
+        );
+
+        let openai = ConnectionSettings::new(
+            ConnectionId::new(),
+            Provider::OpenAi,
+            "gpt-5",
+            AuthMethod::ApiKey,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(model_for(&openai, &endpoints).is_ok());
     }
 
     #[test]
