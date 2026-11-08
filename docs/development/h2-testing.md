@@ -847,3 +847,43 @@ cargo check --workspace --all-targets --locked
 - 実Tauri windowからの監視UI・human confirmation
 
 Task 18の受入sign-off、実provider接続、UI製品レイアウト、H3/H4統合はこのTaskに含めない。
+
+## Task 18 Phase A受入とPhase Bゲート
+
+### Phase Aの実行結果（2026-11-09）
+
+対象revisionは`547ac0094612ae077feb4c4d3d9a0ff984a07ff3`。macOS 27.2（build 26B123）、Mac17,3（Apple M5）、arm64、16 GiB、`rustc 1.97.1`、`cargo 1.97.1`、debug build。実行worktreeは`/Users/h-uma/.local/share/opencode/worktree/b3231b/sdd-h2-supervision`。詳細は[H2受入証跡](../research/2026-11-08-h2-acceptance.md)。
+
+| コマンド | 終了code | 実際の結果 |
+| --- | ---: | --- |
+| `cargo fmt --all -- --check` | 0 | 差分なし |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | warningなし |
+| `cargo test --workspace --locked` | 0 | 615 passed、0 failed、1 ignored（34 test target + 8 doc-test target） |
+| `cargo build -p herness-desktop --locked` | 0 | `Finished dev profile ... in 17.14s` |
+| `HERNESS_APP_DATA_ROOT=<新規tmp>/smoke target/debug/herness-desktop --smoke-test` | 0 | `SMOKE_READY: pid=12646 startup_ms=662`、`SMOKE_OK` |
+| `HERNESS_APP_DATA_ROOT=<新規tmp>/close-reopen target/debug/herness-desktop --close-reopen-test` | 0 | `CLOSE_REOPEN_HIDDEN: pid=12661 generation=1`、`CLOSE_REOPEN_OK: ... generation=2` |
+| `HERNESS_APP_DATA_ROOT=<新規tmp>/quit target/debug/herness-desktop --quit-test` | 0 | `QUIT_TEST_READY: pid=12676`、`QUIT_OK: pid=12676 save=confirmed stop=confirmed` |
+
+- 一時rootは絶対パス`/var/folders/1l/g5bm30qs6mq6m4zd0hqj2y4r0000gn/T/herness-task18.Dn0g4S/{smoke,close-reopen,quit}`として実行ごとに新規作成した。各rootには新規SQLite DBだけが作られ、stderrは空だった。
+- 1 ignoredは`herness-runtime-tests`の`tests/desktop.rs`にある`measure_running_host_rss`（Task 12の手動RSS計測fixture）。
+- 既知のTask 14 loopback timing flake（`tests/supervision/tests/permissions.rs`の`PermissionEvaluationFailed { failure: Unavailable }`）は今回発生しなかった。発生時は同じコマンドを再実行し、両方の結果を記録し、assertを弱めない。
+- 3つの実Tauri実行はlifecycleのみで、外部provider送信・実Keychain探索・login・有料要求を行わない。
+
+### Phase Bゲート
+
+Phase Bは**NOT AUTHORIZED / UNVERIFIED**であり、Task 18のこの実行では行っていない。実接続を検証する前に、controllerは次を人間へ提示して許可を得る。
+
+- 対象接続（purpose、provider、endpoint class、connection ID、model ID/version、認証方式）と許可された経路だけの一覧。
+- 使用するTask 17 fixture IDと合成データ。実repository・会話・secretを含めない。
+- 経路ごとの有限の要求数、attempt/retry上限（transportは最大2回追加）、60秒timeout、停止条件。
+- 金額上限（USD）と`PriceVersion`、または課金なしを保証する隔離手段。ChatGPT login等の見積不能経路は人間の明示許可なしに使わない。
+- 許可の範囲・期限・証拠の保存先（sanitized）。範囲外の接続・fixture・要求は拒否する。
+
+許可がない場合は検証要求を拒否し、実provider・実Keychain・loginへ触れない。許可済みでも失敗profileは利用不可にし、成功扱いにしない。実接続の要求数・usage・返却model ID・閾値結果・未確認範囲はsecretなしで[H2受入証跡](../research/2026-11-08-h2-acceptance.md)へ記録する。許可された全経路の証拠が揃うまでTask 18もH2全体も完了にしない。
+
+### 未確認のまま残るもの
+
+- 通常LLM・Jev System One・OpenAI Decisionsの実endpointによる条件評価と許可評価。
+- 実credential・実Keychain・login・実model ID・usage・rate limit・課金/利用枠。
+- H1のOpenAI/Anthropic APIキー経路（H1受入証跡のUNVERIFIEDを維持）。
+- 完了閾値0.95・許可閾値0.99の実モデルでの妥当性、実Tauri監督UIの手動操作、Jev/Decisions接続の製品UIからの構成。
