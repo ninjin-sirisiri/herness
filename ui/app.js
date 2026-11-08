@@ -64,8 +64,17 @@ async function frontendState() {
   setText(
     "policy-line",
     `Permission mode: ${state.permissionMode} (policy ${state.policyVersion}) · ` +
-      `Automatic decision: unavailable — ${state.automaticModeReason}`
+      `Automatic decision capability: ${state.automaticModeAvailable ? "available" : "unavailable"} — ` +
+      `${state.automaticModeReason}`
   );
+  if (byId("automatic-warning")) {
+    setText(
+      "automatic-warning",
+      state.automaticModeAvailable
+        ? "A verified permission-evaluation profile is configured. The current policy mode still decides whether human approval is required."
+        : "Automatic decision is unavailable without a verified permission-evaluation profile. Every tool operation needs an explicit human decision in this build."
+    );
+  }
   if (state.selectedProject) {
     ui.project = state.selectedProject;
   }

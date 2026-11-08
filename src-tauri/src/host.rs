@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use herness_assessment::AssessmentEndpoints;
 use herness_core::runtime::{
     ProjectView, PumpReport, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
     RuntimeToolExecutor, ShutdownReport, ToolExecution,
@@ -27,6 +28,7 @@ use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
 
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
+use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
 use crate::supervision::runtime::DesktopH1;
 use crate::supervision::store::StoreHandle;
@@ -70,6 +72,31 @@ impl DesktopHost {
             connections,
             credentials,
             endpoints,
+            AssessmentEndpoints::official(),
+            None,
+            None,
+        )
+    }
+
+    /// Test composition seam with explicit assessment provider bases.
+    ///
+    /// Production uses [`Self::open`] with official bases. Tests pass loopback
+    /// bases so the same permission-evaluator and completion-assessment
+    /// composition is exercised without a real provider.
+    #[doc(hidden)]
+    pub fn open_with_assessment_endpoints(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        assessment_endpoints: AssessmentEndpoints,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            assessment_endpoints,
             None,
             None,
         )
@@ -81,8 +108,9 @@ impl DesktopHost {
     /// desktop shell. It lets the Task 17 regression use the real runtime,
     /// store, tool executor, request gate, and quit path while injecting
     /// scripted required-check and assessment ports and a loopback permission
-    /// evaluator. The production `open` path always uses the real ports and no
-    /// permission evaluator.
+    /// evaluator. Production `open` uses the real dynamic permission evaluator
+    /// described by `supervision::permission`; this seam overrides it only for
+    /// the regression test.
     #[doc(hidden)]
     pub fn open_with_test_boundaries(
         app_data_root: impl AsRef<Path>,
@@ -98,6 +126,7 @@ impl DesktopHost {
             connections,
             credentials,
             endpoints,
+            AssessmentEndpoints::official(),
             evaluator,
             Some((assessment, checks)),
         )
@@ -108,6 +137,7 @@ impl DesktopHost {
         connections: ConnectionAdmin,
         credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
         endpoints: ProviderEndpoints,
+        assessment_endpoints: AssessmentEndpoints,
         evaluator: Option<SharedPermissionEvaluator>,
         test_ports: Option<(
             Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
@@ -131,23 +161,24 @@ impl DesktopHost {
             crate::supervision::gate::SupervisionAwareGate::new(store_handle.clone()).boxed(),
         );
         let executor = DesktopToolExecutor::new(Arc::clone(&store));
-        let mut dependencies = RuntimeDependencies::new(
+        let assessment_host = AssessmentHost {
+            directory: directory.clone(),
+            credentials: Arc::clone(&credentials),
+            endpoints: assessment_endpoints,
+        };
+        let permission = PermissionRuntime::new(store_handle.clone(), assessment_host.clone());
+        let evaluator = evaluator.unwrap_or_else(|| permission.evaluator());
+        let dependencies = RuntimeDependencies::new(
             Arc::clone(&store),
             engine,
             Arc::clone(&credentials),
             directory.clone(),
             policy,
             executor,
-        );
-        if let Some(evaluator) = evaluator {
-            dependencies = dependencies.with_shared_evaluator(evaluator);
-        }
+        )
+        .with_shared_evaluator(evaluator);
         let (runtime, report) =
             Runtime::restore(dependencies).map_err(|error| error.to_string())?;
-        let assessment_host = AssessmentHost {
-            directory: directory.clone(),
-            credentials: Arc::clone(&credentials),
-        };
         let supervision_config = ConfigStore::new();
         let (assessment, check_mode) = match test_ports {
             Some((assessment, checks)) => {
@@ -166,12 +197,13 @@ impl DesktopHost {
                 )
             }
         };
-        let supervision = SupervisionHost::with_config(
+        let supervision = SupervisionHost::with_permission(
             store_handle,
             supervision_config,
             assessment_host,
             assessment,
             check_mode,
+            permission,
         );
         let mut host = Self {
             runtime,
@@ -405,6 +437,21 @@ impl DesktopHost {
     /// Mints a host-owned human confirmation after the command guard passed.
     pub fn confirm_supervision(&self, kind: ConfirmationKind) -> HumanConfirmation {
         self.supervision.confirm(kind)
+    }
+
+    /// Shared permission evaluator installed into H1 at open.
+    pub fn permission_evaluator(&self) -> SharedPermissionEvaluator {
+        self.supervision.permission().evaluator()
+    }
+
+    /// Whether any project has a verified permission profile and consent.
+    pub fn permission_available(&self) -> bool {
+        self.supervision.permission_available()
+    }
+
+    /// Whether one project has a verified permission profile and consent.
+    pub fn permission_available_for(&self, project: herness_core::ProjectId) -> bool {
+        self.supervision.permission_available_for(project)
     }
 
     /// Creates a supervision target.

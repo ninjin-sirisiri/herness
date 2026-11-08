@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use herness_assessment::AssessmentEndpoints;
 use herness_core::runtime::RecoveryMode;
 use herness_core::{
     AgentId, AuthMethod, ConnectionAdmin, ConnectionId, ConnectionSettings, CoreError,
@@ -67,6 +68,15 @@ impl CredentialPort for NoCredentials {
             connection: *connection,
         })
     }
+}
+
+fn loopback_assessment_endpoints() -> AssessmentEndpoints {
+    AssessmentEndpoints::for_loopback(
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9",
+    )
+    .expect("unused loopback assessment endpoints")
 }
 
 struct FakeRun {
@@ -501,6 +511,7 @@ fn harness_with_check(pass: bool, met_assessment: bool) -> Harness {
     let assessment_host = AssessmentHost {
         directory: admin.directory(),
         credentials: Arc::new(NoCredentials),
+        endpoints: loopback_assessment_endpoints(),
     };
     let config_store = ConfigStore::new();
     let check: Box<dyn RequiredCheckPort + Send> = if pass {
@@ -823,6 +834,7 @@ fn real_assessment_port_returns_unverified_without_any_network_request() {
         AssessmentHost {
             directory: harness.admin.directory(),
             credentials: Arc::new(NoCredentials),
+            endpoints: loopback_assessment_endpoints(),
         },
     );
     let error = port
@@ -1365,6 +1377,7 @@ fn reopen_restores_saved_plan_state_and_purpose_configuration() {
     let assessment_host = AssessmentHost {
         directory: harness.admin.directory(),
         credentials: Arc::new(NoCredentials),
+        endpoints: loopback_assessment_endpoints(),
     };
     let host = SupervisionHost::with_config_for_test(
         store.clone(),
@@ -1431,4 +1444,666 @@ fn no_child_continuation_or_auto_start_happens_for_normal_creation() {
     assert_eq!(after.state, "ready");
     assert_eq!(harness.runtime.starts, 0);
     assert_eq!(harness.runtime.continuations, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Production permission-evaluator composition (Task 16 follow-up).
+// ---------------------------------------------------------------------------
+
+mod permission_composition {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use herness_assessment::AssessmentEndpoints;
+    use herness_core::{
+        AbsolutePath, ArgumentsDigest, AuthMethod, ConnectionAdmin,
+        ConnectionCapabilityDeclaration, ConnectionId, ConnectionSettings, CredentialAvailability,
+        CredentialKind, CredentialPort, Endpoint, EndpointClass, EvaluationContext,
+        EvaluatorAvailability, FrozenOperation, InputCapabilities, NonEmptyText, OperationId,
+        PermissionEvaluatorPort, PermissionMode, PermissionOutcome, PermissionPolicy,
+        PermissionRule, PolicyAdmin, ProjectId, Provider, Rationale, ResolvedCredential,
+        RuleTarget, RunId, SecretString, ToolArguments, ToolExecutor, ToolGateway, ToolName,
+        WriteArgs,
+    };
+    use herness_desktop::host::DesktopHost;
+    use herness_desktop::supervision::store::HostBudgetClock;
+    use herness_desktop::supervision::{
+        ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
+    };
+    use herness_engine_pi::ProviderEndpoints;
+    use herness_supervision::{
+        BudgetLedger, BudgetPolicy, DisclosureDataKind, ProfilePurpose, ProviderOrigin,
+        TargetVersion,
+    };
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    const API_KEY: &str = "sk-permission-desktop-canary-98ac";
+    const MODEL: &str = "permission-llm";
+    const CONVERSATION_CANARY: &str = "whole-conversation-canary-1f4d";
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        path: String,
+        body: Vec<u8>,
+    }
+
+    struct PermissionMock {
+        address: SocketAddr,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        responses: Arc<Mutex<VecDeque<Value>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl PermissionMock {
+        fn start() -> Arc<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind permission mock");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking permission mock");
+            let address = listener.local_addr().expect("mock address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(Mutex::new(VecDeque::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_requests = Arc::clone(&requests);
+            let thread_responses = Arc::clone(&responses);
+            let thread_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let requests = Arc::clone(&thread_requests);
+                            let responses = Arc::clone(&thread_responses);
+                            thread::spawn(move || handle_connection(stream, requests, responses));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => {
+                            // A reset queued connection must not stop the
+                            // mock for the remaining assertions.
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
+            });
+            Arc::new(Self {
+                address,
+                requests,
+                responses,
+                stop,
+            })
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        fn api_base(&self) -> String {
+            format!("{}/v1", self.url())
+        }
+
+        fn push(&self, response: Value) {
+            self.responses
+                .lock()
+                .expect("responses")
+                .push_back(response);
+        }
+
+        fn count(&self) -> usize {
+            self.requests.lock().expect("requests").len()
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl Drop for PermissionMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+        }
+    }
+
+    fn handle_connection(
+        mut stream: TcpStream,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        responses: Arc<Mutex<VecDeque<Value>>>,
+    ) {
+        let Some((head, body)) = read_request(&mut stream) else {
+            return;
+        };
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_owned();
+        requests
+            .lock()
+            .expect("requests")
+            .push(RecordedRequest { path, body });
+        let response = responses
+            .lock()
+            .expect("responses")
+            .pop_front()
+            .unwrap_or_else(|| json!({"error": "mock exhausted"}));
+        let payload = serde_json::to_vec(&response).expect("encode mock response");
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&payload);
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position;
+            }
+            if buffer.len() > 1024 * 1024 {
+                return None;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        let mut content_length = 0usize;
+        for line in head.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = buffer[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        Some((head, body))
+    }
+
+    struct FakePermissionCredentials {
+        connection: ConnectionId,
+        secret: String,
+        resolves: AtomicUsize,
+    }
+
+    impl FakePermissionCredentials {
+        fn new(connection: ConnectionId) -> Self {
+            Self {
+                connection,
+                secret: API_KEY.to_owned(),
+                resolves: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CredentialPort for FakePermissionCredentials {
+        fn availability(
+            &self,
+            connection: &ConnectionId,
+        ) -> Result<CredentialAvailability, herness_core::CoreError> {
+            Ok(if connection == &self.connection {
+                CredentialAvailability::Available
+            } else {
+                CredentialAvailability::Unavailable
+            })
+        }
+
+        fn resolve(
+            &self,
+            connection: &ConnectionId,
+        ) -> Result<ResolvedCredential, herness_core::CoreError> {
+            if connection != &self.connection {
+                return Err(herness_core::CoreError::AuthenticationRequired {
+                    connection: *connection,
+                });
+            }
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedCredential::new(
+                CredentialKind::ApiKey,
+                SecretString::new(self.secret.clone())?,
+            ))
+        }
+    }
+
+    struct PermissionHost {
+        _temp: TempDir,
+        project: ProjectId,
+        root: PathBuf,
+        connection: ConnectionId,
+        host: DesktopHost,
+        server: Arc<PermissionMock>,
+        credentials: Arc<FakePermissionCredentials>,
+    }
+
+    impl PermissionHost {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temp");
+            let root = temp.path().join("project");
+            std::fs::create_dir_all(root.join("src")).expect("project dirs");
+            std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("project file");
+            let server = PermissionMock::start();
+            let connection = ConnectionId::new();
+            let admin = ConnectionAdmin::new();
+            admin
+                .add(
+                    ConnectionSettings::new_with_capabilities(
+                        connection,
+                        Provider::OpenAiCompatible,
+                        MODEL,
+                        AuthMethod::ApiKey,
+                        Some(
+                            Endpoint::parse(server.api_base().as_str()).expect("loopback endpoint"),
+                        ),
+                        None,
+                        ConnectionCapabilityDeclaration::new(
+                            EndpointClass::OpenAiCompletions,
+                            InputCapabilities::text_only(),
+                        ),
+                    )
+                    .expect("connection"),
+                )
+                .expect("add connection");
+            let credentials = Arc::new(FakePermissionCredentials::new(connection));
+            let engine_endpoints = ProviderEndpoints::for_loopback(server.api_base(), server.url())
+                .expect("engine loopback endpoints");
+            let assessment_endpoints =
+                AssessmentEndpoints::for_loopback(server.url(), server.api_base(), server.url())
+                    .expect("assessment loopback endpoints");
+            let app_data = temp.path().join("app-data");
+            let (mut host, _) = DesktopHost::open_with_assessment_endpoints(
+                &app_data,
+                admin,
+                credentials.clone(),
+                engine_endpoints,
+                assessment_endpoints,
+            )
+            .expect("desktop host");
+            let project = host
+                .runtime_mut()
+                .open_project(&root)
+                .expect("open project")
+                .project_id();
+            Self {
+                _temp: temp,
+                project,
+                root,
+                connection,
+                host,
+                server,
+                credentials,
+            }
+        }
+
+        fn configure_purpose(&self, purpose: ProfilePurpose) {
+            self.host
+                .supervision_configure_profile(
+                    PlanRequestActor::Human,
+                    self.project,
+                    purpose,
+                    self.connection,
+                    MODEL,
+                    Some(self.host.confirm_supervision(ConfirmationKind::Profile)),
+                )
+                .expect("configure profile");
+            self.host
+                .supervision_grant_consent(
+                    PlanRequestActor::Human,
+                    self.project,
+                    purpose,
+                    ProviderOrigin::parse(self.server.url()).expect("origin"),
+                    std::collections::BTreeSet::from([DisclosureDataKind::Text]),
+                    vec!["src/main.rs".to_owned()],
+                    TargetVersion::new(1).expect("version"),
+                    Some(self.host.confirm_supervision(ConfirmationKind::Consent)),
+                )
+                .expect("grant consent");
+        }
+
+        fn configure_verified_permission(&self) {
+            self.configure_purpose(ProfilePurpose::Permission);
+            self.host
+                .supervision()
+                .mark_profile_verified(self.project, ProfilePurpose::Permission, true)
+                .expect("verify permission profile");
+        }
+
+        fn create_started(&mut self) -> (herness_desktop::supervision::SupervisionView, RunId) {
+            self.configure_purpose(ProfilePurpose::Completion);
+            let view = self
+                .host
+                .supervision_create(
+                    PlanRequestActor::Human,
+                    CreateSupervisionRequest {
+                        project: self.project,
+                        connection: self.connection,
+                        instructions: "permission composition fixture".to_owned(),
+                        conditions: vec![super::ConditionInput {
+                            title: "The check passes".to_owned(),
+                            rubric: "fixture".to_owned(),
+                            checks: vec![super::CheckInput {
+                                command: "true".to_owned(),
+                                description: "fixture check".to_owned(),
+                            }],
+                        }],
+                        read_set: vec!["src/main.rs".to_owned()],
+                        write_paths: vec!["src".to_owned()],
+                        allow_shell: false,
+                        condition_version: Some(1),
+                        target_version: Some(1),
+                        budget: None,
+                    },
+                    Some(self.host.confirm_supervision(ConfirmationKind::Create)),
+                )
+                .expect("create supervision");
+            let started = self
+                .host
+                .supervision_start(
+                    self.project,
+                    view.supervision_id,
+                    super::SupervisionRequestId::new(self.project),
+                    view.revision,
+                    Some(self.host.confirm_supervision(ConfirmationKind::Start)),
+                )
+                .expect("start supervision");
+            let run = started
+                .run_group
+                .first()
+                .expect("run")
+                .parse::<RunId>()
+                .expect("run id");
+            let mut ledger = BudgetLedger::open(
+                self.host.store_handle(),
+                self.project,
+                view.supervision_id,
+                BudgetPolicy::h2_default(),
+                1,
+                HostBudgetClock::new(),
+            )
+            .expect("ledger");
+            ledger.begin_active().expect("activate ledger");
+            (started, run)
+        }
+
+        fn automatic_policy(&self) -> PermissionPolicy {
+            let handle = self.host.runtime().policy_handle();
+            let mut admin = PolicyAdmin::from_shared(handle.clone());
+            admin
+                .set_mode(PermissionMode::Automatic, EvaluatorAvailability::Available)
+                .expect("automatic mode");
+            handle.snapshot()
+        }
+
+        fn operation(&self, run: RunId, policy: &PermissionPolicy) -> FrozenOperation {
+            FrozenOperation::new(
+                OperationId::new(self.project),
+                run,
+                ToolName::Write,
+                ToolArguments::Write(WriteArgs {
+                    path: NonEmptyText::new("src/main.rs").expect("path"),
+                    content: "permission fixture content".to_owned(),
+                    rationale: Rationale::new("permission composition fixture").expect("rationale"),
+                }),
+                AbsolutePath::new(self.root.to_string_lossy()).expect("cwd"),
+                policy.version(),
+                PermissionMode::Automatic,
+            )
+            .expect("frozen operation")
+        }
+
+        fn response(&self, operation: &FrozenOperation, decision: &str) -> Value {
+            let content = json!({
+                "decision": decision,
+                "operationId": operation.operation_id().to_string(),
+                "argumentsDigest": ArgumentsDigest::of(operation.arguments()).to_string(),
+                "cwd": operation.cwd().to_string(),
+                "policyVersion": operation.policy_version().get(),
+                "mode": operation.permission_mode().to_string(),
+                "rationale": "The frozen operation is inside the requested boundary.",
+                "uncertainty": null,
+            });
+            json!({
+                "model": MODEL,
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": content.to_string()},
+                }],
+            })
+        }
+    }
+
+    struct CountingExecutor {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor for CountingExecutor {
+        type Output = usize;
+
+        fn execute(
+            &mut self,
+            _operation: &FrozenOperation,
+        ) -> Result<Self::Output, herness_core::CoreError> {
+            Ok(self.count.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+    }
+
+    #[test]
+    fn production_permission_profile_runs_the_real_evaluator_and_charges_the_shared_ledger() {
+        let mut harness = PermissionHost::new();
+        assert!(!harness.host.permission_available());
+        assert_eq!(
+            harness.host.permission_evaluator().availability(),
+            EvaluatorAvailability::Unavailable
+        );
+        assert_eq!(harness.server.count(), 0);
+
+        harness.configure_verified_permission();
+        assert!(harness.host.permission_available_for(harness.project));
+        assert_eq!(
+            harness.host.permission_evaluator().availability(),
+            EvaluatorAvailability::Available
+        );
+        let (view, run) = harness.create_started();
+        let policy = harness.automatic_policy();
+        let grant = herness_core::GrantScope::for_run(harness.project, &policy);
+        let context = EvaluationContext::new(
+            "permission composition fixture",
+            vec!["src/main.rs".to_owned()],
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut gateway = ToolGateway::new(CountingExecutor {
+            count: Arc::clone(&count),
+        });
+        let mut evaluator = harness.host.permission_evaluator();
+
+        let allow = harness.operation(run, &policy);
+        harness.server.push(harness.response(&allow, "allow"));
+        let request = herness_core::EvaluationRequest::new(
+            allow.clone(),
+            "permission composition fixture",
+            "write only src/main.rs",
+            vec!["fixture evidence".to_owned()],
+        );
+        let outcome = gateway
+            .authorize(&policy, &grant, &allow, &context, Some(&mut evaluator))
+            .expect("authorize allow");
+        match outcome {
+            PermissionOutcome::Allow { authorization } => {
+                gateway
+                    .execute(&policy, &allow, &authorization)
+                    .expect("execute once");
+            }
+            other => panic!("expected allow, got {other:?}"),
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let after_allow = harness.server.count();
+        assert!(after_allow >= 1, "the allow decision used the provider");
+
+        // The budget ledger is the same durable record the supervision uses.
+        let stored = harness
+            .host
+            .store_handle()
+            .lock()
+            .load_budget_record(harness.project, view.supervision_id)
+            .expect("budget record")
+            .expect("budget exists");
+        assert!(stored.record().usage().active_seconds_consumed() >= 1);
+        let requests = harness
+            .host
+            .store_handle()
+            .lock()
+            .model_requests_for_project(&harness.project)
+            .expect("model requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].intent().purpose().as_str(),
+            "permission_evaluation"
+        );
+        let recorded = harness.server.requests();
+        assert_eq!(recorded[0].path, "/v1/chat/completions");
+        assert!(!String::from_utf8_lossy(&recorded[0].body).contains(CONVERSATION_CANARY));
+        assert!(String::from_utf8_lossy(&recorded[0].body).contains("operationId"));
+
+        // A single-use authorization cannot execute the same operation twice,
+        // and a duplicate evaluation does not reach the provider again.
+        assert!(
+            gateway
+                .authorize(&policy, &grant, &allow, &context, Some(&mut evaluator))
+                .is_err()
+        );
+        assert_eq!(
+            harness.server.count(),
+            after_allow,
+            "a duplicate evaluation must not reach the provider again"
+        );
+
+        let deny = harness.operation(run, &policy);
+        harness.server.push(harness.response(&deny, "deny"));
+        let deny_request = herness_core::EvaluationRequest::new(
+            deny.clone(),
+            "permission composition fixture",
+            "write only src/main.rs",
+            vec!["fixture evidence".to_owned()],
+        );
+        assert_eq!(
+            gateway
+                .authorize(&policy, &grant, &deny, &context, Some(&mut evaluator))
+                .expect("authorize deny"),
+            PermissionOutcome::Deny {
+                reason: herness_core::DenialReason::Evaluator
+            }
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let after_deny = harness.server.count();
+        assert!(
+            after_deny > after_allow,
+            "the deny decision used the provider"
+        );
+
+        let ask = harness.operation(run, &policy);
+        harness.server.push(harness.response(&ask, "ask"));
+        let ask_request = herness_core::EvaluationRequest::new(
+            ask.clone(),
+            "permission composition fixture",
+            "write only src/main.rs",
+            vec!["fixture evidence".to_owned()],
+        );
+        assert!(matches!(
+            gateway
+                .authorize(&policy, &grant, &ask, &context, Some(&mut evaluator))
+                .expect("authorize ask"),
+            PermissionOutcome::AwaitingApproval { .. }
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(
+            harness.server.count() > after_deny,
+            "the ask decision used the provider"
+        );
+        let _ = (request, deny_request, ask_request);
+    }
+
+    #[test]
+    fn without_a_verified_permission_profile_the_evaluator_never_sends() {
+        let harness = PermissionHost::new();
+        assert!(!harness.host.permission_available());
+        assert_eq!(
+            harness.host.permission_evaluator().availability(),
+            EvaluatorAvailability::Unavailable
+        );
+        assert!(!harness.host.permission_available_for(harness.project));
+
+        let policy = PermissionPolicy::initial();
+        let run = RunId::new(harness.project);
+        let operation = harness.operation(run, &policy);
+        let request = herness_core::EvaluationRequest::new(
+            operation,
+            "permission composition fixture",
+            "write only src/main.rs",
+            vec!["fixture evidence".to_owned()],
+        );
+        let mut evaluator = harness.host.permission_evaluator();
+        assert!(evaluator.evaluate(&request).is_err());
+        assert_eq!(harness.server.count(), 0);
+        assert_eq!(harness.credentials.resolves.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicit_deny_precedes_the_permission_evaluator() {
+        let mut harness = PermissionHost::new();
+        harness.configure_verified_permission();
+        let (_view, run) = harness.create_started();
+        let _ = harness.automatic_policy();
+        let handle = harness.host.runtime().policy_handle();
+        let mut admin = PolicyAdmin::from_shared(handle.clone());
+        admin
+            .add_rule(
+                PermissionRule::deny(
+                    RuleTarget::Tool {
+                        tool: ToolName::Write,
+                    },
+                    herness_core::MatchMethod::AnyInvocation,
+                )
+                .expect("deny rule"),
+            )
+            .expect("add rule");
+        let policy = handle.snapshot();
+        let grant = herness_core::GrantScope::for_run(harness.project, &policy);
+        let context = EvaluationContext::new("permission composition fixture", Vec::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut gateway = ToolGateway::new(CountingExecutor {
+            count: Arc::clone(&count),
+        });
+        let mut evaluator = harness.host.permission_evaluator();
+        let operation = harness.operation(run, &policy);
+        let outcome = gateway
+            .authorize(&policy, &grant, &operation, &context, Some(&mut evaluator))
+            .expect("authorize deny rule");
+        assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.server.count(), 0);
+    }
 }

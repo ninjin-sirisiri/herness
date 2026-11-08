@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use herness_assessment::llm::EvidenceDocument;
 use herness_assessment::{
-    AssessmentTransport, DecisionsAssessmentAdapter, JevAssessmentAdapter, LlmAssessmentAdapter,
+    AssessmentEndpoints, AssessmentTransport, DecisionsAssessmentAdapter, JevAssessmentAdapter,
+    LlmAssessmentAdapter,
 };
 use herness_core::{
     AttemptId, ConnectionDirectory, ConnectionStatus, CredentialAvailability, CredentialPort,
@@ -37,6 +38,8 @@ pub struct AssessmentHost {
     pub directory: ConnectionDirectory,
     /// Shared credential port (the same Keychain boundary used by the runtime).
     pub credentials: Arc<dyn CredentialPort + Send + Sync>,
+    /// Assessment provider bases (official in production, loopback in tests).
+    pub endpoints: AssessmentEndpoints,
 }
 
 impl AssessmentHost {
@@ -80,7 +83,20 @@ impl AssessmentHost {
                     feature: format!("connection origin is unavailable: {error}"),
                 })?;
         if let Some(endpoint) = settings.endpoint() {
-            return ProviderOrigin::parse(endpoint.as_url());
+            // The consent origin is scheme + host + port; a compatible
+            // endpoint may carry a path such as `/v1`.
+            let raw = endpoint.as_url();
+            let (scheme, rest) = raw.split_once("://").ok_or(SupervisionError::Unsupported {
+                feature: "the configured endpoint has no scheme".to_owned(),
+            })?;
+            let authority = rest
+                .split(['/', '?', '#'])
+                .next()
+                .filter(|authority| !authority.is_empty())
+                .ok_or(SupervisionError::Unsupported {
+                    feature: "the configured endpoint has no host".to_owned(),
+                })?;
+            return ProviderOrigin::parse(format!("{scheme}://{authority}"));
         }
         let origin = match settings.provider() {
             herness_core::Provider::OpenAi => "https://api.openai.com",
@@ -185,7 +201,7 @@ impl HostAssessmentPort {
         AssessmentTransport::new(
             Arc::clone(&self.host.credentials),
             self.host.directory.clone(),
-            herness_assessment::AssessmentEndpoints::official(),
+            self.host.endpoints.clone(),
         )
         .map_err(|error| SupervisionError::Unsupported {
             feature: format!("assessment transport is unavailable: {error}"),

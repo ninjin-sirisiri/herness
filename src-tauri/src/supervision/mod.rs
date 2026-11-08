@@ -9,6 +9,7 @@
 pub mod assessment;
 pub mod checks;
 pub mod gate;
+pub mod permission;
 pub mod plan;
 pub mod runtime;
 pub mod store;
@@ -46,6 +47,7 @@ pub use plan::{
 
 use assessment::{AssessmentHost, build_profile};
 use checks::HostCheckPort;
+use permission::PermissionRuntime;
 use plan::{BudgetSnapshot, ConfigStore, build_conditions, load_plan, plan_child, save_plan};
 use runtime::DesktopSupervisionRuntime;
 use store::{HostBudgetClock, HostClock, StoreHandle};
@@ -327,6 +329,7 @@ pub struct SupervisionHost {
     connections: AssessmentHost,
     assessment: Box<dyn ConditionAssessmentPort + Send>,
     checks: CheckMode,
+    permission: PermissionRuntime,
     active: Mutex<BTreeSet<(ProjectId, SupervisionId)>>,
     last_tick: Mutex<BTreeMap<(ProjectId, SupervisionId), Instant>>,
     notifications: Arc<Mutex<VecDeque<NotificationView>>>,
@@ -345,12 +348,14 @@ impl SupervisionHost {
         connections: AssessmentHost,
         assessment: Box<dyn ConditionAssessmentPort + Send>,
     ) -> Self {
+        let permission = PermissionRuntime::new(store.clone(), connections.clone());
         Self::with_config(
             store,
             ConfigStore::new(),
             connections,
             assessment,
             CheckMode::Real,
+            permission,
         )
     }
 
@@ -361,12 +366,14 @@ impl SupervisionHost {
         assessment: Box<dyn ConditionAssessmentPort + Send>,
         checks: Box<dyn RequiredCheckPort + Send>,
     ) -> Self {
+        let permission = PermissionRuntime::new(store.clone(), connections.clone());
         Self::with_config(
             store,
             ConfigStore::new(),
             connections,
             assessment,
             CheckMode::Injected(checks),
+            permission,
         )
     }
 
@@ -377,6 +384,7 @@ impl SupervisionHost {
         connections: AssessmentHost,
         assessment: Box<dyn ConditionAssessmentPort + Send>,
         checks: CheckMode,
+        permission: PermissionRuntime,
     ) -> Self {
         Self {
             store,
@@ -385,11 +393,24 @@ impl SupervisionHost {
             connections,
             assessment,
             checks,
+            permission,
             active: Mutex::new(BTreeSet::new()),
             last_tick: Mutex::new(BTreeMap::new()),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             clock: HostClock,
         }
+    }
+
+    /// Production constructor with the evaluator shared with H1.
+    pub(crate) fn with_permission(
+        store: StoreHandle,
+        config: ConfigStore,
+        connections: AssessmentHost,
+        assessment: Box<dyn ConditionAssessmentPort + Send>,
+        checks: CheckMode,
+        permission: PermissionRuntime,
+    ) -> Self {
+        Self::with_config(store, config, connections, assessment, checks, permission)
     }
 
     /// Test-only composition with an explicit config and check boundary.
@@ -404,12 +425,14 @@ impl SupervisionHost {
         assessment: Box<dyn ConditionAssessmentPort + Send>,
         checks: Box<dyn RequiredCheckPort + Send>,
     ) -> Self {
+        let permission = PermissionRuntime::new(store.clone(), connections.clone());
         Self::with_config(
             store,
             config,
             connections,
             assessment,
             CheckMode::Injected(checks),
+            permission,
         )
     }
 
@@ -421,6 +444,21 @@ impl SupervisionHost {
     /// Shared configuration registry.
     pub fn config(&self) -> ConfigStore {
         self.config.clone()
+    }
+
+    /// Shared dynamic permission evaluator installed into H1.
+    pub fn permission(&self) -> &PermissionRuntime {
+        &self.permission
+    }
+
+    /// Whether any project has a verified permission profile and consent.
+    pub fn permission_available(&self) -> bool {
+        self.permission.available()
+    }
+
+    /// Whether one project has a verified permission profile and consent.
+    pub fn permission_available_for(&self, project: ProjectId) -> bool {
+        self.permission.available_for(project)
     }
 
     /// Mints a host-owned human confirmation. Only the trusted command layer
@@ -465,6 +503,7 @@ impl SupervisionHost {
     pub fn restore(&self, projects: &[ProjectId]) {
         for project in projects {
             self.config.restore(&self.store, *project);
+            self.permission.refresh(&self.config, *project);
             let records = self
                 .store
                 .lock()
@@ -636,6 +675,7 @@ impl SupervisionHost {
         config.set_profile(configured.profile.clone(), false);
         self.config.set(project, config);
         self.config.persist(&self.store, project)?;
+        self.permission.refresh(&self.config, project);
         Ok(self.purpose_status(project, purpose))
     }
 
@@ -675,6 +715,7 @@ impl SupervisionHost {
         config.set_consent(consent);
         self.config.set(project, config);
         self.config.persist(&self.store, project)?;
+        self.permission.refresh(&self.config, project);
         Ok(self.purpose_status(project, purpose))
     }
 
@@ -698,6 +739,7 @@ impl SupervisionHost {
         config.set_profile(existing.profile, verified);
         self.config.set(project, config);
         self.config.persist(&self.store, project)?;
+        self.permission.refresh(&self.config, project);
         Ok(self.purpose_status(project, purpose))
     }
 
@@ -727,6 +769,7 @@ impl SupervisionHost {
         config.set_consent(revoked);
         self.config.set(project, config);
         self.config.persist(&self.store, project)?;
+        self.permission.refresh(&self.config, project);
         Ok(self.purpose_status(project, purpose))
     }
 
@@ -955,6 +998,7 @@ impl SupervisionHost {
             if result.duplicate() {
                 return self.view(project, supervision);
             }
+            let budget_changed = matches!(change, SupervisionChange::Budget { .. });
             match change {
                 SupervisionChange::Conditions(set) => active_plan.set_conditions(set),
                 SupervisionChange::Profile(binding) => {
@@ -992,6 +1036,9 @@ impl SupervisionHost {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert((project, supervision), active_plan.clone());
+            if budget_changed {
+                self.permission.invalidate_supervision(project, supervision);
+            }
         }
         self.set_active(project, supervision, false);
         self.view(project, supervision)

@@ -1415,6 +1415,7 @@ dependencies = [
  "herness-assessment",
  "herness-core",
  "herness-desktop",
+ "herness-engine-pi",
  "herness-store",
  "herness-supervision",
  "serde_json",

@@ -182,6 +182,10 @@ pub fn frontend_state(
         .map_err(|_| "the selected project is unavailable".to_owned())?;
     let selected =
         selected.filter(|project| projects.iter().any(|view| view.project_id() == *project));
+    let automatic_mode_available = selected.map_or_else(
+        || host.permission_available(),
+        |project| host.permission_available_for(project),
+    );
     let reconciliation = state
         .reconciliation
         .lock()
@@ -193,8 +197,12 @@ pub fn frontend_state(
         connections,
         permission_mode: policy.mode(),
         policy_version: policy.version().get(),
-        automatic_mode_available: false,
-        automatic_mode_reason: "no verified permission-evaluation profile is configured; automatic decisions are unavailable",
+        automatic_mode_available,
+        automatic_mode_reason: if automatic_mode_available {
+            "a verified permission-evaluation profile and consent are configured"
+        } else {
+            "no verified permission-evaluation profile is configured; automatic decisions are unavailable"
+        },
         reconciliation,
     })
 }
