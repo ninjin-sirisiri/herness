@@ -1617,9 +1617,9 @@ fn host_state_format_one_is_readable_and_unknown_formats_are_rejected() {
     store
         .save_host_state(
             "herness.runtime.host-state",
-            br#"{"format":3,"projects":{}}"#,
+            br#"{"format":4,"projects":{}}"#,
         )
-        .expect("save format 3");
+        .expect("save unknown format");
     drop(store);
     let admin = ConnectionAdmin::new();
     let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(FakeCredentials::new(

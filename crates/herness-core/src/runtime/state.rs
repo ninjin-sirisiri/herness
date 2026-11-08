@@ -34,10 +34,13 @@ pub(crate) const HOST_STATE_KEY: &str = "herness.runtime.host-state";
 /// Current format of the host-state JSON document.
 ///
 /// Format 2 adds non-secret connection settings and the last shutdown record.
-/// Format 1 documents are still read; they contain neither field.
-pub(crate) const HOST_STATE_FORMAT: u32 = 2;
+/// Format 3 is the first H2-era format and is the only format this build
+/// writes. It currently carries the same fields as format 2; a future format-3
+/// field must also reject the field in older formats explicitly.
+/// Format 1 documents are still read; they contain neither format-2 field.
+pub(crate) const HOST_STATE_FORMAT: u32 = 3;
 /// Formats this build can read.
-const SUPPORTED_HOST_STATE_FORMATS: [u32; 2] = [1, 2];
+const SUPPORTED_HOST_STATE_FORMATS: [u32; 3] = [1, 2, 3];
 
 /// Whole host-owned runtime state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,10 @@ impl HostState {
                 detail: "host-state format 1 must not contain format 2 fields".to_owned(),
             });
         }
+        // Format 3 currently adds no fields. It is still a distinct write
+        // version so an older application rejects it instead of reinterpreting
+        // the document. `deny_unknown_fields` keeps format 1/2 documents from
+        // carrying fields introduced by later formats.
         Ok(state)
     }
 

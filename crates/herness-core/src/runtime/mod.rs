@@ -10,6 +10,8 @@
 
 pub mod error;
 mod host;
+#[cfg(feature = "test-support")]
+pub mod host_state_test_support;
 pub mod reconcile;
 pub mod shutdown;
 mod state;

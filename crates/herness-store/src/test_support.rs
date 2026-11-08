@@ -56,7 +56,9 @@ pub enum MigrationFault {
 /// Opens a store migrated only to `version`.
 ///
 /// Used to build a pre-existing database at an older schema version before
-/// testing a failing migration.
+/// testing a failing migration. The returned store's write and read paths
+/// expect the latest schema, so old-version fixtures must be inserted through a
+/// raw SQLite connection, not through `Store` methods.
 pub fn open_at_schema_version(config: StoreConfig, version: u32) -> Result<Store, StoreError> {
     Store::open_at_version(config, version, None)
 }

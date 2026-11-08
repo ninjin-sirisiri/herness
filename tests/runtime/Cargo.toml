@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-herness-core = { path = "../../crates/herness-core" }
+herness-core = { path = "../../crates/herness-core", features = ["test-support"] }
 
 [dev-dependencies]
 base64 = "0.22.1"

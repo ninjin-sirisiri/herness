@@ -19,7 +19,7 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
   - `RunSubject`: projectに属するagent/session/run。operation IDはrun subjectだけに付けられ、同じprojectに属する必要がある。
   - `HostActivitySubject`: projectに束縛した `activityKind` と `activityId`。runを作らず、operation IDを持たない。
 - version 2に旧 `agentId`/`sessionId`/`runId` を混在させた入力、version 1に `subject` を混在させた入力は拒否する。
-- storeのhost activity永続化はTask 2で追加する。Task 1のschema 3 storeでhost activity eventをrun checkpointやoperation resultへ入れようとした場合は、架空のrun IDを作らず `UnsupportedPortFeature { feature: host_activity_events }` または構造化event errorで拒否する。
+- Task 2でstoreのhost activity永続化を追加した。run checkpointやoperation resultは引き続きrun専用で、host activity eventを入れようとした場合は架空のrun IDを作らず `UnsupportedPortFeature { feature: host_activity_events }` または構造化event errorで拒否する。
 
 ### Inputと継続
 
@@ -42,6 +42,21 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 - TypeSafe/Jev System Oneは `Provider::TypeSafe` + API key + `EndpointClass::TypeSafeSystemOne` + `AssessmentOnly`。OpenAI Decisionsは `Provider::OpenAi` + API key + `EndpointClass::OpenAiDecisions` + `AssessmentOnly` で、ChatGPTログインを流用しない。
 - 通常のOpenAI・Anthropic・OpenAI互換接続はagent実行connectionとして扱い、判定にも利用できる。
 
+## Task 2で追加した保存境界
+
+### DB schema 4〜6
+
+- `0004_event_subjects`: `events`をrebuildし、`subject_type`（`run` / `host_activity`）とactivity kind/ID列を追加した。run列はnullableになり、host activity eventは架空のagent/session/run IDを持たない。既存schema 3の行はcontract version・ID・sequence・kind・時刻・payloadをそのまま保持し、`project_sequences`の連番空間はrunとhost activityで共有する。既存indexは再作成し、activity用indexを追加する。
+- `0005_model_requests`: 要求ID・attempt ID・project・subject・connection・用途・stop/deadline制御・intent時刻・observationを持つ。attempt IDを一意キーとし、同一intentの再記録は既存行を返す。同一attemptの異なるintent、終端結果の上書き、intentなしの観測は拒否する。usageと実model IDは`ModelRequestObservation`のJSONとして保存し、unknownを0へ変換しない。
+- `0006_supervised_state`: project + keyごとのrevision付きstate row。`None`は作成、`Some(revision)`は比較更新を表し、stale revisionは状態もeventも書かずに拒否する。
+- 各書込みは`TransactionBehavior::Immediate`の単一transactionで行い、commit後の`CommitReceipt`だけを返す。receiptのeventは別connectionからも確認できる。読み取りはSQLのみで、engine送信・実行・再開を行わない。
+- migrationはschema 3からのみ昇順に適用する。途中のfaultはtransaction全体をrollbackし、旧schema version・旧events表・既存行を保持する。未知の新しいschemaはwrite前に拒否し、古いtargetによるdowngradeも拒否する。設定されたapp-data配下のDB以外は開かない。
+
+### host-state format
+
+- 読込みはformat 1・2・3。新規書込みはformat 3のみ。format 1がformat 2の`connections`/`shutdown`を持つ場合は拒否し、未知formatと未知fieldは解釈しない。
+- format 2の全record（projects・agents・runs・approvals・connections・shutdown）をformat 3へ移行してもJSON値は保持される。format 3は現在format 2と同じfieldを持ち、将来のformat 3固有fieldは古いformatで明示的に拒否する。
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -51,14 +66,33 @@ cargo test -p herness-core --locked
 cargo check --workspace --locked
 ```
 
+Task 2の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-store --locked
+cargo test -p herness-runtime-tests --test store --locked
+cargo check --workspace --locked
+```
+
+`tests/runtime/tests/store.rs`は次を確認する。
+
+- schema 3のv1 event fixture（contract version 1と2、ID、sequence、operation ID、kind、時刻、payload、件数）をmigration後もSQL値と`Event::from_v1`の両方で保持する。checkpoint、operation、host-state row、`project_sequences`も保持し、migration後の新eventは続きのsequenceを使う。
+- host activity eventをrun eventと同じproject sequenceへ保存し、SQL上でagent/session/run列がNULL、activity kind/IDだけが入ることを確認する。別connectionのreplayと再open後の追記も確認する。
+- schema 4のevents rebuild途中（statement 1と4）とschema 5のfaultで、schema 3・旧columns・旧rows・indexがrollbackされ、その後の正常openで移行できることを確認する。
+- 新しいschemaを古いtargetで開くdowngradeが拒否され、既存rowが残ることを確認する。
+- supervised stateの作成・更新・stale revision拒否・cross-project event拒否と、commit後に別connectionからstate/eventが見えることを確認する。
+- request intentの冪等再記録、同一attemptのconflict、send-started→terminalの遷移、terminal上書き拒否、intentなし観測拒否、unknown usageとknown zeroの区別、実model ID、host activity subjectを確認する。
+- host-state format 1/2→3で全recordが保持され、format 1の不正fieldと未知formatが拒否されることを確認する。
+
 追加の確認:
 
 ```sh
 cargo check --workspace --all-targets --locked
-cargo test -p herness-store --locked
 cargo test -p herness-runtime-tests --test contract_smoke --locked
-cargo test -p herness-runtime-tests --test store --locked
+cargo test -p herness-runtime-tests --test host --locked
+cargo test -p herness-runtime-tests --test desktop --locked
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 - `cargo test -p herness-core --locked` の `tests/contracts.rs` は、version 2 round-trip、version 1互換decodeと旧envelopeへのround-trip、未知version拒否、subject混在拒否、run/activity subjectのproject束縛、operation IDの所属、`RunState::Idle` と入力完結の区別、usage欠落がunknownであること、assessment-only接続のagent実行拒否を確認する。

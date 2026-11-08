@@ -8,7 +8,7 @@
 use std::fmt;
 
 use herness_core::{
-    ArgumentViolation, CONTRACT_VERSION, CoreError, IdKind, OperationId, ProjectId,
+    ArgumentViolation, AttemptId, CONTRACT_VERSION, CoreError, IdKind, OperationId, ProjectId,
     StoreFailureKind,
 };
 
@@ -80,8 +80,8 @@ pub enum StoreError {
     },
     /// A host-activity event was offered to a run-only storage path.
     ///
-    /// Schema 3 has no representation for a subject without a run. The event
-    /// must not be dropped or given a fabricated run identifier.
+    /// A checkpoint or operation result belongs to one run. The event must not
+    /// be dropped or given a fabricated run identifier.
     UnsupportedHostActivityEvent,
     /// A checkpoint commit repeats an operation id that is already recorded.
     DuplicateOperation {
@@ -107,6 +107,33 @@ pub enum StoreError {
         /// Operation id whose stored result differs.
         operation: OperationId,
     },
+    /// A request attempt is already recorded with a different intent.
+    RequestIntentConflict {
+        /// Attempt whose stored intent differs.
+        attempt: AttemptId,
+    },
+    /// A terminal observation is already recorded, or the transition is not
+    /// allowed.
+    RequestObservationConflict {
+        /// Attempt whose stored observation differs.
+        attempt: AttemptId,
+    },
+    /// An observation was supplied for an attempt that was never persisted.
+    UnknownRequestAttempt {
+        /// Attempt with no intent row.
+        attempt: AttemptId,
+    },
+    /// A supervised-state update used an outdated or missing revision.
+    StaleRevision {
+        /// Host-owned state key.
+        key: String,
+        /// Revision the caller expected.
+        expected: Option<u64>,
+        /// Revision currently stored.
+        found: Option<u64>,
+    },
+    /// A supervised-state key was empty.
+    InvalidStateKey,
     /// Stored data failed an integrity check.
     CorruptData {
         /// Sanitized description of the failed check.
@@ -182,7 +209,7 @@ impl fmt::Display for StoreError {
                 "stored event contract version {found} is not supported by contract version {CONTRACT_VERSION}"
             ),
             Self::UnsupportedHostActivityEvent => {
-                f.write_str("host activity events require a store schema with activity subjects")
+                f.write_str("host activity events are not allowed on this run-only path")
             }
             Self::DuplicateOperation { operation } => {
                 write!(f, "operation {operation} is already recorded")
@@ -190,6 +217,30 @@ impl fmt::Display for StoreError {
             Self::UnknownOperation { operation } => {
                 write!(f, "operation {operation} has no recorded intent")
             }
+            Self::RequestIntentConflict { attempt } => {
+                write!(
+                    f,
+                    "request attempt {attempt} is already recorded with another intent"
+                )
+            }
+            Self::RequestObservationConflict { attempt } => {
+                write!(
+                    f,
+                    "request attempt {attempt} already has a conflicting observation"
+                )
+            }
+            Self::UnknownRequestAttempt { attempt } => {
+                write!(f, "request attempt {attempt} has no recorded intent")
+            }
+            Self::StaleRevision {
+                key,
+                expected,
+                found,
+            } => write!(
+                f,
+                "supervised state {key:?} revision is stale: expected {expected:?}, found {found:?}"
+            ),
+            Self::InvalidStateKey => f.write_str("supervised state key must not be empty"),
             Self::CrossProjectReference { expected, found } => write!(
                 f,
                 "history cursor belongs to project {found}, not the expected project {expected}"
@@ -245,7 +296,10 @@ impl From<StoreError> for CoreError {
             | StoreError::UnsupportedCheckpointFormat { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::UnsupportedVersion,
             },
-            StoreError::OperationResultConflict { .. } => CoreError::StoreUnavailable {
+            StoreError::OperationResultConflict { .. }
+            | StoreError::RequestIntentConflict { .. }
+            | StoreError::RequestObservationConflict { .. }
+            | StoreError::StaleRevision { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }
@@ -256,6 +310,8 @@ impl From<StoreError> for CoreError {
             StoreError::InvalidConfig { .. }
             | StoreError::MigrationFailed { .. }
             | StoreError::UnknownOperation { .. }
+            | StoreError::UnknownRequestAttempt { .. }
+            | StoreError::InvalidStateKey
             | StoreError::Database { .. }
             | StoreError::Io { .. }
             | StoreError::InjectedFault { .. } => CoreError::StoreUnavailable {

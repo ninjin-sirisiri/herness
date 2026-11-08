@@ -13,12 +13,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use herness_core::{
-    AbsolutePath, Checkpoint, CheckpointCommit, CheckpointFormatVersion, CheckpointPayload,
-    CommitReceipt, ContractVersion, CoreError, Event, EventDraft, EventKind, EventPayload,
-    EventSubject, FrozenOperation, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery,
-    OperationEvidence, OperationId, OperationIntent, OperationOutcome, OperationRecord,
-    OperationResult, PermissionMode, PolicyVersion, ProjectId, RunId, RunSubject, RuntimeStore,
-    StorePort, Timestamp, ToolArguments, ToolName,
+    AbsolutePath, AttemptId, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
+    CheckpointPayload, CommitReceipt, ConnectionId, ContractVersion, CoreError, Event, EventDraft,
+    EventKind, EventPayload, EventSubject, FrozenOperation, HistoryCursor, HistoryLimit,
+    HistoryPage, HistoryQuery, HostActivitySubject, ModelRequestObservation, OperationEvidence,
+    OperationId, OperationIntent, OperationOutcome, OperationRecord, OperationResult,
+    PermissionMode, PolicyVersion, ProjectId, RequestGateIntent, RequestId, RequestOutcome,
+    RequestPurpose, RunId, RunSubject, RuntimeStore, StopDeadlineControl, StorePort, Timestamp,
+    ToolArguments, ToolName,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -27,12 +29,17 @@ use crate::error::StoreError;
 use crate::fault::{CommitPoint, FaultPlan, ResultPoint};
 use crate::migrations;
 
-const EVENT_COLUMNS: &str = "contract_version, agent_id, session_id, run_id, operation_id, \
-                              sequence, kind, occurred_at, payload";
+const EVENT_COLUMNS: &str = "contract_version, subject_type, agent_id, session_id, run_id, \
+                              activity_kind, activity_id, operation_id, sequence, kind, \
+                              occurred_at, payload";
 
 const OPERATION_COLUMNS: &str = "operation_id, project_id, run_id, tool, arguments, cwd, \
                                  policy_version, permission_mode, recorded_at, outcome, evidence, \
                                  resolved_at";
+
+const REQUEST_COLUMNS: &str = "attempt_id, request_id, project_id, subject_type, agent_id, \
+                               session_id, run_id, activity_kind, activity_id, connection_id, \
+                               purpose, control, recorded_at, observation, observed_at";
 
 /// A loaded checkpoint plus the project sequence observed at commit time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +65,59 @@ impl CheckpointRecord {
     /// Consumes the record and returns the checkpoint.
     pub fn into_checkpoint(self) -> Checkpoint {
         self.checkpoint
+    }
+}
+
+/// A persisted model-request intent with its optional observation.
+///
+/// The intent row is durable before a request may be sent. A repeated identical
+/// record returns this value again instead of inserting or sending twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequestRecord {
+    intent: RequestGateIntent,
+    recorded_at: Timestamp,
+    observation: Option<ModelRequestObservation>,
+    observed_at: Option<Timestamp>,
+}
+
+impl ModelRequestRecord {
+    /// Recorded request intent.
+    pub const fn intent(&self) -> &RequestGateIntent {
+        &self.intent
+    }
+
+    /// When the intent was first persisted.
+    pub const fn recorded_at(&self) -> Timestamp {
+        self.recorded_at
+    }
+
+    /// Send-started or terminal observation, when one exists.
+    pub const fn observation(&self) -> Option<&ModelRequestObservation> {
+        self.observation.as_ref()
+    }
+
+    /// When the current observation was first persisted.
+    pub const fn observed_at(&self) -> Option<Timestamp> {
+        self.observed_at
+    }
+}
+
+/// One generic revision-checked state value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisedStateRecord {
+    revision: u64,
+    value: Vec<u8>,
+}
+
+impl SupervisedStateRecord {
+    /// Revision the value was committed at. Revisions start at one.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Opaque state bytes owned by the caller.
+    pub fn value(&self) -> &[u8] {
+        &self.value
     }
 }
 
@@ -172,7 +232,7 @@ impl Store {
             }
         }
 
-        let (events, next_sequence) = append_events(&transaction, &project, commit.events())?;
+        let (events, next_sequence) = append_event_drafts(&transaction, &project, commit.events())?;
 
         let max_sequence = events.last().map_or(0, Event::sequence);
         let last_sequence = if events.is_empty() {
@@ -390,7 +450,7 @@ impl Store {
             });
         }
 
-        let (events, _) = append_events(&transaction, &intent.project_id(), &events)?;
+        let (events, _) = append_event_drafts(&transaction, &intent.project_id(), &events)?;
         let max_sequence = events.last().map_or(0, Event::sequence);
         if let Some((key, value)) = state {
             write_host_state(&transaction, key, value)?;
@@ -503,7 +563,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         write_host_state(&transaction, key, value)?;
         let (events, _) = match project {
-            Some(project) => append_events(&transaction, &project, &events)?,
+            Some(project) => append_event_drafts(&transaction, &project, &events)?,
             None => (Vec::new(), 0),
         };
         let max_sequence = events.last().map_or(0, Event::sequence);
@@ -519,6 +579,285 @@ impl Store {
         commit: CheckpointCommit,
     ) -> Result<CommitReceipt, StoreError> {
         self.commit_with_state(Some((key, value)), commit)
+    }
+
+    /// Appends events without a checkpoint or host-state write.
+    ///
+    /// Run and host-activity events share one project sequence. An empty list is
+    /// a no-op. The returned receipt contains only committed rows.
+    pub fn append_events(&mut self, events: Vec<EventDraft>) -> Result<CommitReceipt, StoreError> {
+        let Some(project) = events.first().map(EventDraft::project_id) else {
+            return Ok(CommitReceipt::new(Vec::new(), 0));
+        };
+        ensure_same_project(&events, project)?;
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (events, _) = append_event_drafts(&transaction, &project, &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(CommitReceipt::new(events, max_sequence))
+    }
+
+    /// Loads one persisted model-request attempt.
+    pub fn model_request(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<Option<ModelRequestRecord>, StoreError> {
+        load_model_request_record(&self.conn, &attempt.to_string())
+    }
+
+    /// Loads every recorded attempt of one request in stable order.
+    pub fn model_request_attempts(
+        &self,
+        request: &RequestId,
+    ) -> Result<Vec<ModelRequestRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM model_requests
+             WHERE request_id = ?1
+             ORDER BY recorded_at ASC, attempt_id ASC"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query([request.to_string()])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(model_request_record_from_row(row)?);
+        }
+        Ok(records)
+    }
+
+    /// Persists one request intent before any bytes may be sent.
+    ///
+    /// Repeating an identical attempt is idempotent and returns the stored
+    /// record. A different intent for an existing attempt is rejected, so a
+    /// duplicate request cannot cause a second send.
+    pub fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<ModelRequestRecord, StoreError> {
+        self.record_model_request_with_events(intent, recorded_at, Vec::new())
+            .map(|(record, _)| record)
+    }
+
+    /// Persists a request intent and notification events in one transaction.
+    pub fn record_model_request_with_events(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+        events: Vec<EventDraft>,
+    ) -> Result<(ModelRequestRecord, CommitReceipt), StoreError> {
+        let project = intent.subject().project_id();
+        ensure_same_project(&events, project)?;
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = intent.attempt_id();
+        if let Some(existing) = load_model_request_record(&transaction, &attempt.to_string())? {
+            if existing.intent == intent {
+                return Ok((existing, CommitReceipt::new(Vec::new(), 0)));
+            }
+            return Err(StoreError::RequestIntentConflict { attempt });
+        }
+
+        insert_model_request(&transaction, &intent, recorded_at)?;
+        let (events, _) = append_event_drafts(&transaction, &project, &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        transaction.commit().map_err(StoreError::database)?;
+
+        Ok((
+            ModelRequestRecord {
+                intent,
+                recorded_at,
+                observation: None,
+                observed_at: None,
+            },
+            CommitReceipt::new(events, max_sequence),
+        ))
+    }
+
+    /// Records a send-started or terminal observation for a persisted intent.
+    ///
+    /// The intent must already exist. Repeating the identical observation is
+    /// idempotent. A send-started observation may advance once to a terminal
+    /// outcome; a terminal result is never overwritten.
+    pub fn record_model_request_observation(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<ModelRequestRecord, StoreError> {
+        self.record_model_request_observation_with_events(observation, observed_at, Vec::new())
+            .map(|(record, _)| record)
+    }
+
+    /// Records a request observation and notification events atomically.
+    pub fn record_model_request_observation_with_events(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+        events: Vec<EventDraft>,
+    ) -> Result<(ModelRequestRecord, CommitReceipt), StoreError> {
+        let attempt = observation.attempt_id();
+        let project = attempt.project_id();
+        ensure_same_project(&events, project)?;
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = load_model_request_record(&transaction, &attempt.to_string())?
+        else {
+            return Err(StoreError::UnknownRequestAttempt { attempt });
+        };
+        if observation.request_id() != record.intent.request_id() {
+            return Err(StoreError::RequestObservationConflict { attempt });
+        }
+        if let Some(existing) = &record.observation {
+            if existing == &observation {
+                return Ok((record, CommitReceipt::new(Vec::new(), 0)));
+            }
+            let may_advance = existing.outcome() == RequestOutcome::SendStarted
+                && matches!(
+                    observation.outcome(),
+                    RequestOutcome::Completed
+                        | RequestOutcome::Cancelled
+                        | RequestOutcome::SendResultUnknown
+                );
+            if !may_advance {
+                return Err(StoreError::RequestObservationConflict { attempt });
+            }
+        }
+
+        let changed = transaction.execute(
+            "UPDATE model_requests SET observation = ?2, observed_at = ?3
+             WHERE attempt_id = ?1",
+            params![
+                attempt.to_string(),
+                serde_json::to_string(&observation).map_err(StoreError::codec)?,
+                i64::try_from(observed_at.as_unix_millis()).map_err(|_| StoreError::corrupt(
+                    "observation timestamp does not fit in sqlite"
+                ))?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::RequestObservationConflict { attempt });
+        }
+
+        let (events, _) = append_event_drafts(&transaction, &project, &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        transaction.commit().map_err(StoreError::database)?;
+
+        record.observation = Some(observation);
+        record.observed_at = Some(observed_at);
+        Ok((record, CommitReceipt::new(events, max_sequence)))
+    }
+
+    /// Loads one generic supervised-state value.
+    pub fn supervised_state(
+        &self,
+        project: &ProjectId,
+        key: &str,
+    ) -> Result<Option<SupervisedStateRecord>, StoreError> {
+        validate_state_key(key)?;
+        load_supervised_state(&self.conn, project, key)
+    }
+
+    /// Compares the stored revision and writes the new value atomically.
+    ///
+    /// `expected_revision` is `None` for creation and `Some(revision)` for an
+    /// update. A missing or stale revision is rejected; the state and any
+    /// events stay unchanged. Events share the project sequence and are only
+    /// returned after the transaction commits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_and_swap_supervised_state(
+        &mut self,
+        project: &ProjectId,
+        key: &str,
+        expected_revision: Option<u64>,
+        value: &[u8],
+        updated_at: Timestamp,
+        events: Vec<EventDraft>,
+    ) -> Result<(SupervisedStateRecord, CommitReceipt), StoreError> {
+        validate_state_key(key)?;
+        ensure_same_project(&events, *project)?;
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_supervised_state_revision(&transaction, project, key)?;
+
+        let matches = match (expected_revision, current) {
+            (None, None) => true,
+            (Some(expected), Some(found)) => expected == found,
+            _ => false,
+        };
+        if !matches {
+            return Err(StoreError::StaleRevision {
+                key: key.to_owned(),
+                expected: expected_revision,
+                found: current,
+            });
+        }
+
+        let revision = current
+            .map(|found| {
+                found
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::corrupt("supervised state revision overflow"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+
+        let changed = match current {
+            None => transaction.execute(
+                "INSERT INTO supervised_state (project_id, state_key, revision, payload, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    project.to_string(),
+                    key,
+                    sequence_to_sql(revision)?,
+                    value,
+                    i64::try_from(updated_at.as_unix_millis()).map_err(|_| {
+                        StoreError::corrupt("supervised state timestamp does not fit in sqlite")
+                    })?,
+                ],
+            )?,
+            Some(expected) => transaction.execute(
+                "UPDATE supervised_state
+                 SET revision = ?3, payload = ?4, updated_at = ?5
+                 WHERE project_id = ?1 AND state_key = ?2 AND revision = ?6",
+                params![
+                    project.to_string(),
+                    key,
+                    sequence_to_sql(revision)?,
+                    value,
+                    i64::try_from(updated_at.as_unix_millis()).map_err(|_| {
+                        StoreError::corrupt("supervised state timestamp does not fit in sqlite")
+                    })?,
+                    sequence_to_sql(expected)?,
+                ],
+            )?,
+        };
+        if changed != 1 {
+            return Err(StoreError::StaleRevision {
+                key: key.to_owned(),
+                expected: expected_revision,
+                found: current,
+            });
+        }
+
+        let (events, _) = append_event_drafts(&transaction, project, &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        transaction.commit().map_err(StoreError::database)?;
+
+        Ok((
+            SupervisedStateRecord {
+                revision,
+                value: value.to_vec(),
+            },
+            CommitReceipt::new(events, max_sequence),
+        ))
     }
 
     fn history_page(&self, query: HistoryQuery) -> Result<HistoryPage, StoreError> {
@@ -770,7 +1109,7 @@ fn sequence_to_sql(sequence: u64) -> Result<i64, StoreError> {
 /// Assigns project sequences to drafts, inserts them, and advances the project
 /// sequence counter. Returns the committed events and the sequence observed
 /// before the first draft.
-fn append_events(
+fn append_event_drafts(
     transaction: &Transaction<'_>,
     project: &ProjectId,
     drafts: &[EventDraft],
@@ -778,9 +1117,6 @@ fn append_events(
     let next_sequence = next_sequence(transaction, project)?;
     let mut events = Vec::with_capacity(drafts.len());
     for (index, draft) in drafts.iter().enumerate() {
-        let Some(run_subject) = draft.run_subject() else {
-            return Err(StoreError::UnsupportedHostActivityEvent);
-        };
         let offset =
             u64::try_from(index).map_err(|_| StoreError::corrupt("event index overflow"))?;
         let sequence = next_sequence
@@ -790,27 +1126,28 @@ fn append_events(
             .clone()
             .into_event(sequence)
             .map_err(|error| StoreError::corrupt(format!("event draft: {error}")))?;
-        debug_assert_eq!(event.run_subject(), Some(run_subject));
         events.push(event);
     }
 
     if !events.is_empty() {
         let mut statement = transaction.prepare(
-            "INSERT INTO events (project_id, sequence, contract_version, agent_id, session_id,
-                                 run_id, operation_id, kind, occurred_at, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO events (project_id, sequence, contract_version, subject_type, agent_id,
+                                 session_id, run_id, activity_kind, activity_id, operation_id,
+                                 kind, occurred_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         for event in &events {
-            let run = event
-                .run_subject()
-                .ok_or(StoreError::UnsupportedHostActivityEvent)?;
+            let subject = SubjectColumns::from_subject(event.subject());
             statement.execute(params![
                 event.project_id().to_string(),
                 sequence_to_sql(event.sequence())?,
                 i64::from(event.contract_version().get()),
-                run.agent_id().to_string(),
-                run.session_id().to_string(),
-                run.run_id().to_string(),
+                subject.subject_type,
+                subject.agent_id,
+                subject.session_id,
+                subject.run_id,
+                subject.activity_kind,
+                subject.activity_id,
                 event.operation_id().map(|operation| operation.to_string()),
                 event.kind().as_str(),
                 i64::try_from(event.occurred_at().as_unix_millis())
@@ -960,22 +1297,26 @@ fn operation_record_from_row(row: &rusqlite::Row<'_>) -> Result<OperationRecord,
 
 fn event_from_row(row: &rusqlite::Row<'_>, project: ProjectId) -> Result<Event, StoreError> {
     let contract_version: i64 = row.get(0)?;
-    let agent_text: String = row.get(1)?;
-    let session_text: String = row.get(2)?;
-    let run_text: String = row.get(3)?;
-    let operation_text: Option<String> = row.get(4)?;
-    let sequence: i64 = row.get(5)?;
-    let kind_text: String = row.get(6)?;
-    let occurred_at: i64 = row.get(7)?;
-    let payload_text: String = row.get(8)?;
+    let subject_type: String = row.get(1)?;
+    let subject = subject_from_columns(
+        project,
+        &subject_type,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    )?;
+    let operation_text: Option<String> = row.get(7)?;
+    let sequence: i64 = row.get(8)?;
+    let kind_text: String = row.get(9)?;
+    let occurred_at: i64 = row.get(10)?;
+    let payload_text: String = row.get(11)?;
 
     let found = u32::try_from(contract_version)
         .map_err(|_| StoreError::corrupt("event contract version is out of range"))?;
     let contract_version = ContractVersion::try_from(found)
         .map_err(|_| StoreError::UnsupportedContractVersion { found })?;
-    let agent = parse_core(&agent_text, "event agent id")?;
-    let session = parse_core(&session_text, "event session id")?;
-    let run = parse_core(&run_text, "event run id")?;
     let operation = match operation_text {
         Some(text) => Some(parse_core(&text, "event operation id")?),
         None => None,
@@ -988,11 +1329,16 @@ fn event_from_row(row: &rusqlite::Row<'_>, project: ProjectId) -> Result<Event, 
     let payload: EventPayload = serde_json::from_str(&payload_text).map_err(StoreError::codec)?;
 
     if contract_version == ContractVersion::V1 {
+        let Some(run) = subject.run() else {
+            return Err(StoreError::corrupt(
+                "version 1 event row carries a host activity subject",
+            ));
+        };
         Event::from_v1(
-            project,
-            agent,
-            session,
-            run,
+            run.project_id(),
+            run.agent_id(),
+            run.session_id(),
+            run.run_id(),
             operation,
             sequence,
             kind,
@@ -1001,18 +1347,291 @@ fn event_from_row(row: &rusqlite::Row<'_>, project: ProjectId) -> Result<Event, 
         )
         .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
     } else {
-        let subject = RunSubject::new(project, agent, session, run)
-            .map_err(|error| StoreError::corrupt(format!("event row subject: {error}")))?;
-        Event::new(
-            EventSubject::Run(subject),
-            operation,
-            sequence,
-            kind,
-            occurred_at,
-            payload,
-        )
-        .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
+        Event::new(subject, operation, sequence, kind, occurred_at, payload)
+            .map_err(|error| StoreError::corrupt(format!("event row: {error}")))
     }
+}
+
+/// Normalized subject columns shared by events and request intents.
+struct SubjectColumns {
+    subject_type: &'static str,
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    activity_kind: Option<String>,
+    activity_id: Option<String>,
+}
+
+impl SubjectColumns {
+    fn from_subject(subject: &EventSubject) -> Self {
+        match subject {
+            EventSubject::Run(run) => Self {
+                subject_type: "run",
+                agent_id: Some(run.agent_id().to_string()),
+                session_id: Some(run.session_id().to_string()),
+                run_id: Some(run.run_id().to_string()),
+                activity_kind: None,
+                activity_id: None,
+            },
+            EventSubject::HostActivity(activity) => Self {
+                subject_type: "host_activity",
+                agent_id: None,
+                session_id: None,
+                run_id: None,
+                activity_kind: Some(activity.activity_kind().to_string()),
+                activity_id: Some(activity.activity_id().to_string()),
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subject_from_columns(
+    project: ProjectId,
+    subject_type: &str,
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    activity_kind: Option<String>,
+    activity_id: Option<String>,
+) -> Result<EventSubject, StoreError> {
+    match subject_type {
+        "run" => {
+            if activity_kind.is_some() || activity_id.is_some() {
+                return Err(StoreError::corrupt(
+                    "run subject row carries host activity columns",
+                ));
+            }
+            let agent_text =
+                agent_id.ok_or_else(|| StoreError::corrupt("run subject row has no agent id"))?;
+            let session_text = session_id
+                .ok_or_else(|| StoreError::corrupt("run subject row has no session id"))?;
+            let run_text =
+                run_id.ok_or_else(|| StoreError::corrupt("run subject row has no run id"))?;
+            let agent = parse_core(&agent_text, "run subject agent id")?;
+            let session = parse_core(&session_text, "run subject session id")?;
+            let run = parse_core(&run_text, "run subject run id")?;
+            let subject = RunSubject::new(project, agent, session, run)
+                .map_err(|error| StoreError::corrupt(format!("run subject row: {error}")))?;
+            Ok(EventSubject::Run(subject))
+        }
+        "host_activity" => {
+            if agent_id.is_some() || session_id.is_some() || run_id.is_some() {
+                return Err(StoreError::corrupt(
+                    "host activity subject row carries run identifier columns",
+                ));
+            }
+            let kind_text = activity_kind
+                .ok_or_else(|| StoreError::corrupt("host activity row has no activity kind"))?;
+            let id_text = activity_id
+                .ok_or_else(|| StoreError::corrupt("host activity row has no activity id"))?;
+            let kind = EventKind::new(&kind_text)
+                .map_err(|error| StoreError::corrupt(format!("activity kind: {error}")))?;
+            let id = parse_core(&id_text, "host activity id")?;
+            let subject = HostActivitySubject::new(project, kind, id).map_err(|error| {
+                StoreError::corrupt(format!("host activity subject row: {error}"))
+            })?;
+            Ok(EventSubject::HostActivity(subject))
+        }
+        other => Err(StoreError::corrupt(format!(
+            "unknown subject type {other:?}"
+        ))),
+    }
+}
+
+fn ensure_same_project(events: &[EventDraft], project: ProjectId) -> Result<(), StoreError> {
+    if let Some(event) = events.iter().find(|event| event.project_id() != project) {
+        return Err(StoreError::CrossProjectReference {
+            expected: project,
+            found: event.project_id(),
+        });
+    }
+    Ok(())
+}
+
+fn insert_model_request(
+    transaction: &Transaction<'_>,
+    intent: &RequestGateIntent,
+    recorded_at: Timestamp,
+) -> Result<(), StoreError> {
+    let subject = SubjectColumns::from_subject(intent.subject());
+    transaction.execute(
+        "INSERT INTO model_requests (attempt_id, request_id, project_id, subject_type, agent_id,
+                                     session_id, run_id, activity_kind, activity_id, connection_id,
+                                     purpose, control, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            intent.attempt_id().to_string(),
+            intent.request_id().to_string(),
+            intent.subject().project_id().to_string(),
+            subject.subject_type,
+            subject.agent_id,
+            subject.session_id,
+            subject.run_id,
+            subject.activity_kind,
+            subject.activity_id,
+            intent.connection().to_string(),
+            intent.purpose().as_str(),
+            serde_json::to_string(&intent.control()).map_err(StoreError::codec)?,
+            i64::try_from(recorded_at.as_unix_millis())
+                .map_err(|_| StoreError::corrupt("request timestamp does not fit in sqlite"))?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_model_request_record(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Option<ModelRequestRecord>, StoreError> {
+    let sql = format!("SELECT {REQUEST_COLUMNS} FROM model_requests WHERE attempt_id = ?1");
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query([attempt_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(model_request_record_from_row(row)?)),
+        None => Ok(None),
+    }
+}
+
+fn model_request_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ModelRequestRecord, StoreError> {
+    let attempt_text: String = row.get(0)?;
+    let request_text: String = row.get(1)?;
+    let project_text: String = row.get(2)?;
+    let subject_type: String = row.get(3)?;
+    let connection_text: String = row.get(9)?;
+    let purpose_text: String = row.get(10)?;
+    let control_text: String = row.get(11)?;
+    let recorded_at: i64 = row.get(12)?;
+    let observation_text: Option<String> = row.get(13)?;
+    let observed_at: Option<i64> = row.get(14)?;
+
+    let attempt: AttemptId = parse_core(&attempt_text, "request attempt id")?;
+    let request: RequestId = parse_core(&request_text, "request id")?;
+    let project: ProjectId = parse_core(&project_text, "request project id")?;
+    if attempt.project_id() != project {
+        return Err(StoreError::corrupt(
+            "request attempt project does not match its stored project",
+        ));
+    }
+    if request.project_id() != project {
+        return Err(StoreError::corrupt(
+            "request id project does not match its stored project",
+        ));
+    }
+    let subject = subject_from_columns(
+        project,
+        &subject_type,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    )?;
+    let connection: ConnectionId = parse_core(&connection_text, "request connection id")?;
+    let purpose = RequestPurpose::new(&purpose_text)
+        .map_err(|error| StoreError::corrupt(format!("request purpose: {error}")))?;
+    let control: StopDeadlineControl =
+        serde_json::from_str(&control_text).map_err(StoreError::codec)?;
+    let recorded_at = timestamp_from_sql(recorded_at, "request intent timestamp")?;
+    let intent = RequestGateIntent::new(request, attempt, connection, purpose, subject, control)
+        .map_err(|error| StoreError::corrupt(format!("request intent row: {error}")))?;
+
+    let (observation, observed_at) = match observation_text {
+        None => {
+            if observed_at.is_some() {
+                return Err(StoreError::corrupt(
+                    "request without an observation has an observation timestamp",
+                ));
+            }
+            (None, None)
+        }
+        Some(text) => {
+            let observation: ModelRequestObservation =
+                serde_json::from_str(&text).map_err(StoreError::codec)?;
+            if observation.request_id() != request || observation.attempt_id() != attempt {
+                return Err(StoreError::corrupt(
+                    "request observation identifiers do not match its intent",
+                ));
+            }
+            let observed_at = observed_at
+                .ok_or_else(|| StoreError::corrupt("request observation has no timestamp"))?;
+            (
+                Some(observation),
+                Some(timestamp_from_sql(
+                    observed_at,
+                    "request observation timestamp",
+                )?),
+            )
+        }
+    };
+
+    Ok(ModelRequestRecord {
+        intent,
+        recorded_at,
+        observation,
+        observed_at,
+    })
+}
+
+fn validate_state_key(key: &str) -> Result<(), StoreError> {
+    if key.trim().is_empty() {
+        return Err(StoreError::InvalidStateKey);
+    }
+    Ok(())
+}
+
+fn load_supervised_state_revision(
+    conn: &Connection,
+    project: &ProjectId,
+    key: &str,
+) -> Result<Option<u64>, StoreError> {
+    let revision: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM supervised_state WHERE project_id = ?1 AND state_key = ?2",
+            params![project.to_string(), key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .map(|value| {
+            let value = u64::try_from(value)
+                .map_err(|_| StoreError::corrupt("supervised state revision must be positive"))?;
+            if value == 0 {
+                return Err(StoreError::corrupt(
+                    "supervised state revision must be positive",
+                ));
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn load_supervised_state(
+    conn: &Connection,
+    project: &ProjectId,
+    key: &str,
+) -> Result<Option<SupervisedStateRecord>, StoreError> {
+    let row: Option<(i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT revision, payload FROM supervised_state
+             WHERE project_id = ?1 AND state_key = ?2",
+            params![project.to_string(), key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((revision, value)) = row else {
+        return Ok(None);
+    };
+    let revision = u64::try_from(revision)
+        .map_err(|_| StoreError::corrupt("supervised state revision must be positive"))?;
+    if revision == 0 {
+        return Err(StoreError::corrupt(
+            "supervised state revision must be positive",
+        ));
+    }
+    Ok(Some(SupervisedStateRecord { revision, value }))
 }
 
 fn timestamp_from_sql(value: i64, field: &str) -> Result<Timestamp, StoreError> {
