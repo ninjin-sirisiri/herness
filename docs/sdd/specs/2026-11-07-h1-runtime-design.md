@@ -4,7 +4,7 @@
 
 **Status:** 2026-11-08に利用者が設計と基盤選定を承認。その後実装をmainへ統合したが、[受入記録](../../research/2026-11-08-h1-acceptance.md)ではOpenAI・Anthropic APIキー経路が未確認で、H1受入は未完了。H2の設計開始は別途指示されたが、未確認項目の免除ではない。
 
-**H2接続拡張:** Shared contractの「H2 integration additions」は追加の設計案としてレビュー待ち。既存H1の承認と、追加契約の承認を区別する。
+**H2接続拡張:** 2026-11-08に利用者がShared contractの「H2 integration additions」を追加契約として承認。H2 planの先行Taskで補修・拡張を計画する。契約の承認は実装完了・H1受入完了を意味しない。
 
 **Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。
 
@@ -120,7 +120,7 @@ H3は、本specの永続化済み変更通知と許可境界を利用し、全�
 
 ### Events and audit
 
-既存version 1のrunイベントは`contractVersion`、project・agent・session・runのID、必要時の操作ID、project内で単調増加する`sequence`、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。H2接続で必要なversion 2の追加案はH2 integration additionsに定める。
+既存version 1のrunイベントは`contractVersion`、project・agent・session・runのID、必要時の操作ID、project内で単調増加する`sequence`、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。H2接続で必要なversion 2の拡張はH2 integration additionsに定める。
 
 変更・許可・状態遷移は欠落なく追跡できるようにする。streamの表示用deltaはまとめてもよいが、再接続時にはcheckpointと最後のsequenceから整合を回復できなければならない。通知の再配送を操作の再実行として扱わない。
 
@@ -139,7 +139,7 @@ H2はrunの安定状態と検証証拠を消費するが、`idle`や正常終了
 
 ### H2 integration additions
 
-この節は[承認済みH2 spec](2026-11-08-h2-supervision-design.md)のH1 integration prerequisitesを実行境界の正本へ具体化する追加案であり、本節のレビュー完了まではH2の実装planを確定しない。H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。
+この節は[承認済みH2 spec](2026-11-08-h2-supervision-design.md)のH1 integration prerequisitesを実行境界の正本へ具体化した追加契約であり、2026-11-08に利用者が承認した。H2の実装planは本節を前提とする。H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。
 
 1. **追加runと入力の対応:** hostは直前run、同じagent/session、現在の許可、入力IDを指定する継続境界を提供する。前runが安定し未解決操作がない場合だけ、新run IDを作り、同じ会話・制約を保持して入力を送る。追加runの全tool・checkpoint・eventは新runへ結び付け、古い承認は流用しない。入力の受理・開始・完結を入力IDで対応付け、作成直後のidleを入力完結と扱わない。会話を保持できなければ実行せず、能力不足を返す。
 2. **復旧のgate:** paused/interrupted runの再開は、未確定操作、管理下process、接続・権限・保存形式の照合を先に行う。同一process内・再起動後の双方を扱い、SDKが未完了応答を安全に再開できない場合は再開不可とする。未送信と決め付けて同じ入力・toolを再実行したり、会話を捨てて別sessionへ移したりしない。人間待ちからは人間の再開操作を必要とする。
@@ -180,7 +180,7 @@ H2はrunの安定状態と検証証拠を消費するが、`idle`や正常終了
 
 | 項目 | 初期値・制約 |
 | --- | --- |
-| 公開する契約の版 | 既存実装は1。H2接続拡張の追加案は新規書込み2・event読込み1と2。未知の版を黙って解釈しない |
+| 公開する契約の版 | 既存実装は1。H2接続拡張は新規書込み2・event読込み1と2。未知の版を黙って解釈しない |
 | rationale / purpose | trim後に空でない、最大1,000 Unicode文字 |
 | 履歴ページ | 既定100件、上限500件 |
 | 通常終了の停止猶予 | 10秒。その後は人間に待機継続・強制終了を確認 |
@@ -222,3 +222,5 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 ## Approval
 
 2026-11-08、設計文書の保存・検証・commit後のレビュー依頼に対し、利用者が「ok」と回答し、本specと基盤選定を承認した。H1のsdd-planへ進む。これは本実装の開始、実アカウントへのログイン・モデル送信、有料API呼び出し、H2〜H5の設計・実装を自動で許可するものではない。
+
+同日、H2 specの承認とplan作成指示に続き、利用者がH2 integration additionsを承認した。公開eventのversion 2、既存履歴を保持するmigrationを含め、H2 planの前提補修として計画化する。本実装・実DBの移行・実接続はまだ開始しない。

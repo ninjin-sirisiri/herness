@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:62fd1149e1a9a21bba19332c99ce7e1270d0e402fc2d30893b7bae50a0c0929b">
+<meta name="sdd-source-digest" content="sha256:02287b6bcc9d9c5d55bd874ea8dcbc3a17d3d0f3d8b83a9ecd5b756f459c3c99">
 <title>herness Spec roadmap</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -44,7 +44,7 @@
 <main id="content" tabindex="-1">
 <h1 id="herness-spec-roadmap">herness Spec roadmap</h1>
 <p class="metadata"><strong>Classification:</strong> architectural / multi-spec</p>
-<p class="metadata"><strong>Status:</strong> 分割・依存関係とH1・H2のspecは承認済み。H1の実装はmainへ統合済みだが受入未完了。2026-11-08にH2のsdd-planを指示され、前提となるH1共有契約の追加案をレビュー中。本実装・実接続の追加許可ではない。</p>
+<p class="metadata"><strong>Status:</strong> 分割・依存関係とH1・H2のspec、H1のH2接続拡張は承認済み。H1の実装はmainへ統合済みだが受入未完了。H2の実装planを保存済み。本実装・実接続の追加許可ではない。</p>
 <section>
 <h2 id="全体目標">全体目標</h2>
 <p>Piを出発点に、SDDによる開発を進めるデスクトップ型エージェントハーネス「herness」を作る。最初の対象はmacOSとする。軽さを重視してTauriとRust中心の構成を優先し、PiのRust移植や他のエージェント基盤もH1で比較する。CLIの操作をGUIに置き換えるだけでなく、子エージェントの起動・継続・完了判定をhernessが制御する。</p>
@@ -95,7 +95,7 @@
 </section>
 <section>
 <h2 id="specの分割">Specの分割</h2>
-<p>H1・H2は承認済みのspecを保存した。H1のH2接続拡張は追加案としてレビュー中。H3〜H5は未作成の予定specであり、プレースホルダーのファイルは作らない。実際のspecを保存した時点で、この一覧にパスを追記する。</p>
+<p>H1・H2は承認済みのspecを保存し、H1のH2接続拡張も承認された。H3〜H5は未作成の予定specであり、プレースホルダーのファイルは作らない。実際のspecを保存した時点で、この一覧にパスを追記する。</p>
 <section>
 <h3 id="h1--実行基盤と変更理由の記録">H1 — 実行基盤と変更理由の記録</h3>
 <ul>
@@ -116,7 +116,8 @@
 <li><strong>含めないもの:</strong> SDD planの解釈、Taskの進行台帳、HTML固有の検証・公開手順、H1の権限規則の再定義。操作の許可判定とタスクの完了判定は別の問いとして扱い、モデルで明示的な禁止・人間確認を上書きしない。</li>
 <li><strong>観測可能な完了:</strong> 同じ完了条件に対し3種類の判定方式を選べ、未完了の子エージェントが継続する。必須検証の失敗、判定不能、安全停止、上限到達では完了に遷移しないことを確認できる。</li>
 <li><strong>消費先:</strong> H1の自動判定用接続境界・H3・H4・H5。</li>
-<li><strong>Spec:</strong> <a href="2026-11-08-h2-supervision-design.md">H2: 継続実行と完了判定</a>。2026-11-08に承認済み。H1の継続・評価器引継ぎ等の追加契約をH1正本でレビューしてからH2の実装planを確定する。未確認経路は未確認のまま保持する。</li>
+<li><strong>Spec:</strong> <a href="2026-11-08-h2-supervision-design.md">H2: 継続実行と完了判定</a>。2026-11-08に承認済み。H1の継続・評価器引継ぎ等の追加契約もH1正本でレビュー・承認済み。未確認経路は未確認のまま保持する。</li>
+<li><strong>Plan:</strong> <a href="../plans/2026-11-08-h2-supervision.md">H2 Supervision and Assessment Implementation Plan</a>。H1の前提補修を含む18 Taskの計画を保存済み、実行指示待ち。</li>
 </ul>
 </section>
 <section>
@@ -160,7 +161,7 @@
 <li>H5の依存する操作の詳細設計は、その操作が利用するH1〜H4の契約確定後に行う。見た目の検討や試作まで禁止するものではない。</li>
 </ul>
 <p>承認済みの設計順序はH1 → H2 → H3 → H4 → H5とする。これは個別specを自動で連続設計・実装する指示ではない。UIの実装を最後まで禁止せず、必要最小限の接続確認は各specの受入条件で扱う。</p>
-<p><strong>現在の対象は、承認済みH2のsdd-plan。</strong> H1は実装を統合済みだが受入未完了であり、H2のplan作成前に追加共有契約のレビューを行う。その補修・追加実装はH2 planの先行Taskとして扱い、実装済みとはみなさない。本実装・実接続は未許可で、H3以降へは自動で進まない。</p>
+<p><strong>現在の対象はH2で、承認済みの契約に基づく実装planを保存済み。</strong> H1は実装を統合済みだが受入未完了。H1の前提補修・追加実装はH2 planの先行Taskとして扱い、実装済みとはみなさない。sdd-executeの指示までは本実装を開始せず、実接続には別途許可を必要とする。H3以降へは自動で進まない。</p>
 </section>
 <section>
 <h2 id="共通契約の所有者">共通契約の所有者</h2>
@@ -210,6 +211,7 @@
 <p>2026-11-08、H1のspecレビュー依頼への「ok」により、H1の設計とTauri＋pi-rustの基盤選定が承認された。H1だけのsdd-planへ進む。本実装の開始と実接続検証は別の指示・許可を必要とする。</p>
 <p>その後H1の実装がmainへ統合され、受入記録ではOpenAI互換・ChatGPTの実接続を確認した一方、OpenAI・Anthropic APIキー経路は未確認として残った。2026-11-08、利用者がH2の設計開始を明示したため設計へ進んだ。これはH1の受入未完了を免除せず、追加の実接続やH2の本実装を許可しない。H2の面談では、条件案の事前確認と承認継承、累積稼働2時間・追加実行30回、任意の金額上限、承認範囲内の継続送信、判定不能時は人間が再開、条件別評価をhostが統合する方式を合意した。H2 spec全体はレビュー待ちとする。</p>
 <p>続いて利用者が、継続機構はsdd-execute専用ではなく監督対象の子agent共通であることを確認し、H2 specを承認してsdd-planへの移行を指示した。H1正本の追加契約はplan作成前の独立したレビュー対象とし、H1の受入未完了と本実装・実接続の未許可は維持する。</p>
+<p>H1正本へ追加契約を保存・検証した後、利用者が「追加契約を承認してplanへ」を選択した。これに基づきH2の実装planを保存した。公開eventのversion 2と既存履歴を保持するmigrationは承認済みの契約であり、まだ実装・実DBへ適用していない。</p>
 </section>
 </main>
 </div>

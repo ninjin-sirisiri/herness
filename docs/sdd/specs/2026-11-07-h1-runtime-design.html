@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:df9892b13a8b267a2ed1b76984abb883957fe7545033b52f679d2b8c1c60d68c">
+<meta name="sdd-source-digest" content="sha256:c4c547309708f781ee026b8f62f3793ebc16726d56c27ae079a48844fd060578">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -51,7 +51,7 @@
 <h1 id="h1-実行基盤と変更理由の記録">H1: 実行基盤と変更理由の記録</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
 <p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が設計と基盤選定を承認。その後実装をmainへ統合したが、<a href="../../research/2026-11-08-h1-acceptance.md">受入記録</a>ではOpenAI・Anthropic APIキー経路が未確認で、H1受入は未完了。H2の設計開始は別途指示されたが、未確認項目の免除ではない。</p>
-<p class="metadata"><strong>H2接続拡張:</strong> Shared contractの「H2 integration additions」は追加の設計案としてレビュー待ち。既存H1の承認と、追加契約の承認を区別する。</p>
+<p class="metadata"><strong>H2接続拡張:</strong> 2026-11-08に利用者がShared contractの「H2 integration additions」を追加契約として承認。H2 planの先行Taskで補修・拡張を計画する。契約の承認は実装完了・H1受入完了を意味しない。</p>
 <p class="metadata"><strong>Chosen approach:</strong> TauriのRustホストに<code>pi-embedded</code>と<code>pi-ai</code>を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH1を扱う。用語は<a href="../../../CONTEXT.md">CONTEXT.md</a>、選定の証拠と限界は<a href="../../research/2026-11-07-pi-rust-spike.md">spike結果</a>を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。</p>
 <section>
@@ -171,7 +171,7 @@
 </section>
 <section>
 <h3 id="events-and-audit">Events and audit</h3>
-<p>既存version 1のrunイベントは<code>contractVersion</code>、project・agent・session・runのID、必要時の操作ID、project内で単調増加する<code>sequence</code>、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。H2接続で必要なversion 2の追加案はH2 integration additionsに定める。</p>
+<p>既存version 1のrunイベントは<code>contractVersion</code>、project・agent・session・runのID、必要時の操作ID、project内で単調増加する<code>sequence</code>、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。H2接続で必要なversion 2の拡張はH2 integration additionsに定める。</p>
 <p>変更・許可・状態遷移は欠落なく追跡できるようにする。streamの表示用deltaはまとめてもよいが、再接続時にはcheckpointと最後のsequenceから整合を回復できなければならない。通知の再配送を操作の再実行として扱わない。</p>
 <p>履歴はprojectを明示して取得し、新しいsequenceから降順で返す。ページのcursorは取得時の上限sequenceを固定し、次ページに新しい項目を混ぜて重複させない。liveイベントは昇順で扱う。H5の変更理由画面はこの履歴を使い、チャット本文から理由を抽出し直さない。</p>
 <p>H2はrunの安定状態と検証証拠を消費するが、<code>idle</code>や正常終了だけを達成の証拠にしない。H4は独自のTask IDとrun群を関連付ける。H3の同期完了、H4のTask完了を、H1の状態として偽造しない。</p>
@@ -189,7 +189,7 @@
 </section>
 <section>
 <h3 id="h2-integration-additions">H2 integration additions</h3>
-<p>この節は<a href="2026-11-08-h2-supervision-design.md">承認済みH2 spec</a>のH1 integration prerequisitesを実行境界の正本へ具体化する追加案であり、本節のレビュー完了まではH2の実装planを確定しない。H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。</p>
+<p>この節は<a href="2026-11-08-h2-supervision-design.md">承認済みH2 spec</a>のH1 integration prerequisitesを実行境界の正本へ具体化した追加契約であり、2026-11-08に利用者が承認した。H2の実装planは本節を前提とする。H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。</p>
 <ol>
 <li><strong>追加runと入力の対応:</strong> hostは直前run、同じagent/session、現在の許可、入力IDを指定する継続境界を提供する。前runが安定し未解決操作がない場合だけ、新run IDを作り、同じ会話・制約を保持して入力を送る。追加runの全tool・checkpoint・eventは新runへ結び付け、古い承認は流用しない。入力の受理・開始・完結を入力IDで対応付け、作成直後のidleを入力完結と扱わない。会話を保持できなければ実行せず、能力不足を返す。</li>
 <li><strong>復旧のgate:</strong> paused/interrupted runの再開は、未確定操作、管理下process、接続・権限・保存形式の照合を先に行う。同一process内・再起動後の双方を扱い、SDKが未完了応答を安全に再開できない場合は再開不可とする。未送信と決め付けて同じ入力・toolを再実行したり、会話を捨てて別sessionへ移したりしない。人間待ちからは人間の再開操作を必要とする。</li>
@@ -238,7 +238,7 @@
 <caption>Numeric defaults</caption>
 <thead><tr><th scope="col">項目</th><th scope="col">初期値・制約</th></tr></thead>
 <tbody>
-<tr><td>公開する契約の版</td><td>既存実装は1。H2接続拡張の追加案は新規書込み2・event読込み1と2。未知の版を黙って解釈しない</td></tr>
+<tr><td>公開する契約の版</td><td>既存実装は1。H2接続拡張は新規書込み2・event読込み1と2。未知の版を黙って解釈しない</td></tr>
 <tr><td>rationale / purpose</td><td>trim後に空でない、最大1,000 Unicode文字</td></tr>
 <tr><td>履歴ページ</td><td>既定100件、上限500件</td></tr>
 <tr><td>通常終了の停止猶予</td><td>10秒。その後は人間に待機継続・強制終了を確認</td></tr>
@@ -285,6 +285,7 @@
 <section>
 <h2 id="approval">Approval</h2>
 <p>2026-11-08、設計文書の保存・検証・commit後のレビュー依頼に対し、利用者が「ok」と回答し、本specと基盤選定を承認した。H1のsdd-planへ進む。これは本実装の開始、実アカウントへのログイン・モデル送信、有料API呼び出し、H2〜H5の設計・実装を自動で許可するものではない。</p>
+<p>同日、H2 specの承認とplan作成指示に続き、利用者がH2 integration additionsを承認した。公開eventのversion 2、既存履歴を保持するmigrationを含め、H2 planの前提補修として計画化する。本実装・実DBの移行・実接続はまだ開始しない。</p>
 </section>
 </main>
 </div>

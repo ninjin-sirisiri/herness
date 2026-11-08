@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:9320814b2b497260e5c396d83c264baf8d2186abbc46c2459de985962361acae">
+<meta name="sdd-source-digest" content="sha256:04883c7ff5dbee9e2dc447db049f2ac922d5a6a373a54aac2b1316cd9960d931">
 <title>H2: 継続実行と完了判定</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -38,7 +38,7 @@
 <main id="content" tabindex="-1">
 <h1 id="h2-継続実行と完了判定">H2: 継続実行と完了判定</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が本specを承認し、sdd-planを指示した。H1共有契約の追加案をレビューしてからH2のplanを確定する。本実装・実モデルへの送信は未許可。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が本specとH1共有契約の追加を承認し、sdd-planを指示した。<a href="../plans/2026-11-08-h2-supervision.md">H2実装plan</a>を保存済み。本実装・実モデルへの送信は未許可。</p>
 <p class="metadata"><strong>Chosen approach:</strong> 必須検証と安全条件をhostが検査し、モデルによる条件別の評価をhostが統合する。モデルは状態遷移・権限・完了条件を変更しない。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH2を扱う。<a href="2026-11-07-h1-runtime-design.md">H1</a>を実行・権限・保存の正本、<a href="../../../CONTEXT.md">CONTEXT.md</a>を用語の正本とする。H1は実装済みだが<a href="../../research/2026-11-08-h1-acceptance.md">受入未完了</a>。H2の設計承認とplan作成の指示は、H1の未確認項目を免除しない。</p>
 <section>
@@ -200,9 +200,10 @@
 </section>
 <section>
 <h2 id="open-items-and-approval">Open items and approval</h2>
-<p>H1境界の補修・追加APIとmigrationはH2の実装plan作成前にH1正本へ反映し、共有契約の変更としてレビューする。H1受入の未確認経路は未確認のまま追跡する。モデル別の閾値検証・通常LLMの対応能力・画像上限は接続を有効にする前に検証し、満たさないprofileは利用不可とする。これらを黙ったfallbackや成功扱いで埋めない。</p>
+<p>H1境界の補修・追加APIとmigrationはH1正本のH2 integration additionsへ反映し、利用者が共有契約の変更としてレビュー・承認した。H2の実装planはこの補修・拡張を先行Taskとして含める。H1受入の未確認経路は未確認のまま追跡する。モデル別の閾値検証・通常LLMの対応能力・画像上限は接続を有効にする前に検証し、満たさないprofileは利用不可とする。これらを黙ったfallbackや成功扱いで埋めない。</p>
 <p>面談で合意したのは、条件案の事前確認と承認継承、累積稼働2時間・追加30回、金額上限は任意、範囲承認後の継続送信、判定不能後は人間が再開、条件別評価をhostが統合する構成。停滞・timeout・確率等の数値と残る詳細はこの設計案でレビューする。本specの保存・commitは設計の承認ではなく、本実装や実接続を開始しない。</p>
 <p>2026-11-08、利用者が子agent共通の継続機構とsdd-executeへの組込みの区別を確認した後、「ok、sdd-planに進んで」と指示し、本specを承認した。plan作成前のH1共有契約は、H1正本のH2 integration additionsへ追加案として反映した。追加案の承認は別途記録し、本実装・実接続の許可とは区別する。</p>
+<p>続いて利用者がH1の追加契約を承認したため、plan作成前の共有契約レビューは完了した。実装時の前提補修と未確認経路の検証が完了したという意味ではない。</p>
 </section>
 </main>
 </div>

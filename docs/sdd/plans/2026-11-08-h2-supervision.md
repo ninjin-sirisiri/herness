@@ -1,0 +1,251 @@
+# H2 Supervision and Assessment Implementation Plan
+
+**Goal:** 承認済みの完了条件と検証証拠を用いて子agentを有限の範囲で監督し、通常LLM・Jev・OpenAI Decisionsの評価を安全に利用できるようにする。
+
+**Architecture:** Rust hostのsupervisorがH1の実行・権限・保存を使い、必須検証と条件別評価から継続・完了・待機・停止を確定する。H1の追加契約を先に実装し、共通監督をherness-supervision、toolなしの判定adapterをherness-assessmentに分ける。SQLiteに証拠・状態・予算を保存し、Tauriは最小限の設定・承認・操作・観測を接続する。
+
+**Tech Stack:** Rust 1.97.1 / Cargo workspace、Tauri 2.12.5、pi-rust固定commit 4294dba7ac3646477912cc778536fdff0a912d6e、SQLite、macOS Keychain、既存のHTTP・非同期通信基盤、静的HTML/CSS/JavaScript、Python 3.11+のSDD validator。
+
+**Spec:** [docs/sdd/specs/2026-11-08-h2-supervision-design.md](../specs/2026-11-08-h2-supervision-design.md)
+
+## Global Constraints
+
+次の値・文言はH2 specおよびH1のH2 integration additionsを正本とする。
+
+- 対象はhostが完了条件・権限・上限を設定して監督する子agentであり、通常チャットや親agentを無条件に繰り返さない。sdd-executeへの組込みはH4が所有する。
+- SDD planの解釈・Task台帳・Git境界はH4、HTML固有の条件・検証・公開はH3が所有する。H2は既存SDDの再開回数やHTML policyを変更しない。
+- 自動push・merge・公開、権限拡大、OS隔離、必須の独立レビュー、Taskの並列化、新規CLI製品は含めない。
+- 子agentは条件・権限・上限を変更できない。条件や対象版が変わった実行中の判定結果は履歴だけに残し、状態へ適用しない。同じ入力での判定の引き直しを自動で繰り返さない。重複要求IDは同じ結果を返し、追加run・送信・取消しを重複実行しない。
+- 停止・人間待ち・上限・回復不能は完了判定より優先する。停止未確認の間は次runや再判定を開始しない。
+- 新規書込みの公開契約はversion 2、eventの既知の読込み版は1・2とする。
+- 既存履歴・接続・承認記録・checkpointを削除せず、過去の承認を有効化し直さない。
+- H1のrun状態・許可優先順位・停止の意味は変更せず、完了条件や継続回数の判断をH1へ移さない。
+
+| 項目 | 初期値・意味 |
+| --- | --- |
+| 稼働上限・追加run | 7,200秒・30回。人間待ち等を除き、初回runと検証・判定も時間へ含める |
+| 停滞 | 3連続評価サイクルで進展を確認できなければ停止 |
+| 金額上限 | 既定なし。指定時は有限のUSD額と価格版、全モデル要求の見積りを必要とする |
+| 評価timeout | 1要求60秒または残り稼働時間の短い方。許可評価器も適用し、永久に呼出しを占有させない |
+| 一時障害の追加再試行 | 最大2回、待機基準1秒・2秒。各要求は予算内、別モデルfallbackなし |
+| Decisionの採用確率 | 完了条件のmet・unmetは0.95以上、操作allow・denyは0.99以上。insufficient・askは実行／完了の根拠にしない |
+| 分布の許容誤差 | 確率は有限で0〜1、選択肢が完全一致し合計の1からの誤差0.001以内。無断で補正しない |
+| 初期profile | 未設定は利用不可。判定providerと送信同意を人間が選ぶ |
+
+閾値は安全性・正答率の保証ではなく、評価前の保守的な設計初期値。provider・model・用途ごとの評価セットで妥当性を確認する。通常LLMには同じ確率閾値を捏造しない。閾値を下げる変更はprofile版更新と人間の再確認を必要とする。
+
+## File structure
+
+H2 specと[H1 spec](../specs/2026-11-07-h1-runtime-design.md)の追加契約は承認済み。起点はc29a5beのH2設計と、その後の契約承認記録であり、H1の受入未完了は免除しない。以下は提案配置で、本plan作成ではコード・実DB・資格情報を変更しない。
+
+```text
+crates/herness-core/src/
+  contracts/                    # v2 subject、入力・要求ID、接続能力
+  ports/                        # 継続・要求gate・監視・比較更新の境界
+  runtime/ / permissions/ / connections/
+crates/herness-engine-pi/src/
+  adapter.rs / events.rs / session_store.rs / stream.rs
+crates/herness-store/
+  migrations/                   # 0004以降。既存migrationを改変しない
+  src/                          # v1/v2履歴、activity、要求、監督store
+crates/herness-supervision/src/
+  contracts/ / ports/ / profiles/ / evidence/ / budget/ / supervisor/
+crates/herness-assessment/src/
+  transport/ / llm/ / jev/ / decisions/ / permission/
+tests/runtime/tests/            # 既存H1の契約・実Pi回帰
+tests/supervision/
+  Cargo.toml / src/              # herness-supervision-testsと共通fixture
+  tests/                        # contracts、profiles、evidence、budget、adapters、
+                                # supervisor、permissions、recovery、desktop、acceptance
+  fixtures/                     # 合成証拠と正解ラベル。secretを置かない
+src-tauri/src/                   # host pump、composition、信頼されたIPC
+ui/                             # 監督対象と判定profileの最小操作
+docs/development/h2-testing.md
+docs/research/2026-11-08-h2-acceptance.md
+```
+
+coreはsupervision・assessment・store・Pi・Tauriへ依存させない。supervisionはcoreと自身のportを使い、具体的な通信・DBへ依存しない。assessmentとstoreは必要なsupervision portを実装し、Tauriが組み立てる。テストcrateはherness-supervision-testsとし、Task 6でworkspaceへ追加する。
+
+Taskは1〜18を直列に実行する。各Taskは変更対象、実コマンド・終了code・結果、対象revision、検証範囲と未確認事項を報告する。通常テストは一時project・DB、fake credential、loopback mockだけを使う。実資格情報の探索・実Keychainの既存項目読取り・実ログイン・有料要求は行わない。Task 18の実接続は、人間が接続・データ・要求数・料金または利用枠を別途許可した範囲だけとする。
+
+全TaskにH2 spec、H1 spec、Global Constraintsを引き継ぐ。[ロードマップ](../specs/2026-11-07-herness-roadmap.md)のH2境界を守り、../sddを編集しない。既存のH1 planはversion 1を実装した履歴として扱い、このplanのversion 2契約で読み替えて再実行しない。
+
+## Task 1: H1の入力・要求・eventの追加契約を型で表す
+
+**Dependencies / spec:** 先行Taskなし。H1 Shared contractのH2 integration additions 1・3・4・6・7・8、H2 H1 integration prerequisites。
+
+**Paths / deliverable:** herness-coreのcontracts・ports、tests/contracts.rs・tests/ports.rs、docs/development/h2-testing.md。入力ID、要求ID、attempt、run/host activity subject、継続要求、送信前gate・使用量・停止制御、接続能力のhost型を定義する。
+
+**Acceptance:** version 2を書き、既知のversion 1 eventを明示的に読める。run subjectのIDとprojectの一致、activity subjectの束縛、操作IDの所属を検証する。起動時idleと入力完結を型で区別し、unknown usageを0にしない。SDK型・秘密・H2の状態遷移をcoreへ持ち込まない。旧run状態・許可優先順位は維持する。既存adapter・fakeの呼出し箇所もcompile可能に整合し、後続で未実装のport能力は成功でなく明示的な未対応として返す。
+
+**Verification / evidence:** cargo test -p herness-core --locked、cargo check --workspace --locked。v1/v2 round-trip、未知版・subject混在拒否、初期idle、usage欠落を報告する。後続実装を空の成功応答で利用可能と表示しない。
+
+## Task 2: v1履歴を保持するstoreとhost-stateの移行を実装する
+
+**Dependencies / spec:** Task 1。H1 H2 integration additions 7・8、Events and audit、Lifecycle and recovery。
+
+**Paths / deliverable:** herness-storeのmigrations/0004以降・store.rs・migrations.rs、core/runtime/state.rs、tests/runtime/tests/store.rs。project sequenceを共有するactivityとrunの保存、要求意図・結果、revision比較更新の原子的な境界を提供する。
+
+**Acceptance:** schema 3のDBとhost-state format 1・2を保持して移行し、新host-stateはformat 3とする。events表のrun ID必須列を架空IDで埋めず、旧event・cursor・checkpoint・接続・承認記録を保持する。移行失敗は旧DBへ戻り、未知形式・旧アプリによるdowngradeは拒否する。再起動だけでは送信・実行しない。
+
+**Verification / evidence:** cargo test -p herness-store --locked、cargo test -p herness-runtime-tests --test store --locked。旧fixtureのID・sequence・payload・件数の一致、移行途中fault、CAS競合、保存後通知を報告する。fixture以外のDBを移行しない。
+
+## Task 3: 会話を保つ追加runと安全な復旧gateを接続する
+
+**Dependencies / spec:** Tasks 1〜2。H1 H2 integration additions 1・2、H2 States and continuation。
+
+**Paths / deliverable:** core/runtime/host.rs、engine-piのadapter.rs・events.rs・session_store.rs、tests/runtime/tests/engine.rs・host.rs。入力IDに対応した受理・開始・完結と、同一agent/sessionの新runを実装する。
+
+**Acceptance:** 実Pi＋loopback modelで前runの会話・制約を次runへ維持し、新tool・event・checkpointは新runへ属する。未解決tool・process・操作があれば継続／復旧しない。同一processの停止後と別process復元を区別し、SDKが安全に復旧できない状態は明示的に再開不可とする。古い承認・入力を再送しない。
+
+**Verification / evidence:** cargo test -p herness-runtime-tests --test engine --locked、cargo test -p herness-runtime-tests --test host --locked。2回目の要求でのみ参照可能な前会話、入力ID、新旧runの操作対応、起動時idle非完結、復元時要求0を報告する。
+
+## Task 4: Piの実toolへgrant・評価器・停止制御を引き継ぐ
+
+**Dependencies / spec:** Tasks 1〜3。H1 Permission modes、H2 integration additions 3、H2 Model assessment and permission evaluation。
+
+**Paths / deliverable:** core/permissions・tools/gateway・runtime/host.rs、engine-pi/adapter.rs、tests/runtime/tests/permissions.rs・engine.rs。adapter内部で広いGrantScopeを作り直す経路と、評価器をNone固定で渡す経路を置き換える。
+
+**Acceptance:** hostが確定した子grantと現policyを実tool経路で照合し、指定したexecutor一つだけが実行する。実引数のallow・deny・ask・評価不能、評価中のpolicy変更・停止・deadlineを扱う。評価待機はhost全体を塞がず、明示ask・denyをmodelで迂回しない。ここではbounded mock evaluatorを使い、実判定を利用可能としない。
+
+**Verification / evidence:** cargo test -p herness-runtime-tests --test permissions --locked、cargo test -p herness-runtime-tests --test engine --locked。実Pi経路の副作用counter、子scope外で0回、許可時1回、停止中・古い判断・遅延回答で0回を報告する。
+
+## Task 5: UIに依存しない監視と全モデル要求のgateを実装する
+
+**Dependencies / spec:** Tasks 1〜4。H1 H2 integration additions 4・5、H2 Budgets and request failures、Data flow and ordering。
+
+**Paths / deliverable:** coreの要求port・runtime、engine-pi/stream.rs・events.rs、src-tauriのhost composition、tests/runtime/tests/engine.rs・desktop.rs。host pumpと要求の送信前・終端・使用量観測を接続する。
+
+**Acceptance:** SDKのtool往復後の次要求もgateを通り、保存失敗・停止・期限到達では送信しない。要求IDごとに送信開始・結果不明・利用可能なusageを保存し、SDK JSONを公開しない。windowなし・非選択projectでもイベントとdeadlineが進み、WebViewのpollは読取りのみになる。隠れた再試行を入れず、既存quit猶予を維持する。
+
+**Verification / evidence:** cargo test -p herness-runtime-tests --test engine --locked、cargo test -p herness-runtime-tests --test desktop --locked。UI pollなしの進行、拒否gateで要求0、tool後要求の捕捉、usage未知、単発長時間runの停止を報告する。
+
+## Task 6: H2の監督契約・承認・profile・送信同意を定義する
+
+**Dependencies / spec:** Tasks 1〜5。H2 Completion contract and operations、Profiles, providers and disclosure、States and continuation。
+
+**Paths / deliverable:** 新herness-supervision crate、tests/supervision crate、Cargo.toml、profile・consent・証拠・budget・assessmentの契約とport。herness-supervision-testsをworkspaceへ登録し、合成fixtureを置く。
+
+**Acceptance:** 条件版、owner承認根拠、run群、未達条件、profile版、同意範囲、上限、状態と理由を表す。人間確認と承認済みownerからの継承を区別し、modelからの変更を拒否する。用途・origin・対象scope・データ種別に送信を束縛する。未設定・不適合profileは利用不可で、全会話の既定送信をしない。
+
+**Verification / evidence:** cargo test -p herness-supervision --locked、cargo test -p herness-supervision-tests --test contracts --locked、cargo test -p herness-supervision-tests --test profiles --locked。偽承認、別project、条件変更、同意取消し・画像追加、重複要求IDの結果を報告する。
+
+## Task 7: 判定用接続能力とtoolなしtransportを作る
+
+**Dependencies / spec:** Tasks 1〜6。H1 Models and credentials、H2 integration additions 6、H2 Profiles, providers and disclosure、Budgets and request failures。
+
+**Paths / deliverable:** core/connections・contracts/connection.rs、herness-assessmentのtransportと共通error、tests/supervision/tests/adapters.rs、既存connections回帰。既存credential serviceと要求gateを再利用する。
+
+**Acceptance:** TypeSafe/JevとOpenAI Decisionsのendpoint class・認証・入力能力を登録し、判定専用接続のagent実行とChatGPT→Decisionsを拒否する。toolを持たない呼出し、60秒以下のtimeout、取消し、同一接続での限定retry、sanitized errorを提供する。金額予約は上位gateに委ね、二重課金記録を作らない。別originの認証転送・provider fallback・secretログを禁止する。
+
+**Verification / evidence:** cargo test -p herness-assessment --locked、cargo test -p herness-supervision-tests --test adapters --locked、cargo test -p herness-runtime-tests --test connections --locked。各用途の接続拒否、429・5xx・Retry-After、送信不明timeoutで再送0、secret canaryを報告する。
+
+## Task 8: 検証記録とsnapshotに基づく証拠の鮮度を実装する
+
+**Dependencies / spec:** Tasks 2・6。H2 Evidence and freshness、Model assessment and permission evaluation。SDDのverification-before-completionの五項目を維持する。
+
+**Paths / deliverable:** supervision/evidence、storeのSupervisionStore port実装、tests/supervision/tests/evidence.rs。必須checkのpass・fail・not_run・unavailable・inconclusive、入力manifest、証拠IDと適用範囲を保存する。
+
+**Acceptance:** H1権限を通じた検証・読取りと、子agent・CI・人間の証拠の再利用を扱う。実結果・exit code・signal・timeout・truncationを検査し、OperationOutcome::Appliedをpassとしない。未commit・外部／shell変更・依存／設定変更を指紋に含め、影響する証拠だけを失効する。完了後の関連変更はsnapshotの適用をstaleにし、無断再開しない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test evidence --locked。検証前後・評価中の変更、同じHEADの異なる内容、無関係な変更、五項目不足、truncation、虚偽DONE、非zero shellの結果を報告する。
+
+## Task 9: 累積時間・追加run・要求費用の予算台帳を実装する
+
+**Dependencies / spec:** Tasks 5〜8。H2 Budgets and request failures、Numeric defaults、H1の要求gateと保存境界。
+
+**Paths / deliverable:** supervision/budget、storeの予算・要求意図transaction、tests/supervision/tests/budget.rs。clockを注入し、H1の要求gateへ接続できる制御を提供する。
+
+**Acceptance:** 稼働7,200秒・追加30回を永続化し、初回を含め最大31 runとする。人間待ち等を除き、実行・検証・判定・許可・retry待機を合算する。金額指定時は全モデル要求の保守的見積りを送信前に予約し、価格不明・usage欠落・送信不明を解放しない。再開で消費量を戻さず、並行要求の予約超過とクラッシュによる予算回避を防ぐ。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test budget --locked。境界時刻、31番目と32番目のrun、同時予約、ChatGPTの金額見積不能、persist fault、待機区間、未確定稼働区間を報告する。請求額の厳密保証とは表示しない。
+
+## Task 10: 通常LLMの条件別評価adapterを実装する
+
+**Dependencies / spec:** Tasks 6〜9。H2 Model assessment and permission evaluation、Profiles, providers and disclosure。
+
+**Paths / deliverable:** assessment/llm、adapters fixture、tests/supervision/tests/adapters.rs。H1接続のOpenAI・Anthropic・OpenAI互換・認可済みChatGPT経路をtoolなし評価へ接続する。
+
+**Acceptance:** 条件ごとのmet・unmet・insufficient、証拠ID、短い根拠・不確実性をstrict schemaで検査する。未知／重複ID・欠落・拒否・矛盾・不正応答は判定不能とする。自己申告確率や生成文章を校正済み確率・内部思考として扱わない。構造化出力や画像が未対応なら能力不足を返し、別modelへ切り替えない。
+
+**Verification / evidence:** cargo test -p herness-assessment --locked、cargo test -p herness-supervision-tests --test adapters --locked。各既存経路のloopback要求、tool不在、schema拒否、送信範囲、条件と証拠の結付けを報告する。実接続成功は主張しない。
+
+## Task 11: Jevの条件別choice評価adapterを実装する
+
+**Dependencies / spec:** Tasks 6〜10。H2 Model assessment and permission evaluation、Profiles, providers and disclosure、Numeric defaults。
+
+**Paths / deliverable:** assessment/jev、Jev専用wire fixture、tests/supervision/tests/adapters.rs、h2-testing.md。spec参照の公式API・models・errorsを実装前に再確認し、認証付きモデル一覧取得や実要求は行わない。
+
+**Acceptance:** POST /v1/systemone、固定jev-1.14.0、stateと質問ID別choiceを扱う。選択肢・有限確率・合計誤差・選択結果を検証し、met/unmetは0.95未満なら判定不能にする。native confidenceを別に保持し、理由文を捏造しない。画像header・入力制限を能力検査に反映し、必要証拠を切り捨てて成功にしない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test adapters --locked。Jev専用の正常・不正分布・欠落・低確度・画像非対応・429・529をloopbackで報告する。aliasからのmodel変更で旧評価を流用しない。
+
+## Task 12: OpenAI Decisionsの条件別choice評価adapterを実装する
+
+**Dependencies / spec:** Tasks 6〜11。H2 Model assessment and permission evaluation、Profiles, providers and disclosure、Numeric defaults。
+
+**Paths / deliverable:** assessment/decisions、Decisions専用wire fixture、tests/supervision/tests/adapters.rs、h2-testing.md。spec参照の公式guide・APIを実装前に再確認する。
+
+**Acceptance:** APIキーとPOST /v1/decisions、gpt-6-luna、質問name・choice・確率配列を対応付ける。Jevのschemaを使い回さず、全回答の型・ID・分布・refusalを検査する。画像は許可されたbytesだけとし、外部URLを取得させない。ChatGPT認可の流用、部分成功からの完了、別model fallbackをしない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test adapters --locked。同じ完了条件に対する三方式の正規化、順序入替・重複name・refusal・欠落・低確度・usage・timeoutを報告する。実APIへ送信しない。
+
+## Task 13: 決定的な状態遷移と未達時の継続を実装する
+
+**Dependencies / spec:** Tasks 1〜12。H2 Completion contract and operations、States and continuation、Data flow and ordering。
+
+**Paths / deliverable:** supervision/supervisor、RuntimeControl・assessment・storeの接続、tests/supervision/tests/supervisor.rs。監督対象ごとに一つのcontrollerがrevision比較更新で進める。
+
+**Acceptance:** 対応する入力完結と安定を待ち、必須検証→条件別評価→最終再照合→保存後通知を行う。修正可能なfailとunmetは同じ子へ不足を返して新runへ進め、insufficient・人間判断・安全停止・予算は完了より優先する。3サイクル進展なしで停止し、関連する新調査証拠を進展に含める。平均点、idle、正常終了、古い結果で完了しない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test supervisor --locked。通常完了、複数回修正、必須failへの偽met、初期idle、実行中判定禁止、判定中の変更、停滞・進展・重複通知・30回上限を報告する。
+
+## Task 14: H1へ実モデル方式を選べる許可評価器を提供する
+
+**Dependencies / spec:** Tasks 4・6〜13。H1 Permission modesとPermissionEvaluatorPort、H2 Model assessment and permission evaluation。
+
+**Paths / deliverable:** assessment/permission、hostの評価器注入、tests/supervision/tests/permissions.rs、既存実Pi契約テスト。FrozenOperationを用途専用のallow・deny・askへ変換する。
+
+**Acceptance:** Decisionのallow/denyは0.99以上、低確度・失敗はaskとする。通常LLMはschema・操作束縛・根拠・不確実性を検査し、確率を作らない。監督対象の許可評価は同じ予算へ合算し、非監督runの評価はrun参照の単発要求として有限の要求制限・同意を適用する。通常チャットへ子agentの継続loopを付けない。H1のdeny・ask・grant・single-useを維持し、完了判定を許可へ流用しない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test permissions --locked、cargo test -p herness-runtime-tests --test permissions --locked。実Pi＋loopbackの三方式、無断送信0、deny/ask優先、古い引数・policy・同意、二重実行0を報告する。
+
+## Task 15: 監督対象の停止・再判定・復旧を永続化する
+
+**Dependencies / spec:** Tasks 2〜5・9・13〜14。H2 Completion contract and operations、States and continuation、H1 Lifecycle and recovery。
+
+**Paths / deliverable:** supervision/supervisorの再開操作、storeの未完了要求照合、tests/supervision/tests/recovery.rs、Tauri quit接続。
+
+**Acceptance:** 停止・取消し・条件/profile/上限の版変更、原因解消後の人間による再開を実装する。結果不明・未停止process・未完了要求を送信前へ戻さない。復元だけでは要求0、遅延応答は履歴のみ、使用済み予算は維持する。completedのsnapshotがstaleになったら通知し、無断で新jobを作らない。取消しは履歴・成果物を削除しない。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test recovery --locked。別process fixtureで要求前後・保存前後のcrash、取消し競合、停止未確認、古いprofile、条件変更、金額予約未知、復元後の明示再開を報告する。
+
+## Task 16: Tauriへ監督対象と判定設定の最小操作を接続する
+
+**Dependencies / spec:** Tasks 5〜15。H2 Completion contract and operations、Profiles, providers and disclosure、Consuming paths、H1 Tauri / security。
+
+**Paths / deliverable:** src-tauriのapp・commands・guard・credentials・capabilities、ui/、tests/supervision/tests/desktop.rs。明示的な監督対象の作成、条件確認、用途別profile、同意、開始・停止・再判定・再開、状態・証拠・予算の取得を接続する。
+
+**Acceptance:** 信頼されたmainからだけ設定・承認を行える。未検証profileは検証済みとせず、通常チャットは従来どおり明示送信で動く。UI独自の成功・内部思考表示・HTML worker・Task取込みを作らない。表示は安全なtextと構造化状態を使い、window再表示時は保存状態とsequenceで整合する。製品レイアウト・配布はH5へ残す。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --test desktop --locked、cargo test -p herness-runtime-tests --test desktop --locked。remote/preview起点のinvoke拒否、条件の無断変更拒否、用途別同意、判定不能の表示、閉じたwindowと非選択projectの継続を報告する。
+
+## Task 17: 評価fixtureとH1からH2への横断回帰を整備する
+
+**Dependencies / spec:** Tasks 1〜16。H2 Testing and acceptanceの評価セット・契約・送信と権限、H1追加契約の受入。
+
+**Paths / deliverable:** tests/supervision/fixtures・tests/acceptance.rs、既存runtime回帰、docs/development/h2-testing.md。正解ラベルと証拠scopeを持つ共通の完了／許可ケースを作る。
+
+**Acceptance:** 未達・証拠不足・古い成功・虚偽DONE・指示注入・範囲外操作・紛らわしい理由を三方式で扱う。必須負例の誤完了・誤allowは0件であることをassertし、保留・誤停止も集計する。代表的な正例で完了・allowが成立することも確認し、常に保留するだけの実装を合格にしない。scripted modelのcontract testと実modelの精度評価を区別する。旧DBからの移行、実Piの新run、H2予算と許可、quit・復元までを一連のloopback経路で確認する。
+
+**Verification / evidence:** cargo test -p herness-supervision-tests --locked、cargo test -p herness-runtime-tests --locked。fixture ID別の期待・実結果と使用modelの分類、旧fixtureの保持、未確認の実接続一覧を報告する。
+
+## Task 18: H2受入を実施し許可された実接続だけを確認する
+
+**Dependencies / spec:** Tasks 1〜17。H2 Testing and acceptance、Open items and approval、H1受入未完了の記録。
+
+**Paths / deliverable:** docs/development/h2-testing.md、docs/research/2026-11-08-h2-acceptance.md、合成入力だけを使う明示的opt-in検証境界。H1の未確認項目や過去の受入証拠を上書きしない。
+
+**Acceptance:** Phase Aは自動検証・loopback・実Tauriのsmoke/close/reopen/quitであり、外部送信・実Keychainの探索を伴わない。Phase Bの前にcontrollerが対象接続、fixture IDs、送信データ、有限の要求数・retry上限、料金または利用枠の許容条件を人間に提示して許可を得る。未指定なら検証要求を拒否する。実際の通常LLM・Jev・Decisionsと用途別閾値の評価結果を記録し、失敗するprofileは利用不可にする。許可・資格情報がなければ未確認で停止し、Task 18もH2全体も完了扱いにしない。
+
+**Verification / evidence:** cargo fmt --all -- --check、cargo clippy --workspace --all-targets --locked -- -D warnings、cargo test --workspace --locked、cargo build -p herness-desktop --locked。実Tauriは新しい一時HERNESS_APP_DATA_ROOTで既存の--smoke-test・--close-reopen-test・--quit-testを実行する。Phase Bは許可済みのopt-in手順だけを使い、要求数・usage・閾値結果・対象revision・未確認範囲をsecretなしで報告する。変更したTarget文書は../sdd/scripts/html-docsで検証し、承認だけでpush・merge・公開しない。
