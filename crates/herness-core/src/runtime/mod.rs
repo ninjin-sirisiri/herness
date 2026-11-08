@@ -11,6 +11,7 @@
 pub mod error;
 mod host;
 pub mod reconcile;
+pub mod shutdown;
 mod state;
 pub mod tools;
 pub mod views;
@@ -19,8 +20,9 @@ pub use error::RuntimeError;
 pub use host::{AgentSpec, Runtime, RuntimeDependencies};
 pub use reconcile::{
     OperationReconciliation, PermissionReconciliation, ProjectReconciliation, ReconciliationReport,
-    ReconciliationSource, RunReconciliation,
+    ReconciliationSource, RunReconciliation, ShutdownSummary,
 };
+pub use shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 pub use tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 pub use views::{
     AgentView, ApprovalOutcome, DenialOutcome, EventBatch, PendingApproval, ProjectView, RunView,

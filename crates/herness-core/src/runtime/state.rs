@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::connections::ConnectionSettings;
 use crate::contracts::connection::ConnectionId;
 use crate::contracts::ids::{AgentId, OperationId, ProjectId, RunId, SessionId};
 use crate::contracts::operation::FrozenOperation;
@@ -22,14 +23,21 @@ use crate::contracts::time::Timestamp;
 use crate::permissions::{
     GrantScope, MatchMethod, PermissionMode, PermissionRule, PolicyVersion, RuleEffect, RuleTarget,
 };
+use crate::ports::engine::StopReport;
 use crate::runtime::error::RuntimeError;
+use crate::runtime::shutdown::ShutdownOutcome;
 use crate::skills::HostCapability;
 use crate::tools::ToolName;
 
 /// Storage key for the single host-state document.
 pub(crate) const HOST_STATE_KEY: &str = "herness.runtime.host-state";
-/// Format of the host-state JSON document.
-pub(crate) const HOST_STATE_FORMAT: u32 = 1;
+/// Current format of the host-state JSON document.
+///
+/// Format 2 adds non-secret connection settings and the last shutdown record.
+/// Format 1 documents are still read; they contain neither field.
+pub(crate) const HOST_STATE_FORMAT: u32 = 2;
+/// Formats this build can read.
+const SUPPORTED_HOST_STATE_FORMATS: [u32; 2] = [1, 2];
 
 /// Whole host-owned runtime state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +45,10 @@ pub(crate) const HOST_STATE_FORMAT: u32 = 1;
 pub(crate) struct HostState {
     format: u32,
     projects: BTreeMap<ProjectId, ProjectRecord>,
+    #[serde(default)]
+    connections: BTreeMap<ConnectionId, ConnectionSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shutdown: Option<ShutdownRecord>,
 }
 
 impl Default for HostState {
@@ -44,6 +56,8 @@ impl Default for HostState {
         Self {
             format: HOST_STATE_FORMAT,
             projects: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            shutdown: None,
         }
     }
 }
@@ -55,20 +69,27 @@ impl HostState {
             serde_json::from_slice(bytes).map_err(|error| RuntimeError::CorruptState {
                 detail: format!("host-state JSON: {error}"),
             })?;
-        if state.format != HOST_STATE_FORMAT {
+        if !SUPPORTED_HOST_STATE_FORMATS.contains(&state.format) {
             return Err(RuntimeError::CorruptState {
                 detail: format!(
-                    "unsupported host-state format {}; this build supports {}",
-                    state.format, HOST_STATE_FORMAT
+                    "unsupported host-state format {}; this build supports {:?}",
+                    state.format, SUPPORTED_HOST_STATE_FORMATS
                 ),
+            });
+        }
+        if state.format == 1 && (!state.connections.is_empty() || state.shutdown.is_some()) {
+            return Err(RuntimeError::CorruptState {
+                detail: "host-state format 1 must not contain format 2 fields".to_owned(),
             });
         }
         Ok(state)
     }
 
-    /// Serializes host state for the store.
+    /// Serializes host state for the store. The current format is always used.
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, RuntimeError> {
-        serde_json::to_vec(self).map_err(|error| RuntimeError::CorruptState {
+        let mut current = self.clone();
+        current.format = HOST_STATE_FORMAT;
+        serde_json::to_vec(&current).map_err(|error| RuntimeError::CorruptState {
             detail: format!("host-state JSON: {error}"),
         })
     }
@@ -81,6 +102,26 @@ impl HostState {
     /// Mutable project map.
     pub(crate) fn projects_mut(&mut self) -> &mut BTreeMap<ProjectId, ProjectRecord> {
         &mut self.projects
+    }
+
+    /// Persisted non-secret connection settings in stable identifier order.
+    pub(crate) fn connections(&self) -> &BTreeMap<ConnectionId, ConnectionSettings> {
+        &self.connections
+    }
+
+    /// Mutable persisted connection map.
+    pub(crate) fn connections_mut(&mut self) -> &mut BTreeMap<ConnectionId, ConnectionSettings> {
+        &mut self.connections
+    }
+
+    /// Last shutdown attempt, when this state came from a quitting process.
+    pub(crate) fn shutdown(&self) -> Option<&ShutdownRecord> {
+        self.shutdown.as_ref()
+    }
+
+    /// Mutable last-shutdown slot.
+    pub(crate) fn shutdown_mut(&mut self) -> &mut Option<ShutdownRecord> {
+        &mut self.shutdown
     }
 
     /// Finds a project by its canonical real path.
@@ -312,4 +353,57 @@ enum StoredTarget {
     BashCommand {
         command: String,
     },
+}
+
+/// One run included in an explicit shutdown attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ShutdownRunRecord {
+    pub(crate) project_id: ProjectId,
+    pub(crate) run_id: RunId,
+    pub(crate) state: RunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) report: Option<StopReport>,
+    pub(crate) checkpoint_saved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure: Option<String>,
+}
+
+/// Durable, non-secret record of the last explicit application shutdown.
+///
+/// The record never claims that a forced quit saved or stopped anything. The
+/// next process reports it during reconciliation and treats any run still in an
+/// active state as interrupted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ShutdownRecord {
+    pub(crate) outcome: ShutdownOutcome,
+    pub(crate) started_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<Timestamp>,
+    #[serde(default)]
+    pub(crate) stopped_runs: Vec<ShutdownRunRecord>,
+    #[serde(default)]
+    pub(crate) unconfirmed_runs: Vec<RunId>,
+    #[serde(default)]
+    pub(crate) remaining_runs: Vec<RunId>,
+    #[serde(default)]
+    pub(crate) discarded_deferred_messages: u64,
+    #[serde(default)]
+    pub(crate) save_failures: u32,
+}
+
+impl ShutdownRecord {
+    pub(crate) fn in_progress(started_at: Timestamp, discarded_deferred_messages: usize) -> Self {
+        Self {
+            outcome: ShutdownOutcome::InProgress,
+            started_at,
+            finished_at: None,
+            stopped_runs: Vec::new(),
+            unconfirmed_runs: Vec::new(),
+            remaining_runs: Vec::new(),
+            discarded_deferred_messages: discarded_deferred_messages as u64,
+            save_failures: 0,
+        }
+    }
 }

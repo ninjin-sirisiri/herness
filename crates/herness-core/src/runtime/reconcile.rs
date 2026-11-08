@@ -16,7 +16,10 @@ use crate::contracts::operation::{
 };
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
+use crate::contracts::time::Timestamp;
 use crate::permissions::{PermissionMode, PolicyVersion};
+use crate::runtime::shutdown::ShutdownOutcome;
+use crate::runtime::state::ShutdownRecord;
 use crate::runtime::views::PendingApproval;
 use crate::tools::path::ProjectRoot;
 use crate::tools::{ToolArguments, ToolName, hash_bytes};
@@ -26,17 +29,115 @@ use crate::tools::{ToolArguments, ToolName, hash_bytes};
 #[serde(rename_all = "camelCase")]
 pub struct ReconciliationReport {
     projects: Vec<ProjectReconciliation>,
+    previous_shutdown: Option<ShutdownSummary>,
+    discarded_deferred_messages: u64,
 }
 
 impl ReconciliationReport {
     /// Creates a report.
-    pub(crate) const fn new(projects: Vec<ProjectReconciliation>) -> Self {
-        Self { projects }
+    pub(crate) const fn new(
+        projects: Vec<ProjectReconciliation>,
+        previous_shutdown: Option<ShutdownSummary>,
+        discarded_deferred_messages: u64,
+    ) -> Self {
+        Self {
+            projects,
+            previous_shutdown,
+            discarded_deferred_messages,
+        }
     }
 
     /// Per-project reports in stable project identifier order.
     pub fn projects(&self) -> &[ProjectReconciliation] {
         &self.projects
+    }
+
+    /// Summary of the previous process's explicit shutdown, when one exists.
+    pub const fn previous_shutdown(&self) -> Option<&ShutdownSummary> {
+        self.previous_shutdown.as_ref()
+    }
+
+    /// In-memory host-result messages the previous process discarded instead of
+    /// replaying after restart.
+    pub const fn discarded_deferred_messages(&self) -> u64 {
+        self.discarded_deferred_messages
+    }
+
+    /// Replaces the connection status list after the host has restored the
+    /// persisted non-secret settings into its registry.
+    pub fn replace_connections(&mut self, connections: Vec<ConnectionInfo>) {
+        for project in &mut self.projects {
+            project.connections = connections.clone();
+        }
+    }
+}
+
+/// Non-secret summary of the previous process's explicit shutdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownSummary {
+    outcome: ShutdownOutcome,
+    started_at: Timestamp,
+    finished_at: Option<Timestamp>,
+    stopped_runs: usize,
+    unconfirmed_runs: Vec<RunId>,
+    remaining_runs: Vec<RunId>,
+    discarded_deferred_messages: u64,
+    save_failures: u32,
+}
+
+impl ShutdownSummary {
+    pub(crate) fn from_record(record: &ShutdownRecord) -> Self {
+        Self {
+            outcome: record.outcome,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+            stopped_runs: record.stopped_runs.len(),
+            unconfirmed_runs: record.unconfirmed_runs.clone(),
+            remaining_runs: record.remaining_runs.clone(),
+            discarded_deferred_messages: record.discarded_deferred_messages,
+            save_failures: record.save_failures,
+        }
+    }
+
+    /// Outcome recorded by the quitting process.
+    pub const fn outcome(&self) -> ShutdownOutcome {
+        self.outcome
+    }
+
+    /// When the quit flow started.
+    pub const fn started_at(&self) -> Timestamp {
+        self.started_at
+    }
+
+    /// When the quit flow recorded its final state.
+    pub const fn finished_at(&self) -> Option<Timestamp> {
+        self.finished_at
+    }
+
+    /// Number of runs included in the attempt.
+    pub const fn stopped_runs(&self) -> usize {
+        self.stopped_runs
+    }
+
+    /// Runs whose stop was unconfirmed or failed.
+    pub fn unconfirmed_runs(&self) -> &[RunId] {
+        &self.unconfirmed_runs
+    }
+
+    /// Runs that were still active when the attempt ended.
+    pub fn remaining_runs(&self) -> &[RunId] {
+        &self.remaining_runs
+    }
+
+    /// Host-result messages discarded instead of replayed.
+    pub const fn discarded_deferred_messages(&self) -> u64 {
+        self.discarded_deferred_messages
+    }
+
+    /// Number of stop or save failures recorded.
+    pub const fn save_failures(&self) -> u32 {
+        self.save_failures
     }
 }
 

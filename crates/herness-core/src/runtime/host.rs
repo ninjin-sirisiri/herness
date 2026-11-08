@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::json;
 
-use crate::connections::ConnectionDirectory;
+use crate::connections::{ConnectionDirectory, ConnectionSettings};
 use crate::contracts::connection::{ConnectionId, ConnectionInfo, ConnectionStatus};
 use crate::contracts::errors::{ArgumentViolation, CoreError};
 use crate::contracts::events::{Event, EventDraft, EventKind, EventPayload};
@@ -44,8 +44,9 @@ use crate::permissions::{
 use crate::ports::engine::{EngineEvent, EngineInput, EnginePort, EngineStart, StopReport};
 use crate::ports::{PermissionEvaluatorPort, RuntimeStore};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 use crate::runtime::state::{
-    AgentRecord, HOST_STATE_KEY, HostState, ProjectRecord, RunRecord, StoredGrant,
+    AgentRecord, HOST_STATE_KEY, HostState, ProjectRecord, RunRecord, ShutdownRecord, StoredGrant,
 };
 use crate::runtime::tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 use crate::runtime::views::{
@@ -184,9 +185,12 @@ where
     toolchain: ToolchainDetector,
     gateway: ToolGateway<T>,
     state: HostState,
+    /// True after an explicit quit began. New runs, inputs, approvals, and
+    /// resumes are refused until the process restarts.
+    shutting_down: bool,
     /// Host-result messages waiting for an engine turn to become idle. This is
     /// in-process only; it never contains credentials or model output and is
-    /// discarded by restart reconciliation.
+    /// discarded by explicit shutdown and restart reconciliation.
     deferred_continuations: BTreeMap<RunId, Vec<String>>,
 }
 
@@ -238,10 +242,417 @@ where
             toolchain: ToolchainDetector::new(toolchain),
             gateway: ToolGateway::new(executor),
             state,
+            shutting_down: false,
             deferred_continuations: BTreeMap::new(),
         };
         let report = runtime.reconcile()?;
         Ok((runtime, report))
+    }
+
+    /// Whether an explicit shutdown has begun in this process.
+    pub const fn is_shutting_down(&self) -> bool {
+        self.shutting_down
+    }
+
+    /// Persisted non-secret connection settings.
+    ///
+    /// The returned values never contain a token or API key. They are restored
+    /// into the trusted connection registry before a run is resumed.
+    pub fn persisted_connections(&self) -> Vec<ConnectionSettings> {
+        self.state.connections().values().cloned().collect()
+    }
+
+    /// Persists one non-secret connection setting.
+    ///
+    /// The connection must already be registered with exactly these settings;
+    /// this method never creates or re-points a connection from model input.
+    pub fn record_connection_settings(
+        &mut self,
+        settings: ConnectionSettings,
+    ) -> Result<(), RuntimeError> {
+        let connection = settings.connection_id();
+        let registered = self
+            .directory
+            .get(connection)
+            .map_err(|_| RuntimeError::UnknownConnection { connection })?;
+        if registered != settings {
+            return Err(RuntimeError::ConnectionRegistry {
+                detail: "settings differ from the registered connection".to_owned(),
+            });
+        }
+        let mut next = self.state.clone();
+        next.connections_mut().insert(connection, settings);
+        if next.connections() == self.state.connections() {
+            return Ok(());
+        }
+        self.commit_state(next, Vec::new())?;
+        Ok(())
+    }
+
+    /// Persists the complete non-secret connection registry.
+    ///
+    /// Every setting must match a currently registered connection. A duplicate
+    /// identifier is rejected rather than silently collapsing two connections.
+    pub fn replace_connection_settings(
+        &mut self,
+        settings: Vec<ConnectionSettings>,
+    ) -> Result<(), RuntimeError> {
+        let mut map = BTreeMap::new();
+        for settings in settings {
+            let connection = settings.connection_id();
+            let registered = self
+                .directory
+                .get(connection)
+                .map_err(|_| RuntimeError::UnknownConnection { connection })?;
+            if registered != settings {
+                return Err(RuntimeError::ConnectionRegistry {
+                    detail: "settings differ from the registered connection".to_owned(),
+                });
+            }
+            if map.insert(connection, settings).is_some() {
+                return Err(RuntimeError::CorruptState {
+                    detail: "duplicate connection identifier in settings".to_owned(),
+                });
+            }
+        }
+        if map == *self.state.connections() {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        *next.connections_mut() = map;
+        self.commit_state(next, Vec::new())?;
+        Ok(())
+    }
+
+    /// Current non-secret connection availability.
+    pub fn connection_infos(&self) -> Result<Vec<ConnectionInfo>, RuntimeError> {
+        let settings = self
+            .directory
+            .list()
+            .map_err(|error| RuntimeError::ConnectionRegistry {
+                detail: error.to_string(),
+            })?;
+        settings
+            .into_iter()
+            .map(|settings| {
+                let status = self.connection_status(settings.connection_id())?;
+                settings.public_info(status).map_err(RuntimeError::store)
+            })
+            .collect()
+    }
+
+    /// Begins an explicit application shutdown.
+    ///
+    /// The host stops accepting new runs and tool execution immediately and
+    /// persists an in-progress shutdown record. A persistence failure is
+    /// returned to the caller and is never reported as a successful save.
+    pub fn begin_shutdown(&mut self) -> Result<ShutdownReport, RuntimeError> {
+        if self.shutting_down {
+            return Ok(self.shutdown_report().unwrap_or_else(|| {
+                ShutdownReport::new(
+                    ShutdownOutcome::InProgress,
+                    Vec::new(),
+                    Vec::new(),
+                    self.active_runs()
+                        .into_iter()
+                        .map(|(_, run, _)| run)
+                        .collect(),
+                    0,
+                    0,
+                )
+            }));
+        }
+        self.shutting_down = true;
+        let discarded = self.deferred_message_count();
+        let record = ShutdownRecord::in_progress(Timestamp::now(), discarded);
+        let mut next = self.state.clone();
+        *next.shutdown_mut() = Some(record);
+        self.commit_state(next, Vec::new())?;
+        Ok(self
+            .shutdown_report()
+            .expect("a shutdown record was just persisted"))
+    }
+
+    /// Requests coordinated stops for every active run and saves what it can.
+    ///
+    /// A stop is mapped exactly as [`Self::stop_run`] maps it. Unconfirmed
+    /// stops and failed saves are recorded as failures; the report never claims
+    /// a save or stop that did not happen.
+    pub fn stop_all_for_shutdown(&mut self) -> Result<ShutdownReport, RuntimeError> {
+        self.shutting_down = true;
+        let current_deferred = self.deferred_message_count();
+        let discarded = match self.state.shutdown() {
+            Some(record) => (record.discarded_deferred_messages as usize).max(current_deferred),
+            None => current_deferred,
+        };
+        let started_at = match self.state.shutdown() {
+            Some(record) => record.started_at,
+            None => Timestamp::now(),
+        };
+
+        let active = self.active_runs();
+        let mut stopped = Vec::with_capacity(active.len());
+        let mut unconfirmed = Vec::new();
+        let mut save_failures = 0u32;
+        for (project, run, previous_state) in active {
+            match self.stop_run(
+                project,
+                run,
+                crate::ports::engine::StopReason::ApplicationQuit,
+            ) {
+                Ok(outcome) => {
+                    let checkpoint_saved = outcome.checkpoint_saved();
+                    if !checkpoint_saved {
+                        save_failures = save_failures.saturating_add(1);
+                    }
+                    if outcome.report() == StopReport::Unconfirmed {
+                        unconfirmed.push(run);
+                    }
+                    stopped.push(ShutdownRun::new(
+                        project,
+                        run,
+                        outcome.run().state(),
+                        Some(outcome.report()),
+                        checkpoint_saved,
+                        None,
+                    ));
+                }
+                Err(error) => {
+                    save_failures = save_failures.saturating_add(1);
+                    unconfirmed.push(run);
+                    stopped.push(ShutdownRun::new(
+                        project,
+                        run,
+                        previous_state,
+                        None,
+                        false,
+                        Some(error.to_string()),
+                    ));
+                }
+            }
+        }
+
+        // Host-result messages are in-process only. They are discarded rather
+        // than replayed into a restarted engine, and the count stays visible in
+        // the shutdown record and reconciliation report.
+        self.deferred_continuations.clear();
+        let remaining = self
+            .active_runs()
+            .into_iter()
+            .map(|(_, run, _)| run)
+            .collect::<Vec<_>>();
+        let already_forced = self
+            .state
+            .shutdown()
+            .is_some_and(|record| record.outcome == ShutdownOutcome::Forced);
+        let outcome = if already_forced {
+            // A forced exit is terminal; a later call must not rewrite it as a
+            // completed save.
+            ShutdownOutcome::Forced
+        } else if !remaining.is_empty() {
+            ShutdownOutcome::InProgress
+        } else if save_failures > 0 || !unconfirmed.is_empty() {
+            ShutdownOutcome::CompletedWithUnconfirmed
+        } else {
+            ShutdownOutcome::Completed
+        };
+        let now = Timestamp::now();
+        let record = ShutdownRecord {
+            outcome,
+            started_at,
+            finished_at: (outcome != ShutdownOutcome::InProgress).then_some(now),
+            stopped_runs: stopped
+                .iter()
+                .map(|run| crate::runtime::state::ShutdownRunRecord {
+                    project_id: run.project_id(),
+                    run_id: run.run_id(),
+                    state: run.state(),
+                    report: run.report(),
+                    checkpoint_saved: run.checkpoint_saved(),
+                    failure: run.failure().map(str::to_owned),
+                })
+                .collect(),
+            unconfirmed_runs: unconfirmed,
+            remaining_runs: remaining,
+            discarded_deferred_messages: discarded as u64,
+            save_failures,
+        };
+        let mut next = self.state.clone();
+        *next.shutdown_mut() = Some(record);
+        self.commit_state(next, Vec::new())?;
+        Ok(self
+            .shutdown_report()
+            .expect("a shutdown record was just persisted"))
+    }
+
+    /// Marks a shutdown complete after every active run reached a terminal
+    /// state.
+    ///
+    /// This does not turn unconfirmed stops into successes. It only records the
+    /// finish timestamp and the honest completion outcome.
+    pub fn finish_shutdown(&mut self) -> Result<ShutdownReport, RuntimeError> {
+        if !self.shutting_down {
+            return Err(RuntimeError::NotShuttingDown);
+        }
+        let remaining = self.active_runs();
+        if !remaining.is_empty() {
+            return Err(RuntimeError::ShutdownIncomplete {
+                remaining: remaining.len(),
+            });
+        }
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        let record = next
+            .shutdown_mut()
+            .get_or_insert_with(|| ShutdownRecord::in_progress(now, self.deferred_message_count()));
+        if record.outcome == ShutdownOutcome::InProgress {
+            record.outcome = if record.save_failures == 0 && record.unconfirmed_runs.is_empty() {
+                ShutdownOutcome::Completed
+            } else {
+                ShutdownOutcome::CompletedWithUnconfirmed
+            };
+        }
+        record.finished_at.get_or_insert(now);
+        self.commit_state(next, Vec::new())?;
+        Ok(self
+            .shutdown_report()
+            .expect("a shutdown record was just persisted"))
+    }
+
+    /// Forces the remaining active runs to `interrupted` without claiming a
+    /// saveable stop.
+    ///
+    /// Pending operations are not resolved, rolled back, or retried. The
+    /// resulting record is `Forced`, and every affected run remains visible to
+    /// the next process as interrupted and reconciliation-pending.
+    pub fn force_shutdown(&mut self) -> Result<ShutdownReport, RuntimeError> {
+        self.shutting_down = true;
+        let now = Timestamp::now();
+        let discarded = self.deferred_message_count();
+        let active = self.active_runs();
+        let mut forced = Vec::with_capacity(active.len());
+        for (project, run, _) in active {
+            let record = self.run_record(project, run)?.clone();
+            self.gateway.service_mut().invalidate_run(run);
+            let mut next = self.state.clone();
+            if let Some(project_record) = next.projects_mut().get_mut(&project) {
+                project_record
+                    .approvals
+                    .retain(|_, approval| approval.run_id != run);
+                if let Some(stored) = project_record.runs.get_mut(&run) {
+                    stored.state = RunState::Interrupted;
+                    stored.updated_at = now;
+                }
+            }
+            let event = event_draft(
+                project,
+                record.agent_id,
+                record.session_id,
+                run,
+                None,
+                "run.state_changed",
+                json!({
+                    "from": record.state.as_str(),
+                    "to": RunState::Interrupted.as_str(),
+                    "stage": "forced_shutdown",
+                    "detail": { "saveConfirmed": false, "stopConfirmed": false },
+                }),
+            )?;
+            self.commit_state(next, vec![event])?;
+            forced.push(ShutdownRun::new(
+                project,
+                run,
+                RunState::Interrupted,
+                None,
+                false,
+                Some("forced shutdown did not confirm a saveable stop".to_owned()),
+            ));
+        }
+        self.deferred_continuations.clear();
+
+        let started_at = self
+            .state
+            .shutdown()
+            .map(|record| record.started_at)
+            .unwrap_or(now);
+        let record = ShutdownRecord {
+            outcome: ShutdownOutcome::Forced,
+            started_at,
+            finished_at: Some(now),
+            stopped_runs: forced
+                .iter()
+                .map(|run| crate::runtime::state::ShutdownRunRecord {
+                    project_id: run.project_id(),
+                    run_id: run.run_id(),
+                    state: run.state(),
+                    report: None,
+                    checkpoint_saved: false,
+                    failure: run.failure().map(str::to_owned),
+                })
+                .collect(),
+            unconfirmed_runs: forced.iter().map(ShutdownRun::run_id).collect(),
+            remaining_runs: Vec::new(),
+            discarded_deferred_messages: discarded as u64,
+            save_failures: forced.len() as u32,
+        };
+        let mut next = self.state.clone();
+        *next.shutdown_mut() = Some(record);
+        self.commit_state(next, Vec::new())?;
+        Ok(self
+            .shutdown_report()
+            .expect("a shutdown record was just persisted"))
+    }
+
+    /// Last shutdown report derived from persisted host state.
+    pub fn shutdown_report(&self) -> Option<ShutdownReport> {
+        let record = self.state.shutdown()?;
+        Some(ShutdownReport::new(
+            record.outcome,
+            record
+                .stopped_runs
+                .iter()
+                .map(|run| {
+                    ShutdownRun::new(
+                        run.project_id,
+                        run.run_id,
+                        run.state,
+                        run.report,
+                        run.checkpoint_saved,
+                        run.failure.clone(),
+                    )
+                })
+                .collect(),
+            record.unconfirmed_runs.clone(),
+            record.remaining_runs.clone(),
+            record.discarded_deferred_messages,
+            record.save_failures,
+        ))
+    }
+
+    fn deferred_message_count(&self) -> usize {
+        self.deferred_continuations.values().map(Vec::len).sum()
+    }
+
+    fn active_runs(&self) -> Vec<(ProjectId, RunId, RunState)> {
+        self.state
+            .projects()
+            .iter()
+            .flat_map(|(project, record)| {
+                record
+                    .runs
+                    .iter()
+                    .filter(|(_, run)| run.state.is_active())
+                    .map(|(run, stored)| (*project, *run, stored.state))
+            })
+            .collect()
+    }
+
+    fn ensure_accepting(&self) -> Result<(), RuntimeError> {
+        if self.shutting_down {
+            Err(RuntimeError::ShuttingDown)
+        } else {
+            Ok(())
+        }
     }
 
     /// Current policy snapshot.
@@ -354,6 +765,7 @@ where
         project: ProjectId,
         spec: AgentSpec,
     ) -> Result<AgentView, RuntimeError> {
+        self.ensure_accepting()?;
         let project_record = self.project_record(project)?.clone();
         if spec.name.is_empty() {
             return Err(RuntimeError::InvalidValue {
@@ -458,6 +870,7 @@ where
         agent: AgentId,
         instructions: impl Into<String>,
     ) -> Result<RunView, RuntimeError> {
+        self.ensure_accepting()?;
         let project_record = self.project_record(project)?.clone();
         if agent.project_id() != project {
             return Err(RuntimeError::CrossProject {
@@ -606,6 +1019,7 @@ where
                 violation: ArgumentViolation::Empty,
             });
         }
+        self.ensure_accepting()?;
         let record = self.run_record(project, run)?.clone();
         if record.state != RunState::Running {
             return Err(RuntimeError::InvalidRunTransition {
@@ -732,6 +1146,7 @@ where
     /// a model request or replay a tool. `idle` runs are not resumable; a later
     /// execution is a separate run.
     pub fn resume_run(&mut self, project: ProjectId, run: RunId) -> Result<RunView, RuntimeError> {
+        self.ensure_accepting()?;
         let record = self.run_record(project, run)?.clone();
         if !matches!(record.state, RunState::Paused | RunState::Interrupted) {
             return Err(RuntimeError::InvalidRunTransition {
@@ -1686,6 +2101,7 @@ where
         operation_id: crate::contracts::ids::OperationId,
         expected: Option<&FrozenOperation>,
     ) -> Result<crate::runtime::views::ApprovalOutcome, RuntimeError> {
+        self.ensure_accepting()?;
         if operation_id.project_id() != project {
             return Err(RuntimeError::CrossProject {
                 id_kind: IdKind::Operation,
@@ -1819,6 +2235,7 @@ where
         project: ProjectId,
         operation_id: crate::contracts::ids::OperationId,
     ) -> Result<DenialOutcome, RuntimeError> {
+        self.ensure_accepting()?;
         if operation_id.project_id() != project {
             return Err(RuntimeError::CrossProject {
                 id_kind: IdKind::Operation,
@@ -1917,7 +2334,7 @@ where
 
     fn project_view(&self, project: ProjectId) -> Result<ProjectView, RuntimeError> {
         let record = self.project_record(project)?;
-        let connections = self.connection_summaries()?;
+        let connections = self.connection_infos()?;
         Ok(ProjectView::new(
             project,
             record.path.clone(),
@@ -1925,22 +2342,6 @@ where
             self.capabilities,
             self.toolchain.detect(),
         ))
-    }
-
-    fn connection_summaries(&self) -> Result<Vec<ConnectionInfo>, RuntimeError> {
-        let settings = self
-            .directory
-            .list()
-            .map_err(|error| RuntimeError::ConnectionRegistry {
-                detail: error.to_string(),
-            })?;
-        settings
-            .into_iter()
-            .map(|settings| {
-                let status = self.connection_status(settings.connection_id())?;
-                settings.public_info(status).map_err(RuntimeError::store)
-            })
-            .collect()
     }
 
     fn connection_status(
@@ -2104,9 +2505,13 @@ where
     ) -> Result<crate::runtime::reconcile::ReconciliationReport, RuntimeError> {
         use crate::runtime::reconcile::{
             OperationReconciliation, PermissionReconciliation, ProjectReconciliation,
-            ReconciliationReport, RunReconciliation,
+            ReconciliationReport, RunReconciliation, ShutdownSummary,
         };
 
+        let previous_shutdown = self.state.shutdown().map(ShutdownSummary::from_record);
+        let discarded_deferred_messages = previous_shutdown
+            .as_ref()
+            .map_or(0, ShutdownSummary::discarded_deferred_messages);
         let policy = self.policy.policy().clone();
         let evaluator_available = self
             .evaluator
@@ -2185,7 +2590,7 @@ where
                 runs,
                 operations,
                 pending,
-                self.connection_summaries()?,
+                self.connection_infos()?,
                 permission,
             ));
         }
@@ -2193,7 +2598,11 @@ where
         if next != self.state {
             self.commit_state(next, Vec::new())?;
         }
-        Ok(ReconciliationReport::new(reports))
+        Ok(ReconciliationReport::new(
+            reports,
+            previous_shutdown,
+            discarded_deferred_messages,
+        ))
     }
 }
 

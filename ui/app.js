@@ -57,6 +57,7 @@ async function frontendState() {
   const state = await call("frontend_state");
   renderProjects(state.projects || []);
   renderConnections(state.connections || []);
+  renderReconciliation(state.reconciliation);
   setText(
     "policy-line",
     `Permission mode: ${state.permissionMode} (policy ${state.policyVersion}) · ` +
@@ -66,6 +67,50 @@ async function frontendState() {
     ui.project = state.selectedProject;
   }
   return state;
+}
+
+function renderReconciliation(report) {
+  if (!report) {
+    setText("reconciliation", "No restore report is available.");
+    return;
+  }
+  const previous = report.previousShutdown;
+  const lines = [];
+  if (previous) {
+    lines.push(
+      `Previous shutdown: ${previous.outcome} · stopped runs: ${previous.stoppedRuns} · ` +
+        `unconfirmed: ${(previous.unconfirmedRuns || []).length} · ` +
+        `remaining: ${(previous.remainingRuns || []).length} · ` +
+        `discarded host messages: ${previous.discardedDeferredMessages} · ` +
+        `save failures: ${previous.saveFailures}`
+    );
+  } else {
+    lines.push("Previous shutdown: none recorded.");
+  }
+  lines.push(`Discarded host-result messages: ${report.discardedDeferredMessages || 0}`);
+  for (const project of report.projects || []) {
+    lines.push(`Project ${project.path}`);
+    for (const run of project.runs || []) {
+      lines.push(
+        `  run ${run.runId}: ${run.previousState} -> ${run.state}` +
+          (run.awaitingApproval ? " (restored approval requires re-evaluation)" : "")
+      );
+    }
+    for (const operation of project.operations || []) {
+      lines.push(
+        `  operation ${operation.operationId} (${operation.tool}): ` +
+          `${operation.outcome} via ${operation.source}` +
+          (operation.detail ? ` — ${operation.detail}` : "")
+      );
+    }
+    for (const approval of project.pendingApprovals || []) {
+      lines.push(
+        `  pending approval ${approval.operation.operationId} (${approval.operation.tool}) · ` +
+          `reusable: ${approval.reusable}`
+      );
+    }
+  }
+  setText("reconciliation", lines.join("\n"));
 }
 
 function renderProjects(projects) {
@@ -290,6 +335,39 @@ async function refreshAll() {
   await loadLoginStatus();
 }
 
+async function refreshQuit() {
+  try {
+    const state = await call("quit_state");
+    const actions = byId("quit-actions");
+    let text = `Stage: ${state.stage}`;
+    if (state.remainingMs !== null && state.remainingMs !== undefined) {
+      text += ` · grace remaining: ${state.remainingMs} ms`;
+    }
+    if (state.stopFinished) {
+      text += ` · stops finished: ${state.allInactive} · save confirmed: ${state.saveSucceeded}`;
+    }
+    if ((state.unconfirmedRuns || []).length > 0) {
+      text += ` · unconfirmed runs: ${state.unconfirmedRuns.length}`;
+    }
+    if (state.detail) {
+      text += ` · ${state.detail}`;
+    }
+    setText("quit-status", text);
+    actions.hidden = !(state.canKeepWaiting || state.canForceQuit);
+    byId("quit-keep-waiting").hidden = !state.canKeepWaiting;
+    byId("quit-force").hidden = !state.canForceQuit;
+  } catch (error) {
+    setText("quit-status", `Quit state unavailable: ${errorText(error)}`);
+  }
+}
+
+function scheduleQuitPoll() {
+  window.setTimeout(async () => {
+    await refreshQuit();
+    scheduleQuitPoll();
+  }, 500);
+}
+
 function schedulePoll() {
   window.setTimeout(async () => {
     await pollProject();
@@ -431,6 +509,33 @@ function bind() {
     }
   });
 
+  byId("quit-app").addEventListener("click", async () => {
+    try {
+      await call("quit_app");
+      await refreshQuit();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("quit-keep-waiting").addEventListener("click", async () => {
+    try {
+      await call("quit_choice", { choice: "keep_waiting" });
+      await refreshQuit();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("quit-force").addEventListener("click", async () => {
+    try {
+      await call("quit_choice", { choice: "force_quit" });
+      await refreshQuit();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
   // The paste event is allowed so a human can paste a key, but the UI never
   // reads it back after submission.
   byId("api-key").addEventListener("input", () => {
@@ -446,9 +551,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
   try {
     await refreshAll();
+    await refreshQuit();
     await call("ui_ready");
     document.title = "herness ready";
     schedulePoll();
+    scheduleQuitPoll();
   } catch (error) {
     document.title = `herness error: ${errorText(error)}`;
     showError(errorText(error));

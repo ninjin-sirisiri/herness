@@ -93,6 +93,24 @@
       </section>
 
       <section>
+        <h2>Recovery and reconciliation</h2>
+        <p class="muted">
+          Restore only reads saved state. Unknown results stay pending until a human verifies them.
+        </p>
+        <pre id="reconciliation" class="history"></pre>
+      </section>
+
+      <section>
+        <h2>Quit</h2>
+        <p id="quit-status" class="muted">No quit has been requested.</p>
+        <div id="quit-actions" class="row" hidden>
+          <button id="quit-keep-waiting" type="button">Keep waiting</button>
+          <button id="quit-force" type="button">Force quit</button>
+        </div>
+        <button id="quit-app" type="button">Quit herness</button>
+      </section>
+
+      <section>
         <h2>State and history</h2>
         <div class="row">
           <label for="history-limit">History limit</label>

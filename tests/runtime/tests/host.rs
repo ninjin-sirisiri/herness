@@ -116,6 +116,7 @@ struct FakeEngine {
     state: Arc<Mutex<EngineState>>,
     store: Arc<Mutex<Store>>,
     stop_report: StopReport,
+    reject_input: bool,
 }
 
 impl FakeEngine {
@@ -123,11 +124,13 @@ impl FakeEngine {
         state: Arc<Mutex<EngineState>>,
         store: Arc<Mutex<Store>>,
         stop_report: StopReport,
+        reject_input: bool,
     ) -> Self {
         Self {
             state,
             store,
             stop_report,
+            reject_input,
         }
     }
 }
@@ -150,6 +153,12 @@ impl EnginePort for FakeEngine {
     }
 
     fn send_input(&mut self, run: &RunId, input: EngineInput) -> Result<(), CoreError> {
+        if self.reject_input {
+            return Err(CoreError::InvalidRunTransition {
+                from: RunState::Running,
+                to: RunState::Running,
+            });
+        }
         let EngineInput::Text(text) = input;
         self.state
             .lock()
@@ -343,6 +352,7 @@ struct Options {
     credential: CredentialAvailability,
     register_connection: bool,
     stop_report: StopReport,
+    reject_input: bool,
 }
 
 impl Default for Options {
@@ -353,6 +363,7 @@ impl Default for Options {
             credential: CredentialAvailability::Available,
             register_connection: true,
             stop_report: StopReport::Stopped,
+            reject_input: false,
         }
     }
 }
@@ -370,6 +381,7 @@ struct TestHost {
     policy: PolicyAdmin,
     evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
     stop_report: StopReport,
+    reject_input: bool,
     runtime: HostRuntime,
 }
 
@@ -410,6 +422,7 @@ impl TestHost {
             Arc::clone(&engine_state),
             Arc::clone(&store),
             options.stop_report,
+            options.reject_input,
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let executor = TestExecutor::new(Arc::clone(&store), Arc::clone(&calls));
@@ -442,6 +455,7 @@ impl TestHost {
             policy: options.policy,
             evaluator: None,
             stop_report: options.stop_report,
+            reject_input: options.reject_input,
             runtime,
         }
     }
@@ -465,6 +479,7 @@ impl TestHost {
             Arc::clone(&self.engine_state),
             Arc::clone(&self.store),
             self.stop_report,
+            self.reject_input,
         );
         let executor = TestExecutor::new(Arc::clone(&self.store), Arc::clone(&self.calls));
         let deps = RuntimeDependencies::new(
@@ -1555,4 +1570,269 @@ fn child_agents_cannot_widen_the_parent_grant() {
 #[allow(dead_code)]
 fn _assert_json_payloads() {
     let _ = json!({});
+}
+
+#[test]
+fn explicit_shutdown_refuses_new_work_saves_checkpoints_and_restores() {
+    use herness_core::runtime::ShutdownOutcome;
+
+    let mut host = TestHost::new();
+    let (project, _) = host.open_both();
+    let agent = host
+        .runtime
+        .create_agent(project, AgentSpec::new("a", "implementer", host.connection))
+        .expect("agent");
+    let run = host
+        .runtime
+        .start_run(project, agent.agent_id(), "write notes")
+        .expect("run");
+    host.push_event(
+        run.run_id(),
+        EngineEvent::ToolCall {
+            tool: ToolName::Write,
+            arguments: write_arguments("shutdown.txt", "not yet"),
+        },
+    );
+    host.runtime.poll_run(project, run.run_id()).unwrap();
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::AwaitingApproval
+    );
+
+    let settings = host
+        .directory
+        .get(host.connection)
+        .expect("registered settings");
+    host.runtime
+        .record_connection_settings(settings)
+        .expect("persist settings");
+
+    let started = host.runtime.begin_shutdown().expect("begin shutdown");
+    assert_eq!(started.outcome(), ShutdownOutcome::InProgress);
+    assert!(host.runtime.is_shutting_down());
+    assert!(matches!(
+        host.runtime.start_run(project, agent.agent_id(), "later"),
+        Err(RuntimeError::ShuttingDown)
+    ));
+    assert!(matches!(
+        host.runtime.submit_input(project, run.run_id(), "later"),
+        Err(RuntimeError::ShuttingDown)
+    ));
+    let operation = host.runtime.pending_approvals(project).unwrap()[0]
+        .operation()
+        .operation_id();
+    assert!(matches!(
+        host.runtime.approve(project, operation),
+        Err(RuntimeError::ShuttingDown)
+    ));
+
+    let stopped = host
+        .runtime
+        .stop_all_for_shutdown()
+        .expect("stop all for shutdown");
+    assert!(stopped.all_inactive());
+    assert!(stopped.save_succeeded());
+    assert!(stopped.unconfirmed_runs().is_empty());
+    assert_eq!(stopped.outcome(), ShutdownOutcome::Completed);
+    let stopped_run = host.runtime.run(project, run.run_id()).unwrap();
+    assert_eq!(stopped_run.state(), RunState::Paused);
+    assert_eq!(
+        stopped
+            .runs()
+            .iter()
+            .find(|entry| entry.run_id() == run.run_id())
+            .map(|entry| entry.checkpoint_saved()),
+        Some(true)
+    );
+    let finished = host.runtime.finish_shutdown().expect("finish shutdown");
+    assert_eq!(finished.outcome(), ShutdownOutcome::Completed);
+
+    host.reset_request_counters();
+    let report = host.restart();
+    assert_eq!(host.engine_state().request_count(), 0);
+    let previous = report.previous_shutdown().expect("previous shutdown");
+    assert_eq!(previous.outcome(), ShutdownOutcome::Completed);
+    assert_eq!(previous.stopped_runs(), 1);
+    assert!(previous.unconfirmed_runs().is_empty());
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::Paused
+    );
+    assert_eq!(host.runtime.persisted_connections().len(), 1);
+    assert!(host.runtime.pending_approvals(project).unwrap().is_empty());
+}
+
+#[test]
+fn unconfirmed_shutdown_stop_is_interrupted_and_never_reported_as_saved() {
+    use herness_core::runtime::ShutdownOutcome;
+
+    let mut host = TestHost::with_options(Options {
+        stop_report: StopReport::Unconfirmed,
+        ..Options::default()
+    });
+    let (project, _) = host.open_both();
+    let agent = host
+        .runtime
+        .create_agent(project, AgentSpec::new("a", "implementer", host.connection))
+        .expect("agent");
+    let run = host
+        .runtime
+        .start_run(project, agent.agent_id(), "work")
+        .expect("run");
+
+    host.runtime.begin_shutdown().expect("begin shutdown");
+    let stopped = host
+        .runtime
+        .stop_all_for_shutdown()
+        .expect("stop all for shutdown");
+    assert_eq!(stopped.outcome(), ShutdownOutcome::CompletedWithUnconfirmed);
+    assert!(!stopped.save_succeeded());
+    assert_eq!(stopped.unconfirmed_runs(), &[run.run_id()]);
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::Interrupted
+    );
+
+    host.reset_request_counters();
+    let report = host.restart();
+    assert_eq!(host.engine_state().request_count(), 0);
+    assert_eq!(
+        report.previous_shutdown().unwrap().outcome(),
+        ShutdownOutcome::CompletedWithUnconfirmed
+    );
+    assert_eq!(
+        report.previous_shutdown().unwrap().unconfirmed_runs(),
+        &[run.run_id()]
+    );
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::Interrupted
+    );
+}
+
+#[test]
+fn forced_shutdown_leaves_operation_intents_pending_for_reconciliation() {
+    use herness_core::runtime::{ReconciliationSource, ShutdownOutcome};
+
+    let mut host = TestHost::new();
+    let (project, _) = host.open_both();
+    let agent = host
+        .runtime
+        .create_agent(project, AgentSpec::new("a", "implementer", host.connection))
+        .expect("agent");
+    let run = host
+        .runtime
+        .start_run(project, agent.agent_id(), "run a shell command")
+        .expect("run");
+    let arguments = ToolArguments::Bash(BashArgs {
+        command: NonEmptyText::new("sleep 30").expect("command"),
+        purpose: Purpose::new("pending shell operation").expect("purpose"),
+        timeout_ms: None,
+    });
+    let operation = commit_intent(
+        &host.store,
+        project,
+        &host.project_a,
+        run.run_id(),
+        ToolName::Bash,
+        arguments,
+    );
+
+    host.runtime.begin_shutdown().expect("begin shutdown");
+    let forced = host.runtime.force_shutdown().expect("force shutdown");
+    assert_eq!(forced.outcome(), ShutdownOutcome::Forced);
+    assert!(!forced.save_succeeded());
+    assert_eq!(forced.unconfirmed_runs(), &[run.run_id()]);
+    assert!(forced.remaining_runs().is_empty());
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::Interrupted
+    );
+    assert!(
+        host.engine_state().stops.is_empty(),
+        "force shutdown must not claim a coordinated stop"
+    );
+
+    let unresolved = host
+        .store
+        .lock()
+        .expect("store lock")
+        .unresolved_operations(&project)
+        .expect("unresolved operations");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].intent().operation().operation_id(), operation);
+
+    host.reset_request_counters();
+    let report = host.restart();
+    assert_eq!(host.engine_state().request_count(), 0);
+    let project_report = report
+        .projects()
+        .iter()
+        .find(|entry| entry.project_id() == project)
+        .expect("project report");
+    let reconciled = project_report
+        .operations()
+        .iter()
+        .find(|entry| entry.operation_id() == operation)
+        .expect("pending operation is reconciled");
+    assert_eq!(reconciled.outcome(), OperationOutcome::Unverifiable);
+    assert_eq!(reconciled.source(), ReconciliationSource::ShellUncertain);
+    assert_eq!(
+        host.runtime.run(project, run.run_id()).unwrap().state(),
+        RunState::Interrupted
+    );
+}
+
+#[test]
+fn deferred_host_messages_are_discarded_and_visible_in_reconciliation() {
+    let mut host = TestHost::with_options(Options {
+        reject_input: true,
+        ..Options::default()
+    });
+    let (project, _) = host.open_both();
+    let agent = host
+        .runtime
+        .create_agent(project, AgentSpec::new("a", "implementer", host.connection))
+        .expect("agent");
+    let run = host
+        .runtime
+        .start_run(project, agent.agent_id(), "write notes")
+        .expect("run");
+    host.push_event(
+        run.run_id(),
+        EngineEvent::ToolCall {
+            tool: ToolName::Write,
+            arguments: write_arguments("deferred.txt", "not yet"),
+        },
+    );
+    host.runtime.poll_run(project, run.run_id()).unwrap();
+    let operation = host.runtime.pending_approvals(project).unwrap()[0]
+        .operation()
+        .operation_id();
+    host.runtime.deny(project, operation).expect("deny");
+
+    host.runtime.begin_shutdown().expect("begin shutdown");
+    let stopped = host
+        .runtime
+        .stop_all_for_shutdown()
+        .expect("stop all for shutdown");
+    assert_eq!(stopped.discarded_deferred_messages(), 1);
+    assert!(stopped.save_succeeded());
+
+    host.reset_request_counters();
+    let report = host.restart();
+    assert_eq!(host.engine_state().request_count(), 0);
+    assert_eq!(report.discarded_deferred_messages(), 1);
+    assert_eq!(
+        report
+            .previous_shutdown()
+            .expect("previous shutdown")
+            .discarded_deferred_messages(),
+        1
+    );
+    assert_eq!(
+        host.engine_state().inputs.len(),
+        0,
+        "a discarded host result must never be replayed after restart"
+    );
 }

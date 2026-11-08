@@ -353,11 +353,19 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         }
         context.tools.stopping.store(true, Ordering::SeqCst);
         // Refuse new managed processes and signal existing groups before the
-        // SDK cancellation is waited on.
+        // SDK cancellation is waited on. `stop_all` owns the bounded grace and
+        // SIGKILL escalation so this synchronous stop can actually return even
+        // when a shell ignores SIGTERM. An unconfirmed group is never reported
+        // as a confirmed stop.
         context.tools.supervisor.begin_stop();
+        let supervisor_report = context
+            .tools
+            .supervisor
+            .stop_all(herness_core::DEFAULT_STOP_GRACE);
+        let groups_confirmed = supervisor_report.all_confirmed();
         let report = match self.runtime.block_on(context.session.cancel()) {
-            Ok(()) => StopReport::Stopped,
-            Err(_) => StopReport::Unconfirmed,
+            Ok(()) if groups_confirmed => StopReport::Stopped,
+            Ok(()) | Err(_) => StopReport::Unconfirmed,
         };
         if report == StopReport::Stopped {
             context

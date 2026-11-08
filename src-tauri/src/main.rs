@@ -6,7 +6,9 @@
 
 fn main() {
     let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
-    if let Err(error) = herness_desktop::app::run(smoke_test) {
+    let quit_test = std::env::args().any(|argument| argument == "--quit-test");
+    let close_reopen_test = std::env::args().any(|argument| argument == "--close-reopen-test");
+    if let Err(error) = herness_desktop::app::run(smoke_test, quit_test, close_reopen_test) {
         eprintln!("herness-desktop failed to start: {error}");
         std::process::exit(1);
     }

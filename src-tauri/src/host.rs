@@ -12,14 +12,15 @@ use std::sync::{Arc, Mutex};
 
 use herness_core::runtime::{
     ProjectView, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
-    RuntimeToolExecutor, ToolExecution,
+    RuntimeToolExecutor, ShutdownReport, ToolExecution,
 };
 use herness_core::{
     ArgumentViolation, BashExecutor, Checkpoint, CheckpointCommit, ConnectionAdmin,
-    ConnectionDirectory, CoreError, EventDraft, FileLockRegistry, FileObservation, FileToolOutput,
-    FrozenOperation, HistoryPage, HistoryQuery, NativeFileTools, OperationEvidence, OperationId,
-    OperationIntent, OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin,
-    ProcessSupervisor, ProjectId, ProjectRoot, RunId, StorePort, ToolExecutor, ToolName,
+    ConnectionDirectory, ConnectionSettings, CoreError, EventDraft, FileLockRegistry,
+    FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery, NativeFileTools,
+    OperationEvidence, OperationId, OperationIntent, OperationRecord, OperationResult,
+    PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId, ProjectRoot, RunId, StorePort,
+    ToolExecutor, ToolName,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -70,16 +71,123 @@ impl DesktopHost {
         );
         let (runtime, report) =
             Runtime::restore(dependencies).map_err(|error| error.to_string())?;
-        Ok((
-            Self {
-                runtime,
-                connections,
-                directory,
-                credentials,
-                app_data_root: app_data_root.as_ref().to_path_buf(),
-            },
-            report,
-        ))
+        let mut host = Self {
+            runtime,
+            connections,
+            directory,
+            credentials,
+            app_data_root: app_data_root.as_ref().to_path_buf(),
+        };
+        let reconciliation = host.restore_connection_settings(report)?;
+        Ok((host, reconciliation))
+    }
+
+    /// Restores non-secret connection settings into the trusted registry and
+    /// refreshes the reconciliation report's status list.
+    ///
+    /// Persisted settings are the durable source. A connection already present
+    /// in the in-memory registry must match exactly; a conflict is an error
+    /// rather than a silent re-point. Conversely, in-memory settings that were
+    /// not persisted yet are persisted before any run can use them.
+    fn restore_connection_settings(
+        &mut self,
+        mut report: ReconciliationReport,
+    ) -> Result<ReconciliationReport, String> {
+        let persisted = self.runtime.persisted_connections();
+        for settings in persisted {
+            let connection = settings.connection_id();
+            match self.directory.get(connection) {
+                Ok(existing) if existing == settings => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "persisted connection {connection} differs from the registered settings"
+                    ));
+                }
+                Err(_) => self
+                    .connections
+                    .add(settings)
+                    .map_err(|error| error.to_string())?,
+            }
+        }
+        let registered = self.directory.list().map_err(|error| error.to_string())?;
+        self.runtime
+            .replace_connection_settings(registered)
+            .map_err(|error| error.to_string())?;
+        let connections = self
+            .runtime
+            .connection_infos()
+            .map_err(|error| error.to_string())?;
+        report.replace_connections(connections);
+        Ok(report)
+    }
+
+    /// Registers one human-configured connection and persists its non-secret
+    /// settings in the same operation.
+    pub fn register_connection(
+        &mut self,
+        settings: ConnectionSettings,
+    ) -> Result<herness_core::ConnectionInfo, String> {
+        let connection = settings.connection_id();
+        self.connections
+            .add(settings.clone())
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.runtime.record_connection_settings(settings) {
+            let _ = self.connections.remove(connection);
+            return Err(error.to_string());
+        }
+        self.runtime
+            .connection_infos()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|info| info.connection_id() == connection)
+            .ok_or_else(|| "the new connection is not visible".to_owned())
+    }
+
+    /// Persists every currently registered non-secret connection setting.
+    ///
+    /// The quit flow calls this before starting coordinated stops so a ChatGPT
+    /// account selection or other human settings change made in this process is
+    /// not lost. Secrets remain in the Keychain only.
+    pub fn persist_connection_settings(&mut self) -> Result<(), String> {
+        let registered = self.directory.list().map_err(|error| error.to_string())?;
+        self.runtime
+            .replace_connection_settings(registered)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Begins explicit shutdown and refuses new runs and tool decisions.
+    pub fn begin_shutdown(&mut self) -> Result<ShutdownReport, String> {
+        self.runtime
+            .begin_shutdown()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stops active runs, saves checkpoints, and records what it could not
+    /// confirm.
+    pub fn stop_all_for_shutdown(&mut self) -> Result<ShutdownReport, String> {
+        self.runtime
+            .stop_all_for_shutdown()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Records a completed shutdown after all active runs reached a terminal
+    /// state.
+    pub fn finish_shutdown(&mut self) -> Result<ShutdownReport, String> {
+        self.runtime
+            .finish_shutdown()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Forces remaining runs to `interrupted` without claiming saved stops.
+    pub fn force_shutdown(&mut self) -> Result<ShutdownReport, String> {
+        self.runtime
+            .force_shutdown()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Whether an explicit shutdown has begun.
+    pub const fn is_shutting_down(&self) -> bool {
+        self.runtime.is_shutting_down()
     }
 
     /// Runtime used by the trusted command layer.
@@ -140,27 +248,9 @@ impl DesktopHost {
 
     /// Non-secret connection views for the UI.
     pub fn connection_infos(&self) -> Result<Vec<herness_core::ConnectionInfo>, String> {
-        let settings = self.directory.list().map_err(|error| error.to_string())?;
-        settings
-            .into_iter()
-            .map(|settings| {
-                let status = match self.credentials.availability(&settings.connection_id()) {
-                    Ok(herness_core::CredentialAvailability::Available) => {
-                        herness_core::ConnectionStatus::Available
-                    }
-                    Ok(herness_core::CredentialAvailability::LoginRequired) => {
-                        herness_core::ConnectionStatus::LoginRequired
-                    }
-                    Ok(herness_core::CredentialAvailability::Unavailable) => {
-                        herness_core::ConnectionStatus::AuthRequired
-                    }
-                    Err(_) => herness_core::ConnectionStatus::Unavailable,
-                };
-                settings
-                    .public_info(status)
-                    .map_err(|error| error.to_string())
-            })
-            .collect()
+        self.runtime
+            .connection_infos()
+            .map_err(|error| error.to_string())
     }
 }
 

@@ -175,6 +175,16 @@ pub enum RuntimeError {
         /// Requested tool.
         tool: ToolName,
     },
+    /// An explicit shutdown began and no new run, input, or tool decision is
+    /// accepted.
+    ShuttingDown,
+    /// The shutdown was not started in this process.
+    NotShuttingDown,
+    /// A shutdown cannot finish while runs are still active.
+    ShutdownIncomplete {
+        /// Number of active runs that remain.
+        remaining: usize,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -245,6 +255,13 @@ impl fmt::Display for RuntimeError {
             }
             Self::ToolUnavailable { tool } => {
                 write!(f, "no host executor is configured for {tool}")
+            }
+            Self::ShuttingDown => {
+                f.write_str("the application is shutting down and accepts no new work")
+            }
+            Self::NotShuttingDown => f.write_str("the application is not shutting down"),
+            Self::ShutdownIncomplete { remaining } => {
+                write!(f, "{remaining} run(s) are still active during shutdown")
             }
         }
     }

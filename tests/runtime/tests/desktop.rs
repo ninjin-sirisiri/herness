@@ -8,20 +8,29 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use herness_core::runtime::AgentSpec;
+use herness_core::runtime::{
+    AgentSpec, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor, ToolExecution,
+};
 use herness_core::{
-    AuthMethod, ConnectionAdmin, ConnectionId, ConnectionSettings, CredentialAvailability,
-    CredentialKind, CredentialPort, Endpoint, HistoryLimit, MatchMethod, OperationOutcome,
-    PermissionRule, Provider, ResolvedCredential, RuleTarget, RunState, SecretString, ToolName,
+    AbsolutePath, AuthMethod, BashArgs, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
+    CheckpointPayload, ConnectionAdmin, ConnectionId, ConnectionSettings, CoreError,
+    CredentialAvailability, CredentialKind, CredentialPort, Endpoint, FileLockRegistry,
+    FrozenOperation, HistoryLimit, MatchMethod, NativeFileTools, NonEmptyText, OperationId,
+    OperationIntent, OperationOutcome, PermissionRule, Provider, Purpose, ResolvedCredential,
+    RuleTarget, RunId, RunState, SecretString, StopReport, StorePort, Timestamp, ToolArguments,
+    ToolExecutor, ToolName, VaultAccount, WriteArgs,
 };
 use herness_desktop::guard::{self, GuardError, Navigation};
 use herness_desktop::host::DesktopHost;
 use herness_engine_pi::ProviderEndpoints;
+use herness_store::{Store, StoreConfig};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -234,6 +243,7 @@ struct FakeCredentials {
     connection: ConnectionId,
     secret: String,
     resolves: AtomicUsize,
+    available: bool,
 }
 
 impl FakeCredentials {
@@ -242,6 +252,16 @@ impl FakeCredentials {
             connection,
             secret: secret.to_owned(),
             resolves: AtomicUsize::new(0),
+            available: true,
+        }
+    }
+
+    fn unavailable(connection: ConnectionId) -> Self {
+        Self {
+            connection,
+            secret: String::new(),
+            resolves: AtomicUsize::new(0),
+            available: false,
         }
     }
 }
@@ -251,7 +271,7 @@ impl CredentialPort for FakeCredentials {
         &self,
         connection: &ConnectionId,
     ) -> Result<CredentialAvailability, herness_core::CoreError> {
-        if connection == &self.connection {
+        if connection == &self.connection && self.available {
             Ok(CredentialAvailability::Available)
         } else {
             Ok(CredentialAvailability::Unavailable)
@@ -262,7 +282,7 @@ impl CredentialPort for FakeCredentials {
         &self,
         connection: &ConnectionId,
     ) -> Result<ResolvedCredential, herness_core::CoreError> {
-        if connection != &self.connection {
+        if connection != &self.connection || !self.available {
             return Err(herness_core::CoreError::AuthenticationRequired {
                 connection: *connection,
             });
@@ -371,6 +391,604 @@ fn wait_for_approval(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 12 separate-process workers.
+//
+// The integration test binary re-executes itself with `--exact
+// task12_worker_entrypoint` and an environment-selected mode. This is a
+// test-only process fixture: it is not a production binary, IPC command, or
+// feature. It uses the same real SQLite store and, for the normal-quit mode,
+// the same real Tauri host composition with a loopback provider and fake
+// credentials.
+// ---------------------------------------------------------------------------
+
+fn task12_worker_main() {
+    let Ok(mode) = std::env::var("HERNESS_TASK12_WORKER") else {
+        return;
+    };
+    let app_data = PathBuf::from(worker_env("HERNESS_TASK12_APP_DATA"));
+    let project = PathBuf::from(worker_env("HERNESS_TASK12_PROJECT"));
+    let connection: ConnectionId = worker_env("HERNESS_TASK12_CONNECTION")
+        .parse()
+        .expect("worker connection id");
+    let secret = std::env::var("HERNESS_TASK12_SECRET").unwrap_or_default();
+    match mode.as_str() {
+        "normal-quit" => worker_normal_quit(&app_data, &project, connection, &secret),
+        "unconfirmed-quit" => worker_unconfirmed_quit(&app_data, &project, connection),
+        "force-quit" => worker_force_quit(&app_data, &project, connection),
+        "crash-after-apply" => worker_crash_after_apply(&app_data, &project, connection),
+        other => panic!("unknown Task 12 worker mode: {other}"),
+    }
+}
+
+#[test]
+fn task12_worker_entrypoint() {
+    task12_worker_main();
+}
+
+fn worker_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+}
+
+fn worker_settings(connection: ConnectionId) -> ConnectionSettings {
+    ConnectionSettings::new(
+        connection,
+        Provider::OpenAi,
+        "gpt-test",
+        AuthMethod::ApiKey,
+        None::<Endpoint>,
+        None,
+    )
+    .expect("worker connection settings")
+}
+
+fn worker_sequence(store: &Arc<Mutex<Store>>, project: herness_core::ProjectId) -> u64 {
+    store
+        .lock()
+        .expect("worker store lock")
+        .history(herness_core::HistoryQuery::first(project))
+        .expect("worker history")
+        .events()
+        .first()
+        .map_or(0, herness_core::Event::sequence)
+}
+
+fn worker_open_runtime(
+    app_data: &Path,
+    project: &Path,
+    connection: ConnectionId,
+    stop_report: StopReport,
+) -> (
+    Runtime<Store, WorkerEngine, WorkerExecutor>,
+    Arc<Mutex<Store>>,
+    herness_core::ProjectId,
+    herness_core::AgentId,
+) {
+    let config = StoreConfig::new(app_data).expect("worker store config");
+    let store = Arc::new(Mutex::new(Store::open(config).expect("worker store")));
+    let admin = ConnectionAdmin::new();
+    let settings = worker_settings(connection);
+    admin.add(settings.clone()).expect("worker connection");
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, "sk-task12-worker"));
+    let deps = RuntimeDependencies::new(
+        Arc::clone(&store),
+        WorkerEngine::new(stop_report),
+        credentials,
+        admin.directory(),
+        herness_core::PolicyAdmin::new(),
+        WorkerExecutor,
+    );
+    let (mut runtime, _) = Runtime::restore(deps).expect("worker runtime");
+    runtime
+        .record_connection_settings(settings)
+        .expect("persist worker connection");
+    let project_id = runtime
+        .open_project(project)
+        .expect("worker open project")
+        .project_id();
+    let agent = runtime
+        .create_agent(
+            project_id,
+            AgentSpec::new("worker", "implementer", connection),
+        )
+        .expect("worker agent");
+    (runtime, store, project_id, agent.agent_id())
+}
+
+fn worker_normal_quit(app_data: &Path, project: &Path, connection: ConnectionId, secret: &str) {
+    let queue = Arc::new(Mutex::new(VecDeque::from(vec![
+        responses_tool_call(
+            "write",
+            json!({
+                "path": "quit-normal.txt",
+                "content": "approved later",
+                "rationale": "cross-process normal quit fixture"
+            }),
+        ),
+        responses_text("waiting for approval"),
+    ])));
+    let server = MockServer::start({
+        let queue = Arc::clone(&queue);
+        move |_index| {
+            let mut queue = queue.lock().expect("worker responses");
+            queue.pop_front().unwrap_or_else(|| MockResponse {
+                status: 500,
+                content_type: "application/json",
+                body: json!({"error": {"message": "worker mock exhausted"}}).to_string(),
+            })
+        }
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("worker loopback endpoints");
+    let admin = ConnectionAdmin::new();
+    admin
+        .add(worker_settings(connection))
+        .expect("worker connection");
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, secret));
+    let (mut host, _) =
+        DesktopHost::open(app_data, admin, credentials, endpoints).expect("worker desktop host");
+    let project_id = host
+        .runtime_mut()
+        .open_project(project)
+        .expect("worker project")
+        .project_id();
+    let agent = host
+        .runtime_mut()
+        .create_agent(
+            project_id,
+            AgentSpec::new("worker", "implementer", connection),
+        )
+        .expect("worker agent");
+    let run = host
+        .runtime_mut()
+        .start_run(project_id, agent.agent_id(), "normal quit fixture")
+        .expect("worker run");
+    host.runtime_mut()
+        .submit_input(project_id, run.run_id(), "normal quit fixture")
+        .expect("worker submit");
+    let _approval = wait_for_approval(&mut host, project_id);
+    // Let the adapter finish the tool-failure turn and save its checkpoint.
+    let settle = Instant::now() + Duration::from_secs(10);
+    while server.request_count() < 2 {
+        assert!(Instant::now() < settle, "worker adapter did not settle");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let sequence_before = host.runtime().last_sequence(project_id).expect("sequence");
+    host.begin_shutdown().expect("begin worker shutdown");
+    let stopped = host
+        .stop_all_for_shutdown()
+        .expect("worker coordinated stops");
+    let _ = host.finish_shutdown();
+    let sequence_after = host.runtime().last_sequence(project_id).expect("sequence");
+    let state = host
+        .runtime()
+        .run(project_id, run.run_id())
+        .expect("worker run view")
+        .state();
+    let checkpoint_saved = stopped
+        .runs()
+        .iter()
+        .find(|entry| entry.run_id() == run.run_id())
+        .is_some_and(|entry| entry.checkpoint_saved());
+    println!("WORKER_PID={}", std::process::id());
+    println!("WORKER_MODE=normal-quit");
+    println!("WORKER_PROJECT={project_id}");
+    println!("WORKER_RUN={}", run.run_id());
+    println!("WORKER_CONNECTION={connection}");
+    println!("WORKER_RUN_STATE={}", state.as_str());
+    println!("WORKER_CHECKPOINT_SAVED={checkpoint_saved}");
+    println!("WORKER_SAVE_SUCCEEDED={}", stopped.save_succeeded());
+    println!("WORKER_SEQUENCE_BEFORE={sequence_before}");
+    println!("WORKER_SEQUENCE_AFTER={sequence_after}");
+    let code = if stopped.save_succeeded() { 0 } else { 3 };
+    std::process::exit(code);
+}
+
+fn worker_unconfirmed_quit(app_data: &Path, project: &Path, connection: ConnectionId) {
+    let (mut runtime, store, project_id, agent) =
+        worker_open_runtime(app_data, project, connection, StopReport::Unconfirmed);
+    let run = runtime
+        .start_run(project_id, agent, "unconfirmed quit fixture")
+        .expect("worker run");
+    runtime.begin_shutdown().expect("begin worker shutdown");
+    let stopped = runtime
+        .stop_all_for_shutdown()
+        .expect("worker coordinated stops");
+    let state = runtime
+        .run(project_id, run.run_id())
+        .expect("worker run view")
+        .state();
+    println!("WORKER_PID={}", std::process::id());
+    println!("WORKER_MODE=unconfirmed-quit");
+    println!("WORKER_PROJECT={project_id}");
+    println!("WORKER_RUN={}", run.run_id());
+    println!("WORKER_RUN_STATE={}", state.as_str());
+    println!("WORKER_SAVE_SUCCEEDED={}", stopped.save_succeeded());
+    println!(
+        "WORKER_SEQUENCE_AFTER={}",
+        worker_sequence(&store, project_id)
+    );
+    let code = if stopped.save_succeeded() { 0 } else { 3 };
+    std::process::exit(code);
+}
+
+fn worker_force_quit(app_data: &Path, project: &Path, connection: ConnectionId) {
+    let (mut runtime, store, project_id, agent) =
+        worker_open_runtime(app_data, project, connection, StopReport::Stopped);
+    let run = runtime
+        .start_run(project_id, agent, "force quit fixture")
+        .expect("worker run");
+    let policy = runtime.policy().clone();
+    let arguments = ToolArguments::Bash(BashArgs {
+        command: NonEmptyText::new("sleep 30").expect("worker command"),
+        purpose: Purpose::new("pending operation before forced quit").expect("worker purpose"),
+        timeout_ms: None,
+    });
+    let operation = FrozenOperation::new(
+        OperationId::new(project_id),
+        run.run_id(),
+        ToolName::Bash,
+        arguments,
+        AbsolutePath::new(
+            std::fs::canonicalize(project)
+                .expect("canonical worker project")
+                .to_str()
+                .expect("worker project utf8"),
+        )
+        .expect("worker absolute path"),
+        policy.version(),
+        policy.mode(),
+    )
+    .expect("worker frozen operation");
+    let operation_id = operation.operation_id();
+    let checkpoint = Checkpoint::new(
+        run.run_id(),
+        CheckpointFormatVersion::new(1).expect("checkpoint version"),
+        CheckpointPayload::new(b"force-quit-worker".to_vec()),
+    );
+    let intent = OperationIntent::new(operation, Timestamp::now());
+    store
+        .lock()
+        .expect("worker store lock")
+        .commit(CheckpointCommit::new(checkpoint, Some(intent), Vec::new()).expect("commit"))
+        .expect("worker intent commit");
+
+    runtime.begin_shutdown().expect("begin worker shutdown");
+    let forced = runtime.force_shutdown().expect("worker force shutdown");
+    let state = runtime
+        .run(project_id, run.run_id())
+        .expect("worker run view")
+        .state();
+    println!("WORKER_PID={}", std::process::id());
+    println!("WORKER_MODE=force-quit");
+    println!("WORKER_PROJECT={project_id}");
+    println!("WORKER_RUN={}", run.run_id());
+    println!("WORKER_OPERATION={operation_id}");
+    println!("WORKER_RUN_STATE={}", state.as_str());
+    println!("WORKER_SAVE_SUCCEEDED={}", forced.save_succeeded());
+    println!(
+        "WORKER_SEQUENCE_AFTER={}",
+        worker_sequence(&store, project_id)
+    );
+    std::process::exit(2);
+}
+
+fn worker_crash_after_apply(app_data: &Path, project: &Path, connection: ConnectionId) {
+    let (mut runtime, store, project_id, agent) =
+        worker_open_runtime(app_data, project, connection, StopReport::Stopped);
+    let run = runtime
+        .start_run(project_id, agent, "crash after apply fixture")
+        .expect("worker run");
+    let agent_view = runtime
+        .snapshot(project_id)
+        .expect("worker snapshot")
+        .runs()
+        .first()
+        .expect("worker run view")
+        .agent_id();
+    let session = runtime
+        .snapshot(project_id)
+        .expect("worker snapshot")
+        .runs()
+        .first()
+        .expect("worker run view")
+        .session_id();
+    let policy = runtime.policy().clone();
+    let operation = FrozenOperation::new(
+        OperationId::new(project_id),
+        run.run_id(),
+        ToolName::Write,
+        ToolArguments::Write(WriteArgs {
+            path: NonEmptyText::new("crash-after-apply.txt").expect("worker path"),
+            content: "applied before the result record".to_owned(),
+            rationale: herness_core::Rationale::new("cross-process crash fixture")
+                .expect("worker rationale"),
+        }),
+        AbsolutePath::new(
+            std::fs::canonicalize(project)
+                .expect("canonical worker project")
+                .to_str()
+                .expect("worker project utf8"),
+        )
+        .expect("worker absolute path"),
+        policy.version(),
+        policy.mode(),
+    )
+    .expect("worker frozen operation");
+    let operation_id = operation.operation_id();
+    println!("WORKER_PID={}", std::process::id());
+    println!("WORKER_MODE=crash-after-apply");
+    println!("WORKER_PROJECT={project_id}");
+    println!("WORKER_RUN={}", run.run_id());
+    println!("WORKER_OPERATION={operation_id}");
+    let root = herness_core::ProjectRoot::new(
+        std::fs::canonicalize(project).expect("canonical worker project"),
+    )
+    .expect("worker project root");
+    let mut files = NativeFileTools::with_lock_registry(
+        root,
+        agent_view,
+        session,
+        CrashStore(Arc::clone(&store)),
+        Arc::new(FileLockRegistry::new()),
+    )
+    .expect("worker native tools");
+    let _ = files.execute(&operation);
+    panic!("the crash fixture should never record an operation result");
+}
+
+struct WorkerEngine {
+    stop_report: StopReport,
+}
+
+impl WorkerEngine {
+    fn new(stop_report: StopReport) -> Self {
+        Self { stop_report }
+    }
+}
+
+impl herness_core::EnginePort for WorkerEngine {
+    fn start(&mut self, _start: herness_core::EngineStart) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn send_input(
+        &mut self,
+        _run: &RunId,
+        _input: herness_core::EngineInput,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn request_stop(
+        &mut self,
+        _run: &RunId,
+        _reason: herness_core::StopReason,
+    ) -> Result<StopReport, CoreError> {
+        Ok(self.stop_report)
+    }
+
+    fn resume(&mut self, _run: &RunId, _checkpoint: Checkpoint) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn checkpoint(&mut self, run: &RunId) -> Result<Option<Checkpoint>, CoreError> {
+        Ok(Some(Checkpoint::new(
+            *run,
+            CheckpointFormatVersion::new(1).expect("checkpoint version"),
+            CheckpointPayload::new(b"task12-worker-checkpoint".to_vec()),
+        )))
+    }
+
+    fn poll_events(&mut self, _run: &RunId) -> Result<Vec<herness_core::EngineEvent>, CoreError> {
+        Ok(Vec::new())
+    }
+}
+
+struct WorkerExecutor;
+
+impl RuntimeToolExecutor for WorkerExecutor {
+    fn enter_run(&mut self, _context: RunToolContext) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+impl ToolExecutor for WorkerExecutor {
+    type Output = ToolExecution;
+
+    fn execute(&mut self, _operation: &FrozenOperation) -> Result<ToolExecution, CoreError> {
+        Err(CoreError::EngineUnavailable {
+            failure: herness_core::EngineFailureKind::Unavailable,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CrashStore(Arc<Mutex<Store>>);
+
+impl CrashStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl StorePort for CrashStore {
+    fn commit_checkpoint(
+        &mut self,
+        commit: CheckpointCommit,
+    ) -> Result<herness_core::CommitReceipt, CoreError> {
+        self.lock().commit(commit).map_err(Into::into)
+    }
+
+    fn load_checkpoint(&self, run: &RunId) -> Result<Option<Checkpoint>, CoreError> {
+        <Store as StorePort>::load_checkpoint(&self.lock(), run)
+    }
+
+    fn history(
+        &self,
+        query: herness_core::HistoryQuery,
+    ) -> Result<herness_core::HistoryPage, CoreError> {
+        <Store as StorePort>::history(&self.lock(), query)
+    }
+
+    fn pending_operations(
+        &self,
+        project: &herness_core::ProjectId,
+    ) -> Result<Vec<OperationIntent>, CoreError> {
+        <Store as StorePort>::pending_operations(&self.lock(), project)
+    }
+
+    fn operation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<Option<herness_core::OperationRecord>, CoreError> {
+        <Store as StorePort>::operation(&self.lock(), operation)
+    }
+
+    fn record_operation_result(
+        &mut self,
+        operation: &OperationId,
+        _result: herness_core::OperationResult,
+    ) -> Result<(), CoreError> {
+        print_crash_sequence(self, operation);
+        std::process::exit(70);
+    }
+
+    fn record_operation_result_with_events(
+        &mut self,
+        operation: &OperationId,
+        _result: herness_core::OperationResult,
+        _events: Vec<herness_core::EventDraft>,
+    ) -> Result<herness_core::CommitReceipt, CoreError> {
+        print_crash_sequence(self, operation);
+        std::process::exit(70);
+    }
+}
+
+fn print_crash_sequence(store: &CrashStore, operation: &OperationId) {
+    let sequence = store
+        .lock()
+        .history(herness_core::HistoryQuery::first(operation.project_id()))
+        .ok()
+        .and_then(|page| page.events().first().map(herness_core::Event::sequence))
+        .unwrap_or(0);
+    println!("WORKER_CRASH_AFTER_APPLY=1");
+    println!("WORKER_OPERATION={operation}");
+    println!("WORKER_SEQUENCE_AFTER={sequence}");
+}
+
+struct WorkerFixture {
+    _temp: tempfile::TempDir,
+    project: PathBuf,
+    app_data: PathBuf,
+    connection: ConnectionId,
+}
+
+impl WorkerFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("worker temp dir");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).expect("worker project");
+        let app_data = temp.path().join("app-data");
+        std::fs::create_dir_all(&app_data).expect("worker app data");
+        Self {
+            _temp: temp,
+            project,
+            app_data,
+            connection: ConnectionId::new(),
+        }
+    }
+
+    fn spawn(&self, mode: &str) -> Output {
+        let exe = std::env::current_exe().expect("current test executable");
+        Command::new(exe)
+            .arg("--exact")
+            .arg("task12_worker_entrypoint")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("HERNESS_TASK12_WORKER", mode)
+            .env("HERNESS_TASK12_APP_DATA", &self.app_data)
+            .env("HERNESS_TASK12_PROJECT", &self.project)
+            .env("HERNESS_TASK12_CONNECTION", self.connection.to_string())
+            .env("HERNESS_TASK12_SECRET", "sk-task12-canary")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn Task 12 worker")
+    }
+
+    fn open_restored_counting(
+        &self,
+        server: &MockServer,
+    ) -> (DesktopHost, herness_core::runtime::ReconciliationReport) {
+        self.open_restored_with_endpoints(server)
+    }
+
+    fn open_restored_unavailable_counting(
+        &self,
+        server: &MockServer,
+    ) -> (DesktopHost, herness_core::runtime::ReconciliationReport) {
+        let admin = ConnectionAdmin::new();
+        let credentials: Arc<dyn CredentialPort + Send + Sync> =
+            Arc::new(FakeCredentials::unavailable(self.connection));
+        let endpoints =
+            ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+                .expect("loopback endpoints");
+        DesktopHost::open(&self.app_data, admin, credentials, endpoints)
+            .expect("restored desktop host with unavailable credentials")
+    }
+
+    fn open_restored_with_endpoints(
+        &self,
+        server: &MockServer,
+    ) -> (DesktopHost, herness_core::runtime::ReconciliationReport) {
+        let admin = ConnectionAdmin::new();
+        let credentials: Arc<dyn CredentialPort + Send + Sync> =
+            Arc::new(FakeCredentials::new(self.connection, "sk-task12-canary"));
+        let endpoints =
+            ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+                .expect("loopback endpoints");
+        DesktopHost::open(&self.app_data, admin, credentials, endpoints)
+            .expect("restored desktop host")
+    }
+
+    fn project_id(&self, host: &DesktopHost) -> herness_core::ProjectId {
+        host.runtime()
+            .projects()
+            .expect("projects")
+            .into_iter()
+            .find(|view| {
+                view.path().as_str()
+                    == std::fs::canonicalize(&self.project)
+                        .expect("canonical")
+                        .to_string_lossy()
+                        .as_ref()
+            })
+            .expect("restored project")
+            .project_id()
+    }
+}
+
+fn worker_output(output: &Output, key: &str) -> String {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.lines()
+        .find_map(|line| {
+            line.split_once(&format!("{key}="))
+                .map(|(_, value)| value.trim().to_owned())
+        })
+        .unwrap_or_else(|| panic!("worker output is missing {key}:\n{text}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -854,4 +1472,820 @@ fn restore_is_read_only_and_reports_interrupted_state_without_pending_reuse() {
     );
     assert!(!fixture.project.join("restored.txt").exists());
     assert_eq!(fixture._server.request_count(), requests_before_restore);
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: explicit quit, cross-process restore, and lifecycle measurements.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connection_settings_survive_restart_with_the_selected_chatgpt_account() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let app_data = temp.path().join("app-data");
+    std::fs::create_dir_all(&app_data).expect("app data");
+    let connection = ConnectionId::new();
+    let account = VaultAccount::for_chatgpt_account(connection, "oaiapp_task12", "subject-task12")
+        .expect("chatgpt account");
+    let settings = ConnectionSettings::new(
+        connection,
+        Provider::OpenAi,
+        "gpt-test",
+        AuthMethod::ChatGptLogin,
+        None::<Endpoint>,
+        None,
+    )
+    .expect("settings")
+    .select_chatgpt_account(account.clone())
+    .expect("selected account");
+
+    let admin = ConnectionAdmin::new();
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, "sk-task12-canary"));
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:9/v1", "http://127.0.0.1:9")
+        .expect("unused loopback endpoints");
+    let (mut host, _) =
+        DesktopHost::open(&app_data, admin, credentials, endpoints).expect("first host");
+    let info = host
+        .register_connection(settings.clone())
+        .expect("register");
+    assert_eq!(info.auth_method(), AuthMethod::ChatGptLogin);
+    drop(host);
+
+    let reopened_admin = ConnectionAdmin::new();
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, "sk-task12-canary"));
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:9/v1", "http://127.0.0.1:9")
+        .expect("unused loopback endpoints");
+    let (host, _) = DesktopHost::open(&app_data, reopened_admin, credentials, endpoints)
+        .expect("reopened host");
+    let restored = host
+        .directory()
+        .get(connection)
+        .expect("persisted chatgpt connection");
+    assert_eq!(restored.selected_chatgpt_account(), Some(&account));
+    assert_eq!(restored.vault_account(), account);
+    assert_eq!(
+        host.connection_infos().expect("connections")[0].status(),
+        herness_core::ConnectionStatus::Available
+    );
+
+    // The store has no token field: connection settings are non-secret and the
+    // fake key was never saved by this path.
+    let bytes = std::fs::read(app_data.join("herness.sqlite3")).expect("database bytes");
+    assert!(
+        !bytes
+            .windows("sk-task12-canary".len())
+            .any(|window| window == b"sk-task12-canary")
+    );
+}
+
+#[test]
+fn stored_connection_settings_cannot_contain_secret_fields() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let app_data = temp.path().join("app-data");
+    std::fs::create_dir_all(&app_data).expect("app data");
+    let connection = ConnectionId::new();
+    let mut store = Store::open(StoreConfig::new(&app_data).expect("store config")).expect("store");
+    let state = json!({
+        "format": 2,
+        "projects": {},
+        "connections": {
+            connection.to_string(): {
+                "connectionId": connection.to_string(),
+                "provider": "openai",
+                "model": "gpt-test",
+                "authMethod": "api_key",
+                "credentialRef": format!("connection/{connection}/api_key"),
+                "token": "sk-must-not-be-accepted"
+            }
+        }
+    });
+    store
+        .save_host_state(
+            "herness.runtime.host-state",
+            serde_json::to_vec(&state).expect("state json").as_slice(),
+        )
+        .expect("save host state");
+    drop(store);
+
+    let admin = ConnectionAdmin::new();
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, "sk-task12-canary"));
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:9/v1", "http://127.0.0.1:9")
+        .expect("unused loopback endpoints");
+    let error = DesktopHost::open(&app_data, admin, credentials, endpoints)
+        .err()
+        .expect("unknown secret field must be rejected");
+    assert!(
+        error.contains("host-state JSON"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn host_state_format_one_is_readable_and_unknown_formats_are_rejected() {
+    // Format 1 (Task 10/11) has no connection or shutdown fields.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let app_data = temp.path().join("app-data");
+    std::fs::create_dir_all(&app_data).expect("app data");
+    let mut store = Store::open(StoreConfig::new(&app_data).expect("store config")).expect("store");
+    store
+        .save_host_state(
+            "herness.runtime.host-state",
+            br#"{"format":1,"projects":{}}"#,
+        )
+        .expect("save format 1");
+    drop(store);
+    let admin = ConnectionAdmin::new();
+    let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(FakeCredentials::new(
+        ConnectionId::new(),
+        "sk-task12-canary",
+    ));
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:9/v1", "http://127.0.0.1:9")
+        .expect("unused loopback endpoints");
+    let (host, report) =
+        DesktopHost::open(&app_data, admin, credentials, endpoints).expect("read format 1");
+    assert!(report.previous_shutdown().is_none());
+    assert!(host.runtime().persisted_connections().is_empty());
+    drop(host);
+
+    // An unknown format is rejected rather than silently interpreted.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let app_data = temp.path().join("app-data");
+    std::fs::create_dir_all(&app_data).expect("app data");
+    let mut store = Store::open(StoreConfig::new(&app_data).expect("store config")).expect("store");
+    store
+        .save_host_state(
+            "herness.runtime.host-state",
+            br#"{"format":3,"projects":{}}"#,
+        )
+        .expect("save format 3");
+    drop(store);
+    let admin = ConnectionAdmin::new();
+    let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(FakeCredentials::new(
+        ConnectionId::new(),
+        "sk-task12-canary",
+    ));
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:9/v1", "http://127.0.0.1:9")
+        .expect("unused loopback endpoints");
+    let error = DesktopHost::open(&app_data, admin, credentials, endpoints)
+        .err()
+        .expect("unknown format must be rejected");
+    assert!(
+        error.contains("unsupported host-state format"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn normal_quit_process_saves_checkpoint_and_restores_connection_settings() {
+    let fixture = WorkerFixture::new();
+    let output = fixture.spawn("normal-quit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "normal quit worker failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(worker_output(&output, "WORKER_PID").parse::<u32>().unwrap() > 0);
+    assert_eq!(worker_output(&output, "WORKER_RUN_STATE"), "paused");
+    assert_eq!(worker_output(&output, "WORKER_CHECKPOINT_SAVED"), "true");
+    assert_eq!(worker_output(&output, "WORKER_SAVE_SUCCEEDED"), "true");
+    let sequence_after: u64 = worker_output(&output, "WORKER_SEQUENCE_AFTER")
+        .parse()
+        .unwrap();
+    let sequence_before: u64 = worker_output(&output, "WORKER_SEQUENCE_BEFORE")
+        .parse()
+        .unwrap();
+    assert!(sequence_after > sequence_before);
+
+    let server = MockServer::start(|_index| MockResponse {
+        status: 500,
+        content_type: "application/json",
+        body: json!({"error": {"message": "restore must not send requests"}}).to_string(),
+    });
+
+    // The restore reports the persisted connection but cannot resume while the
+    // credential is unavailable. No model request is sent.
+    let (mut unavailable, _) = fixture.open_restored_unavailable_counting(&server);
+    let project = fixture.project_id(&unavailable);
+    let run = unavailable
+        .runtime()
+        .snapshot(project)
+        .expect("snapshot")
+        .runs()
+        .first()
+        .cloned()
+        .expect("restored run");
+    assert_eq!(run.state(), RunState::Paused);
+    assert_eq!(
+        unavailable.connection_infos().expect("connections")[0].status(),
+        herness_core::ConnectionStatus::AuthRequired
+    );
+    assert!(matches!(
+        unavailable.runtime_mut().resume_run(project, run.run_id()),
+        Err(herness_core::runtime::RuntimeError::ConnectionUnavailable { .. })
+    ));
+    assert_eq!(server.request_count(), 0);
+    drop(unavailable);
+
+    let (mut host, report) = fixture.open_restored_counting(&server);
+    let previous = report.previous_shutdown().expect("previous shutdown");
+    assert_eq!(
+        previous.outcome(),
+        herness_core::runtime::ShutdownOutcome::Completed
+    );
+    assert_eq!(previous.stopped_runs(), 1);
+    assert!(previous.unconfirmed_runs().is_empty());
+    assert_eq!(server.request_count(), 0);
+    let project = fixture.project_id(&host);
+    assert!(host.runtime().last_sequence(project).unwrap() >= sequence_after);
+    assert_eq!(
+        host.connection_infos().expect("connections")[0].status(),
+        herness_core::ConnectionStatus::Available
+    );
+    assert_eq!(
+        host.directory()
+            .get(fixture.connection)
+            .expect("persisted connection")
+            .model(),
+        "gpt-test"
+    );
+    assert!(
+        host.runtime()
+            .pending_approvals(project)
+            .unwrap()
+            .is_empty()
+    );
+    let run = host
+        .runtime()
+        .snapshot(project)
+        .expect("snapshot")
+        .runs()
+        .first()
+        .cloned()
+        .expect("run");
+    assert_eq!(run.state(), RunState::Paused);
+
+    // The fake credential used by the quitting process never reaches the store.
+    for entry in std::fs::read_dir(&fixture.app_data).expect("app data") {
+        let path = entry.expect("app data entry").path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).expect("database bytes");
+            assert!(
+                !bytes
+                    .windows("sk-task12-canary".len())
+                    .any(|window| window == b"sk-task12-canary"),
+                "credential canary leaked into {}",
+                path.display()
+            );
+        }
+    }
+
+    // Human resume re-checks the current credential and restores from the
+    // saved checkpoint without sending a model request.
+    let resumed = host
+        .runtime_mut()
+        .resume_run(project, run.run_id())
+        .expect("resume after restore");
+    assert_eq!(resumed.state(), RunState::Running);
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn unconfirmed_quit_process_restores_interrupted_without_claiming_success() {
+    let fixture = WorkerFixture::new();
+    let output = fixture.spawn("unconfirmed-quit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "unconfirmed quit worker must exit 3\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(worker_output(&output, "WORKER_RUN_STATE"), "interrupted");
+    assert_eq!(worker_output(&output, "WORKER_SAVE_SUCCEEDED"), "false");
+    let sequence_after: u64 = worker_output(&output, "WORKER_SEQUENCE_AFTER")
+        .parse()
+        .unwrap();
+
+    let server = MockServer::start(|_index| MockResponse {
+        status: 500,
+        content_type: "application/json",
+        body: String::new(),
+    });
+    let (host, report) = fixture.open_restored_counting(&server);
+    let project = fixture.project_id(&host);
+    let previous = report.previous_shutdown().expect("previous shutdown");
+    assert_eq!(
+        previous.outcome(),
+        herness_core::runtime::ShutdownOutcome::CompletedWithUnconfirmed
+    );
+    assert_eq!(previous.unconfirmed_runs().len(), 1);
+    let run = host
+        .runtime()
+        .snapshot(project)
+        .expect("snapshot")
+        .runs()
+        .first()
+        .cloned()
+        .expect("run");
+    assert_eq!(run.state(), RunState::Interrupted);
+    assert!(host.runtime().last_sequence(project).unwrap() >= sequence_after);
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn forced_quit_process_keeps_operation_pending_for_reconciliation() {
+    let fixture = WorkerFixture::new();
+    let output = fixture.spawn("force-quit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "forced quit worker must exit 2\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let operation: OperationId = worker_output(&output, "WORKER_OPERATION")
+        .parse()
+        .expect("operation id");
+    assert_eq!(worker_output(&output, "WORKER_RUN_STATE"), "interrupted");
+    assert_eq!(worker_output(&output, "WORKER_SAVE_SUCCEEDED"), "false");
+    let sequence_after: u64 = worker_output(&output, "WORKER_SEQUENCE_AFTER")
+        .parse()
+        .unwrap();
+
+    let server = MockServer::start(|_index| MockResponse {
+        status: 500,
+        content_type: "application/json",
+        body: String::new(),
+    });
+    let (host, report) = fixture.open_restored_counting(&server);
+    let project = fixture.project_id(&host);
+    let previous = report.previous_shutdown().expect("previous shutdown");
+    assert_eq!(
+        previous.outcome(),
+        herness_core::runtime::ShutdownOutcome::Forced
+    );
+    assert_eq!(previous.unconfirmed_runs().len(), 1);
+    let run = host
+        .runtime()
+        .snapshot(project)
+        .expect("snapshot")
+        .runs()
+        .first()
+        .cloned()
+        .expect("run");
+    assert_eq!(run.state(), RunState::Interrupted);
+    let project_report = report
+        .projects()
+        .iter()
+        .find(|entry| entry.project_id() == project)
+        .expect("project report");
+    let reconciled = project_report
+        .operations()
+        .iter()
+        .find(|entry| entry.operation_id() == operation)
+        .expect("forced operation appears in reconciliation");
+    assert_eq!(reconciled.outcome(), OperationOutcome::Unverifiable);
+    assert_eq!(
+        reconciled.source(),
+        herness_core::runtime::ReconciliationSource::ShellUncertain
+    );
+    assert!(host.runtime().last_sequence(project).unwrap() >= sequence_after);
+    assert_eq!(server.request_count(), 0);
+
+    let store = Store::open(StoreConfig::new(&fixture.app_data).expect("store config"))
+        .expect("read store");
+    let record = store
+        .operation(&operation)
+        .expect("operation")
+        .expect("record");
+    assert!(
+        record.result().is_none(),
+        "forced quit must not invent an operation result"
+    );
+    assert!(
+        store
+            .unresolved_operations(&project)
+            .expect("unresolved")
+            .iter()
+            .any(|entry| entry.intent().operation().operation_id() == operation)
+    );
+}
+
+#[test]
+fn crash_after_file_apply_restores_evidence_without_inventing_a_result() {
+    let fixture = WorkerFixture::new();
+    let output = fixture.spawn("crash-after-apply");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "crash-after-apply worker must exit 70\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(worker_output(&output, "WORKER_PID").parse::<u32>().unwrap() > 0);
+    assert_eq!(worker_output(&output, "WORKER_CRASH_AFTER_APPLY"), "1");
+    let operation: OperationId = worker_output(&output, "WORKER_OPERATION")
+        .parse()
+        .expect("operation id");
+    let sequence_after: u64 = worker_output(&output, "WORKER_SEQUENCE_AFTER")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.join("crash-after-apply.txt"))
+            .expect("applied file"),
+        "applied before the result record"
+    );
+
+    let server = MockServer::start(|_index| MockResponse {
+        status: 500,
+        content_type: "application/json",
+        body: String::new(),
+    });
+    let (host, report) = fixture.open_restored_counting(&server);
+    let project = fixture.project_id(&host);
+    let run = host
+        .runtime()
+        .snapshot(project)
+        .expect("snapshot")
+        .runs()
+        .first()
+        .cloned()
+        .expect("run");
+    assert_eq!(run.state(), RunState::Interrupted);
+    let project_report = report
+        .projects()
+        .iter()
+        .find(|entry| entry.project_id() == project)
+        .expect("project report");
+    let reconciled = project_report
+        .operations()
+        .iter()
+        .find(|entry| entry.operation_id() == operation)
+        .expect("crash operation appears in reconciliation");
+    assert_eq!(reconciled.outcome(), OperationOutcome::Applied);
+    assert_eq!(
+        reconciled.source(),
+        herness_core::runtime::ReconciliationSource::NativeFileContent
+    );
+    assert!(host.runtime().last_sequence(project).unwrap() >= sequence_after);
+    assert_eq!(server.request_count(), 0);
+
+    let store = Store::open(StoreConfig::new(&fixture.app_data).expect("store config"))
+        .expect("read store");
+    let record = store
+        .operation(&operation)
+        .expect("operation")
+        .expect("record");
+    assert!(
+        record.result().is_none(),
+        "native content evidence must not be written back as an invented result"
+    );
+    assert!(
+        store
+            .unresolved_operations(&project)
+            .expect("unresolved")
+            .iter()
+            .any(|entry| entry.intent().operation().operation_id() == operation)
+    );
+}
+
+#[test]
+fn explicit_shutdown_stops_a_managed_shell_group() {
+    let responses = vec![
+        responses_tool_call(
+            "bash",
+            json!({
+                "command": "sleep 30",
+                "purpose": "hold a managed shell group for shutdown"
+            }),
+        ),
+        responses_text("shell turn finished"),
+    ];
+    let mut fixture = Fixture::new(responses);
+    {
+        let policy = fixture.host.runtime_mut().policy_admin_mut();
+        policy
+            .add_rule(
+                PermissionRule::allow(
+                    RuleTarget::Tool {
+                        tool: ToolName::Bash,
+                    },
+                    MatchMethod::AnyInvocation,
+                )
+                .expect("allow bash"),
+            )
+            .expect("add allow rule");
+        let policy = policy.policy().clone();
+        fixture
+            .host
+            .runtime_mut()
+            .engine_mut()
+            .replace_policy(policy);
+    }
+    let connection = fixture.connection();
+    let project = fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project")
+        .project_id();
+    let agent = fixture
+        .host
+        .runtime_mut()
+        .create_agent(project, AgentSpec::new("main", "implementer", connection))
+        .expect("agent");
+    let run = fixture
+        .host
+        .runtime_mut()
+        .start_run(project, agent.agent_id(), "start a managed shell")
+        .expect("run");
+    fixture
+        .host
+        .runtime_mut()
+        .submit_input(project, run.run_id(), "start a managed shell")
+        .expect("submit");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut shell_pid = None;
+    while shell_pid.is_none() {
+        let _ = fixture.host.runtime_mut().poll_run(project, run.run_id());
+        let history = fixture
+            .host
+            .runtime()
+            .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
+            .expect("history");
+        shell_pid = history.events().iter().find_map(|event| {
+            (event.kind().as_str() == "shell.spawned")
+                .then(|| {
+                    event
+                        .payload()
+                        .as_value()
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                })
+                .flatten()
+        });
+        assert!(Instant::now() < deadline, "managed shell did not spawn");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let shell_pid = u32::try_from(shell_pid.unwrap()).expect("pid");
+    assert!(
+        herness_core::process_group_exists(shell_pid),
+        "managed shell group should be alive before shutdown"
+    );
+
+    fixture.host.begin_shutdown().expect("begin shutdown");
+    let stopped = fixture
+        .host
+        .stop_all_for_shutdown()
+        .expect("coordinated shutdown");
+    assert!(stopped.all_inactive());
+    assert!(
+        !herness_core::process_group_exists(shell_pid),
+        "the managed shell group must be gone after shutdown"
+    );
+    let state = fixture
+        .host
+        .runtime()
+        .run(project, run.run_id())
+        .expect("run view")
+        .state();
+    assert!(
+        matches!(state, RunState::Paused | RunState::Interrupted),
+        "unexpected state after shell stop: {state}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let history = fixture
+            .host
+            .runtime()
+            .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
+            .expect("history");
+        if history
+            .events()
+            .iter()
+            .any(|event| event.kind().as_str() == "shell.finished")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stopped shell must record a non-success finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let store = Store::open(StoreConfig::new(&fixture.app_data).expect("store config"))
+        .expect("read store");
+    let unresolved = store
+        .unresolved_operations(&project)
+        .expect("unresolved operations");
+    assert!(
+        !unresolved.is_empty(),
+        "a stopped shell outcome must remain reconciliation-pending"
+    );
+}
+
+#[test]
+fn closed_window_runtime_keeps_processing_and_reopen_reads_latest_sequence() {
+    let mut fixture = Fixture::new(vec![responses_text("continued while hidden")]);
+    let connection = fixture.connection();
+    let project = fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project")
+        .project_id();
+    let agent = fixture
+        .host
+        .runtime_mut()
+        .create_agent(project, AgentSpec::new("main", "implementer", connection))
+        .expect("agent");
+    let run = fixture
+        .host
+        .runtime_mut()
+        .start_run(project, agent.agent_id(), "continue while hidden")
+        .expect("run");
+    fixture
+        .host
+        .runtime_mut()
+        .submit_input(project, run.run_id(), "continue while hidden")
+        .expect("submit");
+
+    // No UI command or lifecycle call runs here: this is the runtime state a
+    // hidden window leaves behind.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_text = false;
+    while !saw_text {
+        fixture
+            .host
+            .runtime_mut()
+            .poll_run(project, run.run_id())
+            .expect("poll while hidden");
+        let history = fixture
+            .host
+            .runtime()
+            .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
+            .expect("history");
+        saw_text = history
+            .events()
+            .iter()
+            .any(|event| event.kind().as_str() == "run.text_completed");
+        assert!(Instant::now() < deadline, "hidden run did not progress");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The page-reload path used on reopen reads a fresh snapshot and history
+    // instead of reusing hidden-page state.
+    let snapshot = fixture
+        .host
+        .runtime()
+        .snapshot(project)
+        .expect("reopen snapshot");
+    assert_eq!(snapshot.runs()[0].run_id(), run.run_id());
+    let history = fixture
+        .host
+        .runtime()
+        .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
+        .expect("reopen history");
+    assert!(history.last_sequence() > 0);
+    assert!(history.events().iter().any(|event| {
+        event.kind().as_str() == "run.text_completed"
+            && event.payload().as_value()["text"] == "continued while hidden"
+    }));
+}
+
+/// Manual Task 12 running-memory fixture.
+///
+/// This is not part of the normal test suite. It composes the same desktop host
+/// (real store, real PiEngine, loopback provider, fake credentials) in a
+/// separate OS process, starts an allowed `bash` command that sleeps, prints its
+/// PID and the managed shell PID, then holds so an external sampler can measure
+/// RSS. It is the host-runtime running measurement; the Tauri WebView is not in
+/// this process.
+#[test]
+#[ignore = "manual Task 12 running-memory measurement fixture"]
+fn measure_running_host_rss() {
+    let temp = tempfile::tempdir().expect("measurement temp dir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("measurement project");
+    let app_data = temp.path().join("app-data");
+    std::fs::create_dir_all(&app_data).expect("measurement app data");
+    let queue = Arc::new(Mutex::new(VecDeque::from(vec![
+        responses_tool_call(
+            "bash",
+            json!({
+                "command": "sleep 20",
+                "purpose": "hold the host in a running state for memory measurement"
+            }),
+        ),
+        responses_text("measurement turn finished"),
+    ])));
+    let server = MockServer::start({
+        let queue = Arc::clone(&queue);
+        move |_index| {
+            let mut queue = queue.lock().expect("measurement responses");
+            queue.pop_front().unwrap_or_else(|| MockResponse {
+                status: 500,
+                content_type: "application/json",
+                body: String::new(),
+            })
+        }
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("measurement endpoints");
+    let connection = ConnectionId::new();
+    let connections = ConnectionAdmin::new();
+    connections
+        .add(
+            ConnectionSettings::new(
+                connection,
+                Provider::OpenAi,
+                "gpt-test",
+                AuthMethod::ApiKey,
+                None::<Endpoint>,
+                None,
+            )
+            .expect("measurement settings"),
+        )
+        .expect("measurement connection");
+    let credentials: Arc<dyn CredentialPort + Send + Sync> =
+        Arc::new(FakeCredentials::new(connection, "sk-measurement-fake"));
+    let (mut host, _) = DesktopHost::open(&app_data, connections, credentials, endpoints)
+        .expect("measurement host");
+    {
+        let policy = host.runtime_mut().policy_admin_mut();
+        policy
+            .add_rule(
+                PermissionRule::allow(
+                    RuleTarget::Tool {
+                        tool: ToolName::Bash,
+                    },
+                    MatchMethod::AnyInvocation,
+                )
+                .expect("allow bash"),
+            )
+            .expect("add allow rule");
+        let policy = policy.policy().clone();
+        host.runtime_mut().engine_mut().replace_policy(policy);
+    }
+    let project_id = host
+        .runtime_mut()
+        .open_project(&project)
+        .expect("measurement project")
+        .project_id();
+    let agent = host
+        .runtime_mut()
+        .create_agent(
+            project_id,
+            AgentSpec::new("measure", "implementer", connection),
+        )
+        .expect("measurement agent");
+    let run = host
+        .runtime_mut()
+        .start_run(project_id, agent.agent_id(), "hold a shell process")
+        .expect("measurement run");
+    host.runtime_mut()
+        .submit_input(project_id, run.run_id(), "hold a shell process")
+        .expect("measurement submit");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut shell_pid = None;
+    while shell_pid.is_none() {
+        let _ = host.runtime_mut().poll_run(project_id, run.run_id());
+        let history = host
+            .runtime()
+            .subscribe(project_id, None, HistoryLimit::new(500).expect("limit"))
+            .expect("measurement history");
+        shell_pid = history.events().iter().find_map(|event| {
+            (event.kind().as_str() == "shell.spawned")
+                .then(|| {
+                    event
+                        .payload()
+                        .as_value()
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                })
+                .flatten()
+        });
+        assert!(Instant::now() < deadline, "measurement shell did not spawn");
+        thread::sleep(Duration::from_millis(20));
+    }
+    println!("MEASURE_READY: pid={}", std::process::id());
+    println!("MEASURE_SHELL_PID: {}", shell_pid.unwrap());
+    let hold = std::env::var("HERNESS_MEASURE_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
+    thread::sleep(Duration::from_millis(hold));
+
+    let _ = host.begin_shutdown();
+    let _ = host.stop_all_for_shutdown();
+    let _ = host.finish_shutdown();
+    println!("MEASURE_DONE: pid={}", std::process::id());
+    std::process::exit(0);
 }

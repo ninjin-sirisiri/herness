@@ -12,8 +12,8 @@
 use std::sync::MutexGuard;
 
 use herness_core::runtime::{
-    AgentSpec, ApprovalOutcome, DenialOutcome, EventBatch, ProjectView, RunView, RuntimeSnapshot,
-    StopOutcome,
+    AgentSpec, ApprovalOutcome, DenialOutcome, EventBatch, ProjectView, ReconciliationReport,
+    RunView, RuntimeSnapshot, StopOutcome,
 };
 use herness_core::{
     ArgumentViolation, AuthMethod, ConnectionId, ConnectionInfo, ConnectionSettings, CoreError,
@@ -21,11 +21,12 @@ use herness_core::{
     Provider, RunId, SecretString, StopReason,
 };
 use serde::Serialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::app::AppState;
 use crate::guard;
 use crate::host::DesktopHost;
+use crate::lifecycle::quit::{self as quit_flow, QuitChoice, QuitSnapshot};
 
 /// Non-secret aggregate the UI reloads after every window reopen.
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +39,7 @@ pub struct FrontendState {
     policy_version: u64,
     automatic_mode_available: bool,
     automatic_mode_reason: &'static str,
+    reconciliation: ReconciliationReport,
 }
 
 /// Non-secret result of draining engine events for one project.
@@ -104,6 +106,11 @@ pub fn frontend_state(
         .map_err(|_| "the selected project is unavailable".to_owned())?;
     let selected =
         selected.filter(|project| projects.iter().any(|view| view.project_id() == *project));
+    let reconciliation = state
+        .reconciliation
+        .lock()
+        .map_err(|_| "the reconciliation report is unavailable".to_owned())?
+        .clone();
     Ok(FrontendState {
         selected_project: selected,
         projects,
@@ -112,6 +119,7 @@ pub fn frontend_state(
         policy_version: policy.version().get(),
         automatic_mode_available: false,
         automatic_mode_reason: "H2 evaluator is not connected; automatic decisions are unavailable",
+        reconciliation,
     })
 }
 
@@ -217,10 +225,8 @@ pub fn add_connection(
     )
     .map_err(|error| error.to_string())?;
     let connection = settings.connection_id();
-    let host = lock_host(&state)?;
-    host.connections()
-        .add(settings)
-        .map_err(|error| error.to_string())?;
+    let mut host = lock_host(&state)?;
+    host.register_connection(settings)?;
     host.connection_infos()?
         .into_iter()
         .find(|info| info.connection_id() == connection)
@@ -307,14 +313,22 @@ pub fn chatgpt_login_status(
     connection: ConnectionId,
 ) -> Result<crate::login::LoginStatus, String> {
     verify_source(&window)?;
-    let login = state
-        .login
-        .lock()
-        .map_err(|_| "the login service is unavailable".to_owned())?;
-    match login.as_ref() {
-        Some(login) => login.status(connection),
-        None => Ok(crate::login::closed_terms_status()),
+    let status = {
+        let login = state
+            .login
+            .lock()
+            .map_err(|_| "the login service is unavailable".to_owned())?;
+        match login.as_ref() {
+            Some(login) => login.status(connection),
+            None => Ok(crate::login::closed_terms_status()),
+        }
+    };
+    // A completed login may select a non-secret account-scoped vault key in the
+    // shared registry. Persist that selection; secrets remain in the Keychain.
+    if let Ok(mut host) = state.host.lock() {
+        let _ = host.persist_connection_settings();
     }
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -467,4 +481,36 @@ pub fn deny(
         .runtime_mut()
         .deny(project, operation)
         .map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Explicit quit and shutdown state
+// ---------------------------------------------------------------------------
+
+/// Starts the explicit quit flow. New runs and tool decisions are refused from
+/// this point.
+#[tauri::command(async)]
+pub fn quit_app(
+    window: tauri::WebviewWindow,
+    _state: State<'_, AppState>,
+) -> Result<QuitSnapshot, String> {
+    verify_source(&window)?;
+    Ok(quit_flow::request_quit(window.app_handle()))
+}
+
+/// Returns non-secret quit state for the trusted UI prompt.
+#[tauri::command(async)]
+pub fn quit_state(window: tauri::WebviewWindow) -> Result<QuitSnapshot, String> {
+    verify_source(&window)?;
+    Ok(quit_flow::coordinator().snapshot())
+}
+
+/// Applies the human choice after the coordinated-stop grace.
+#[tauri::command(async)]
+pub fn quit_choice(
+    window: tauri::WebviewWindow,
+    choice: QuitChoice,
+) -> Result<QuitSnapshot, String> {
+    verify_source(&window)?;
+    quit_flow::choose(window.app_handle(), choice)
 }

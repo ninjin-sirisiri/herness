@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use herness_core::runtime::ReconciliationReport;
 use herness_core::{
     ConnectionAdmin, CredentialAdmin, CredentialPort, CredentialService, ProjectId,
 };
@@ -25,10 +27,18 @@ pub struct AppState {
     pub(crate) credential_admin: CredentialAdmin<MacKeychainVault<SystemKeychain>>,
     pub(crate) login: Mutex<Option<LoginManager>>,
     pub(crate) selected_project: Mutex<Option<ProjectId>>,
+    /// Non-secret restore/reconciliation report produced by this process's
+    /// startup. It is shown to the trusted UI and never re-executes work.
+    pub(crate) reconciliation: Mutex<ReconciliationReport>,
 }
 
 /// Builds and runs the desktop application.
-pub fn run(smoke_test: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    smoke_test: bool,
+    quit_test: bool,
+    close_reopen_test: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
     let app = tauri::Builder::default()
         .setup(move |app| {
             let root = application_data_root(app)?;
@@ -39,7 +49,7 @@ pub fn run(smoke_test: bool) -> Result<(), Box<dyn std::error::Error>> {
             let credential_service = CredentialService::new(connections.directory(), vault.clone());
             let credential_admin = credential_service.admin();
             let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(credential_service);
-            let (host, _reconciliation) = DesktopHost::open(
+            let (host, reconciliation) = DesktopHost::open(
                 &root,
                 connections.clone(),
                 credentials,
@@ -52,11 +62,18 @@ pub fn run(smoke_test: bool) -> Result<(), Box<dyn std::error::Error>> {
                 credential_admin,
                 login: Mutex::new(login),
                 selected_project: Mutex::new(None),
+                reconciliation: Mutex::new(reconciliation),
             });
 
             lifecycle::create_main_window(app)?;
             if smoke_test {
-                lifecycle::start_smoke_test(app);
+                lifecycle::start_smoke_test(app, started);
+            }
+            if quit_test {
+                lifecycle::start_quit_test(app);
+            }
+            if close_reopen_test {
+                lifecycle::start_close_reopen_test(app);
             }
             Ok(())
         })
@@ -81,6 +98,9 @@ pub fn run(smoke_test: bool) -> Result<(), Box<dyn std::error::Error>> {
             commands::history,
             commands::approve,
             commands::deny,
+            commands::quit_app,
+            commands::quit_state,
+            commands::quit_choice,
         ])
         .build(tauri::generate_context!())?;
 

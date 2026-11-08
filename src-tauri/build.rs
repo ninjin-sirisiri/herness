@@ -27,6 +27,9 @@ fn main() {
         "approve",
         "deny",
         "frontend_state",
+        "quit_app",
+        "quit_state",
+        "quit_choice",
     ];
 
     tauri_build::try_build(
