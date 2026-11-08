@@ -1,0 +1,1434 @@
+//! Task 16 desktop supervision composition tests.
+//!
+//! These tests exercise the library composition without a Tauri window. The
+//! H1 runtime, required-check execution, and assessment transport are scripted
+//! fakes; the store, command journal, recovery facts, budget ledger, and
+//! protection boundaries are the real implementations. No provider,
+//! credential, Keychain item, shell, or GUI session is used.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use herness_core::runtime::RecoveryMode;
+use herness_core::{
+    AgentId, AuthMethod, ConnectionAdmin, ConnectionId, ConnectionSettings, CoreError,
+    CredentialAvailability, CredentialPort, Endpoint, InputId, InputPhase, InputProgress,
+    PermissionPolicy, ProjectId, Provider, ResolvedCredential, RunId, RunState, SessionId,
+    SharedPolicy, Timestamp,
+};
+use herness_desktop::guard::{self, GuardError, Navigation};
+use herness_desktop::supervision::ChangeSupervisionRequest;
+use herness_desktop::supervision::assessment::AssessmentHost;
+use herness_desktop::supervision::plan::ConfigStore;
+use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};
+use herness_desktop::supervision::store::StoreHandle;
+use herness_desktop::supervision::{
+    CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
+    SupervisionHost,
+};
+use herness_store::{Store, StoreConfig};
+use herness_supervision::operations::SupervisionOperationRequest;
+use herness_supervision::operations::{HumanOperation, OperationRuntimePort};
+use herness_supervision::recovery::{
+    ManagedProcessState, RecoveryCheckpoint, RecoveryRuntimePort, RecoveryStopState,
+};
+use herness_supervision::supervisor::{
+    AssessmentProfileFacts, CheckExecution, CheckExecutionRequest, ChildRunContinuation,
+    ChildRunStart, ConditionAssessmentPort, RequiredCheckPort, StopDisposition,
+    SupervisionRuntimePort, TargetSnapshotRequest, capture_target_snapshot,
+};
+use herness_supervision::{
+    AdapterVersion, AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
+    CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
+    EvidenceRecord, EvidenceScope, ProfilePurpose, ProfileThresholds, ProviderKind, ProviderOrigin,
+    RubricVersion, SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId,
+    TargetReadSet, TargetVersion,
+};
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Fake credentials and runtime.
+// ---------------------------------------------------------------------------
+
+struct NoCredentials;
+
+impl CredentialPort for NoCredentials {
+    fn availability(
+        &self,
+        _connection: &ConnectionId,
+    ) -> Result<CredentialAvailability, CoreError> {
+        Ok(CredentialAvailability::Available)
+    }
+
+    fn resolve(&self, connection: &ConnectionId) -> Result<ResolvedCredential, CoreError> {
+        Err(CoreError::AuthenticationRequired {
+            connection: *connection,
+        })
+    }
+}
+
+struct FakeRun {
+    state: RunState,
+    inputs: BTreeMap<InputId, InputPhase>,
+}
+
+struct FakeRuntime {
+    store: StoreHandle,
+    roots: BTreeMap<ProjectId, PathBuf>,
+    children: BTreeMap<ProjectId, ChildIdentity>,
+    runs: BTreeMap<RunId, FakeRun>,
+    starts: usize,
+    continuations: usize,
+    stops: usize,
+    policy: SharedPolicy,
+}
+
+impl FakeRuntime {
+    fn new(store: StoreHandle, project: ProjectId, root: PathBuf) -> Self {
+        let mut roots = BTreeMap::new();
+        roots.insert(project, root);
+        let mut children = BTreeMap::new();
+        children.insert(
+            project,
+            ChildIdentity {
+                agent_id: AgentId::new(project),
+                session_id: SessionId::new(project),
+            },
+        );
+        Self {
+            store,
+            roots,
+            children,
+            runs: BTreeMap::new(),
+            starts: 0,
+            continuations: 0,
+            stops: 0,
+            policy: SharedPolicy::new(PermissionPolicy::default()),
+        }
+    }
+
+    fn add_project(&mut self, project: ProjectId, root: PathBuf) {
+        self.roots.insert(project, root);
+        self.children.insert(
+            project,
+            ChildIdentity {
+                agent_id: AgentId::new(project),
+                session_id: SessionId::new(project),
+            },
+        );
+    }
+
+    fn complete_all_inputs(&mut self) {
+        for run in self.runs.values_mut() {
+            for phase in run.inputs.values_mut() {
+                *phase = InputPhase::Completed;
+            }
+        }
+    }
+
+    fn set_all_idle(&mut self) {
+        for run in self.runs.values_mut() {
+            run.state = RunState::Idle;
+        }
+    }
+
+    fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+}
+
+impl SupervisionRuntimePort for FakeRuntime {
+    fn start_child(&mut self, request: &ChildRunStart) -> Result<(), SupervisionError> {
+        self.starts += 1;
+        let mut inputs = BTreeMap::new();
+        inputs.insert(request.input_id(), InputPhase::Accepted);
+        self.runs.insert(
+            request.run_id(),
+            FakeRun {
+                state: RunState::Running,
+                inputs,
+            },
+        );
+        Ok(())
+    }
+
+    fn continue_child(&mut self, request: &ChildRunContinuation) -> Result<(), SupervisionError> {
+        self.continuations += 1;
+        let mut inputs = BTreeMap::new();
+        inputs.insert(request.input_id(), InputPhase::Accepted);
+        self.runs.insert(
+            request.run_id(),
+            FakeRun {
+                state: RunState::Running,
+                inputs,
+            },
+        );
+        Ok(())
+    }
+
+    fn input_progress(&mut self, input_id: InputId) -> Result<InputProgress, SupervisionError> {
+        for run in self.runs.values() {
+            if let Some(phase) = run.inputs.get(&input_id) {
+                return Ok(InputProgress::new(input_id, *phase));
+            }
+        }
+        Ok(InputProgress::new(input_id, InputPhase::Failed))
+    }
+
+    fn run_state(&mut self, run_id: RunId) -> Result<RunState, SupervisionError> {
+        Ok(self
+            .runs
+            .get(&run_id)
+            .map(|run| run.state)
+            .unwrap_or(RunState::Failed))
+    }
+
+    fn request_stop(&mut self, run_id: RunId) -> Result<StopDisposition, SupervisionError> {
+        self.stops += 1;
+        if let Some(run) = self.runs.get_mut(&run_id) {
+            run.state = RunState::Paused;
+        }
+        Ok(StopDisposition::Confirmed)
+    }
+
+    fn target_snapshot(
+        &mut self,
+        request: &TargetSnapshotRequest,
+    ) -> Result<herness_supervision::TargetManifest, SupervisionError> {
+        let root = self
+            .roots
+            .get(&request.project_id())
+            .cloned()
+            .ok_or(SupervisionError::UnknownSupervision)?;
+        let workspace = herness_desktop::supervision::workspace::ProjectWorkspace::new(root);
+        capture_target_snapshot(&workspace, request)
+    }
+}
+
+impl RecoveryRuntimePort for FakeRuntime {
+    fn run_state(&mut self, run: RunId) -> Result<RunState, SupervisionError> {
+        <Self as SupervisionRuntimePort>::run_state(self, run)
+    }
+
+    fn recovery_mode(&mut self, _run: RunId) -> Result<RecoveryMode, SupervisionError> {
+        Ok(RecoveryMode::SameProcess)
+    }
+
+    fn managed_processes(
+        &mut self,
+        _run: RunId,
+    ) -> Result<Vec<ManagedProcessState>, SupervisionError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self, _run: RunId) -> Result<RecoveryCheckpoint, SupervisionError> {
+        Ok(RecoveryCheckpoint::Present)
+    }
+
+    fn stop_state(&mut self, run: RunId) -> Result<RecoveryStopState, SupervisionError> {
+        Ok(
+            match <Self as SupervisionRuntimePort>::run_state(self, run)? {
+                RunState::Paused => RecoveryStopState::Confirmed,
+                RunState::Interrupted => RecoveryStopState::Unconfirmed,
+                _ => RecoveryStopState::NotRequested,
+            },
+        )
+    }
+
+    fn permissions_current(
+        &mut self,
+        _record: &SupervisionRecord,
+    ) -> Result<bool, SupervisionError> {
+        Ok(true)
+    }
+}
+
+impl OperationRuntimePort for FakeRuntime {
+    fn request_stop(&mut self, run: RunId) -> Result<StopDisposition, SupervisionError> {
+        <Self as SupervisionRuntimePort>::request_stop(self, run)
+    }
+}
+
+impl DesktopSupervisionRuntime for FakeRuntime {
+    fn create_child(
+        &mut self,
+        project: ProjectId,
+        _connection: ConnectionId,
+    ) -> Result<ChildIdentity, SupervisionError> {
+        self.children
+            .get(&project)
+            .copied()
+            .ok_or(SupervisionError::UnknownSupervision)
+    }
+
+    fn project_path(&mut self, project: ProjectId) -> Result<PathBuf, SupervisionError> {
+        self.roots
+            .get(&project)
+            .cloned()
+            .ok_or(SupervisionError::UnknownSupervision)
+    }
+
+    fn policy(&self) -> PermissionPolicy {
+        self.policy.snapshot()
+    }
+
+    fn shared_policy(&self) -> SharedPolicy {
+        self.policy.clone()
+    }
+
+    fn record(
+        &self,
+        project: ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<Option<SupervisionRecord>, SupervisionError> {
+        Ok(self
+            .store
+            .lock()
+            .load_supervision_record(project, supervision)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fake checks and assessment.
+// ---------------------------------------------------------------------------
+
+struct UnavailableCheck;
+
+impl RequiredCheckPort for UnavailableCheck {
+    fn execute(
+        &mut self,
+        request: &CheckExecutionRequest,
+    ) -> Result<CheckExecution, SupervisionError> {
+        let result = herness_supervision::RequiredCheckResult::new(
+            request.check_id(),
+            request.condition_id(),
+            CheckStatus::Unavailable,
+            None,
+            request.condition_version(),
+            request.target_version(),
+            Timestamp::now(),
+        )?;
+        Ok(CheckExecution::new(result, None))
+    }
+}
+
+struct PassCheck {
+    root: PathBuf,
+}
+
+impl RequiredCheckPort for PassCheck {
+    fn execute(
+        &mut self,
+        request: &CheckExecutionRequest,
+    ) -> Result<CheckExecution, SupervisionError> {
+        let workspace =
+            herness_desktop::supervision::workspace::ProjectWorkspace::new(self.root.clone());
+        let manifest = herness_supervision::freshness::capture_manifest(
+            &workspace,
+            request.project_id(),
+            request.target_version(),
+            TargetReadSet::Declared(request.read_set().to_vec()),
+        )?;
+        let target = manifest.target_scope()?;
+        let evidence = EvidenceRecord::new(
+            request.evidence_id(),
+            request.supervision_id(),
+            Some(request.condition_id()),
+            Some(request.check_id()),
+            EvidenceAcquirer::ChildAgent,
+            request.operation().clone(),
+            EvidenceOutcome::new(Some(0), None, false, false, "exit=0")?,
+            target,
+            EvidenceScope::new(
+                vec![format!("check: {}", request.check_id())],
+                vec!["scripted check evidence".to_owned()],
+            )?,
+            CheckStatus::Pass,
+            request.sequence(),
+            Timestamp::now(),
+        )?;
+        let result = herness_supervision::RequiredCheckResult::from_evidence(
+            &evidence,
+            request.condition_version(),
+        )?;
+        Ok(CheckExecution::new(result, Some(evidence)))
+    }
+}
+
+struct UnverifiedAssessment;
+
+impl ConditionAssessmentPort for UnverifiedAssessment {
+    fn profile(
+        &self,
+        _binding: herness_supervision::ProfileBinding,
+    ) -> Result<AssessmentProfileFacts, SupervisionError> {
+        Err(SupervisionError::Unsupported {
+            feature: "assessment profile is not verified".to_owned(),
+        })
+    }
+
+    fn assess(
+        &mut self,
+        _request: &AssessmentRequest,
+    ) -> Result<AssessmentResult, SupervisionError> {
+        Err(SupervisionError::Unsupported {
+            feature: "assessment profile is not verified".to_owned(),
+        })
+    }
+}
+
+struct MetAssessment;
+
+impl ConditionAssessmentPort for MetAssessment {
+    fn profile(
+        &self,
+        _binding: herness_supervision::ProfileBinding,
+    ) -> Result<AssessmentProfileFacts, SupervisionError> {
+        Ok(AssessmentProfileFacts::new(
+            AdapterVersion::new("herness-llm-condition-v1")?,
+            RubricVersion::new("herness-conditions-v1")?,
+            ProfileThresholds::normal_llm(),
+        ))
+    }
+
+    fn assess(
+        &mut self,
+        request: &AssessmentRequest,
+    ) -> Result<AssessmentResult, SupervisionError> {
+        let provenance = AssessmentProvenance::new(
+            herness_core::Provider::OpenAi,
+            ProviderKind::NormalLlm,
+            herness_core::ModelId::new("judge-model").expect("static model"),
+            request.adapter_version().clone(),
+            request.rubric_version().clone(),
+        )?;
+        AssessmentResult::new(
+            request,
+            request.evidence().to_vec(),
+            "scripted met verdict",
+            None,
+            AssessmentOutcome::NormalLlm {
+                verdict: ConditionVerdict::Met,
+                confidence: None,
+            },
+            provenance,
+            Timestamp::now(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Harness.
+// ---------------------------------------------------------------------------
+
+struct Harness {
+    _temp: TempDir,
+    store_path: PathBuf,
+    project: ProjectId,
+    connection: ConnectionId,
+    store: StoreHandle,
+    admin: ConnectionAdmin,
+    host: SupervisionHost,
+    runtime: FakeRuntime,
+}
+
+fn request(project: ProjectId, connection: ConnectionId) -> CreateSupervisionRequest {
+    CreateSupervisionRequest {
+        project,
+        connection,
+        instructions: "Implement the approved change.".to_owned(),
+        conditions: vec![ConditionInput {
+            title: "The check passes".to_owned(),
+            rubric: "The required check must pass on the current target.".to_owned(),
+            checks: vec![CheckInput {
+                command: "true".to_owned(),
+                description: "trivial passing command".to_owned(),
+            }],
+        }],
+        read_set: vec!["src/main.rs".to_owned()],
+        write_paths: vec!["src".to_owned()],
+        allow_shell: false,
+        condition_version: Some(1),
+        target_version: Some(1),
+        budget: Some(herness_desktop::supervision::BudgetInput {
+            active_seconds: 7_200,
+            additional_runs: 30,
+            money_limit_micros: None,
+            price_version: None,
+        }),
+    }
+}
+
+fn harness() -> Harness {
+    harness_with_check(false, false)
+}
+
+fn harness_with_pass_check() -> Harness {
+    harness_with_check(true, false)
+}
+
+fn harness_with_completion() -> Harness {
+    harness_with_check(true, true)
+}
+
+fn harness_with_check(pass: bool, met_assessment: bool) -> Harness {
+    let temp = tempfile::tempdir().expect("temp");
+    let project_root = temp.path().join("project");
+    std::fs::create_dir_all(project_root.join("src")).expect("project dirs");
+    std::fs::write(project_root.join("src/main.rs"), "fn main() {}\n").expect("project file");
+    let store_path = temp.path().join("app-data");
+    let config = StoreConfig::new(&store_path).expect("store config");
+    let store = Store::open(config).expect("store");
+    let store = StoreHandle::new(Arc::new(std::sync::Mutex::new(store)));
+    let project = ProjectId::new();
+    let connection = ConnectionId::new();
+    let admin = ConnectionAdmin::new();
+    admin
+        .add(
+            ConnectionSettings::new(
+                connection,
+                Provider::OpenAi,
+                "judge-model",
+                AuthMethod::ApiKey,
+                None::<Endpoint>,
+                None,
+            )
+            .expect("connection"),
+        )
+        .expect("add connection");
+    let assessment_host = AssessmentHost {
+        directory: admin.directory(),
+        credentials: Arc::new(NoCredentials),
+    };
+    let config_store = ConfigStore::new();
+    let check: Box<dyn RequiredCheckPort + Send> = if pass {
+        Box::new(PassCheck {
+            root: project_root.clone(),
+        })
+    } else {
+        Box::new(UnavailableCheck)
+    };
+    let assessment: Box<dyn ConditionAssessmentPort + Send> = if met_assessment {
+        Box::new(MetAssessment)
+    } else {
+        Box::new(UnverifiedAssessment)
+    };
+    let host = SupervisionHost::with_config_for_test(
+        store.clone(),
+        config_store,
+        assessment_host,
+        assessment,
+        check,
+    );
+    let runtime = FakeRuntime::new(store.clone(), project, project_root.clone());
+    Harness {
+        _temp: temp,
+        store_path,
+        project,
+        connection,
+        store,
+        admin,
+        host,
+        runtime,
+    }
+}
+
+impl Harness {
+    fn configure_completion(&mut self) {
+        self.host
+            .configure_profile(
+                PlanRequestActor::Human,
+                self.project,
+                ProfilePurpose::Completion,
+                self.connection,
+                "judge-model",
+                Some(self.host.confirm(ConfirmationKind::Profile)),
+            )
+            .expect("profile");
+    }
+
+    fn grant_completion(&mut self, target_version: u64) {
+        self.host
+            .grant_consent(
+                PlanRequestActor::Human,
+                self.project,
+                ProfilePurpose::Completion,
+                ProviderOrigin::parse("https://api.openai.com").expect("origin"),
+                BTreeSet::from([DisclosureDataKind::Text]),
+                vec!["src/main.rs".to_owned()],
+                TargetVersion::new(target_version).expect("version"),
+                Some(self.host.confirm(ConfirmationKind::Consent)),
+            )
+            .expect("consent");
+    }
+
+    fn create(&mut self) -> herness_desktop::supervision::SupervisionView {
+        self.host
+            .create(
+                &mut self.runtime,
+                PlanRequestActor::Human,
+                request(self.project, self.connection),
+                Some(self.host.confirm(ConfirmationKind::Create)),
+            )
+            .expect("create")
+    }
+
+    fn start(
+        &mut self,
+        supervision: SupervisionId,
+    ) -> herness_desktop::supervision::SupervisionView {
+        let view = self.host.get(self.project, supervision).expect("view");
+        self.host
+            .start(
+                &mut self.runtime,
+                self.project,
+                supervision,
+                SupervisionRequestId::new(self.project),
+                view.revision,
+                Some(self.host.confirm(ConfirmationKind::Start)),
+            )
+            .expect("start")
+    }
+}
+
+fn pump_until(
+    host: &mut SupervisionHost,
+    runtime: &mut FakeRuntime,
+    project: ProjectId,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        host.pump(runtime, &[project]).expect("pump");
+        let views = host.list(project).expect("list");
+        if let Some(view) = views.first()
+            && predicate(&view.state)
+        {
+            return view.state.clone();
+        }
+        assert!(Instant::now() < deadline, "pump did not converge");
+        std::thread::sleep(supervision_interval());
+    }
+}
+
+fn supervision_interval() -> Duration {
+    herness_desktop::supervision::PUMP_INTERVAL + Duration::from_millis(20)
+}
+
+// ---------------------------------------------------------------------------
+// Guard and human proof.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remote_and_preview_origins_cannot_invoke_the_trusted_surface() {
+    assert_eq!(
+        guard::verify("main", "main", Some("tauri://localhost/index.html")),
+        Ok(())
+    );
+    assert_eq!(
+        guard::verify("preview", "preview", Some("tauri://localhost/index.html")),
+        Err(GuardError::UntrustedWindow)
+    );
+    assert_eq!(
+        guard::verify("main", "preview", Some("tauri://localhost/index.html")),
+        Err(GuardError::UntrustedWebview)
+    );
+    assert_eq!(
+        guard::verify("main", "main", Some("https://example.com/")),
+        Err(GuardError::UntrustedOrigin)
+    );
+    assert_eq!(
+        guard::classify_navigation("https://example.com/"),
+        Navigation::OpenExternal
+    );
+}
+
+#[test]
+fn model_actor_and_missing_human_confirmation_cannot_change_conditions() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+
+    let change = ChangeSupervisionRequest {
+        conditions: Some(vec![ConditionInput {
+            title: "Changed".to_owned(),
+            rubric: "Changed".to_owned(),
+            checks: vec![],
+        }]),
+        condition_version: Some(2),
+        profile_purpose: None,
+        consent_purpose: None,
+        budget: None,
+    };
+    let request_id = SupervisionRequestId::new(harness.project);
+
+    let model = harness.host.change(
+        &mut harness.runtime,
+        harness.project,
+        view.supervision_id,
+        request_id,
+        view.revision,
+        PlanRequestActor::Model,
+        change.clone(),
+        None,
+    );
+    assert!(matches!(
+        model,
+        Err(SupervisionError::ModelCannotApproveOrChange { .. })
+    ));
+
+    let missing = harness.host.change(
+        &mut harness.runtime,
+        harness.project,
+        view.supervision_id,
+        request_id,
+        view.revision,
+        PlanRequestActor::Human,
+        change,
+        None,
+    );
+    assert!(matches!(missing, Err(SupervisionError::Unsupported { .. })));
+
+    let latest = harness
+        .host
+        .get(harness.project, view.supervision_id)
+        .expect("view");
+    assert_eq!(latest.revision, view.revision);
+    assert_eq!(latest.condition_version, 1);
+}
+
+#[test]
+fn profile_configuration_requires_a_human_confirmation() {
+    let harness = harness();
+    let model = harness.host.configure_profile(
+        PlanRequestActor::Model,
+        harness.project,
+        ProfilePurpose::Completion,
+        harness.connection,
+        "judge-model",
+        None,
+    );
+    assert!(matches!(
+        model,
+        Err(SupervisionError::ModelCannotApproveOrChange { .. })
+    ));
+
+    let missing = harness.host.configure_profile(
+        PlanRequestActor::Human,
+        harness.project,
+        ProfilePurpose::Completion,
+        harness.connection,
+        "judge-model",
+        None,
+    );
+    assert!(matches!(missing, Err(SupervisionError::Unsupported { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Per-purpose profile and consent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn per_purpose_profiles_and_consents_are_independent_and_consent_revocation_is_explicit() {
+    let mut harness = harness();
+    for purpose in [
+        ProfilePurpose::Completion,
+        ProfilePurpose::Html,
+        ProfilePurpose::Permission,
+    ] {
+        harness
+            .host
+            .configure_profile(
+                PlanRequestActor::Human,
+                harness.project,
+                purpose,
+                harness.connection,
+                "judge-model",
+                Some(harness.host.confirm(ConfirmationKind::Profile)),
+            )
+            .expect("profile");
+        harness
+            .host
+            .grant_consent(
+                PlanRequestActor::Human,
+                harness.project,
+                purpose,
+                ProviderOrigin::parse("https://api.openai.com").expect("origin"),
+                BTreeSet::from([DisclosureDataKind::Text]),
+                vec!["src/main.rs".to_owned()],
+                TargetVersion::new(1).expect("version"),
+                Some(harness.host.confirm(ConfirmationKind::Consent)),
+            )
+            .expect("consent");
+    }
+    harness
+        .host
+        .revoke_consent(
+            PlanRequestActor::Human,
+            harness.project,
+            ProfilePurpose::Html,
+            Some(harness.host.confirm(ConfirmationKind::Consent)),
+        )
+        .expect("revoke html");
+
+    let view = harness.create();
+    let status = |purpose: &str| {
+        view.purposes
+            .iter()
+            .find(|status| status.purpose == purpose)
+            .expect("purpose")
+    };
+    assert_eq!(status("completion").consent_state, "granted");
+    assert_eq!(status("html").consent_state, "revoked");
+    assert_eq!(status("permission").consent_state, "granted");
+    assert!(status("completion").profile_id.is_some());
+    assert!(status("html").profile_id.is_some());
+    assert!(status("permission").profile_id.is_some());
+    assert!(!status("completion").verified);
+}
+
+#[test]
+fn unverified_profiles_are_displayed_as_unverified_and_never_start_a_model_request() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    let completion = view
+        .purposes
+        .iter()
+        .find(|status| status.purpose == "completion")
+        .expect("completion");
+    assert!(completion.profile_id.is_some());
+    assert!(!completion.verified);
+    assert_eq!(view.state, "ready");
+    assert_eq!(harness.runtime.starts, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Create/start/pump and waiting-human.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_assessment_port_returns_unverified_without_any_network_request() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    let port = herness_desktop::supervision::assessment::HostAssessmentPort::new(
+        harness.store.clone(),
+        harness.host.config(),
+        AssessmentHost {
+            directory: harness.admin.directory(),
+            credentials: Arc::new(NoCredentials),
+        },
+    );
+    let error = port
+        .profile(view.profile)
+        .expect_err("an unverified profile must not resolve");
+    assert!(matches!(
+        error,
+        SupervisionError::Unsupported { .. } | SupervisionError::ProfileUnavailable { .. }
+    ));
+    harness
+        .host
+        .mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+        .expect("mark verified");
+    let facts = port.profile(view.profile).expect("verified profile facts");
+    assert_eq!(facts.adapter_version().as_str(), "herness-llm-condition-v1");
+}
+
+#[test]
+fn create_does_not_start_and_pump_progresses_an_explicitly_started_target() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    assert_eq!(view.state, "ready");
+    assert!(view.run_group.is_empty());
+    assert_eq!(harness.runtime.starts, 0);
+
+    // A ready target is not pumped: no child and no continuation exist.
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump ready");
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+
+    let started = harness.start(view.supervision_id);
+    assert_eq!(started.state, "running");
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+    assert_eq!(harness.runtime.continuations, 0);
+    harness.runtime.complete_all_inputs();
+    harness.runtime.set_all_idle();
+
+    let state = pump_until(
+        &mut harness.host,
+        &mut harness.runtime,
+        harness.project,
+        |state| state == "waiting_human",
+    );
+    assert_eq!(state, "waiting_human");
+    assert_eq!(harness.runtime.continuations, 0);
+}
+
+#[test]
+fn unverified_assessment_profile_waits_for_a_human_and_never_completes() {
+    let mut harness = harness_with_pass_check();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    let _ = harness.start(view.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    harness.runtime.complete_all_inputs();
+    harness.runtime.set_all_idle();
+    let state = pump_until(
+        &mut harness.host,
+        &mut harness.runtime,
+        harness.project,
+        |state| state == "waiting_human",
+    );
+    assert_eq!(state, "waiting_human");
+    let latest = harness
+        .host
+        .get(harness.project, view.supervision_id)
+        .expect("view");
+    assert!(latest.completion.is_none());
+    assert_eq!(
+        latest
+            .reason
+            .get("action")
+            .and_then(|action| action.as_str()),
+        Some("confirm_assessment_profile")
+    );
+}
+
+#[test]
+fn inconclusive_checks_are_waiting_human_not_completed() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    let _ = harness.start(view.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    harness.runtime.complete_all_inputs();
+    harness.runtime.set_all_idle();
+    let state = pump_until(
+        &mut harness.host,
+        &mut harness.runtime,
+        harness.project,
+        |state| state == "waiting_human",
+    );
+    assert_eq!(state, "waiting_human");
+    let latest = harness
+        .host
+        .get(harness.project, view.supervision_id)
+        .expect("view");
+    assert_ne!(latest.state, "completed");
+    assert!(latest.completion.is_none());
+    assert!(matches!(
+        latest.reason.get("kind").and_then(|kind| kind.as_str()),
+        Some("waiting_human")
+    ));
+}
+
+#[test]
+fn explicit_budget_change_updates_policy_version_and_retains_usage() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let _ = harness.start(created.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    let latest = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    let change = ChangeSupervisionRequest {
+        conditions: None,
+        condition_version: None,
+        profile_purpose: None,
+        consent_purpose: None,
+        budget: Some(herness_desktop::supervision::BudgetInput {
+            active_seconds: 600,
+            additional_runs: 5,
+            money_limit_micros: None,
+            price_version: None,
+        }),
+    };
+    let changed = harness
+        .host
+        .change(
+            &mut harness.runtime,
+            harness.project,
+            created.supervision_id,
+            SupervisionRequestId::new(harness.project),
+            latest.revision,
+            PlanRequestActor::Human,
+            change,
+            Some(harness.host.confirm(ConfirmationKind::Change)),
+        )
+        .expect("budget change");
+    assert_eq!(changed.state, "waiting_human");
+    let budget = changed.budget.expect("budget");
+    assert_eq!(budget.policy_version, 2);
+    assert_eq!(budget.active_seconds, 600);
+    assert_eq!(budget.additional_runs, 5);
+    let record = harness
+        .runtime
+        .record(harness.project, created.supervision_id)
+        .expect("record")
+        .expect("stored");
+    assert_eq!(record.change_log().len(), 1);
+    assert_eq!(record.change_log()[0].kind().as_str(), "budget");
+}
+
+#[test]
+fn revoking_completion_consent_stops_pump_progress_before_new_work() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let _ = harness.start(created.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+    harness
+        .host
+        .revoke_consent(
+            PlanRequestActor::Human,
+            harness.project,
+            ProfilePurpose::Completion,
+            Some(harness.host.confirm(ConfirmationKind::Consent)),
+        )
+        .expect("revoke");
+    std::thread::sleep(supervision_interval());
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump after revoke");
+    let latest = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(latest.state, "waiting_human");
+    assert_eq!(
+        latest
+            .reason
+            .get("action")
+            .and_then(|action| action.as_str()),
+        Some("grant_disclosure_consent")
+    );
+    assert_eq!(harness.runtime.starts, 1);
+}
+
+#[test]
+fn recovery_read_reports_zero_side_effects() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let _ = harness.start(created.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    let recovery = harness
+        .host
+        .recovery(
+            &mut harness.runtime,
+            harness.project,
+            created.supervision_id,
+        )
+        .expect("recovery");
+    assert_eq!(
+        recovery
+            .side_effects
+            .get("modelRequests")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        recovery
+            .side_effects
+            .get("runsStarted")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        recovery
+            .side_effects
+            .get("toolExecutions")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        recovery
+            .side_effects
+            .get("autoResumes")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+}
+
+#[test]
+fn explicit_condition_change_updates_the_plan_contract_before_resume() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let change = ChangeSupervisionRequest {
+        conditions: Some(vec![ConditionInput {
+            title: "The replacement check passes".to_owned(),
+            rubric: "The replacement check must pass on the current target.".to_owned(),
+            checks: vec![CheckInput {
+                command: "true".to_owned(),
+                description: "replacement check".to_owned(),
+            }],
+        }]),
+        condition_version: Some(2),
+        profile_purpose: None,
+        consent_purpose: None,
+        budget: None,
+    };
+    let changed = harness
+        .host
+        .change(
+            &mut harness.runtime,
+            harness.project,
+            created.supervision_id,
+            SupervisionRequestId::new(harness.project),
+            created.revision,
+            PlanRequestActor::Human,
+            change,
+            Some(harness.host.confirm(ConfirmationKind::Change)),
+        )
+        .expect("condition change");
+    assert_eq!(changed.condition_version, 2);
+    assert_eq!(changed.state, "waiting_human");
+    assert!(changed.plan_available);
+    let resume = SupervisionOperationRequest::new(
+        SupervisionRequestId::new(harness.project),
+        created.supervision_id,
+        HumanOperation::Resume,
+        changed.revision,
+    )
+    .expect("resume request");
+    let resumed = harness
+        .host
+        .resume(
+            &mut harness.runtime,
+            resume,
+            1,
+            Some(harness.host.confirm(ConfirmationKind::Resume)),
+        )
+        .expect("resume after condition change");
+    assert_eq!(resumed.condition_version, 2);
+    assert_eq!(resumed.state, "running");
+}
+
+#[test]
+fn duplicate_start_request_id_returns_the_recorded_result_without_a_second_run() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let request_id = SupervisionRequestId::new(harness.project);
+    let first = harness
+        .host
+        .start(
+            &mut harness.runtime,
+            harness.project,
+            created.supervision_id,
+            request_id,
+            created.revision,
+            Some(harness.host.confirm(ConfirmationKind::Start)),
+        )
+        .expect("first start");
+    let second = harness
+        .host
+        .start(
+            &mut harness.runtime,
+            harness.project,
+            created.supervision_id,
+            request_id,
+            first.revision,
+            Some(harness.host.confirm(ConfirmationKind::Start)),
+        )
+        .expect("duplicate start");
+    assert_eq!(second.revision, first.revision);
+    assert_eq!(second.run_group.len(), first.run_group.len());
+    assert_eq!(harness.runtime.starts, 0);
+}
+
+#[test]
+fn passing_checks_and_a_met_assessment_complete_after_the_state_is_saved() {
+    let mut harness = harness_with_completion();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let _ = harness.start(created.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    harness.runtime.complete_all_inputs();
+    harness.runtime.set_all_idle();
+    let state = pump_until(
+        &mut harness.host,
+        &mut harness.runtime,
+        harness.project,
+        |state| state == "completed",
+    );
+    assert_eq!(state, "completed");
+    let latest = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert!(latest.completion.is_some());
+    assert!(!latest.notifications.is_empty());
+    assert_eq!(latest.unmet_conditions.len(), 0);
+}
+
+#[test]
+fn reassess_from_stopped_can_complete_from_a_stable_paused_run() {
+    let mut harness = harness_with_completion();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let _ = harness.start(created.supervision_id);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    harness.runtime.complete_all_inputs();
+    let running = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    let stop = SupervisionOperationRequest::new(
+        SupervisionRequestId::new(harness.project),
+        created.supervision_id,
+        HumanOperation::Stop,
+        running.revision,
+    )
+    .expect("stop request");
+    let stopped = harness
+        .host
+        .stop(
+            &mut harness.runtime,
+            stop,
+            false,
+            1,
+            Some(harness.host.confirm(ConfirmationKind::Stop)),
+        )
+        .expect("stop");
+    assert_eq!(stopped.state, "stopped");
+    let reassess = SupervisionOperationRequest::new(
+        SupervisionRequestId::new(harness.project),
+        created.supervision_id,
+        HumanOperation::Reassess,
+        stopped.revision,
+    )
+    .expect("reassess request");
+    let _ = harness
+        .host
+        .reassess(
+            &mut harness.runtime,
+            reassess,
+            1,
+            Some(harness.host.confirm(ConfirmationKind::Reassess)),
+        )
+        .expect("reassess");
+    let state = pump_until(
+        &mut harness.host,
+        &mut harness.runtime,
+        harness.project,
+        |state| state == "completed",
+    );
+    assert_eq!(state, "completed");
+}
+
+#[test]
+fn pump_progresses_targets_in_every_project_without_a_window_or_selected_project() {
+    let mut harness = harness();
+    // Second project with its own profile/consent and target.
+    let other_root = harness._temp.path().join("other-project");
+    std::fs::create_dir_all(other_root.join("src")).expect("other dirs");
+    std::fs::write(other_root.join("src/main.rs"), "fn other() {}\n").expect("other file");
+    let other_project = ProjectId::new();
+    harness
+        .host
+        .configure_profile(
+            PlanRequestActor::Human,
+            other_project,
+            ProfilePurpose::Completion,
+            harness.connection,
+            "judge-model",
+            Some(harness.host.confirm(ConfirmationKind::Profile)),
+        )
+        .expect("other profile");
+    harness
+        .host
+        .grant_consent(
+            PlanRequestActor::Human,
+            other_project,
+            ProfilePurpose::Completion,
+            ProviderOrigin::parse("https://api.openai.com").expect("origin"),
+            BTreeSet::from([DisclosureDataKind::Text]),
+            vec!["src/main.rs".to_owned()],
+            TargetVersion::new(1).expect("version"),
+            Some(harness.host.confirm(ConfirmationKind::Consent)),
+        )
+        .expect("other consent");
+    harness
+        .runtime
+        .add_project(other_project, other_root.clone());
+    let other_view = harness
+        .host
+        .create(
+            &mut harness.runtime,
+            PlanRequestActor::Human,
+            request(other_project, harness.connection),
+            Some(harness.host.confirm(ConfirmationKind::Create)),
+        )
+        .expect("other create");
+    let _ = harness
+        .host
+        .start(
+            &mut harness.runtime,
+            other_project,
+            other_view.supervision_id,
+            SupervisionRequestId::new(other_project),
+            other_view.revision,
+            Some(harness.host.confirm(ConfirmationKind::Start)),
+        )
+        .expect("other start");
+
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let view = harness.create();
+    let _ = harness.start(view.supervision_id);
+
+    // The pump receives both project IDs, not a UI selection or a window.
+    for _ in 0..3 {
+        harness
+            .host
+            .pump(&mut harness.runtime, &[harness.project, other_project])
+            .expect("pump both");
+        std::thread::sleep(supervision_interval());
+    }
+    assert_eq!(harness.runtime.starts, 2);
+    assert!(harness.runtime.run_count() >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// Restore/reopen.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reopen_restores_saved_plan_state_and_purpose_configuration() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let save_path = harness.store_path.clone();
+    let project = harness.project;
+    let supervision = created.supervision_id;
+    let revision = created.revision;
+
+    drop(harness.host);
+    drop(harness.runtime);
+    drop(harness.store);
+
+    let config = StoreConfig::new(&save_path).expect("reopen config");
+    let store = Store::open(config).expect("reopen store");
+    let store = StoreHandle::new(Arc::new(std::sync::Mutex::new(store)));
+    let assessment_host = AssessmentHost {
+        directory: harness.admin.directory(),
+        credentials: Arc::new(NoCredentials),
+    };
+    let host = SupervisionHost::with_config_for_test(
+        store.clone(),
+        ConfigStore::new(),
+        assessment_host,
+        Box::new(UnverifiedAssessment),
+        Box::new(UnavailableCheck),
+    );
+    host.restore(&[project]);
+    let views = host.list(project).expect("restored list");
+    assert_eq!(views.len(), 1);
+    let restored = &views[0];
+    assert_eq!(restored.supervision_id, supervision);
+    assert_eq!(restored.revision, revision);
+    assert_eq!(restored.state, "ready");
+    assert!(restored.plan_available);
+    let completion = restored
+        .purposes
+        .iter()
+        .find(|status| status.purpose == "completion")
+        .expect("completion");
+    assert_eq!(completion.consent_state, "granted");
+    assert!(completion.profile_id.is_some());
+    assert!(!completion.verified);
+    assert!(
+        host.get(project, supervision)
+            .expect("get")
+            .run_group
+            .is_empty()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Default no-child-continuation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_child_continuation_or_auto_start_happens_for_normal_creation() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let before = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(before.state, "ready");
+    assert_eq!(before.run_group.len(), 0);
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+
+    // Repeated pumps with no explicit start still do nothing.
+    for _ in 0..3 {
+        harness
+            .host
+            .pump(&mut harness.runtime, &[harness.project])
+            .expect("pump");
+    }
+    let after = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.state, "ready");
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+}

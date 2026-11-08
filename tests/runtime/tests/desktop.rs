@@ -2447,3 +2447,107 @@ fn measure_running_host_rss() {
     println!("MEASURE_DONE: pid={}", std::process::id());
     std::process::exit(0);
 }
+
+#[test]
+fn quit_hook_marks_real_supervision_without_starting_a_run() {
+    use std::collections::BTreeSet;
+
+    use herness_core::runtime::{ShutdownOutcome, ShutdownReport};
+    use herness_desktop::supervision::{
+        CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
+    };
+    use herness_supervision::{DisclosureDataKind, ProfilePurpose, ProviderOrigin, TargetVersion};
+
+    let mut fixture = Fixture::new(Vec::new());
+    std::fs::create_dir_all(fixture.project.join("src")).expect("supervision dirs");
+    std::fs::write(fixture.project.join("src/main.rs"), "fn main() {}\n")
+        .expect("supervision file");
+    let project = fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project")
+        .project_id();
+    let connection = fixture.connection();
+    fixture
+        .host
+        .supervision_configure_profile(
+            PlanRequestActor::Human,
+            project,
+            ProfilePurpose::Completion,
+            connection,
+            "gpt-test",
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Profile)),
+        )
+        .expect("profile");
+    fixture
+        .host
+        .supervision_grant_consent(
+            PlanRequestActor::Human,
+            project,
+            ProfilePurpose::Completion,
+            ProviderOrigin::parse("https://api.openai.com").expect("origin"),
+            BTreeSet::from([DisclosureDataKind::Text]),
+            vec!["src/main.rs".to_owned()],
+            TargetVersion::new(1).expect("version"),
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Consent)),
+        )
+        .expect("consent");
+    let created = fixture
+        .host
+        .supervision_create(
+            PlanRequestActor::Human,
+            CreateSupervisionRequest {
+                project,
+                connection,
+                instructions: "quit hook fixture".to_owned(),
+                conditions: vec![ConditionInput {
+                    title: "The check passes".to_owned(),
+                    rubric: "fixture".to_owned(),
+                    checks: vec![CheckInput {
+                        command: "true".to_owned(),
+                        description: "fixture check".to_owned(),
+                    }],
+                }],
+                read_set: vec!["src/main.rs".to_owned()],
+                write_paths: vec!["src".to_owned()],
+                allow_shell: false,
+                condition_version: Some(1),
+                target_version: Some(1),
+                budget: None,
+            },
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Create)),
+        )
+        .expect("create supervision");
+    assert_eq!(created.state, "ready");
+
+    let report = ShutdownReport::new(
+        ShutdownOutcome::Completed,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
+    fixture
+        .host
+        .mark_supervision_for_quit(&report)
+        .expect("quit hook");
+    let record = fixture
+        .host
+        .supervision_record(project, created.supervision_id)
+        .expect("stored record")
+        .expect("record");
+    assert_eq!(record.state().as_str(), "stopped");
+    let revision = record.revision();
+    fixture
+        .host
+        .mark_supervision_for_quit(&report)
+        .expect("repeat quit hook");
+    let after = fixture
+        .host
+        .supervision_record(project, created.supervision_id)
+        .expect("stored record")
+        .expect("record");
+    assert_eq!(after.revision(), revision);
+}

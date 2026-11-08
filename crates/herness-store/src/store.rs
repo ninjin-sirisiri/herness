@@ -1241,6 +1241,29 @@ impl Store {
         load_command_result(&self.conn, request_id)
     }
 
+    /// Atomically compares the revision, writes the next supervision record,
+    /// and binds the command result in one transaction.
+    ///
+    /// This is the public store boundary used by `SharedStore`/`StoreHandle`;
+    /// it performs no notification, run, or send.
+    pub fn commit_supervision_command(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &SupervisionRecord,
+        result: &CommandResult,
+    ) -> Result<u64, StoreError> {
+        commit_command_atomically(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+            result,
+        )
+    }
+
     /// Records one command result exactly once.
     pub fn record_supervision_command_result(
         &mut self,

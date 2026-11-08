@@ -435,9 +435,21 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
         ),
     };
 
-    let mut snapshot = match stop_result {
-        Ok(report) => coordinator.note_stopped(report),
-        Err(error) => coordinator.note_failed(error),
+    let mut snapshot = match &stop_result {
+        Ok(report) => {
+            // Mark H2 supervision state with the real H1 stop facts before the
+            // quit decision is evaluated. The hook never starts or resumes work.
+            if let Ok(mut host) = state.host.lock()
+                && let Err(error) = host.mark_supervision_for_quit(report)
+            {
+                eprintln!(
+                    "QUIT_INCOMPLETE: pid={} supervision-mark-failed=true detail={error}",
+                    std::process::id()
+                );
+            }
+            coordinator.note_stopped(report.clone())
+        }
+        Err(error) => coordinator.note_failed(error.clone()),
     };
     if let Some(error) = begin_failure {
         snapshot = coordinator.note_save_failure(error);

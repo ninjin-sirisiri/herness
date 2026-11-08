@@ -1327,6 +1327,7 @@ dependencies = [
 name = "herness-desktop"
 version = "0.1.0"
 dependencies = [
+ "herness-assessment",
  "herness-core",
  "herness-engine-pi",
  "herness-store",
@@ -1339,6 +1340,7 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1412,6 +1414,7 @@ dependencies = [
  "base64 0.22.1",
  "herness-assessment",
  "herness-core",
+ "herness-desktop",
  "herness-store",
  "herness-supervision",
  "serde_json",

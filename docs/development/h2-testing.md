@@ -707,3 +707,55 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 実provider・実credential・実Keychain・実Tauri windowは使わない。Task 16の監督UI・実store/quit composition、Task 17のfixtures、Task 18の受入はこのTaskに含めない。
+
+## Task 16で追加したTauri監督操作と表示
+
+### Library composition
+
+- `src-tauri/src/supervision/`は、既存の`DesktopHost`が持つ一つの`Store`・`Runtime`・`PiEngine`・executorを共有する。二つ目のstore・engine・executor・budget ledgerは作らない。`SupervisionHost`はTauri window型を持たず、`tests/supervision/tests/desktop.rs`から直接呼べる。
+- 実`SupervisionRuntimePort`はH1のadditiveな`Runtime::start_run_with_id`と`Runtime::submit_input_as`を使い、監督者が先に永続化したrun/input IDをそのままH1へ渡す。同じIDの再送はrun・inputを二重に作らない。追加runは`ContinuationPort`で同じ子の会話を続け、旧inputを再送しない。
+- `RecoveryRuntimePort`はH1のrun状態・`RecoveryMode`・未解決Bash操作を管理process事実・checkpoint・stop状態・現在のpolicy/mode/接続状態へ写す。`RecoveryFactsPort`は既存`Store`の一つの読み取りtransactionを使う。
+- `RequiredCheckPort`はcheckをH1の`ToolGateway`/`PermissionService`/`BashExecutor`へ通す。deny、人間待ち、automatic modeで評価器がない場合、非shellのequivalent checkは`unavailable`として返し、passにしない。passはexit 0・signalなし・timeoutなし・truncationなしの観測だけから作る。checkは60秒の有限timeoutを持ち、host pump・停止・quitを無期限に占有しない。
+- `ConditionAssessmentPort`はper-purposeに保存したprofileとconsentを照合し、profileが未検証なら`Unsupported`を返して`waiting_human`にする。run modelや別providerへのfallbackはない。実LLM/Jev/Decisions adapterの構築経路はあるが、このbuildの新規profileはすべて`verified=false`で、実provider要求は送らない。`mark_profile_verified`はIPCに出さないhost専用の受入seam。
+- 完了評価のbudget admissionは同じ`BudgetLedger`と`BudgetRequestGate`を使い、assessment timeoutは60秒と残り稼働時間の短い方にする。H1 engineのmodel要求は`SupervisionAwareGate`がrun groupから監督対象を見つけ、同じdurable ledgerへadmit/observeする。非監督の通常chatは従来と同じstore-backed admission/observationを通る。監督対象なのにplan/policyがない場合はunbudgeted送信へfallbackせず拒否する。
+- owner通知はhost所有のqueueへ入り、state commit後にだけ追加する。同じnotification IDは重複しない。UIは成功を推測しない。
+- host pumpは`DesktopHost::pump`から全projectの明示start/resume済みtargetだけを200ms間隔で進める。window閉鎖・非選択projectでも同じhost threadが進む。作成直後の`ready`、および復元しただけのtargetは自動start・自動resumeしない。
+- quit workerはH1協調停止の実`ShutdownReport`からrunごとの確認済みstopを作り、`mark_supervision_for_quit`を呼ぶ。grace・auto-resume・H1 stop意味は変更しない。
+
+### IPCとUI
+
+- `src-tauri/src/commands.rs`へ`supervision_create/list/get/start/stop/cancel/reassess/resume/change/profile/consent/evidence/budget/recovery`を追加した。すべて最初に`guard::verify`（`verify_source`）を通し、`capabilities/main.json`と`build.rs`のcommand一覧へ追加した。
+- create/start/stop/cancel/resume/reassess/change/profile/consentはhostがmintする一度限りの`HumanConfirmation`を要求する。`RequestActor::Model`は`ModelCannotApproveOrChange`で拒否し、confirmationなしのhuman操作は`Unsupported`で拒否する。条件・profile・consent・limitの変更は無断適用しない。
+- per-purpose consentはcompletion/html/permissionを別recordとして保存し、grant/revokeを別操作にする。取消しは送信済み内容を撤回しない。completionの同意を取消すと、次のpumpは新規workの前に`waiting_human(grantDisclosureConsent)`へ移る。
+- UIの`ui/index.html`・`ui/app.js`は監督targetの作成、条件確認、purpose別profile/consent、start/stop/cancel/reassess/resume、change、state/reason/unmet/evidence/budget/notification/recovery表示を追加した。すべて`textContent`/`createElement`で描画し、`innerHTML`・HTML worker・Task取込み・内部思考表示・UI独自成功状態を使わない。window再表示時は`frontend_state`と`supervision_list`を読み直す。
+- 未検証profileはUIでも`unverified`と表示する。`waiting_human`・insufficient・unavailableは完了として表示しない。recoveryの副作用counter、budget使用量、保存state/revisionをhostから読む。
+
+### Task 16のテスト
+
+`tests/supervision/tests/desktop.rs`はTauri windowなしで、実SQLite store・実supervision record/journal/evidence/budget/recovery契約と、scriptedなH1 runtime・required check・assessmentを使う。provider・credential・Keychain・Tauri window・外部processは使わない。
+
+- remote/preview originの`guard::verify`拒否、model actorとconfirmation欠落の条件変更拒否、profile設定のhuman proofを確認する。
+- completion/html/permissionのprofile/consent独立性とrevoke、未検証profileの表示、実`HostAssessmentPort`が未検証profileでnetwork要求をしないことを確認する。
+- 作成だけでは子runを開始せず、明示start後のpumpだけで開始すること、`ready`のtargetをpumpしないこと、通常chat向けの子continuationを作らないことを確認する。
+- 2 projectを同時にpumpし、windowや選択projectに依存せず、それぞれの明示start済みtargetが進むことを確認する。
+- 実`DesktopHost::open`を経由せず保存したplan/state/configを再openし、`restore`がstate/revision/profile/consentを読み直し、runを開始しないことを確認する。
+- unavailable checkと未検証assessmentは`waiting_human`/`completion: null`になり、完了にならないことを確認する。pass check + met assessmentのscripted境界では完了し、`stopped`からpaused runを再開せずreassessして完了できることを確認する。
+- completion consent取消しが`waiting_human(grantDisclosureConsent)`へ移り、追加runを開始しないことを確認する。budget変更はpolicy versionを進め、change logと使用量を保持する。条件変更はplan contractを新しいversionへ更新し、明示resume後だけ次のrunを開始する。
+
+Task 16の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test desktop --locked
+cargo test -p herness-runtime-tests --test desktop --locked
+cargo check --workspace --all-targets --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+追加確認:
+
+- `cargo test -p herness-supervision-tests --test desktop --locked`は実storeとscripted H1/check/assessmentだけを使い、実provider・実credential・実Keychain・Tauri windowを必要としない。19件の監督composition testを実行する。
+- `cargo test -p herness-runtime-tests --test desktop --locked`は既存H1のwindow閉鎖・pump・approval・quit・restore回帰を維持する。追加の`quit_hook_marks_real_supervision_without_starting_a_run`は実`DesktopHost`で監督planを作成し、runを開始せずに実`ShutdownReport`で停止markを1回だけ記録する。
+- `cargo check --workspace --all-targets --locked`はTauri binaryを含むworkspaceをcompileする。`src-tauri/permissions/autogenerated/`はbuild時に再生成される。
+
+実provider・実credential・実Keychain・実connection受入・実Tauri windowは未使用のまま未確認とする。Jev/Decisions/complete assessmentの実送信成功は主張しない。Task 17のfixture/受入、Task 18の実接続受入はこのTaskに含めない。

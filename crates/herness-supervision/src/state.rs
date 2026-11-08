@@ -1375,9 +1375,9 @@ impl SupervisionRecord {
         self.begin_verification(self.required_checks.clone())?;
         let state = self.supervisor_mut();
         state.phase = crate::supervisor::SupervisorPhase::Evaluating;
-        state.current_run = None;
-        state.current_input = None;
-        state.current_budget_request = None;
+        // Reassessment reuses the last stable run/input only for observing the
+        // target and input correspondence. It never resumes or replays that
+        // run; a new run requires an explicit resume.
         state.continuation_of = None;
         state.pending_deficiency = None;
         state.cycle_checks_done.clear();

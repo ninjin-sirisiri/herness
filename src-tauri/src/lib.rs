@@ -12,3 +12,4 @@ pub mod host;
 pub mod lifecycle;
 pub mod login;
 pub mod real_check;
+pub mod supervision;

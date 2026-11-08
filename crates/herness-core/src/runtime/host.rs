@@ -972,6 +972,48 @@ where
         agent: AgentId,
         instructions: impl Into<String>,
     ) -> Result<RunView, RuntimeError> {
+        self.start_run_with_id(project, agent, RunId::new(project), instructions)
+    }
+
+    /// Starts one run using an identifier allocated by the host composition.
+    ///
+    /// This is the H2 supervision boundary: the supervisor persists the run and
+    /// input identifiers before calling H1, so a retry after a crash must be
+    /// answered idempotently instead of starting a second run. An existing run
+    /// with the same identifier and agent is returned without a second engine
+    /// start; a different agent or instruction set for the same identifier is
+    /// refused.
+    pub fn start_run_with_id(
+        &mut self,
+        project: ProjectId,
+        agent: AgentId,
+        run_id: RunId,
+        instructions: impl Into<String>,
+    ) -> Result<RunView, RuntimeError> {
+        run_id
+            .validate_in(&project)
+            .map_err(|_| RuntimeError::CrossProject {
+                id_kind: IdKind::Run,
+                expected: project,
+                found: run_id.project_id(),
+            })?;
+        let instructions = instructions.into();
+        if let Some(existing) = self
+            .state
+            .projects()
+            .get(&project)
+            .and_then(|record| record.runs.get(&run_id))
+        {
+            if existing.agent_id != agent || existing.instructions != instructions {
+                return Err(RuntimeError::InvalidValue {
+                    field: "runId".to_owned(),
+                    violation: ArgumentViolation::Invalid {
+                        detail: "the run identifier is already bound to another start".to_owned(),
+                    },
+                });
+            }
+            return Ok(run_view(project, run_id, existing));
+        }
         self.ensure_accepting()?;
         let project_record = self.project_record(project)?.clone();
         if agent.project_id() != project {
@@ -1020,7 +1062,6 @@ where
             None => GrantScope::for_run(project, &policy),
         };
 
-        let run_id = RunId::new(project);
         let control = RunControl::new();
         let permission = self.run_permission_context(project, run_id, &grant, control.clone())?;
         let start = EngineStart::new(
@@ -1030,7 +1071,7 @@ where
             run_id,
             agent_record.connection,
             project_record.path.clone(),
-            instructions.into(),
+            instructions,
         )
         .map_err(RuntimeError::engine)?
         .with_permission(permission);
@@ -1137,6 +1178,25 @@ where
         run: RunId,
         text: impl Into<String>,
     ) -> Result<InputId, RuntimeError> {
+        let input_id = InputId::new(project);
+        self.submit_input_as(project, run, input_id, text)?;
+        Ok(input_id)
+    }
+
+    /// Submits text for a host-allocated input identifier.
+    ///
+    /// H2 supervision persists the input identifier before the runtime call. A
+    /// repeated call with the same identifier is idempotent: an already
+    /// dispatched or terminal input is not sent again, while a durably accepted
+    /// continuation input is dispatched once. The input text is never stored in
+    /// the audit payload.
+    pub fn submit_input_as(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        input_id: InputId,
+        text: impl Into<String>,
+    ) -> Result<(), RuntimeError> {
         let text = text.into();
         if text.trim().is_empty() {
             return Err(RuntimeError::InvalidValue {
@@ -1144,15 +1204,32 @@ where
                 violation: ArgumentViolation::Empty,
             });
         }
+        if input_id.project_id() != project {
+            return Err(RuntimeError::CrossProject {
+                id_kind: IdKind::Input,
+                expected: project,
+                found: input_id.project_id(),
+            });
+        }
         self.ensure_accepting()?;
         let record = self.run_record(project, run)?.clone();
-        if record.state != RunState::Running {
+        let existing = record
+            .inputs
+            .iter()
+            .find(|input| input.input_id == input_id)
+            .cloned();
+        if let Some(existing) = &existing {
+            if existing.dispatched_at.is_some() || existing.phase != InputPhase::Accepted {
+                // The input already left the accepted state. Retrying must not
+                // send it again; the caller observes its progress instead.
+                return Ok(());
+            }
+        } else if record.state != RunState::Running {
             return Err(RuntimeError::InvalidRunTransition {
                 from: record.state,
                 to: RunState::Running,
             });
         }
-        let input_id = InputId::new(project);
         let now = Timestamp::now();
         let mut next = self.state.clone();
         let stored = next
@@ -1162,30 +1239,39 @@ where
             .runs
             .get_mut(&run)
             .ok_or(RuntimeError::UnknownRun { run })?;
-        stored.inputs.push(InputRecord {
-            input_id,
-            phase: InputPhase::Accepted,
-            accepted_at: now,
-            dispatched_at: Some(now),
-            started_at: None,
-            finished_at: None,
-        });
+        let mut event = None;
+        if let Some(input) = stored
+            .inputs
+            .iter_mut()
+            .find(|input| input.input_id == input_id)
+        {
+            input.dispatched_at = Some(now);
+        } else {
+            stored.inputs.push(InputRecord {
+                input_id,
+                phase: InputPhase::Accepted,
+                accepted_at: now,
+                dispatched_at: Some(now),
+                started_at: None,
+                finished_at: None,
+            });
+            event = Some(event_draft(
+                project,
+                record.agent_id,
+                record.session_id,
+                run,
+                None,
+                "run.input_submitted",
+                json!({
+                    "inputId": input_id.to_string(),
+                    "phase": InputPhase::Accepted,
+                    "source": "human",
+                    "unicodeScalars": text.chars().count(),
+                }),
+            )?);
+        }
         stored.updated_at = now;
-        let event = event_draft(
-            project,
-            record.agent_id,
-            record.session_id,
-            run,
-            None,
-            "run.input_submitted",
-            json!({
-                "inputId": input_id.to_string(),
-                "phase": InputPhase::Accepted,
-                "source": "human",
-                "unicodeScalars": text.chars().count(),
-            }),
-        )?;
-        self.commit_state(next, vec![event])?;
+        self.commit_state(next, event.into_iter().collect())?;
         if let Err(error) = self.engine.send_input(&run, EngineInput::Text(text)) {
             self.fail_input(
                 project,
@@ -1197,7 +1283,7 @@ where
             )?;
             return Err(RuntimeError::Engine { error });
         }
-        Ok(input_id)
+        Ok(())
     }
 
     /// Starts a new run that continues a stable previous conversation.

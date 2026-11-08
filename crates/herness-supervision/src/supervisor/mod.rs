@@ -504,7 +504,11 @@ impl<'a> Supervisor<'a> {
             RunState::Running | RunState::AwaitingApproval => {
                 return Ok(TickReport::noop(record));
             }
-            RunState::Paused | RunState::Interrupted => {
+            RunState::Paused => {
+                // A paused run is a stable, non-active target. An explicit
+                // reassessment may verify it without resuming the old run.
+            }
+            RunState::Interrupted => {
                 return self.wait_human(
                     record,
                     record.clone(),
@@ -651,7 +655,11 @@ impl<'a> Supervisor<'a> {
             RunState::Running | RunState::AwaitingApproval => {
                 return Ok(TickReport::refused(record));
             }
-            RunState::Paused | RunState::Interrupted => {
+            RunState::Paused => {
+                // See `phase_verifying`: an explicitly reassessed target may
+                // use its last stable run without resuming it.
+            }
+            RunState::Interrupted => {
                 return self.wait_human(
                     record,
                     record.clone(),
