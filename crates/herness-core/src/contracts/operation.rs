@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::errors::{ArgumentViolation, CoreError};
 use crate::contracts::ids::{OperationId, ProjectScope, RunId};
 use crate::contracts::path::AbsolutePath;
+use crate::contracts::shell::ShellObservation;
 use crate::contracts::time::Timestamp;
 use crate::permissions::{PermissionMode, PolicyVersion};
 use crate::tools::{FileVersion, ToolArguments, ToolName};
@@ -247,6 +248,8 @@ impl FileObservation {
 pub struct OperationEvidence {
     files: Vec<FileObservation>,
     shell_outcome_unknown: bool,
+    #[serde(default)]
+    shell: Option<ShellObservation>,
 }
 
 impl OperationEvidence {
@@ -255,6 +258,7 @@ impl OperationEvidence {
         Self {
             files,
             shell_outcome_unknown,
+            shell: None,
         }
     }
 
@@ -263,12 +267,25 @@ impl OperationEvidence {
         Self {
             files: Vec::new(),
             shell_outcome_unknown: false,
+            shell: None,
         }
+    }
+
+    /// Attaches a structured shell observation.
+    #[must_use]
+    pub fn with_shell(mut self, observation: ShellObservation) -> Self {
+        self.shell = Some(observation);
+        self
     }
 
     /// File observations captured around the operation.
     pub fn files(&self) -> &[FileObservation] {
         &self.files
+    }
+
+    /// Structured shell observation, when the tool ran a managed command.
+    pub const fn shell(&self) -> Option<&ShellObservation> {
+        self.shell.as_ref()
     }
 
     /// Whether a shell's completion or cleanup could not be confirmed.

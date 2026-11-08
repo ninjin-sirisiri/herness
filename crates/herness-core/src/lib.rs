@@ -30,3 +30,13 @@ pub use tools::{
     ResolvedPath, SearchArgs, SearchMatch, SearchOutput, ToolArguments, ToolExecutor, ToolGateway,
     ToolName, WriteArgs, glob_matches, hash_bytes,
 };
+#[cfg(unix)]
+pub use tools::{
+    BashExecutor, BashOutput, Completion, DEFAULT_CAPTURE_TIMEOUT, DEFAULT_CONFIRM_TIMEOUT,
+    DEFAULT_OUTPUT_LIMIT, DEFAULT_STOP_GRACE, DEFAULT_TIMEOUT_GRACE, GroupLease, GroupStopReport,
+    ManagedChild, ManagedGroup, ManagedSignal, ProcessLauncher, ProcessSupervisor,
+    SHELL_FINISHED_EVENT_KIND, SHELL_SPAWNED_EVENT_KIND, SHELL_STARTED_EVENT_KIND,
+    ShellReconciliation, SpawnGate, SpawnRequest, StopRequest, SupervisorStopReport, SystemChild,
+    SystemLauncher, process_group_exists, reconcile_shell_operation, signal_process_group,
+    spawn_failure, supervise,
+};

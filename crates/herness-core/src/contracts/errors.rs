@@ -177,6 +177,13 @@ pub enum CoreError {
         /// Structured, non-secret failure detail.
         failure: FileFailure,
     },
+    /// A managed shell command did not complete as a plain success.
+    ShellToolFailed {
+        /// Tool that failed.
+        tool: ToolName,
+        /// Structured, non-secret failure detail.
+        failure: ShellFailure,
+    },
     /// A run is not in a state that permits the requested transition.
     InvalidRunTransition {
         /// State before the attempted transition.
@@ -411,6 +418,62 @@ pub enum FileFailure {
     },
 }
 
+/// Structured, non-secret reason a managed shell command failed or was
+/// interrupted.
+///
+/// A shell `allow` rule is a policy match, not an OS sandbox. These errors do
+/// not claim that the command was harmless or that detached descendants were
+/// captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ShellFailure {
+    /// The frozen working directory was missing or not a directory.
+    WorkingDirectoryUnavailable {
+        /// Rejected absolute path.
+        path: String,
+    },
+    /// The intent could not be recorded, so no process was started.
+    NotExecutable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The host could not create the managed process.
+    SpawnFailed {
+        /// Sanitized operating-system error kind. No command output is carried.
+        detail: String,
+    },
+    /// The command exceeded its timeout and was terminated.
+    TimedOut {
+        /// Whether the host confirmed that the managed group is gone.
+        confirmed: bool,
+    },
+    /// A host stop request terminated the command.
+    Stopped {
+        /// Whether the host confirmed that the managed group is gone.
+        confirmed: bool,
+    },
+    /// The host could not confirm that the managed process group is gone.
+    Unconfirmed {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The command ran but its result could not be recorded durably.
+    /// Reconciliation is required; the host did not retry or roll back.
+    Unverifiable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// This executor does not handle the requested tool.
+    Unsupported {
+        /// Requested tool.
+        tool: ToolName,
+    },
+}
+
 impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -544,6 +607,9 @@ impl fmt::Display for CoreError {
             Self::FileToolFailed { tool, failure } => {
                 write!(f, "{tool} failed: {failure}")
             }
+            Self::ShellToolFailed { tool, failure } => {
+                write!(f, "{tool} failed: {failure}")
+            }
             Self::InvalidRunTransition { from, to } => {
                 write!(f, "run cannot transition from {from} to {to}")
             }
@@ -602,6 +668,51 @@ impl fmt::Display for FileFailure {
             }
             Self::Unsupported { tool } => {
                 write!(f, "{tool} is not handled by the native file executor")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ShellFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkingDirectoryUnavailable { path } => {
+                write!(f, "working directory {path:?} is not usable")
+            }
+            Self::NotExecutable { detail } => {
+                write!(f, "operation was not executed: {detail}")
+            }
+            Self::SpawnFailed { detail } => {
+                write!(f, "the managed process could not be started: {detail}")
+            }
+            Self::TimedOut { confirmed } => {
+                write!(f, "the command timed out")?;
+                if *confirmed {
+                    f.write_str("; the managed process group is gone")
+                } else {
+                    f.write_str("; the managed process group could not be confirmed gone")
+                }
+            }
+            Self::Stopped { confirmed } => {
+                write!(f, "the command was stopped")?;
+                if *confirmed {
+                    f.write_str("; the managed process group is gone")
+                } else {
+                    f.write_str("; the managed process group could not be confirmed gone")
+                }
+            }
+            Self::Unconfirmed { detail } => {
+                write!(
+                    f,
+                    "the managed process group is not confirmed stopped: {detail}"
+                )
+            }
+            Self::Unverifiable { detail } => write!(
+                f,
+                "the command ran but its result is not durable; reconciliation required: {detail}"
+            ),
+            Self::Unsupported { tool } => {
+                write!(f, "{tool} is not handled by the bash executor")
             }
         }
     }

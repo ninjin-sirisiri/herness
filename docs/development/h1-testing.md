@@ -10,7 +10,7 @@ H1のRust workspaceにおけるtoolchain、依存方針、テストコマンド�
 
 ## 依存方針
 
-`herness-core` の依存は次の4つに限定する。
+`herness-core` の依存は次の5つに限定する。
 
 | crate | 用途 | 理由 |
 | --- | --- | --- |
@@ -18,8 +18,10 @@ H1のRust workspaceにおけるtoolchain、依存方針、テストコマンド�
 | `serde_json` | event payload | payloadを型付きenvelope内の構造化JSONとして保持 |
 | `sha2` | 最終tool引数のSHA-256 digest | 承認を人間が確認した最終引数へ束縛する。I/O・network・秘密の保存には使わない |
 | `uuid` (`v4`) | project・scoped ID・connection ID | 再起動をまたいで衝突しない安定ID |
+| `libc` (`0.2.191`) | managed process groupのsignal | `killpg`・signal定数のみ。`unsafe`は `tools/process.rs` の局所的な `#[allow(unsafe_code)]` に閉じ込める |
 
 - async runtime、HTTP client、DB、Tauri、pi crate、時刻整形crateはTask 1のcoreへ入れない。checkpointはadapter所有のversion付きopaque bytesとして運び、coreは解釈しない。
+- workspace lintは `unsafe_code = "deny"` とし、`forbid` を外した。`tools/process.rs` のlibc呼出しだけがmodule内の明示的な `#[allow(unsafe_code)]` を持つ。他のcrate・moduleはdenyのまま。
 - `tests/runtime` は `herness-core` にだけ依存するlibrary crate。black-box test用に `serde_json` をdev-dependencyとする。
 - 依存追加は、そのTaskのreportで用途とcoreの依存方向（store・engine・Tauriへ依存しない）への影響を説明する。
 - secretは `SecretString` / `ResolvedCredential` に閉じ込め、`Serialize`・`Display` を実装しない。`Debug` は `[REDACTED]` を返す。event・error・checkpoint・connection情報へtokenやproviderの生errorを入れない。
@@ -38,6 +40,7 @@ cargo test -p herness-core
 cargo test -p herness-runtime-tests
 cargo test -p herness-runtime-tests --test permissions
 cargo test -p herness-runtime-tests --test files --locked
+cargo test -p herness-runtime-tests --test shell --locked
 cargo fmt --all -- --check
 ```
 
@@ -71,6 +74,23 @@ cargo test --workspace --locked
 - **checkpoint:** 現時点のfile toolは `herness.file-operation`（format 1、stage `intent`）のhost監査用opaque checkpointをintent transactionで書く。engineの会話checkpointはTask 9が供給する。result + `file.change` は同じtransactionで保存するがcheckpointの `lastSequence` はintent時点のままなので、checkpointからの再購読で通知が再配送され得る。再配送を操作の再実行として扱わない。
 - **fault injection:** storeの `CommitFault::{BeforeRows,BeforeCommit}` はintent transactionに、`ResultFault::BeforeUpdate` はresult記録に使う。どちらも `test-support` feature限定で、production hostは有効にしない。
 
+
+## Task 5で固定したbashとmanaged process groupの契約
+
+実装は `crates/herness-core/src/tools/{bash,process}.rs`、testは `tests/runtime/tests/shell.rs`。
+
+- **起動:** frozen cwdで `/bin/sh -c <command>` を実行する。stdinはnull、stdout/stderrはpipe、環境変数はhostから継承し、`PATH` を書き換えない（Finderの最小PATH検出はTask 6）。`CommandExt::process_group(0)` で子を自分のprocess groupのleaderにする（`setpgid(0,0)` と同じ意味）。pidとpgidは等しく、`shell.spawned` eventとobservationへ記録する。
+- **順序:** schema/purpose検証 → 重複operation ID拒否 → cwd確認 → checkpoint + `OperationIntent` + `shell.started` eventを1 transactionで保存 → spawn拒否判定 → spawn → `shell.spawned` eventとpid/pgidを保存 → stdout/stderr capture → wait/stop/timeout → `Applied`または`Unverifiable` result + `ShellObservation` + `shell.finished` eventを1 transactionで保存 → 成功または構造化errorを返す。
+- **事前失敗:** cwd不正、intent保存失敗（`CommitFault::{BeforeRows,BeforeCommit}`）、権限拒否・未承認、空白purposeはspawnしない。spawn試行回数は `ProcessLauncher` のtest wrapperで0を確認する。production IPCへcounterを追加しない。
+- **出力:** stdout/stderrは各自の専用threadで読み、head 64 KiB + tail 64 KiBだけ保持する。切詰め時は `truncated: true`、`originalBytes`（観測した全byte数）、本文中の `[herness output truncated: ...]` markerを残す。groupを停止・killするとpipeが閉じてreaderが戻る。group外のprocessがpipeを保持してEOFにならない場合は、bounded待機後に `[herness output capture incomplete: ...]` を付けて `truncated: true` とし、全量保存済みとは表示しない。
+- **stop制御:** `ProcessSupervisor::begin_stop` は以後の新規spawnを拒否し、登録済み全groupへSIGTERMを送る。spawnとstop開始は同じgateで直列化し、stop開始後にprocessを作らない。`stop_all(grace)` は全groupをまとめてgrace待機し、残存groupへSIGKILLを送り、`DEFAULT_CONFIRM_TIMEOUT` までgroup消滅を待つ。executorは直接の子をreapし、groupが空になったことを確認できたときだけ `stop_requested`、できなければ `unconfirmed` を記録する。host stopではexecutorが勝手にSIGKILLしない。10秒後の人間への待機継続・強制終了の確認はTask 12が `begin_stop` / `stop_all` を使って実装する。`stop_all(Duration::ZERO)` は即時強制停止に使える。supervisorのstopはterminalで、同じsupervisorで新規runを再開しない（runごとにsupervisorを作る）。
+- **timeout:** `timeoutMs` は同じgroup終了経路を使い、既定2秒の猶予後にSIGKILLする。observationは `stopStatus: timeout`、exit codeまたはsignalを記録し、resultは `Unverifiable`、呼出し側には `TimedOut` errorを返す。timeoutを成功として返さない。
+- **停止不能:** groupが消えたことを確認できない場合は `stopStatus: unconfirmed`、`shellOutcomeUnknown: true`、result `Unverifiable` とし、成功・停止済みと表示しない。意図的な `setsid`・double forkは管理group外であり、捕捉を保証しない。testはdetached processが生き残り、observationが管理groupだけを記述することを確認する。
+- **永続失敗:** intent保存前の失敗はspawnしない。実行後のresult保存失敗はcommandを再実行せず、rollbackもせず、`Unverifiable` を返してintentをpendingのまま残す。`shellOutcomeUnknown` を保存できない場合は、reconciliationがpendingを不確実として扱う。
+- **event:** `shell.started` はcommand・purpose・cwd・timeoutMs・startedAt、`shell.spawned` はoperationId・pid・pgid・spawnedAt、`shell.finished` は停止結果・exit code・signal・stdout/stderrのbyte数と切詰めflag・observation summaryを持つ。出力本文はresult evidenceだけに保存し、historyを肥大化させない。purposeと出力は別fieldで、bashは `file.change` / `file.change.intended` eventを出さず、file別rationaleやactorを捏造しない。
+- **再起動:** `reconcile_shell_operation(record, events)` はcommand・purpose・cwd・timeoutMs・pid/pgid（result observationまたは `shell.spawned` eventから）・startedAt・outcome・stopStatus・不確実flagを返す。pending intentは `shellOutcomeUnknown: true`、outcomeなしのまま。native fileのhash一致をshell成功の証拠にしない。restart後の再実行は `DuplicateOperation` でspawnしない。
+- **test:** `tests/runtime/tests/shell.rs` は実store・一時project・実processで、子/孫の停止、SIGTERM無視時のSIGKILL、output floodと切詰め永続化、停止後のresult保存失敗、拒否・未承認・空白purpose・事前保存失敗のspawn回数0、file変更理由の非捏造、timeout、再起動非再送、detached子の非保証を確認する。
+- **fault injection:** storeの `CommitFault::{BeforeRows,BeforeCommit}` はintent transactionに、`ResultFault::BeforeUpdate` はresult記録に使う。どちらも `test-support` feature限定で、production hostは有効にしない。
 
 ## Task 1で固定した契約と検証
 
