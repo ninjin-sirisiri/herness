@@ -197,3 +197,22 @@ cargo test --workspace --locked
 - **history:** 既定100件、上限500件。0件・501件、cursor 0を拒否する。
 - **connection:** 公開JSONはconnection ID・provider・model・認証方式・状態だけを含み、token/secret/authorization fieldを持たない。
 - **ports:** engine・store・credential・permission evaluatorはtrait objectとして利用可能。fake実装でcommit、checkpoint、history、secret redaction、configured/automatic modeの可用性を確認する。
+
+## Tauri 2.12.5 command ACLと最小画面（Task 11）
+
+2026-11-08にTauri 2の現行ドキュメント（Capabilities、Permissions、Calling Rust from the Frontend、Configuration、CSP）を確認した。固定する依存は `tauri = 2.12.5`、`tauri-build = 2.7.4`。`src-tauri/build.rs` は `tauri_build::AppManifest::new().commands(...)` で全custom commandの `allow-<command>` / `deny-<command>` ACLを生成し、`src-tauri/capabilities/main.json` はそれを `windows: ["main"]`、`local: true`、`remote` なしでmainだけへ許可する。
+
+command layerは設定だけに依存せず、window label `main`、webview label `main`、document origin `tauri://localhost`（rootまたは`/index.html`）を毎回検証する。`tauri.conf.json` のCSPは `default-src`/`script-src`/`style-src` を `'self'`、`connect-src` を `ipc: http://ipc.localhost` に限定し、`object-src`/`frame-src`/`base-uri`/`form-action` を禁止する。navigationはlocal originだけを許可し、外部HTTP(S)はsystem browserへ渡さずWebView内で開かない（Task 11では`/usr/bin/open -u`へ渡す）。
+
+最小画面は `ui/` の静的assetで、Node runtime・bundler・sidecarを含まない。project・tool・eventのtextは `textContent` で描画し、APIキーはwrite-only入力からKeychainへ保存後にDOMから消去する。ChatGPT loginはhostのloopback listenerとsystem browserを使い、WebViewへauthorization URLやtokenを渡さない。実token transportはTask 13まで接続せず、UIは未接続を明示する。
+
+Task 11の検証コマンド:
+
+```sh
+cargo test -p herness-runtime-tests --test desktop --locked
+cargo test -p herness-desktop --locked
+cargo build -p herness-desktop --locked
+HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --smoke-test
+```
+
+`--smoke-test` は実Tauriアプリを起動し、main windowの表示と、信頼されたUIからの `frontend_state` → `ui_ready` IPC往復を確認して0で終了する。GUI操作の人間による全確認やmacOSのclose/reopen/quitの実動作はTask 12・13の範囲とする。
