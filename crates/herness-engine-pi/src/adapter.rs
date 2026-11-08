@@ -95,7 +95,7 @@ pub struct PiEngine<S: StorePort + Send + 'static> {
     config: PiEngineConfig,
     policy: Arc<RwLock<PermissionPolicy>>,
     file_locks: Arc<FileLockRegistry>,
-    catalog: ChatGptCatalog,
+    catalog: Arc<ChatGptCatalog>,
     runs: HashMap<RunId, Arc<RunContext<S>>>,
 }
 
@@ -107,11 +107,11 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         directory: ConnectionDirectory,
         config: PiEngineConfig,
     ) -> Result<Self, CoreError> {
-        let catalog = ChatGptCatalog::new(
+        let catalog = Arc::new(ChatGptCatalog::new(
             Arc::clone(&credentials),
             directory.clone(),
             config.endpoints.clone(),
-        )?;
+        )?);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -144,6 +144,21 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
     }
 
+    /// Runs one engine future on the adapter runtime and waits for its result.
+    ///
+    /// Tauri commands and other hosts may call the synchronous [`EnginePort`]
+    /// from inside another tokio runtime. `Runtime::block_on` panics in that
+    /// situation, so the future is scheduled on the adapter runtime and the
+    /// caller waits on a channel instead. The adapter runtime keeps its worker
+    /// threads running independently.
+    fn run_on_engine<F, T>(&self, future: F) -> Result<T, CoreError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        run_on_runtime(&self.runtime, future)
+    }
+
     /// Lists the selected ChatGPT account's public model catalog.
     ///
     /// Only models intended for display (`visibility: "list"`) are returned,
@@ -153,7 +168,8 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         &self,
         connection: ConnectionId,
     ) -> Result<Vec<ChatGptModel>, CoreError> {
-        self.runtime.block_on(self.catalog.list(connection))
+        let catalog = Arc::clone(&self.catalog);
+        self.run_on_engine(async move { catalog.list(connection).await })?
     }
 
     fn build_run(
@@ -168,9 +184,9 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         if settings.auth_method() == AuthMethod::ChatGptLogin && restore.is_none() {
             // The catalog is checked when a run starts. Restoring a saved run
             // must not make a network request or re-resolve a model choice.
-            let models = self
-                .runtime
-                .block_on(self.catalog.list(start.connection()))?;
+            let catalog = Arc::clone(&self.catalog);
+            let connection = start.connection();
+            let models = self.run_on_engine(async move { catalog.list(connection).await })??;
             if !models.iter().any(|model| model.slug() == settings.model()) {
                 // The selected model is not available to this account. Never
                 // substitute another model or provider.
@@ -243,10 +259,11 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         let embedded = EmbeddedRuntime::new(host).map_err(|_| engine_unavailable())?;
         let session_id = start.session_id().to_string();
         let instructions = start.instructions().trim().to_owned();
+        let restore_present = restore.is_some();
+        let restore_for_session = restore;
         let session = self
-            .runtime
-            .block_on(async {
-                match restore {
+            .run_on_engine(async move {
+                match restore_for_session {
                     Some(_) => embedded.restore(&session_id).await,
                     None => {
                         embedded
@@ -258,7 +275,7 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
                             .await
                     }
                 }
-            })
+            })?
             .map_err(|_| engine_unavailable())?;
         let translator = Arc::new(Mutex::new(EventTranslator::new()));
         let subscription = session.subscribe({
@@ -272,7 +289,7 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
                 queue.extend(mapped);
             }
         });
-        if restore.is_some() {
+        if restore_present {
             // The SDK emits its recovery event before restore returns, so the
             // listener cannot see it. The recovery save is already durable;
             // publish the resulting state after subscribing.
@@ -363,9 +380,11 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             .supervisor
             .stop_all(herness_core::DEFAULT_STOP_GRACE);
         let groups_confirmed = supervisor_report.all_confirmed();
-        let report = match self.runtime.block_on(context.session.cancel()) {
-            Ok(()) if groups_confirmed => StopReport::Stopped,
-            Ok(()) | Err(_) => StopReport::Unconfirmed,
+        let session = context.session.clone();
+        let cancellation = self.run_on_engine(async move { session.cancel().await });
+        let report = match cancellation {
+            Ok(Ok(())) if groups_confirmed => StopReport::Stopped,
+            Ok(Ok(())) | Ok(Err(_)) | Err(_) => StopReport::Unconfirmed,
         };
         if report == StopReport::Stopped {
             context
@@ -812,6 +831,20 @@ fn declaration(tool: ToolName) -> ToolDeclaration {
     }
 }
 
+/// Schedules a future on `runtime` and waits for it without entering a nested
+/// runtime. Safe to call from another tokio worker.
+fn run_on_runtime<F, T>(runtime: &tokio::runtime::Runtime, future: F) -> Result<T, CoreError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    rx.recv().map_err(|_| engine_unavailable())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +877,24 @@ mod tests {
         .map(|tool| declaration(tool).name)
         .collect();
         assert_eq!(names, vec!["read", "search", "write", "edit", "bash"]);
+    }
+
+    #[test]
+    fn engine_bridge_survives_being_called_from_another_tokio_runtime() {
+        let engine_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("engine runtime");
+        let host_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("host runtime");
+        let value = host_runtime.block_on(async {
+            run_on_runtime(&engine_runtime, async { 7_u32 }).expect("bridge result")
+        });
+        assert_eq!(value, 7);
     }
 
     #[test]
