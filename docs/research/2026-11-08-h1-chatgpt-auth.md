@@ -141,6 +141,15 @@ hernessは次の状態にある。
 | open-source / locally hosted向け、paid/remoteはinterest form | 確認 |
 | license/distribution gate | **未決定**。local unpublished useだけを許可し、公開・商用・remoteはclosed |
 
+## Task 9で再確認したmodel catalogとResponses経路（2026-11-08）
+
+Task 9のengine adapter実装時に、[Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)を再確認し、次の追加事実を記録する。
+
+- **model catalog:** `GET https://api.openai.com/v1/models` の応答は `models` 配列で、各entryは `slug`、`display_name`、`visibility` を持つ（Task 8時点の記録には応答形状がなかった）。`visibility == "list"` のentryだけを表示対象とし、serverの順序を保つ。UIには `display_name` を出し、Responses requestの `model` には `slug` を渡す。ChatGPT accountを切り替えたら再取得する。`slug` の欠落・空白・制御文字を含むentryは選択しない。
+- **Responses:** `POST https://api.openai.com/v1/responses` へ `Authorization: Bearer <ACCESS_TOKEN>`、`store: false`、`stream: true` を毎回送る。`backend-api` endpointへtokenを送らない。選択accountで利用可能なmodelだけを使う。
+- **終端:** `response.completed` を受けるまで成功としない。`response.incomplete`、`response.failed`（`subscription_sharing_usage_limit_exceeded` 等のusage-limit codeを含む）、明示error、`response.completed` 前の切断は失敗として扱う。
+- **Task 9の実装:** catalogはhost所有の狭いHTTP GET（redirectは `redirect_auth_decision` で判定）として実装する。Responsesのstreamは `pi-ai` の `openai-responses` providerをhost所有のStreamFnから呼び、`pi-embedded` の `openai_codex`（`{baseUrl}/codex/responses`・WebSocket）は使わない。model fallbackは行わない。loopback mockだけをtestに使い、実OpenAI hostへの接続はTask 13の許可まで行わない。
+
 ## 参照
 
 - OpenAI, Sign in with ChatGPT — Overview: https://developers.openai.com/siwc/token-sharing-open-source

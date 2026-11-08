@@ -37,6 +37,7 @@ Task 1の受入で実行するコマンド:
 
 ```sh
 cargo test -p herness-core
+cargo test -p herness-engine-pi
 cargo test -p herness-runtime-tests
 cargo test -p herness-runtime-tests --test permissions
 cargo test -p herness-runtime-tests --test files --locked
@@ -44,6 +45,7 @@ cargo test -p herness-runtime-tests --test shell --locked
 cargo test -p herness-runtime-tests --test skills --locked
 cargo test -p herness-runtime-tests --test connections --locked
 cargo test -p herness-runtime-tests --test oauth --locked
+cargo test -p herness-runtime-tests --test engine --locked
 cargo test -p herness-desktop --lib --locked
 cargo fmt --all -- --check
 ```
@@ -131,7 +133,7 @@ cargo test --workspace --locked
 
 ## Task 8で固定したChatGPT OAuthと利用条件gate
 
-実装は `crates/herness-engine-pi/src/auth/`、testは `tests/runtime/tests/oauth.rs`、確認記録は [ChatGPT auth research](../research/2026-11-08-h1-chatgpt-auth.md)。`herness-engine-pi`をworkspace memberへ追加したが、Task 9のpi crateはまだ依存に加えていない。
+実装は `crates/herness-engine-pi/src/auth/`、testは `tests/runtime/tests/oauth.rs`、確認記録は [ChatGPT auth research](../research/2026-11-08-h1-chatgpt-auth.md)。`herness-engine-pi` はTask 8でworkspace memberへ追加し、Task 9でpi crateとasync/HTTP依存を加えた。
 
 - **確認とgate:** 2026-11-08に公式overview・sign-in・accounts/sessions・models/inferenceを再確認した。公式はChatGPT plan usageをopen-source / locally hosted app向けとし、paid/remotely hostedはinterest formへ案内する。hernessはlocally hosted・未公開・非商用だがlicense未決定なので、許可するのは`TermsGate::LocalUnpublishedUse`だけ。`ChatGptAuthConfig::new`の既定gateは`Closed(ConditionsUnconfirmed)`で、hostが研究記録を確認してlocal unpublished useを明示した場合だけ開く。公開・配布・license選択・商用提供・remote hosting・申請は行わず、`TermsGate::Closed`ではlogin attemptを開始しない。実login・実model接続・実credential作成は未確認で、Task 13の別途許可まで行わない。
 - **依存:** engine crateのauth依存は`herness-core`、`base64`、`ring`、`serde`、`serde_json`、`sha2`、`uuid`だけ。HTTP client・async runtime・pi crateはTask 9まで追加しない。`ring`はID tokenのRS256/ES256署名検証とPKCE用乱数・合成RSA/EC署名鍵のtestにだけ使う。`unsafe`は自crateに書かない。
@@ -148,6 +150,22 @@ cargo test --workspace --locked
 - **sign-out:** refresh tokenがあれば`TokenTransport::revoke`を呼ぶが、OIDC discoveryはTask 8では未取得なので結果は`NotAttempted` / `RequestAcceptedUnverified` / `FailedUnverified`のいずれかで、provider側のrevokeをconfirmedと表示しない。vault上のaccess/refresh/ID tokenを削除し、選択中なら`vaultAccount`をclearする。issued client ID・host ID・非secret account mappingは次回sign-in用に保持する。削除失敗は`Vault` errorで成功と表示しない。
 - **redaction:** `AuthorizationUrl`のDebugはscheme/host/pathだけを残しquery（state・nonce・PKCE・`id_token_hint`）を落とす。`PendingAuthorization`、`TokenExchangeRequest`、`RefreshRequest`、`RevokeRequest`、`TokenResponse`、`OAuthTokenSet`のDebugはcode・verifier・tokenを出さない。canary testでauthorization URL、Debug、errorにsecretが現れないことを確認する。
 - **test:** `cargo test -p herness-runtime-tests --test oauth --locked`。loopback listenerと合成RSA/EC署名鍵だけを使い、正常系、state/nonce/署名/issuer/audience/expiry拒否、plan scope欠落、callback再送、issued client ID欠落、`dynamic_agent_client`拒否、client不一致、port競合、cancel、2 account分離、同時refreshと回転、refresh失敗、保存失敗、sign-out/revoke未確認、canary redaction、host ID再利用を確認する。実OpenAI hostへのrequestは0件。
+
+## Task 9で固定したpi engine adapterとprovider経路
+
+実装は `crates/herness-engine-pi/src/{adapter,session_store,stream,events,error}.rs`、testは `crates/herness-engine-pi` のunit testと `tests/runtime/tests/engine.rs`。`herness-engine-pi` は `herness-core` にだけ依存し、coreからengineへの依存は追加しない。
+
+- **固定dependency:** `pi-agent`・`pi-ai`・`pi-embedded` を `https://github.com/yannelli/pi-rust` の `rev = "4294dba7ac3646477912cc778536fdff0a912d6e"`（v0.12.11）へ固定する。`Cargo.lock` を追跡し、branch追従・fork・vendoringは行わない。async bridge用に `tokio`（multi-thread、2 worker）、`tokio-util`、`futures`、`async-trait`、`anyhow`、host HTTP用に `reqwest`（rustls、redirect無効client）を使う。piの型・JSON・errorは公開しない。
+- **session分離:** engine runごとに独立した `EmbeddedRuntime`・`EmbeddedSession`・`SessionStore`・`ToolGateway`・`ProcessSupervisor` を作る。同期`EnginePort`とasync SDKの間はadapter所有のtokio runtimeで橋渡しし、`poll_events`はrun別queueをdrainするだけにする。複数sessionで会話・tool・process状態を共有しない。一方、同一engine内のsessionは1つの`FileLockRegistry`を共有し、同一canonical fileへのwrite/editを直列化する。
+- **checkpoint:** `CheckpointFormatVersion(1)` のadapter所有envelope（`format`・`engine: "pi-embedded"`・run/agent/session/connection/cwd/instructions・SDK `snapshot`）をcoreのopaque bytesとして保存する。未知のcheckpoint形式・envelope形式・SDK snapshot形式は破棄せず読み込みを拒否する。`resume`は保存済み最新checkpointと一致する場合だけ復元し、古いsnapshotを上書きしない。復元はSDKの`recover`だけで、model request・tool再送を開始しない。
+- **intentとcheckpointの同一transaction:** write/edit/bashの`OperationIntent`は既存`NativeFileTools`/`BashExecutor`がside effect前に保存する。adapterの`EngineStore`はそのcommit内のaudit checkpointを現在のengine snapshotへ置換し、`engine.tool.intent` eventを先頭に加えて同じ`commit_checkpoint`で保存する。重複した同一intentはcoalesceし、異なる引数の同じoperation IDは`DuplicateOperation`で拒否する。read/searchは副作用がないためintentを作らない。resultはexecutorがside effect後に別transactionで記録する。
+- **5 tool限定:** pi-embeddedへ登録するのはhost所有のread・search・write・edit・bashの`FnTool`だけ。SDK宣言は`effect: Read`・`approval: false`とし、SDK内蔵のfile/shell toolやSDK-local approvalでhost gatewayを迂回させない。tool handlerは最終引数をhost schemaで再検証し、`ToolGateway`のauthorize→intent/checkpoint→execute→resultの順を守る。deny・awaiting approvalではside effectを実行せず、`engine.tool.denied` / `engine.tool.awaiting_approval` eventを保存してmodelへ構造化failureを返す。完全でない引数はSDKがtool handlerへ渡す前に拒否する。
+- **operation ID:** SDKのtool-call IDとrun IDからSHA-256で決定的に導出する。同じrun・同じtool-call IDは同じoperation IDになり、storeのunique制約で二重適用しない。providerが同じtool-call IDを再利用した場合はSDKがrunを失敗させる。
+- **stop:** `request_stop`は新規spawnを拒否し、`ProcessSupervisor::begin_stop`で管理groupへSIGTERMを送ってからSDKの`cancel`を待つ。停止を確認できなければ`Unconfirmed`を返す。途中停止後のcheckpointは`interrupted`で、再起動時にpending/uncertainなtoolを再送しない。
+- **stream:** host所有の`StreamFn`が要求ごとに`CredentialPort::resolve`で選択connectionのcredentialを解決し、`max_retries = 0`でpi-aiのproviderを呼ぶ。OpenAI APIキーは`openai-responses`、Anthropicは`anthropic-messages`、OpenAI互換は`openai-completions`。`create_openai_stream`（completions専用）で全providerを対応済みとは扱わない。
+- **ChatGPT:** `GET https://api.openai.com/v1/models` の`models`配列から`visibility == "list"`だけをserver順で取得し、`slug`を選択modelとして使う。選択modelがcatalogに無ければrunを開始せず、別model・別providerへfallbackしない。Responsesはpublic `POST https://api.openai.com/v1/responses`へ`store: false`・`stream: true`で送る。`response.completed`前の切断、`response.incomplete`、`response.failed`（usage-limit codeを含む）、明示errorは失敗とし、`length`終端もengine errorへ変換する。`backend-api` endpointは使わない。catalogはhost所有の狭いHTTP GETで、redirectは`redirect_auth_decision`で判定する。restore時はcatalog GETも含めnetwork requestを送らない。
+- **secret:** credentialは各requestで解決し、SDKのmodel・provider error文、diagnostics、snapshotの`error`は保存前にsanitizeする。canary testでAPIキーがcheckpoint・event・DB・WALへ出ないことを確認する。tokenはprovider streamのheaderだけに使い、event・checkpoint・logへ出さない。
+- **test:** `cargo test -p herness-engine-pi` はenvelope/unknown version/duplicate save、audit checkpoint置換、intent+checkpoint同一transaction、operation ID、event変換と再配送dedupe、catalog filter、provider mappingを確認する。`cargo test -p herness-runtime-tests --test engine --locked` はloopback mockだけで、OpenAI・Anthropic・OpenAI互換・ChatGPTのtext/tool往復、request形状、terminal、cancel、auth失敗、ChatGPTのcatalog・`response.completed`必須・incomplete/failed/early disconnect・backend-api非使用・model非fallback、複数session非混入、SQLiteのintent先行とengine checkpoint、event/history再配送の非再実行、tool ID重複、途中停止とrestore非再送、未知checkpoint形式の拒否と保持、secret canary、requestごとのcredential解決を確認する。実provider・実Keychain・実loginはTask 13の許可まで実行しない。
 
 ## Task 1で固定した契約と検証
 

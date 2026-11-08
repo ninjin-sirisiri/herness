@@ -10,10 +10,22 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
 base64 = "0.22.1"
+futures = "0.3.31"
 herness-core = { path = "../herness-core" }
+pi-agent = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
+pi-ai = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
+pi-embedded = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
