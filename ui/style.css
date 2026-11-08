@@ -1,0 +1,203 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1rem 1.25rem 3rem;
+  background: #f6f6f7;
+  color: #1c1c1e;
+}
+
+header {
+  border-bottom: 1px solid #d0d0d4;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0 0 0.25rem;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+
+section {
+  background: #ffffff;
+  border: 1px solid #d8d8dc;
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem;
+}
+
+.row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+label {
+  font-weight: 500;
+}
+
+input,
+select,
+textarea {
+  background: #ffffff;
+  border: 1px solid #b8b8bd;
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  padding: 0.25rem 0.4rem;
+}
+
+input[type="text"],
+input[type="password"] {
+  min-width: 16rem;
+}
+
+textarea {
+  display: block;
+  margin-bottom: 0.5rem;
+  width: 100%;
+}
+
+button {
+  background: #e9e9ec;
+  border: 1px solid #b8b8bd;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0.25rem 0.6rem;
+}
+
+button:hover {
+  background: #dedee2;
+}
+
+.list {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+
+.list li {
+  border-top: 1px solid #ececf0;
+  padding: 0.35rem 0;
+}
+
+.list li:first-child {
+  border-top: 0;
+}
+
+.list pre {
+  background: #f1f1f4;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  margin: 0.25rem 0;
+  max-height: 12rem;
+  overflow: auto;
+  padding: 0.4rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.history li {
+  font-size: 0.82rem;
+}
+
+.muted {
+  color: #5c5c63;
+  margin: 0.25rem 0;
+}
+
+#project-summary {
+  white-space: pre-wrap;
+}
+
+.warn {
+  background: #fff6da;
+  border: 1px solid #e3c25b;
+  border-radius: 4px;
+  margin: 0 0 0.5rem;
+  padding: 0.4rem 0.5rem;
+}
+
+.error {
+  color: #a3181c;
+  min-height: 1.2rem;
+}
+
+.checkbox {
+  align-items: center;
+  display: inline-flex;
+  gap: 0.3rem;
+  font-weight: 400;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #1c1c1e;
+    color: #f2f2f7;
+  }
+
+  section {
+    background: #242426;
+    border-color: #3a3a3e;
+  }
+
+  input,
+  select,
+  textarea {
+    background: #1c1c1e;
+    border-color: #4a4a4f;
+  }
+
+  button {
+    background: #333336;
+    border-color: #55555a;
+  }
+
+  button:hover {
+    background: #3e3e42;
+  }
+
+  header {
+    border-color: #3a3a3e;
+  }
+
+  .list li,
+  .list pre {
+    border-color: #3a3a3e;
+  }
+
+  .list pre {
+    background: #1c1c1e;
+  }
+
+  .muted {
+    color: #adadb5;
+  }
+
+  .warn {
+    background: #3a3219;
+    border-color: #6f5c1f;
+  }
+
+  .error {
+    color: #ff8b8f;
+  }
+}

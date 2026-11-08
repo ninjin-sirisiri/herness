@@ -1,0 +1,17 @@
+[package]
+name = "herness-core"
+description = "Host-owned public contracts and ports for the herness runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true

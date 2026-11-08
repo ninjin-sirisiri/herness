@@ -1,0 +1,39 @@
+//! Host-owned public contract values.
+
+pub mod checkpoint;
+pub mod connection;
+pub mod errors;
+pub mod events;
+pub mod history;
+pub mod ids;
+pub mod operation;
+pub mod path;
+pub mod run;
+pub mod shell;
+pub mod time;
+pub mod version;
+
+pub use checkpoint::{Checkpoint, CheckpointFormatVersion, CheckpointPayload};
+pub use connection::{AuthMethod, ConnectionId, ConnectionInfo, ConnectionStatus, Provider};
+pub use errors::{
+    ArgumentViolation, CoreError, CredentialFailureKind, EngineFailureKind, EvaluationFailureKind,
+    FileFailure, PathViolation, ProviderFailureKind, ShellFailure, StoreFailureKind,
+};
+pub use events::{Event, EventDraft, EventKind, EventPayload};
+pub use history::{
+    DEFAULT_HISTORY_LIMIT, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery,
+    MAX_HISTORY_LIMIT,
+};
+pub use ids::{
+    AgentId, AgentKind, IdKind, OperationId, OperationKind, ProjectId, ProjectScope, RunId,
+    RunKind, ScopedId, ScopedIdKind, SessionId, SessionKind,
+};
+pub use operation::{
+    FileObservation, FrozenOperation, OperationEvidence, OperationIntent, OperationOutcome,
+    OperationRecord, OperationResult,
+};
+pub use path::AbsolutePath;
+pub use run::RunState;
+pub use shell::{ShellObservation, ShellOutput, ShellStopStatus};
+pub use time::Timestamp;
+pub use version::{CONTRACT_VERSION, ContractVersion};

@@ -1,0 +1,24 @@
+[package]
+name = "herness-runtime-tests"
+description = "Black-box contract tests and shared fixtures for the herness runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+herness-core = { path = "../../crates/herness-core" }
+
+[dev-dependencies]
+base64 = "0.22.1"
+herness-desktop = { path = "../../src-tauri" }
+herness-engine-pi = { path = "../../crates/herness-engine-pi" }
+herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+ring = "0.17.14"
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true

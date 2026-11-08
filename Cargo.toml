@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "crates/herness-core",
+    "crates/herness-engine-pi",
+    "crates/herness-store",
+    "src-tauri",
+    "tests/runtime",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[workspace.dependencies]
+libc = "0.2.191"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.27"
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+# `forbid` is relaxed to `deny` so the process module can carry the narrowly
+# audited libc calls required for process-group signalling. Every other crate
+# and module keeps the deny and must add an explicit local allow.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
