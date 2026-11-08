@@ -1764,6 +1764,7 @@ fn unconfirmed_quit_process_restores_interrupted_without_claiming_success() {
         Some(3),
         "unconfirmed quit worker must exit 3\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    assert!(worker_output(&output, "WORKER_PID").parse::<u32>().unwrap() > 0);
     assert_eq!(worker_output(&output, "WORKER_RUN_STATE"), "interrupted");
     assert_eq!(worker_output(&output, "WORKER_SAVE_SUCCEEDED"), "false");
     let sequence_after: u64 = worker_output(&output, "WORKER_SEQUENCE_AFTER")
@@ -1807,6 +1808,7 @@ fn forced_quit_process_keeps_operation_pending_for_reconciliation() {
         Some(2),
         "forced quit worker must exit 2\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    assert!(worker_output(&output, "WORKER_PID").parse::<u32>().unwrap() > 0);
     let operation: OperationId = worker_output(&output, "WORKER_OPERATION")
         .parse()
         .expect("operation id");
