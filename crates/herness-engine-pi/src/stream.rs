@@ -115,7 +115,8 @@ fn join_url(base: &str, path: &str) -> String {
 }
 
 /// One ChatGPT model the selected account may use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatGptModel {
     slug: String,
     display_name: String,

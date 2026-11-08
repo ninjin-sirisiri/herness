@@ -5,6 +5,11 @@
 //! window, and exits without requiring interaction.
 
 fn main() {
+    // Controller-only real checks never construct the Tauri app. They are
+    // explicit opt-in invocations from the Phase B runbook.
+    if let Some(exit_code) = herness_desktop::real_check::main_entry(std::env::args().skip(1)) {
+        std::process::exit(exit_code);
+    }
     let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
     let quit_test = std::env::args().any(|argument| argument == "--quit-test");
     let close_reopen_test = std::env::args().any(|argument| argument == "--close-reopen-test");

@@ -1029,6 +1029,37 @@ fn concurrent_refreshes_for_different_connections_do_not_block_each_other() {
 }
 
 #[test]
+fn explicit_refresh_refreshes_an_unexpired_token_once() {
+    let refresher = Arc::new(CountingRefresher::new(
+        RefresherOutcome::Fresh,
+        Duration::ZERO,
+    ));
+    let harness = Harness::with_refresher(CountingRefresherClone(Arc::clone(&refresher)));
+    let connection = harness.add(chatgpt_settings());
+    harness.save_token_set(connection.connection_id(), valid_token_set("still-valid"));
+
+    let broker = harness.service.broker();
+    // A normal resolve keeps the unexpired token and does not refresh.
+    let resolved = broker
+        .resolve_at(
+            connection.connection_id(),
+            Timestamp::from_unix_millis(2_000),
+        )
+        .expect("resolve");
+    assert_eq!(resolved.expose_secret(), "still-valid");
+    assert_eq!(refresher.calls(), 0);
+
+    let refreshed = broker
+        .refresh_at(
+            connection.connection_id(),
+            Timestamp::from_unix_millis(2_000),
+        )
+        .expect("forced refresh");
+    assert!(refreshed.expose_secret().starts_with("refreshed-1-"));
+    assert_eq!(refresher.calls(), 1);
+}
+
+#[test]
 fn failed_refresh_stops_and_never_publishes_an_expired_or_bogus_credential() {
     let refresher = Arc::new(CountingRefresher::new(
         RefresherOutcome::Failure,

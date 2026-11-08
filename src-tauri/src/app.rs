@@ -46,16 +46,31 @@ pub fn run(
 
             let connections = ConnectionAdmin::new();
             let vault = MacKeychainVault::default();
-            let credential_service = CredentialService::new(connections.directory(), vault.clone());
-            let credential_admin = credential_service.admin();
-            let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(credential_service);
+            let login_result = LoginManager::new(connections.clone(), vault.clone(), root.clone());
+            let (credentials, credential_admin, login) = match login_result {
+                Ok(login) => {
+                    let credentials = login.credential_port();
+                    let admin = login.credential_admin();
+                    (credentials, admin, Some(login))
+                }
+                Err(_) => {
+                    // API-key connections still work without the ChatGPT
+                    // refresh machinery. The UI reports login as unavailable.
+                    let service = CredentialService::new(connections.directory(), vault.clone());
+                    let admin = service.admin();
+                    (
+                        Arc::new(service) as Arc<dyn CredentialPort + Send + Sync>,
+                        admin,
+                        None,
+                    )
+                }
+            };
             let (host, reconciliation) = DesktopHost::open(
                 &root,
-                connections.clone(),
+                connections,
                 credentials,
                 ProviderEndpoints::official(),
             )?;
-            let login = LoginManager::new(connections, vault, root).ok();
 
             app.manage(AppState {
                 host: Mutex::new(host),
@@ -90,6 +105,8 @@ pub fn run(
             commands::start_chatgpt_login,
             commands::cancel_chatgpt_login,
             commands::chatgpt_login_status,
+            commands::chatgpt_models,
+            commands::set_connection_model,
             commands::start_run,
             commands::stop_run,
             commands::resume_run,

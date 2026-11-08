@@ -114,6 +114,7 @@ struct TransportState {
     exchange_capture: Option<ExchangeCapture>,
     refresh_capture: Option<RefreshCapture>,
     refresh_delay: Duration,
+    confirm_next_revoke: bool,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,10 @@ impl TransportMock {
 
     fn revoke_calls(&self) -> usize {
         self.state.lock().unwrap().revoke_calls
+    }
+
+    fn confirm_next_revoke(&self) {
+        self.state.lock().unwrap().confirm_next_revoke = true;
     }
 
     fn exchange_capture(&self) -> ExchangeCapture {
@@ -232,6 +237,17 @@ impl TokenTransport for TransportMock {
         state.revoke_calls += 1;
         state.revoke.pop_front().unwrap_or(Ok(()))
     }
+
+    fn revoke_confirmed(&self, _request: &RevokeRequest) -> Result<bool, TokenTransportError> {
+        let mut state = self.state.lock().unwrap();
+        state.revoke_calls += 1;
+        let confirmed = state.confirm_next_revoke;
+        state.confirm_next_revoke = false;
+        match state.revoke.pop_front().unwrap_or(Ok(())) {
+            Ok(()) => Ok(confirmed),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -268,6 +284,7 @@ struct Harness {
     browser: RecordingBrowser,
     accounts: Arc<InMemoryAccountDirectory>,
     clock: Arc<FixedClock>,
+    jwks: Arc<dyn JwksSource>,
     connection: ConnectionId,
 }
 
@@ -305,7 +322,7 @@ impl Harness {
             accounts.clone(),
             host_store,
             transport.clone(),
-            jwks,
+            jwks.clone(),
             clock.clone(),
             Arc::new(browser.clone()),
             config,
@@ -319,6 +336,7 @@ impl Harness {
             browser,
             accounts,
             clock,
+            jwks,
             connection,
         }
     }
@@ -1719,6 +1737,69 @@ fn sign_out_removes_local_tokens_and_reports_unverified_revoke() {
     assert_eq!(
         harness.accounts.accounts(harness.connection).unwrap().len(),
         1
+    );
+}
+
+#[test]
+fn sign_out_confirms_remote_revoke_only_when_the_transport_confirms() {
+    let harness = Harness::new();
+    let outcome = harness
+        .sign_in(
+            "oaiapp_confirmed_revoke",
+            "subject-confirmed-revoke",
+            "access-confirmed-revoke",
+            "refresh-confirmed-revoke",
+            PLAN_SCOPE,
+            None,
+            TEST_KEY_PKCS8_B64,
+        )
+        .unwrap();
+    harness.transport.push_revoke(Ok(()));
+    harness.transport.confirm_next_revoke();
+    let signed_out = harness.sign_out(&outcome.account).unwrap();
+    assert_eq!(signed_out.remote_revoke, RemoteRevokeStatus::Confirmed);
+    assert!(signed_out.remote_revoke.is_confirmed());
+    assert!(signed_out.local_credentials_removed);
+}
+
+#[test]
+fn sign_out_selected_reconstructs_the_account_without_the_registry() {
+    let mut harness = Harness::new();
+    let outcome = harness
+        .sign_in(
+            "oaiapp_selected_signout",
+            "subject-selected-signout",
+            "access-selected-signout",
+            "refresh-selected-signout",
+            PLAN_SCOPE,
+            None,
+            TEST_KEY_PKCS8_B64,
+        )
+        .unwrap();
+    harness.transport.push_revoke(Ok(()));
+    // Replace the in-memory account directory with an empty one to model a
+    // fresh controller process. The persisted settings and token set are the
+    // only inputs to the selected sign-out path.
+    harness.auth = ChatGptAuth::new(
+        harness.admin.clone(),
+        harness.vault.clone(),
+        Arc::new(InMemoryAccountDirectory::new()),
+        Arc::new(MemoryHostIdStore::new()),
+        harness.transport.clone(),
+        harness.jwks.clone(),
+        harness.clock.clone(),
+        Arc::new(RecordingBrowser::default()),
+        ChatGptAuthConfig::new("herness").with_terms(TermsConfirmation::local_unpublished()),
+    )
+    .unwrap();
+    let signed_out = harness.auth.sign_out_selected(harness.connection).unwrap();
+    assert!(signed_out.local_credentials_removed);
+    assert_eq!(signed_out.account.subject(), "subject-selected-signout");
+    assert!(
+        harness
+            .vault
+            .raw(outcome.account.vault_account().as_str())
+            .is_none()
     );
 }
 

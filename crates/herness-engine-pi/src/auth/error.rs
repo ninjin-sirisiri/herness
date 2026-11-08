@@ -10,8 +10,8 @@ use herness_core::{ConnectionId, CredentialFailureKind};
 
 /// Transport failure reported by a token endpoint adapter.
 ///
-/// The real transport in Task 9 maps HTTP and provider errors to these kinds
-/// and never forwards a response body.
+/// The real transport maps HTTP and provider errors to these kinds and never
+/// forwards a response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenTransportError {
     /// The authorization code was rejected. A fresh authorization is required.

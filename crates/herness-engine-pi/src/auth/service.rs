@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use herness_core::{
     CHATGPT_PLAN_SCOPE, ConnectionAdmin, ConnectionDirectory, ConnectionId, ConnectionSettings,
-    CoreError, CredentialAdmin, CredentialBroker, CredentialFailureKind, CredentialRefresher,
-    CredentialService, CredentialVault, OAuthTokenSet, OAuthTokenSetDetails, ResolvedCredential,
-    SecretString, Timestamp, VaultAccount, redact_url,
+    CoreError, CredentialAdmin, CredentialBroker, CredentialFailureKind, CredentialPort,
+    CredentialRefresher, CredentialService, CredentialVault, OAuthTokenSet, OAuthTokenSetDetails,
+    ResolvedCredential, SecretString, Timestamp, VaultAccount, redact_url,
 };
 
 use super::error::{AuthError, IdTokenFailure, JwksError, TokenTransportError};
@@ -30,8 +30,8 @@ use super::transport::{
 };
 use super::types::{
     AUTHORIZATION_ENDPOINT, AuthRequiredReason, ChatGptAccount, ChatGptAccountRef,
-    ChatGptAuthState, Clock, IssuedClientId, REQUESTED_SCOPES, RESOURCE, TermsConfirmation,
-    TermsGate,
+    ChatGptAuthState, Clock, ISSUER, IssuedClientId, REQUESTED_SCOPES, RESOURCE, TermsConfirmation,
+    TermsGate, VerifiedIdentity,
 };
 
 /// Opens the system browser at an authorization URL.
@@ -221,6 +221,11 @@ impl PendingAuthorization {
         self.consumed.load(Ordering::SeqCst)
     }
 
+    /// Whether the human cancelled this attempt.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
     /// Waits for the loopback callback. Each attempt accepts one callback.
     pub fn wait_for_callback(&self, timeout: Duration) -> Result<AuthorizationCallback, AuthError> {
         if self.consumed.load(Ordering::SeqCst) {
@@ -321,6 +326,7 @@ pub struct SignOutOutcome {
 pub struct ChatGptAuth<V: CredentialVault + Clone> {
     directory: ConnectionDirectory,
     admin: ConnectionAdmin,
+    service: CredentialService<V>,
     credential_admin: CredentialAdmin<V>,
     broker: CredentialBroker<V>,
     vault: V,
@@ -360,6 +366,7 @@ impl<V: CredentialVault + Clone> ChatGptAuth<V> {
             admin,
             credential_admin: service.admin(),
             broker: service.broker(),
+            service,
             vault,
             host_ids: HostIdManager::new(host_id_store),
             accounts,
@@ -789,6 +796,23 @@ impl<V: CredentialVault + Clone> ChatGptAuth<V> {
         self.accounts.accounts(connection)
     }
 
+    /// Write-only credential handle for the trusted host adapter.
+    pub fn credential_admin(&self) -> CredentialAdmin<V> {
+        self.service.admin()
+    }
+
+    /// Read/resolve credential port backed by the ChatGPT refresh machinery.
+    ///
+    /// The desktop host shares this port with the engine so an expired ChatGPT
+    /// access token is refreshed through the same per-connection gate instead
+    /// of falling back to an unrefreshed credential.
+    pub fn credential_port(&self) -> Arc<dyn CredentialPort + Send + Sync>
+    where
+        V: 'static,
+    {
+        Arc::new(self.service.broker())
+    }
+
     /// Reads the selected token set without refreshing. Intended for the
     /// trusted host adapter, not for UI display.
     pub fn token_set_at(
@@ -822,10 +846,48 @@ impl<V: CredentialVault + Clone> ChatGptAuth<V> {
         self.resolve_at(connection, self.clock.now())
     }
 
+    /// Forces one refresh through the per-connection gate.
+    ///
+    /// Used only by the opt-in real-connection controller, which must verify
+    /// refresh without waiting for the access token to expire. The refreshed
+    /// token set is validated and saved before it is returned.
+    pub fn force_refresh(&self, connection: ConnectionId) -> Result<ResolvedCredential, CoreError> {
+        self.broker.refresh_at(connection, self.clock.now())
+    }
+
+    /// Signed-out account selected in the persisted settings.
+    ///
+    /// This path does not depend on the in-memory account registration
+    /// directory. It reconstructs the non-secret account reference from the
+    /// stored token set's verified subject and issued client ID, so the opt-in
+    /// real-connection sign-out works in a fresh controller process.
+    pub fn sign_out_selected(&self, connection: ConnectionId) -> Result<SignOutOutcome, AuthError> {
+        let settings = self.chatgpt_settings(connection)?;
+        let selected = settings
+            .selected_chatgpt_account()
+            .cloned()
+            .ok_or(AuthError::AccountNotFound { connection })?;
+        let token_set = self
+            .broker
+            .account_token_set_at(connection, &selected)
+            .map_err(map_core_error)?
+            .ok_or(AuthError::AccountNotFound { connection })?;
+        let client_id = token_set
+            .issued_client_id()
+            .ok_or(AuthError::InvalidTokenResponse)?;
+        let subject = token_set
+            .account_subject()
+            .ok_or(AuthError::InvalidTokenResponse)?;
+        let reference = ChatGptAccountRef::new(IssuedClientId::new(client_id)?, subject)?;
+        let email = token_set.account_email().map(str::to_owned);
+        self.sign_out_registration(connection, selected, &reference, email)
+    }
+
     /// Signs out one account.
     ///
-    /// Remote revocation is attempted when a refresh token exists, but this
-    /// build cannot confirm provider-side revocation. The local vault item
+    /// Remote revocation is attempted when a refresh token exists. Provider
+    /// confirmation is reported only when the transport received an empty HTTP
+    /// 200 from the discovered revocation endpoint. The local vault item
     /// (access, refresh, and retained ID token) is removed, and the selected
     /// account is cleared. The non-secret client/account mapping and host ID are
     /// retained for a later sign-in.
@@ -839,17 +901,46 @@ impl<V: CredentialVault + Clone> ChatGptAuth<V> {
             .accounts
             .find_ref(connection, reference)?
             .ok_or(AuthError::AccountNotFound { connection })?;
+        self.sign_out_registration(
+            connection,
+            account.vault_account().clone(),
+            reference,
+            account.email().map(str::to_owned),
+        )
+    }
+
+    fn sign_out_registration(
+        &self,
+        connection: ConnectionId,
+        vault_account: VaultAccount,
+        reference: &ChatGptAccountRef,
+        email: Option<String>,
+    ) -> Result<SignOutOutcome, AuthError> {
+        let account = ChatGptAccount::new(
+            connection,
+            reference.client_id().clone(),
+            &VerifiedIdentity {
+                issuer: ISSUER.to_owned(),
+                subject: reference.subject().to_owned(),
+                email: email.clone(),
+            },
+            email,
+        )?;
+        if account.vault_account() != &vault_account {
+            return Err(AuthError::AccountMismatch);
+        }
         let token_set = self
             .broker
-            .account_token_set_at(connection, account.vault_account())
+            .account_token_set_at(connection, &vault_account)
             .map_err(map_core_error)?;
 
         let remote_revoke = match token_set.as_ref().and_then(|set| set.refresh_token()) {
             Some(refresh_token) => {
                 let request =
                     RevokeRequest::new(account.client_id().as_str(), refresh_token.expose_secret());
-                match self.transport.revoke(&request) {
-                    Ok(()) => RemoteRevokeStatus::RequestAcceptedUnverified,
+                match self.transport.revoke_confirmed(&request) {
+                    Ok(true) => RemoteRevokeStatus::Confirmed,
+                    Ok(false) => RemoteRevokeStatus::RequestAcceptedUnverified,
                     Err(_) => RemoteRevokeStatus::FailedUnverified,
                 }
             }

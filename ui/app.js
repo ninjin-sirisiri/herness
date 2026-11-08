@@ -309,7 +309,30 @@ async function loadLoginStatus() {
     "login-status",
     `Terms: ${status.terms} · state: ${status.state} · pending: ${status.pending} · ` +
       `token exchange: ${status.transport}` +
-      (status.accountSubject ? ` · account: ${status.accountSubject}` : "")
+      (status.accountSubject ? ` · account: ${status.accountSubject}` : "") +
+      (status.error ? ` · last attempt: ${status.error}` : "")
+  );
+}
+
+async function loadChatGptModels() {
+  if (!ui.connection || ui.connectionAuth !== "chatgpt_login") {
+    throw new Error("select a ChatGPT-login connection first");
+  }
+  const models = await call("chatgpt_models", { connection: ui.connection });
+  const choice = byId("model-choice");
+  clear("model-list");
+  choice.replaceChildren();
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.slug;
+    option.textContent = `${model.displayName} (${model.slug})`;
+    choice.append(option);
+  }
+  setText(
+    "model-list",
+    models.length === 0
+      ? "The account catalog has no models with visibility=list."
+      : models.map((model) => `${model.displayName} · ${model.slug}`).join("\n")
   );
 }
 
@@ -451,6 +474,28 @@ function bind() {
         throw new Error("select a ChatGPT-login connection first");
       }
       await call("cancel_chatgpt_login", { connection: ui.connection });
+      await loadLoginStatus();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("list-models").addEventListener("click", async () => {
+    try {
+      await loadChatGptModels();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("set-model").addEventListener("click", async () => {
+    try {
+      const model = byId("model-choice").value;
+      if (!ui.connection || !model) {
+        throw new Error("list and select a ChatGPT model first");
+      }
+      await call("set_connection_model", { connection: ui.connection, model });
+      await frontendState();
       await loadLoginStatus();
     } catch (error) {
       showError(errorText(error));

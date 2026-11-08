@@ -1,7 +1,8 @@
 //! Provider JWKS boundary and synthetic-key support.
 //!
-//! Task 8 never fetches a real JWKS. The production transport will implement
-//! [`JwksSource`] in Task 9. Tests supply a static synthetic key set.
+//! The real OIDC discovery/JWKS source is
+//! [`super::https::DiscoveryJwksSource`]. Normal tests supply a static synthetic
+//! key set and never contact a provider.
 
 use serde::Deserialize;
 

@@ -35,6 +35,7 @@ pub struct DesktopHost {
     directory: ConnectionDirectory,
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
     app_data_root: PathBuf,
+    endpoints: ProviderEndpoints,
 }
 
 impl DesktopHost {
@@ -57,7 +58,7 @@ impl DesktopHost {
             Arc::clone(&store),
             Arc::clone(&credentials),
             directory.clone(),
-            PiEngineConfig::new(policy.policy().clone()).with_endpoints(endpoints),
+            PiEngineConfig::new(policy.policy().clone()).with_endpoints(endpoints.clone()),
         )
         .map_err(|error| error.to_string())?;
         let executor = DesktopToolExecutor::new(Arc::clone(&store));
@@ -77,6 +78,7 @@ impl DesktopHost {
             directory,
             credentials,
             app_data_root: app_data_root.as_ref().to_path_buf(),
+            endpoints,
         };
         let reconciliation = host.restore_connection_settings(report)?;
         Ok((host, reconciliation))
@@ -251,6 +253,94 @@ impl DesktopHost {
         self.runtime
             .connection_infos()
             .map_err(|error| error.to_string())
+    }
+
+    /// Lists the selected ChatGPT account's model catalog.
+    ///
+    /// This is a real network read, reached only from a human action in the
+    /// trusted UI or the opt-in controller real-check. It never changes the
+    /// selected connection or model.
+    pub fn list_chatgpt_models(
+        &self,
+        connection: herness_core::ConnectionId,
+    ) -> Result<Vec<herness_engine_pi::ChatGptModel>, String> {
+        herness_engine_pi::probe::list_chatgpt_models(
+            &self.directory,
+            Arc::clone(&self.credentials),
+            &self.endpoints,
+            connection,
+        )
+        .map_err(|failure| failure.as_str().to_owned())
+    }
+
+    /// Changes only the non-secret model name of an existing connection.
+    ///
+    /// The provider, endpoint, authentication method, credential reference, and
+    /// selected ChatGPT account stay unchanged. A model inferred by a provider
+    /// cannot call this: only the trusted main window reaches the command.
+    pub fn set_connection_model(
+        &mut self,
+        connection: herness_core::ConnectionId,
+        model: impl Into<String>,
+    ) -> Result<herness_core::ConnectionInfo, String> {
+        let current = self
+            .directory
+            .get(connection)
+            .map_err(|error| error.to_string())?;
+        let next = ConnectionSettings::new(
+            connection,
+            current.provider(),
+            model,
+            current.auth_method(),
+            current.endpoint().cloned(),
+            current.insecure_http_acknowledged(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.connections
+            .update(next)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.persist_connection_settings() {
+            let _ = self.connections.update(current);
+            return Err(error);
+        }
+        self.connection_infos()?
+            .into_iter()
+            .find(|info| info.connection_id() == connection)
+            .ok_or_else(|| "the updated connection is not visible".to_owned())
+    }
+
+    /// Removes one connection from host state after its credential was deleted.
+    ///
+    /// The credential deletion is the caller's responsibility so the ChatGPT
+    /// sign-out path can attempt remote revocation first. A persistence failure
+    /// restores the registry entry instead of silently forgetting the
+    /// connection.
+    pub fn forget_connection(
+        &mut self,
+        connection: herness_core::ConnectionId,
+    ) -> Result<(), String> {
+        let settings = self
+            .directory
+            .get(connection)
+            .map_err(|error| error.to_string())?;
+        self.connections
+            .remove(connection)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.persist_connection_settings() {
+            let _ = self.connections.add(settings);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Private application-data root used by the opt-in real-check evidence.
+    pub fn app_data_root(&self) -> &Path {
+        &self.app_data_root
+    }
+
+    /// Provider base URLs in use by this host.
+    pub const fn endpoints(&self) -> &ProviderEndpoints {
+        &self.endpoints
     }
 }
 

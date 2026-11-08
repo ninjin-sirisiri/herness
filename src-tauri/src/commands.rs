@@ -331,6 +331,29 @@ pub fn chatgpt_login_status(
     status
 }
 
+/// Lists the selected ChatGPT account's model catalog.
+#[tauri::command(async)]
+pub fn chatgpt_models(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    connection: ConnectionId,
+) -> Result<Vec<herness_engine_pi::ChatGptModel>, String> {
+    verify_source(&window)?;
+    lock_host(&state)?.list_chatgpt_models(connection)
+}
+
+/// Changes only the non-secret model name of an existing connection.
+#[tauri::command(async)]
+pub fn set_connection_model(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    connection: ConnectionId,
+    model: String,
+) -> Result<ConnectionInfo, String> {
+    verify_source(&window)?;
+    lock_host(&state)?.set_connection_model(connection, model)
+}
+
 // ---------------------------------------------------------------------------
 // Runs, approvals, snapshot, history
 // ---------------------------------------------------------------------------

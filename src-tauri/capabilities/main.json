@@ -16,6 +16,8 @@
     "allow-start-chatgpt-login",
     "allow-cancel-chatgpt-login",
     "allow-chatgpt-login-status",
+    "allow-chatgpt-models",
+    "allow-set-connection-model",
     "allow-start-run",
     "allow-stop-run",
     "allow-resume-run",

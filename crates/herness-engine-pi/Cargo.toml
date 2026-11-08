@@ -18,7 +18,7 @@ herness-core = { path = "../herness-core" }
 pi-agent = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
 pi-ai = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
 pi-embedded = { git = "https://github.com/yannelli/pi-rust", rev = "4294dba7ac3646477912cc778536fdff0a912d6e" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls"] }
 ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true

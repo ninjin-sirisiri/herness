@@ -9,8 +9,13 @@ pub mod adapter;
 pub mod auth;
 mod error;
 mod events;
+pub mod probe;
 mod session_store;
 mod stream;
 
 pub use adapter::{PiEngine, PiEngineConfig};
+pub use probe::{
+    ProbeFailure, ProbeOutcome, ProbeTerminal, ProbeUsage, REAL_CHECK_MAX_OUTPUT_TOKENS,
+    REAL_CHECK_PROMPT,
+};
 pub use stream::{ChatGptModel, ProviderEndpoints};

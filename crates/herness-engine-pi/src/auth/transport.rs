@@ -1,8 +1,8 @@
 //! Injectable token endpoint and revocation boundary.
 //!
-//! Task 8 defines the exact request shape and validates responses. It does not
-//! implement an HTTP client and never contacts an OpenAI host. Task 9 supplies
-//! the real transport; tests supply scripted responses.
+//! Task 8 defines the exact request shape and validates responses.
+//! [`super::https::HttpsTokenTransport`] is the real Task 13 implementation;
+//! tests supply scripted responses and never contact an OpenAI host.
 
 use std::fmt;
 
@@ -304,16 +304,34 @@ pub trait TokenTransport: Send + Sync {
     /// Refreshes a token set using a form-encoded `refresh_token` grant.
     fn refresh(&self, request: &RefreshRequest) -> Result<TokenResponse, TokenTransportError>;
 
-    /// Requests remote session revocation. Task 8 never reports this as
-    /// confirmed.
+    /// Requests remote session revocation.
+    ///
+    /// An `Ok(())` result only means the request was accepted. Provider-side
+    /// revocation stays unconfirmed unless [`Self::revoke_confirmed`] reports
+    /// otherwise.
     fn revoke(&self, request: &RevokeRequest) -> Result<(), TokenTransportError>;
+
+    /// Requests remote revocation and reports whether the provider confirmed
+    /// it.
+    ///
+    /// The default implementation keeps the Task 8 behavior: a successful
+    /// scripted request is never treated as provider confirmation. The real
+    /// HTTPS transport overrides this and returns `Ok(true)` only for an empty
+    /// HTTP 200 from the discovered revocation endpoint.
+    fn revoke_confirmed(&self, request: &RevokeRequest) -> Result<bool, TokenTransportError> {
+        self.revoke(request).map(|()| false)
+    }
 }
 
-/// What Task 8 can honestly report about remote revocation.
+/// What the build can honestly report about remote revocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteRevokeStatus {
     /// No refresh token was available, so revocation was not attempted.
     NotAttempted,
+    /// The provider returned an empty HTTP 200 from the discovered revocation
+    /// endpoint, or a scripted transport reported that it could not confirm the
+    /// result.
+    Confirmed,
     /// A revocation request was sent or scripted but provider-side revocation
     /// cannot be confirmed by this build.
     RequestAcceptedUnverified,
@@ -322,8 +340,8 @@ pub enum RemoteRevokeStatus {
 }
 
 impl RemoteRevokeStatus {
-    /// Task 8 never confirms provider-side revocation.
+    /// Whether the provider confirmed the revocation.
     pub const fn is_confirmed(self) -> bool {
-        false
+        matches!(self, Self::Confirmed)
     }
 }

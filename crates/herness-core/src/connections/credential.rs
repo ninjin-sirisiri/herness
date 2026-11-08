@@ -1019,6 +1019,95 @@ impl<V: CredentialVault> CredentialBroker<V> {
         }
     }
 
+    /// Forces one refresh for a ChatGPT token set even when the current access
+    /// token has not expired.
+    ///
+    /// This is the explicit controller path used by the opt-in real-connection
+    /// check. It takes the same per-connection gate as [`Self::resolve_at`] so
+    /// it cannot race an automatic refresh. The refreshed set must be valid at
+    /// `now`; a failed or already-expired result never replaces stored
+    /// material.
+    pub fn refresh_at(
+        &self,
+        connection: ConnectionId,
+        now: Timestamp,
+    ) -> Result<ResolvedCredential, CoreError> {
+        self.settings(connection)?;
+        let gate = self.inner.gate(connection);
+        let _guard = gate
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let settings = self.settings(connection)?;
+        let version = gate.version.load(Ordering::SeqCst);
+        let account = settings.vault_account();
+        let bytes = match self.inner.vault.get(&account) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err(CoreError::AuthenticationRequired { connection }),
+            Err(failure) => {
+                return Err(credential_unavailable(
+                    connection,
+                    failure.credential_failure_kind(),
+                ));
+            }
+        };
+        let stored = decode_credential(&bytes).map_err(|()| {
+            credential_unavailable(connection, CredentialFailureKind::InvalidCredentialData)
+        })?;
+        let token_set = match (settings.auth_method(), stored) {
+            (AuthMethod::ChatGptLogin, StoredCredential::OAuthTokenSet(token_set)) => token_set,
+            _ => {
+                return Err(credential_unavailable(
+                    connection,
+                    CredentialFailureKind::InvalidCredentialData,
+                ));
+            }
+        };
+        if !token_set.plan_scope_satisfied() {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::PlanScopeMissing,
+            ));
+        }
+        let Some(refresher) = self.inner.refresher.as_ref() else {
+            return Err(credential_unavailable(
+                connection,
+                CredentialFailureKind::Expired,
+            ));
+        };
+        match refresher.refresh(connection, &token_set) {
+            Ok(refreshed) if !refreshed.is_expired_at(now) => {
+                let encoded = encode_oauth_token_set(&refreshed);
+                self.inner
+                    .vault
+                    .set(&account, &encoded)
+                    .map_err(|failure| {
+                        credential_unavailable(connection, failure.credential_failure_kind())
+                    })?;
+                gate.version.fetch_add(1, Ordering::SeqCst);
+                *gate
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                Ok(ResolvedCredential::new(
+                    CredentialKind::OAuthToken,
+                    refreshed.into_access_token(),
+                ))
+            }
+            Ok(_) => {
+                record_refresh_failure(&gate, version, CredentialFailureKind::RefreshFailed);
+                Err(credential_unavailable(
+                    connection,
+                    CredentialFailureKind::RefreshFailed,
+                ))
+            }
+            Err(kind) => {
+                record_refresh_failure(&gate, version, kind);
+                Err(credential_unavailable(connection, kind))
+            }
+        }
+    }
+
     fn settings(&self, connection: ConnectionId) -> Result<ConnectionSettings, CoreError> {
         self.inner
             .directory

@@ -18,6 +18,8 @@ fn main() {
         "start_chatgpt_login",
         "cancel_chatgpt_login",
         "chatgpt_login_status",
+        "chatgpt_models",
+        "set_connection_model",
         "start_run",
         "stop_run",
         "resume_run",
