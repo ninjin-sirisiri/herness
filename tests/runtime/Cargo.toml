@@ -1,0 +1,16 @@
+[package]
+name = "herness-runtime-tests"
+description = "Black-box contract tests and shared fixtures for the herness runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+herness-core = { path = "../../crates/herness-core" }
+
+[dev-dependencies]
+serde_json.workspace = true
