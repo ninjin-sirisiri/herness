@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use herness_core::{ConnectionAdmin, ConnectionId};
+use herness_core::{ConnectionAdmin, ConnectionId, CredentialVault};
 use herness_engine_pi::auth::{
     AuthError, BrowserOpener, ChatGptAccount, ChatGptAuth, ChatGptAuthConfig, ChatGptAuthState,
     FileHostIdStore, InMemoryAccountDirectory, JwkSet, JwksError, JwksSource, PendingAuthorization,
@@ -106,12 +106,12 @@ impl JwksSource for UnavailableJwks {
 }
 
 /// Per-process ChatGPT login manager.
-pub struct LoginManager {
-    auth: ChatGptAuth<MacKeychainVault>,
+pub struct LoginManager<V: CredentialVault + Clone = MacKeychainVault> {
+    auth: ChatGptAuth<V>,
     pending: Mutex<BTreeMap<ConnectionId, Arc<PendingAuthorization>>>,
 }
 
-impl LoginManager {
+impl LoginManager<MacKeychainVault> {
     /// Builds the official flow with the confirmed local/unpublished terms gate.
     ///
     /// The gate is chosen explicitly because this workspace is a local,
@@ -122,9 +122,30 @@ impl LoginManager {
         vault: MacKeychainVault,
         app_data_root: PathBuf,
     ) -> Result<Self, String> {
+        Self::with_browser(
+            admin,
+            vault,
+            app_data_root,
+            Arc::new(SystemBrowser),
+            TermsConfirmation::local_unpublished(),
+        )
+    }
+}
+
+impl<V: CredentialVault + Clone> LoginManager<V> {
+    /// Builds the service with an explicit browser and terms gate.
+    ///
+    /// Production uses [`SystemBrowser`] and the local/unpublished gate. Tests
+    /// inject a recording browser so no real browser is opened.
+    pub fn with_browser(
+        admin: ConnectionAdmin,
+        vault: V,
+        app_data_root: PathBuf,
+        browser: Arc<dyn BrowserOpener>,
+        terms: TermsConfirmation,
+    ) -> Result<Self, String> {
         let host_id = FileHostIdStore::new(app_data_root.join("chatgpt-host-id"));
-        let config =
-            ChatGptAuthConfig::new("herness").with_terms(TermsConfirmation::local_unpublished());
+        let config = ChatGptAuthConfig::new("herness").with_terms(terms);
         let auth = ChatGptAuth::new(
             admin,
             vault,
@@ -133,7 +154,7 @@ impl LoginManager {
             Arc::new(UnavailableTransport),
             Arc::new(UnavailableJwks),
             Arc::new(SystemClock),
-            Arc::new(SystemBrowser),
+            browser,
             config,
         )
         .map_err(|error| error.to_string())?;
@@ -224,4 +245,109 @@ pub fn closed_terms_status() -> LoginStatus {
 #[allow(dead_code)]
 fn empty_jwks() -> StaticJwks {
     StaticJwks::new(JwkSet::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use herness_core::{AuthMethod, ConnectionSettings, Provider, VaultAccount, VaultFailure};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingBrowser {
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl BrowserOpener for RecordingBrowser {
+        fn open(&self, authorization_url: &str) -> Result<(), AuthError> {
+            self.urls
+                .lock()
+                .expect("browser urls")
+                .push(authorization_url.to_owned());
+            Ok(())
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct TestVault {
+        items: Arc<Mutex<BTreeMap<VaultAccount, Vec<u8>>>>,
+    }
+
+    impl CredentialVault for TestVault {
+        fn set(&self, account: &VaultAccount, data: &[u8]) -> Result<(), VaultFailure> {
+            self.items
+                .lock()
+                .map_err(|_| VaultFailure::Unavailable)?
+                .insert(account.clone(), data.to_vec());
+            Ok(())
+        }
+
+        fn get(&self, account: &VaultAccount) -> Result<Option<Vec<u8>>, VaultFailure> {
+            Ok(self
+                .items
+                .lock()
+                .map_err(|_| VaultFailure::Unavailable)?
+                .get(account)
+                .cloned())
+        }
+
+        fn delete(&self, account: &VaultAccount) -> Result<(), VaultFailure> {
+            self.items
+                .lock()
+                .map_err(|_| VaultFailure::Unavailable)?
+                .remove(account);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn start_opens_the_system_browser_and_cancel_closes_the_attempt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let admin = ConnectionAdmin::new();
+        let connection = ConnectionId::new();
+        admin
+            .add(
+                ConnectionSettings::new(
+                    connection,
+                    Provider::OpenAi,
+                    "gpt-test",
+                    AuthMethod::ChatGptLogin,
+                    None,
+                    None,
+                )
+                .expect("settings"),
+            )
+            .expect("connection");
+        let browser = Arc::new(RecordingBrowser::default());
+        let manager = LoginManager::with_browser(
+            admin,
+            TestVault::default(),
+            temp.path().to_path_buf(),
+            browser.clone(),
+            TermsConfirmation::local_unpublished(),
+        )
+        .expect("login manager");
+
+        let started = manager.start(connection).expect("start login");
+        assert!(started.pending);
+        assert_eq!(started.terms, "local_unpublished_use");
+        assert_eq!(started.transport, "unavailable_in_this_build");
+        let urls = browser.urls.lock().expect("urls");
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("https://auth.openai.com/"));
+        drop(urls);
+
+        let cancelled = manager.cancel(connection).expect("cancel login");
+        assert!(!cancelled.pending);
+        assert_eq!(cancelled.state, "login_required");
+    }
+
+    #[test]
+    fn the_system_browser_rejects_non_https_urls_without_launching() {
+        assert!(SystemBrowser.open("http://example.com/").is_err());
+        assert!(SystemBrowser.open("file:///tmp/page.html").is_err());
+    }
 }
