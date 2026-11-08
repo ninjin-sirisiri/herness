@@ -17,18 +17,27 @@
 //!   request body, or raw provider response body,
 //! * a strict normal-LLM condition schema with explicit inconclusive reasons,
 //! * a Jev System One choice adapter with fixed-model, distribution, native
-//!   confidence, image, and input-limit validation.
+//!   confidence, image, and input-limit validation,
+//! * an OpenAI Decisions choice adapter with the fixed `gpt-6-luna` model,
+//!   ordered probability validation, refusal handling, and caller-byte images.
 //!
 //! Money reservation and billing/cost records belong to the upper H2 request
 //! gate and budget ledger. The transport neither reserves nor records money.
 
 #![deny(missing_docs)]
 
+mod image;
+
+pub mod decisions;
 pub mod error;
 pub mod jev;
 pub mod llm;
 pub mod transport;
 
+pub use decisions::{
+    DECISIONS_CONFIDENCE_SCALE, DECISIONS_REQUEST_MODEL, DecisionsAssessment,
+    DecisionsAssessmentAdapter, DecisionsRejection, DecisionsUsage, decisions_question_id,
+};
 pub use error::{AssessmentError, AssessmentErrorKind};
 pub use jev::{
     JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment, JevAssessmentAdapter, JevRejection,

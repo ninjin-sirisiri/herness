@@ -387,6 +387,52 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 実Jev/TypeSafeへの接続、APIキー、`GET /v1/models`、実課金要求は行わず、接続成功を主張しない。
 
+## Task 12で追加したOpenAI Decisions条件別choice評価adapter
+
+### 公式文書の再確認記録
+
+- 2026-11-08から2026-11-09に次の公開文書を確認した: <https://developers.openai.com/api/docs/guides/decisions>、<https://developers.openai.com/api/reference/resources/decisions/methods/create>。
+- 認証付き要求、実OpenAI/Decisionsへの送信、model一覧取得、課金要求は行っていない。文書の確認は実接続の成功を意味しない。
+- endpointは`POST /v1/decisions`、認証はOpenAI APIキーの`Authorization: Bearer <OPENAI_API_KEY>`、modelは`gpt-6-luna`のみ。入力はstringまたはordered message arrayで、choice questionは`{"type":"choice","name":"...","instructions":"...","choices":[{"value":"...","description":"..."}]}`、応答は`{"model":"...","answers":[...],"usage":{"input_tokens":...,"input_tokens_details":{"cached_tokens":...,"cache_write_tokens":...},"output_tokens":...}}`。
+- choice answerは`{"type":"choice","name":"...","choice":"...","probabilities":[{"value":"...","probability":...}],"confidence":...}`。`{"type":"refusal","name":"..."}`は任意のanswerを置換し得る。画像は`input_image`のbase64 data URLまたは公開HTTP(S) URLで、`file_id`は未対応。H2は承認されたcaller bytesだけを送る。
+
+### adapter境界とrequest
+
+- `crates/herness-assessment/src/decisions/` は `DecisionsAssessmentAdapter::new(transport, clock)` と `assess(&AssessmentRequest, &ProfileEntry, &[EvidenceDocument], TransportControl)` を提供する。通常LLM・Jevと同じ`EvidenceDocument`だけを受け取り、会話・repository・file・shellを自分で読まない。
+- profileの接続が`Provider::OpenAi` + `EndpointClass::OpenAiDecisions` + APIキー + `AssessmentOnly`でなければ送信前に`CapabilityMismatch`にする。ChatGPTログイン（OAuth）、通常のagent接続、TypeSafe接続、permission用途、stale entryは送信前に拒否する。別provider/model/connectionへのfallbackはない。
+- requestの`model`は常に固定の`gpt-6-luna`。profileのmodel（aliasを含む）はprovenanceの`model`に、応答が返したmodel IDは`reportedModel`に記録する。応答の`model`が`gpt-6-luna`と完全一致しない場合は`insufficient`にし、再利用しない。
+- 質問IDは`AssessmentRequest`の`DecisionId`から導出し、同じ要求の再試行では同じ名前、別の評価では別の名前になる。`questions`はそのIDのchoice 1件だけを持ち、`choices`は`met` / `unmet` / `insufficient`の3件だけを持つ。
+- `input`は呼出し元が渡した証拠文書だけを含む。text-onlyでは証拠IDと本文のstring、画像を含む場合はuser messageの`input_text` / `input_image` part列にする。全会話・全repository・file一覧・shell出力を追加せず、`tools` / `tool_choice`も送らない。
+- 画像はPNG/JPEGのcaller bytesだけを`data:image/png;base64,...` / `data:image/jpeg;base64,...`として送る。外部URLはfetchも送信もせず、`file_id`を生成しない。画像を含む要求でもTypeSafeのdanger-zone headerは付けない。
+
+### 応答検証と採用
+
+- 応答は次をすべて満たす場合だけ`AssessmentOutcome::Decision`として扱う: `model`が`gpt-6-luna`と完全一致、`answers`が配列で質問IDのanswerがちょうど1件、answer typeが`choice`、`choice`が3値のいずれか、`probabilities`が同じ3値を順序どおり1回ずつ持つ、各確率が有限で0〜1、合計が1から0.001以内、選択choiceが最大確率、`confidence`が有限で0〜1。
+- 次はすべて`insufficient`にし、`met` / `unmet`にしない: 不正JSON、envelope不一致、answer欠落、未知質問、重複answer名、複数回答、answer objectの重複field、wrong type、refusal、provider error、未知/重複/欠落/順序不一致/範囲外/合計外の確率、選択と分布の不一致、response modelのalias/version drift、confidence不正。
+- 拒否時は分布を捏造せず、verdict-onlyの`NormalLlm { verdict: Insufficient, confidence }`に正規化する。Decisionsはrationaleを返さないため、rationaleは`Host note:`で始まるhost所有の説明にし、`AssessmentResult::rationaleOrigin = host`を記録する。providerの未知fieldやthinking風の文章は保存しない。
+- 採用は選択されたmet/unmetの確率がprofileのcompletion threshold（既定0.95）以上の場合だけ。0.95未満、`insufficient`、拒否は`adopted_verdict`が`None`になる。native confidenceは`AssessmentOutcome::Decision.confidence`または拒否時の`NormalLlm.confidence`に`NativeConfidence`として別保存し、確率・採用判定には使わない。
+- usageは`DecisionsUsage`（input_tokens、任意のcached/cache_write tokens、output_tokens）としてadapter wrapperに保持し、`AssessmentResult`へ混ぜない。欠落・不正は`None`で、0を捏造しない。永続usageの所有はH2のrequest gate / budget ledgerのまま。
+
+### 能力・入力上限
+
+- text入力とassessment-only APIキー接続を必須にする。画像証拠またはprofileの画像要求に対して接続が画像非対応なら`UnsupportedModality`を返し、HTTPを送らない。
+- 画像はPNG/JPEG still imageだけ。1画像16 MiB以下、幅・高さ1〜8192 px、画素数33,554,432以下、全画像のdecoded bytes 16 MiB以下、request body 32 MiB以下を検査する。APNG、不完全なPNG、SOFのないJPEGは拒否する。
+- text証拠は1,000,000 bytes、rubricと固定instructionを含むrequest textは1,200,000 bytesを上限とする。いずれかを超える場合は送信前に`InputTooLarge`を返す。必要証拠を切り捨てたり、切り捨てた内容で成功にしたりしない。
+- 証拠ID集合はrequestと完全一致させる。欠落・余分・重複は`InvalidEvidence`、project外は`CrossProjectReference`、画像形式・寸法不正は`InvalidEvidence`、容量超過は`InputTooLarge`。いずれもHTTPとcredential解決の前に返す。
+
+### Task 12のテスト
+
+`tests/supervision/tests/adapters.rs`はloopback mockとin-memory credentialだけで次を確認する。
+
+- 固定`gpt-6-luna`・`/v1/decisions`・toolなしbody・質問ID・3 choices・inputが指定証拠だけであること、met/unmet/insufficientの受理、選択・確率・confidence・usage（cache detailsを含む）の解析。
+- 確率配列の欠落/余分/重複/順序不一致、answerの欠落/未知/重複/複数、wrong type、refusal、provider error、model alias/version mismatch、confidence不正、0.95未満が採用されないこと。
+- native confidenceを確率と別に保持し、rationaleを捏造せずhost所有の注記にすること。alias/profile version変更後に旧評価を再利用しないこと。
+- text-only接続への画像証拠がHTTP 0件の能力エラーになること、対応接続ではbase64 data URLだけを送り外部URL/`file_id`を送らないこと、過大画像・過大text・不正画像を切り捨てず送信前に拒否すること。
+- 429と5xxの再試行、`Retry-After`がdeadlineを超える場合、送信不明timeoutの再送0、secret canaryがerror/Debug/resultに出ないこと。
+- 同じ完了条件を通常LLM・Jev・Decisionsへ渡し、同じcondition/target/profile bindingと採用/不採用の意味が各provider固有のschemaで成立すること。Jev応答をDecisions schemaとして受理せず、その逆もしないこと。
+
+実OpenAI/Decisionsへの接続、APIキー、model一覧、実課金要求は行わず、接続成功を主張しない。
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -540,3 +586,19 @@ Task 11の追加確認:
 - `cargo test -p herness-supervision-tests --test adapters --locked` はloopback mockだけで、固定 `jev-1.14.0`、`POST /v1/systemone`、toolなし、質問ID、3 criteria、state範囲、全拒否理由、0.95境界、native confidence分離、画像header/assets、入力上限、429/529/Retry-After、送信不明timeoutの再送0、secret canary非表示、alias/version非再利用を確認する。
 - `cargo test -p herness-supervision-tests --test profiles --locked` は `Decision.confidence`、`rationaleOrigin`、`reportedModel` のadditive round-tripと、native confidenceが採用判定に使われないことを確認する。
 - 実Jev/TypeSafeへの接続成功は主張しない。認証付き要求・model一覧・実送信は別途許可された実接続検証まで未確認である。
+
+Task 12の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-assessment --locked
+cargo test -p herness-supervision-tests --test adapters --locked
+cargo test -p herness-supervision-tests --test profiles --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 12の追加確認:
+
+- `cargo test -p herness-assessment --locked` はDecisions wireの正常分布、確率の順序/重複/選択最大の検査、refusal/モデル不一致/usage欠落、PNG/JPEG共通header検証、既存Jev wireとtransportの回帰を確認する。
+- `cargo test -p herness-supervision-tests --test adapters --locked` はloopback mockだけで、固定 `gpt-6-luna`、`POST /v1/decisions`、toolなし、質問ID、3 choices、証拠だけのinput、全拒否理由、0.95境界、native confidence分離、画像data URL、外部URL/`file_id`拒否、入力上限、429/5xx/Retry-After、送信不明timeoutの再送0、secret canary非表示、alias/version非再利用、三方式正規化を確認する。
+- `cargo test -p herness-supervision-tests --test profiles --locked` はTask 11のadditive field回帰と、Decisionsの結果が同じcondition/target/profile bindingへ適用されることを確認する。
+- 実OpenAI/Decisionsへの接続成功は主張しない。認証付き要求・model一覧・実送信は別途許可された実接続検証まで未確認である。

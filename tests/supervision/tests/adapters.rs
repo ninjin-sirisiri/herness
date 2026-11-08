@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use herness_assessment::{
     AssessmentEndpoints, AssessmentError, AssessmentErrorKind, AssessmentRequest,
-    AssessmentTransport, CancelToken, EvidenceDocument, ImageInput, ImageSource,
-    InconclusiveReason, JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment,
-    JevAssessmentAdapter, JevRejection, JevUsage, LlmAssessment, LlmAssessmentAdapter, RetryPolicy,
-    TransportControl, jev_question_id,
+    AssessmentTransport, CancelToken, DECISIONS_CONFIDENCE_SCALE, DECISIONS_REQUEST_MODEL,
+    DecisionsAssessment, DecisionsAssessmentAdapter, DecisionsRejection, DecisionsUsage,
+    EvidenceDocument, ImageInput, ImageSource, InconclusiveReason, JEV_CONFIDENCE_SCALE,
+    JEV_REQUEST_MODEL, JevAssessment, JevAssessmentAdapter, JevRejection, JevUsage, LlmAssessment,
+    LlmAssessmentAdapter, RetryPolicy, TransportControl, decisions_question_id, jev_question_id,
 };
 use herness_core::{
     AuthMethod, ConnectionAdmin, ConnectionCapabilities, ConnectionCapabilityDeclaration,
@@ -39,7 +40,9 @@ use herness_supervision::profiles::{
     ProfileThresholds, ProfileVersion, ProviderKind, RubricVersion,
 };
 use herness_supervision_tests::{
-    FixedClock, Ids, assessment_request, ids, jev_assessment_request, jev_choice_answer,
+    FixedClock, Ids, assessment_request, decisions_assessment_request, decisions_choice_answer,
+    decisions_completion_profile_for, decisions_completion_profile_with_inputs,
+    decisions_profile_entry, decisions_response, ids, jev_assessment_request, jev_choice_answer,
     jev_completion_profile_for, jev_completion_profile_with_inputs, jev_profile_entry,
     jev_system_one_response, llm_completion_profile_for, llm_profile_entry, other_project, project,
 };
@@ -4255,4 +4258,1926 @@ fn jev_adapter_parses_usage_without_inventing_zero() {
     assert_eq!(zero_usage.usage(), Some(JevUsage::new(0, 0)));
     assert_eq!(server.count(), 3);
     assert_eq!(other.count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Decisions condition assessment adapter (Task 12)
+// ---------------------------------------------------------------------------
+
+fn decisions_named(
+    admin: &ConnectionAdmin,
+    model: &str,
+    input: InputCapabilities,
+) -> ConnectionSettings {
+    settings(
+        admin,
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        model,
+        None,
+        EndpointClass::OpenAiDecisions,
+        input,
+    )
+}
+
+struct DecisionsFixture {
+    profile: AssessmentProfile,
+    entry: ProfileEntry,
+    request: SupervisionAssessmentRequest,
+}
+
+fn decisions_fixture(
+    model: &str,
+    input: InputCapabilities,
+    profile_version: u64,
+    required: ProfileInputs,
+) -> (ConnectionAdmin, DecisionsFixture) {
+    let admin = ConnectionAdmin::new();
+    let settings = decisions_named(&admin, model, input);
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = decisions_completion_profile_with_inputs(
+        project,
+        settings.connection_id(),
+        model,
+        profile_version,
+        required,
+    );
+    let entry = decisions_profile_entry(&settings, profile.clone());
+    let request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    (
+        admin,
+        DecisionsFixture {
+            profile,
+            entry,
+            request,
+        },
+    )
+}
+
+fn decisions_adapter(
+    credentials: Arc<dyn CredentialPort + Send + Sync>,
+    directory: ConnectionDirectory,
+    openai: &MockServer,
+    other: &MockServer,
+) -> DecisionsAssessmentAdapter {
+    let endpoints =
+        AssessmentEndpoints::for_loopback(other.url(), openai.openai_base(), other.url())
+            .expect("loopback endpoints");
+    let transport = AssessmentTransport::new(credentials, directory, endpoints)
+        .expect("transport")
+        .with_retry_policy(RetryPolicy::with_base_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ]));
+    DecisionsAssessmentAdapter::new(transport, Arc::new(FixedClock))
+}
+
+fn decisions_png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = jev_png(280);
+    bytes[16..20].copy_from_slice(&width.to_be_bytes());
+    bytes[20..24].copy_from_slice(&height.to_be_bytes());
+    bytes
+}
+
+fn decisions_text_documents(fixture_ids: Ids) -> Vec<EvidenceDocument> {
+    jev_text_documents(fixture_ids)
+}
+
+fn decisions_image_documents(fixture_ids: Ids, png: &[u8]) -> Vec<EvidenceDocument> {
+    jev_image_documents(fixture_ids, png)
+}
+
+fn decisions_valid_response(
+    question_id: &str,
+    choice: &str,
+    met: f64,
+    unmet: f64,
+    insufficient: f64,
+    confidence: f64,
+) -> serde_json::Value {
+    decisions_response(
+        DECISIONS_REQUEST_MODEL,
+        question_id,
+        decisions_choice_answer(choice, met, unmet, insufficient, confidence),
+    )
+}
+
+fn assert_decisions_rejected(assessment: &DecisionsAssessment, reason: DecisionsRejection) {
+    assert_eq!(assessment.rejection(), Some(reason));
+    assert_eq!(
+        assessment.result().reported_verdict(),
+        ConditionVerdict::Insufficient
+    );
+    assert_eq!(
+        assessment.adopted_verdict(ProfileThresholds::decisions()),
+        None
+    );
+    match assessment.result().outcome() {
+        AssessmentOutcome::NormalLlm { verdict, .. } => {
+            assert_eq!(*verdict, ConditionVerdict::Insufficient);
+        }
+        _ => panic!("a rejected Decisions answer used a fabricated Decision outcome"),
+    }
+}
+
+#[test]
+fn decisions_adapter_sends_fixed_model_tool_less_choice_request_and_parses_met() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        "gpt-6-luna-latest",
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.82),
+    ));
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = decisions_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+
+    assert!(assessment.rejection().is_none());
+    assert_eq!(assessment.attempts(), 1);
+    assert_eq!(
+        assessment.usage(),
+        Some(DecisionsUsage::new(120, 12).with_cache_details(Some(20), Some(30)))
+    );
+    let result = assessment.result();
+    assert_eq!(result.reported_verdict(), ConditionVerdict::Met);
+    assert_eq!(
+        assessment.adopted_verdict(fixture.profile.thresholds()),
+        Some(ConditionVerdict::Met)
+    );
+    assert_eq!(
+        result.evidence(),
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b]
+    );
+    assert_eq!(result.rationale_origin(), RationaleOrigin::Host);
+    assert!(result.rationale().starts_with("Host note:"));
+    assert!(!result.rationale().contains(EVIDENCE_A_MARKER));
+    assert_eq!(result.provenance().provider(), Provider::OpenAi);
+    assert_eq!(result.provenance().provider_kind(), ProviderKind::Decisions);
+    assert_eq!(result.provenance().model().as_str(), "gpt-6-luna-latest");
+    assert_eq!(
+        result
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some(DECISIONS_REQUEST_MODEL)
+    );
+    match result.outcome() {
+        AssessmentOutcome::Decision {
+            selected,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(*selected, ConditionVerdict::Met);
+            assert_eq!(probabilities.met(), 0.96);
+            assert_eq!(probabilities.unmet(), 0.03);
+            assert_eq!(probabilities.insufficient(), 0.01);
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.82);
+            assert_eq!(confidence.scale(), DECISIONS_CONFIDENCE_SCALE);
+            assert!(!confidence.is_probability());
+        }
+        _ => panic!("expected a Decision outcome"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/decisions");
+    assert_eq!(
+        requests[0].header("authorization"),
+        Some(format!("Bearer {CANARY}").as_str())
+    );
+    assert_eq!(requests[0].header("content-type"), Some("application/json"));
+    let body = requests[0].json_body();
+    assert_tool_less(&body);
+    assert_eq!(body["model"].as_str(), Some(DECISIONS_REQUEST_MODEL));
+    assert!(body["input"].is_string());
+    let serialized = body.to_string();
+    assert!(serialized.contains(EVIDENCE_A_MARKER));
+    assert!(serialized.contains(EVIDENCE_B_MARKER));
+    assert!(!serialized.contains(UNRELATED_EVIDENCE_MARKER));
+    assert!(!serialized.contains(CONVERSATION_CANARY));
+    assert!(!serialized.contains("http://"));
+    assert!(!serialized.contains("https://"));
+    assert!(!serialized.contains("file_id"));
+    assert!(!serialized.contains("data:image"));
+    assert!(body.get("state").is_none());
+    let questions = body["questions"].as_array().expect("questions array");
+    assert_eq!(questions.len(), 1);
+    let question = &questions[0];
+    assert_eq!(question["type"].as_str(), Some("choice"));
+    assert_eq!(question["name"].as_str(), Some(question_id.as_str()));
+    assert!(
+        question["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains(fixture.request.rubric()))
+    );
+    let choices = question["choices"].as_array().expect("choices");
+    assert_eq!(choices.len(), 3);
+    let values: Vec<&str> = choices
+        .iter()
+        .map(|choice| choice["value"].as_str().expect("choice value"))
+        .collect();
+    assert_eq!(values, ["met", "unmet", "insufficient"]);
+    for choice in choices {
+        assert!(
+            choice["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty())
+        );
+    }
+    assert_eq!(credentials.calls(), 1);
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn decisions_adapter_accepts_choice_verdicts_and_threshold_boundaries() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    let cases = [
+        (
+            "unmet",
+            0.04,
+            0.95,
+            0.01,
+            0.8,
+            Some(ConditionVerdict::Unmet),
+        ),
+        ("insufficient", 0.01, 0.01, 0.98, 0.9, None),
+        ("met", 0.94, 0.05, 0.01, 0.99, None),
+        ("met", 0.96, 0.03, 0.01, 0.1, Some(ConditionVerdict::Met)),
+        ("met", 0.95, 0.04, 0.01, 0.5, Some(ConditionVerdict::Met)),
+        ("met", 0.4, 0.3, 0.3, 0.99, None),
+    ];
+    for (choice, met, unmet, insufficient, confidence, _) in cases {
+        server.push(MockResponse::json(
+            200,
+            decisions_valid_response(&question_id, choice, met, unmet, insufficient, confidence),
+        ));
+    }
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    for (choice, _, _, _, _, expected) in cases {
+        let assessment = adapter
+            .assess(
+                &fixture.request,
+                &fixture.entry,
+                &decisions_text_documents(fixture_ids),
+                TransportControl::default(),
+            )
+            .expect("assessment");
+        assert!(assessment.rejection().is_none(), "{choice}");
+        assert_eq!(
+            assessment.result().reported_verdict(),
+            jev_choice_verdict(choice)
+        );
+        assert_eq!(
+            assessment.adopted_verdict(fixture.profile.thresholds()),
+            expected,
+            "{choice} {expected:?}"
+        );
+    }
+    assert_eq!(server.count(), cases.len());
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn decisions_adapter_rejects_invalid_answers_as_insufficient() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    let valid = || decisions_choice_answer("met", 0.96, 0.03, 0.01, 0.9);
+    let body = |answer: serde_json::Value| {
+        decisions_response(DECISIONS_REQUEST_MODEL, &question_id, answer)
+    };
+    let mut cases: Vec<(Vec<u8>, DecisionsRejection)> = Vec::new();
+    let mut push = |value: serde_json::Value, reason| {
+        cases.push((serde_json::to_vec(&value).expect("case body"), reason));
+    };
+
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": []}),
+        DecisionsRejection::MissingAnswer,
+    );
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL}),
+        DecisionsRejection::MissingAnswer,
+    );
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": null}),
+        DecisionsRejection::MissingAnswer,
+    );
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": {"name": question_id}}),
+        DecisionsRejection::SchemaViolation,
+    );
+    let mut answer = valid();
+    answer["name"] = json!("other");
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [answer]}),
+        DecisionsRejection::UnknownAnswer,
+    );
+    let mut answer = valid();
+    answer["name"] = json!(question_id);
+    let mut other_answer = valid();
+    other_answer["name"] = json!("other");
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [answer.clone(), other_answer]}),
+        DecisionsRejection::UnknownAnswer,
+    );
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [answer.clone(), answer.clone()]}),
+        DecisionsRejection::DuplicateAnswer,
+    );
+    let mut unnamed = valid();
+    unnamed.as_object_mut().unwrap().remove("name");
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [unnamed]}),
+        DecisionsRejection::UnknownAnswer,
+    );
+
+    let mut answer = body(valid());
+    answer["answers"][0]["type"] = json!("predicate");
+    push(answer, DecisionsRejection::WrongAnswerType);
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [{"type": "refusal", "name": question_id}]}),
+        DecisionsRejection::Refusal,
+    );
+    let mut answer = body(valid());
+    answer["answers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("choice");
+    push(answer, DecisionsRejection::InvalidChoice);
+    let mut answer = body(valid());
+    answer["answers"][0]["choice"] = json!("maybe");
+    push(answer, DecisionsRejection::InvalidChoice);
+    let mut answer = body(valid());
+    answer["answers"][0]["choice"] = json!(true);
+    push(answer, DecisionsRejection::InvalidChoice);
+    let mut answer = body(valid());
+    answer["answers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("confidence");
+    push(answer, DecisionsRejection::InvalidConfidence);
+    let mut answer = body(valid());
+    answer["answers"][0]["confidence"] = json!(1.5);
+    push(answer, DecisionsRejection::InvalidConfidence);
+
+    let mut answer = body(valid());
+    answer["answers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("probabilities");
+    push(answer, DecisionsRejection::MissingProbabilities);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
+    push(answer, DecisionsRejection::MissingProbabilities);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"value": "other", "probability": 0.0}));
+    push(answer, DecisionsRejection::ExtraProbabilities);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"][0]["value"] = json!("other");
+    push(answer, DecisionsRejection::ExtraProbabilities);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!([
+        {"value": "met", "probability": 0.96},
+        {"value": "met", "probability": 0.03},
+        {"value": "insufficient", "probability": 0.01},
+    ]);
+    push(answer, DecisionsRejection::DuplicateProbability);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!([
+        {"value": "unmet", "probability": 0.03},
+        {"value": "met", "probability": 0.96},
+        {"value": "insufficient", "probability": 0.01},
+    ]);
+    push(answer, DecisionsRejection::ReorderedProbabilities);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"][0]["probability"] = json!(-0.01);
+    push(answer, DecisionsRejection::InvalidProbability);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"][0]["probability"] = json!(1.01);
+    push(answer, DecisionsRejection::InvalidProbability);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"][0]["probability"] = json!("NaN");
+    push(answer, DecisionsRejection::InvalidProbability);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!([
+        {"value": "met", "probability": 0.98},
+        {"value": "unmet", "probability": 0.01},
+        {"value": "insufficient", "probability": 0.02},
+    ]);
+    push(answer, DecisionsRejection::ProbabilitySum);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!([
+        {"value": "met", "probability": 0.2},
+        {"value": "unmet", "probability": 0.7},
+        {"value": "insufficient", "probability": 0.1},
+    ]);
+    push(answer, DecisionsRejection::SelectionNotMaximum);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!("not-an-array");
+    push(answer, DecisionsRejection::SchemaViolation);
+    let mut answer = body(valid());
+    answer["answers"][0]["probabilities"] = json!(null);
+    push(answer, DecisionsRejection::SchemaViolation);
+    push(
+        json!({"model": DECISIONS_REQUEST_MODEL, "answers": [7]}),
+        DecisionsRejection::SchemaViolation,
+    );
+
+    push(
+        json!({"model": "gpt-6-luna-latest", "answers": [valid_with_name(&question_id)]}),
+        DecisionsRejection::ModelMismatch,
+    );
+    push(
+        json!({"model": "gpt-6", "answers": [valid_with_name(&question_id)]}),
+        DecisionsRejection::ModelMismatch,
+    );
+    push(
+        json!({"answers": [valid_with_name(&question_id)]}),
+        DecisionsRejection::ModelMismatch,
+    );
+    push(
+        json!({"error": {"type": "provider", "message": "fixture failure"}}),
+        DecisionsRejection::ProviderFailure,
+    );
+    push(
+        json!({"error": {"type": "refusal", "message": "fixture refusal"}}),
+        DecisionsRejection::Refusal,
+    );
+    cases.push((b"{not-json".to_vec(), DecisionsRejection::InvalidJson));
+
+    cases.push((
+        format!(
+            r#"{{"model":"{DECISIONS_REQUEST_MODEL}","answers":[{{"type":"choice","type":"refusal","name":"{question_id}","choice":"met","confidence":0.9,"probabilities":[{{"value":"met","probability":0.96}},{{"value":"unmet","probability":0.03}},{{"value":"insufficient","probability":0.01}}]}}]}}"#
+        )
+        .into_bytes(),
+        DecisionsRejection::SchemaViolation,
+    ));
+    cases.push((
+        format!(
+            r#"{{"model":"{DECISIONS_REQUEST_MODEL}","answers":[{{"type":"choice","name":"{question_id}","choice":"met","confidence":0.9,"probabilities":[{{"value":"met","value":"unmet","probability":0.96}},{{"value":"unmet","probability":0.03}},{{"value":"insufficient","probability":0.01}}]}}]}}"#
+        )
+        .into_bytes(),
+        DecisionsRejection::SchemaViolation,
+    ));
+
+    for (case, _) in &cases {
+        server.push(MockResponse::body(200, case.clone()));
+    }
+    let case_count = cases.len();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    for (_, reason) in cases {
+        let assessment = adapter
+            .assess(
+                &fixture.request,
+                &fixture.entry,
+                &decisions_text_documents(fixture_ids),
+                TransportControl::default(),
+            )
+            .expect("assessment");
+        assert_decisions_rejected(&assessment, reason);
+        assert_eq!(assessment.attempts(), 1);
+    }
+    assert_eq!(server.count(), case_count);
+    assert_eq!(other.count(), 0);
+}
+
+fn valid_with_name(question_id: &str) -> serde_json::Value {
+    let mut answer = decisions_choice_answer("met", 0.96, 0.03, 0.01, 0.9);
+    answer["name"] = json!(question_id);
+    answer
+}
+
+#[test]
+fn decisions_adapter_retains_native_confidence_without_fabricating_rationale() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    let mut answer = decisions_choice_answer("met", 0.97, 0.02, 0.01, 0.73);
+    answer["rationale"] = json!(JEV_REASONING_CANARY);
+    let mut response = decisions_response(DECISIONS_REQUEST_MODEL, &question_id, answer);
+    response["thinking"] = json!(JEV_REASONING_CANARY);
+    server.push(MockResponse::json(200, response));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(assessment.rejection().is_none());
+    match assessment.result().outcome() {
+        AssessmentOutcome::Decision { confidence, .. } => {
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.73);
+            assert_eq!(confidence.scale(), DECISIONS_CONFIDENCE_SCALE);
+            assert!(!confidence.is_probability());
+        }
+        _ => panic!("expected a Decision outcome"),
+    }
+    let result = assessment.result();
+    assert_eq!(result.rationale_origin(), RationaleOrigin::Host);
+    assert!(result.rationale().starts_with("Host note:"));
+    assert!(!result.rationale().contains(JEV_REASONING_CANARY));
+    assert!(
+        !serde_json::to_string(result)
+            .expect("result JSON")
+            .contains(JEV_REASONING_CANARY)
+    );
+    assert!(!format!("{assessment:?}").contains(JEV_REASONING_CANARY));
+
+    let mut answer = decisions_choice_answer("met", 0.2, 0.7, 0.1, 0.66);
+    answer["rationale"] = json!(JEV_REASONING_CANARY);
+    server.push(MockResponse::json(
+        200,
+        decisions_response(DECISIONS_REQUEST_MODEL, &question_id, answer),
+    ));
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_decisions_rejected(&assessment, DecisionsRejection::SelectionNotMaximum);
+    match assessment.result().outcome() {
+        AssessmentOutcome::NormalLlm { confidence, .. } => {
+            let confidence = confidence.as_ref().expect("native confidence");
+            assert_eq!(confidence.value(), 0.66);
+            assert_eq!(confidence.scale(), DECISIONS_CONFIDENCE_SCALE);
+        }
+        _ => panic!("expected the verdict-only rejection shape"),
+    }
+    assert!(!format!("{assessment:?}").contains(JEV_REASONING_CANARY));
+}
+
+#[test]
+fn decisions_adapter_requires_image_capability_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let png = jev_png(280);
+
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = decisions_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = decisions_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+}
+
+#[test]
+fn decisions_adapter_sends_only_approved_image_bytes_as_data_urls() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    let png = jev_png(280);
+    server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&question_id, "met", 0.97, 0.02, 0.01, 0.8),
+    ));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(assessment.rejection().is_none());
+    assert_eq!(
+        assessment.result().evidence(),
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b]
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/decisions");
+    assert_eq!(requests[0].header("typesafe-danger-zone-images"), None);
+    let body = requests[0].json_body();
+    assert_tool_less(&body);
+    let messages = body["input"].as_array().expect("message input");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"].as_str(), Some("user"));
+    let parts = messages[0]["content"].as_array().expect("content parts");
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0]["type"].as_str(), Some("input_text"));
+    assert!(
+        parts[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("image (image/png"))
+    );
+    assert_eq!(parts[1]["type"].as_str(), Some("input_image"));
+    assert_eq!(
+        parts[1]["image_url"].as_str(),
+        Some(format!("data:image/png;base64,{JEV_PNG_280_BASE64}").as_str())
+    );
+    assert_eq!(parts[2]["type"].as_str(), Some("input_text"));
+    assert!(
+        parts[2]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(EVIDENCE_B_MARKER))
+    );
+    let serialized = body.to_string();
+    assert!(!serialized.contains("http://"));
+    assert!(!serialized.contains("https://"));
+    assert!(!serialized.contains("file_id"));
+    assert!(body.get("state").is_none());
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn decisions_adapter_rejects_external_image_urls_and_file_ids_before_sending() {
+    let admin = ConnectionAdmin::new();
+    let settings = decisions_named(&admin, DECISIONS_MODEL, InputCapabilities::text_and_image());
+    let server = MockServer::start();
+
+    for image_reference in [
+        json!("https://example.com/candidate.png"),
+        json!({"file_id": "file-fixture"}),
+    ] {
+        let body = json!({
+            "model": DECISIONS_REQUEST_MODEL,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": image_reference,
+                }],
+            }],
+            "questions": [{
+                "type": "choice",
+                "name": "fixture-question",
+                "instructions": "fixture",
+                "choices": [
+                    {"value": "met", "description": "met"},
+                    {"value": "unmet", "description": "unmet"},
+                    {"value": "insufficient", "description": "insufficient"},
+                ],
+            }],
+        });
+        let error = AssessmentRequest::new(settings.connection_id(), DECISIONS_MODEL, body)
+            .expect_err("an external image reference must be rejected");
+        assert_eq!(error.kind(), AssessmentErrorKind::ExternalImageUrl);
+    }
+    assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn decisions_adapter_refuses_oversized_or_unsupported_evidence_without_truncation() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = decisions_adapter(credentials.clone(), admin.directory(), &server, &other);
+
+    let too_large = vec![0_u8; 16 * 1024 * 1024 + 1];
+    let documents = vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/png", too_large)
+            .expect("oversized image document"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InputTooLarge);
+    assert_eq!(server.count(), 0);
+
+    let documents = decisions_image_documents(fixture_ids, &decisions_png(8_193, 1));
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+
+    let documents = decisions_image_documents(fixture_ids, &decisions_png(8_192, 8_192));
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+
+    let documents = vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/webp", vec![1, 2, 3, 4])
+            .expect("webp image document"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+
+    let overflow_ids: Vec<EvidenceId> = (0..11).map(|_| EvidenceId::new(project)).collect();
+    let overflow_request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &fixture.profile,
+        overflow_ids.clone(),
+    );
+    let documents: Vec<EvidenceDocument> = overflow_ids
+        .iter()
+        .map(|id| EvidenceDocument::text(*id, "x".repeat(100_000)).expect("large text document"))
+        .collect();
+    let error = adapter
+        .assess(
+            &overflow_request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InputTooLarge);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+}
+
+#[test]
+fn decisions_adapter_retries_429_and_5xx_and_honors_retry_after() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = decisions_question_id(&fixture.request);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server
+        .push(MockResponse::json(429, json!({"error": "rate limited"})).header("retry-after", "0"));
+    server.push(
+        MockResponse::json(500, json!({"error": "server failure"})).header("retry-after", "0"),
+    );
+    server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+    ));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("retried assessment");
+    assert_eq!(assessment.attempts(), 3);
+    assert_eq!(server.count(), 3);
+    assert_eq!(other.count(), 0);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    for _ in 0..3 {
+        server.push(MockResponse::status(503));
+    }
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ServerFailure);
+    assert_eq!(error.status(), Some(503));
+    assert_eq!(error.attempts(), 3);
+    assert!(error.is_retry_exhausted());
+    assert_eq!(server.count(), 3);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server.push(
+        MockResponse::json(429, json!({"error": "rate limited"})).header("retry-after", "30"),
+    );
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default().with_remaining(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::RetryAfterBeyondDeadline);
+    assert_eq!(error.attempts(), 1);
+    assert_eq!(server.count(), 1);
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server.push(MockResponse::status(500));
+    server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+    ));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("500 retry");
+    assert_eq!(assessment.attempts(), 2);
+    assert_eq!(server.count(), 2);
+}
+
+#[test]
+fn decisions_adapter_does_not_retry_an_ambiguous_timeout() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    server.push(
+        MockResponse::json(
+            200,
+            decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8),
+        )
+        .delay(Duration::from_secs(2)),
+    );
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let started = Instant::now();
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default().with_remaining(Duration::from_millis(100)),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::SendResultUnknown);
+    assert_eq!(error.attempts(), 1);
+    assert!(!error.is_retryable());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.count(), 1, "an ambiguous timeout was retried");
+}
+
+#[test]
+fn decisions_adapter_keeps_secret_canaries_out_of_errors_and_debug() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    for _ in 0..3 {
+        server.push(MockResponse::body(
+            500,
+            format!("{{\"error\":\"{CANARY}\",\"detail\":\"{CANARY_B}\"}}"),
+        ));
+    }
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let request_debug = format!("{:?}", fixture.request);
+    assert!(!request_debug.contains(CANARY_B));
+    let evidence_debug = format!("{:?}", decisions_text_documents(fixture_ids));
+    assert!(!evidence_debug.contains(EVIDENCE_A_MARKER));
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ServerFailure);
+    for rendered in [format!("{error:?}"), error.to_string()] {
+        assert!(!rendered.contains(CANARY), "secret in error: {rendered}");
+        assert!(!rendered.contains(CANARY_B), "body in error: {rendered}");
+    }
+    assert!(
+        server.requests()[0]
+            .header("authorization")
+            .is_some_and(|value| value.contains(CANARY))
+    );
+
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let question_id = decisions_question_id(&fixture.request);
+    let mut body = decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    body["provider_note"] = json!(CANARY_B);
+    server.push(MockResponse::json(200, body));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert!(!format!("{assessment:?}").contains(CANARY_B));
+    assert!(
+        !serde_json::to_string(assessment.result())
+            .expect("result JSON")
+            .contains(CANARY_B)
+    );
+}
+
+#[test]
+fn decisions_adapter_does_not_reuse_evaluations_across_model_or_profile_versions() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        "gpt-6-luna-latest",
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = decisions_question_id(&fixture.request);
+    let server = MockServer::start();
+    let other = MockServer::start();
+    server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&question_id, "met", 0.97, 0.02, 0.01, 0.8),
+    ));
+    server.push(MockResponse::json(
+        200,
+        decisions_response(
+            "gpt-6-luna-latest",
+            &question_id,
+            decisions_choice_answer("met", 0.97, 0.02, 0.01, 0.8),
+        ),
+    ));
+    server.push(MockResponse::json(
+        200,
+        decisions_response(
+            "gpt-6",
+            &question_id,
+            decisions_choice_answer("met", 0.97, 0.02, 0.01, 0.8),
+        ),
+    ));
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    let result = assessment.result();
+    assert_eq!(result.reported_verdict(), ConditionVerdict::Met);
+    assert_eq!(
+        result
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some(DECISIONS_REQUEST_MODEL)
+    );
+    assert!(result.applies_to(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        fixture.profile.binding(),
+    ));
+    assert!(result.supports_completion(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        fixture.profile.binding(),
+        fixture.profile.thresholds(),
+    ));
+
+    let profile_v2 = decisions_completion_profile_for(
+        project,
+        fixture.entry.profile().connection(),
+        "gpt-6-luna-latest",
+        2,
+    );
+    assert!(!result.applies_to(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        profile_v2.binding(),
+    ));
+    assert!(!result.supports_completion(
+        fixture.request.condition_version(),
+        fixture.request.target_version(),
+        profile_v2.binding(),
+        profile_v2.thresholds(),
+    ));
+
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_decisions_rejected(&assessment, DecisionsRejection::ModelMismatch);
+    assert_eq!(
+        assessment
+            .result()
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some("gpt-6-luna-latest")
+    );
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_decisions_rejected(&assessment, DecisionsRejection::ModelMismatch);
+    assert_eq!(
+        assessment
+            .result()
+            .provenance()
+            .reported_model()
+            .map(|model| model.as_str()),
+        Some("gpt-6")
+    );
+    assert_eq!(server.count(), 3);
+    for request in server.requests() {
+        assert_eq!(
+            request.json_body()["model"].as_str(),
+            Some(DECISIONS_REQUEST_MODEL)
+        );
+    }
+}
+
+#[test]
+fn decisions_adapter_rejects_wrong_provider_or_purpose_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+
+    let admin = ConnectionAdmin::new();
+    let agent_settings = settings(
+        &admin,
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        LLM_MODEL,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let agent_profile =
+        decisions_completion_profile_for(project, agent_settings.connection_id(), LLM_MODEL, 1);
+    let agent_entry = decisions_profile_entry(&agent_settings, agent_profile.clone());
+    let agent_request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &agent_profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    let error = adapter
+        .assess(
+            &agent_request,
+            &agent_entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CapabilityMismatch);
+    assert_eq!(server.count(), 0);
+
+    let admin = ConnectionAdmin::new();
+    let jev_settings = jev_named(&admin, JEV_MODEL, InputCapabilities::text_only());
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let jev_profile =
+        decisions_completion_profile_for(project, jev_settings.connection_id(), JEV_MODEL, 1);
+    let jev_entry = decisions_profile_entry(&jev_settings, jev_profile.clone());
+    let jev_request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &jev_profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    let error = adapter
+        .assess(
+            &jev_request,
+            &jev_entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CapabilityMismatch);
+    assert_eq!(server.count(), 0);
+
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let permission_settings =
+        decisions_named(&admin, DECISIONS_MODEL, InputCapabilities::text_only());
+    let permission_profile = AssessmentProfile::new(
+        fixture_ids.permission_profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Permission,
+        ProviderKind::Decisions,
+        permission_settings.connection_id(),
+        ModelId::new(DECISIONS_MODEL).expect("model"),
+        AdapterVersion::new("fixture-decisions-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-decisions-rubric-1").expect("rubric"),
+        ProfileInputs::text_only(),
+        ProfileThresholds::decisions(),
+    )
+    .expect("permission profile");
+    let permission_entry =
+        decisions_profile_entry(&permission_settings, permission_profile.clone());
+    let permission_request = SupervisionAssessmentRequest::new(
+        fixture_ids.decision,
+        fixture_ids.supervision,
+        fixture_ids.condition_a,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "fixture permission rubric",
+        permission_profile.binding(),
+        AdapterVersion::new("fixture-decisions-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-decisions-rubric-1").expect("rubric"),
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    )
+    .expect("permission request");
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &permission_request,
+            &permission_entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+
+    let stale_entry = ProfileEntry::new(
+        fixture.profile.clone(),
+        permission_settings
+            .capabilities()
+            .expect("second connection capabilities"),
+        ConnectionStatus::Available,
+        false,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &stale_entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+
+    let chatgpt = ConnectionSettings::new_with_capabilities(
+        ConnectionId::new(),
+        Provider::OpenAi,
+        DECISIONS_MODEL,
+        AuthMethod::ChatGptLogin,
+        None,
+        None,
+        ConnectionCapabilityDeclaration::new(
+            EndpointClass::OpenAiDecisions,
+            InputCapabilities::text_only(),
+        ),
+    );
+    assert!(chatgpt.is_err());
+
+    let admin = ConnectionAdmin::new();
+    let chatgpt_agent = settings(
+        &admin,
+        Provider::OpenAi,
+        AuthMethod::ChatGptLogin,
+        "gpt-5",
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+    );
+    let chatgpt_profile =
+        decisions_completion_profile_for(project, chatgpt_agent.connection_id(), "gpt-5", 1);
+    let chatgpt_entry = decisions_profile_entry(&chatgpt_agent, chatgpt_profile.clone());
+    let chatgpt_request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &chatgpt_profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &chatgpt_request,
+            &chatgpt_entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CapabilityMismatch);
+    assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn decisions_adapter_rejects_evidence_scope_mismatches_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = decisions_adapter(credentials.clone(), admin.directory(), &server, &other);
+
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &[
+                EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER)
+                    .expect("evidence a"),
+            ],
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+
+    let extra_id = EvidenceId::from_parts(project, uuid::Uuid::new_v4());
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(extra_id, "extra evidence").expect("extra evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+
+    let other_id = EvidenceId::from_parts(other_project(), uuid::Uuid::new_v4());
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(other_id, "cross-project evidence").expect("cross-project evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::CrossProjectReference);
+
+    let documents = vec![
+        EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER).expect("evidence a"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+        EvidenceDocument::text(fixture_ids.evidence_a, "duplicate evidence")
+            .expect("duplicate evidence"),
+    ];
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::InvalidEvidence);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+}
+
+#[test]
+fn decisions_adapter_parses_usage_without_inventing_zero() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let question_id = decisions_question_id(&fixture.request);
+    let server = MockServer::start();
+    let other = MockServer::start();
+
+    let mut missing = decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    missing.as_object_mut().unwrap().remove("usage");
+    server.push(MockResponse::json(200, missing));
+    let mut malformed = decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    malformed["usage"] = json!({"input_tokens": "120", "output_tokens": 12});
+    server.push(MockResponse::json(200, malformed));
+    let mut zero = decisions_valid_response(&question_id, "met", 0.96, 0.03, 0.01, 0.8);
+    zero["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
+    server.push(MockResponse::json(200, zero));
+
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let missing_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(missing_usage.usage(), None);
+    let malformed_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(malformed_usage.usage(), None);
+    let zero_usage = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_eq!(zero_usage.usage(), Some(DecisionsUsage::new(0, 0)));
+    assert_eq!(server.count(), 3);
+    assert_eq!(other.count(), 0);
+}
+
+#[test]
+fn same_completion_condition_normalizes_across_llm_jev_and_decisions() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let condition_version = ConditionVersion::new(1).expect("version");
+    let target_version = TargetVersion::new(1).expect("version");
+
+    let llm_admin = ConnectionAdmin::new();
+    let llm_settings = settings(
+        &llm_admin,
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        LLM_MODEL,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+    );
+    let llm_profile = llm_completion_profile_for(
+        project,
+        llm_settings.connection_id(),
+        LLM_MODEL,
+        ProfileInputs::text_only(),
+    );
+    let llm_entry = llm_profile_entry(&llm_settings, llm_profile.clone(), false);
+    let llm_request = assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &llm_profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    let llm_server = MockServer::start();
+    let llm_other = MockServer::start();
+    let llm_adapter = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        llm_admin.directory(),
+        &llm_server,
+        &llm_other,
+    );
+
+    let (jev_admin, jev_fixture) = jev_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let jev_server = MockServer::start();
+    let jev_other = MockServer::start();
+    let jev_adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        jev_admin.directory(),
+        &jev_server,
+        &jev_other,
+    );
+
+    let (decisions_admin, decisions_fixture) = decisions_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let decisions_server = MockServer::start();
+    let decisions_other = MockServer::start();
+    let decisions_adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        decisions_admin.directory(),
+        &decisions_server,
+        &decisions_other,
+    );
+
+    let binding = llm_profile.binding();
+    assert_eq!(binding, jev_fixture.profile.binding());
+    assert_eq!(binding, decisions_fixture.profile.binding());
+    assert_eq!(llm_request.condition_id(), fixture_ids.condition_a);
+    assert_eq!(jev_fixture.request.condition_id(), fixture_ids.condition_a);
+    assert_eq!(
+        decisions_fixture.request.condition_id(),
+        fixture_ids.condition_a
+    );
+
+    let llm_met = condition_answer(vec![condition_entry(
+        fixture_ids.condition_a,
+        "met",
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b],
+        "fixture rationale",
+        None,
+    )]);
+    llm_server.push(MockResponse::json(
+        200,
+        responses_envelope(&llm_met.to_string()),
+    ));
+    jev_server.push(MockResponse::json(
+        200,
+        jev_response(
+            &jev_question_id(&jev_fixture.request),
+            "met",
+            0.96,
+            0.03,
+            0.01,
+            0.8,
+        ),
+    ));
+    decisions_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(
+            &decisions_question_id(&decisions_fixture.request),
+            "met",
+            0.96,
+            0.03,
+            0.01,
+            0.8,
+        ),
+    ));
+
+    let llm_met = llm_adapter
+        .assess(
+            &llm_request,
+            &llm_entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("llm assessment")
+        .into_result();
+    let jev_met = jev_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("jev assessment")
+        .into_result();
+    let decisions_met = decisions_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("decisions assessment")
+        .into_result();
+
+    for (result, thresholds) in [
+        (&llm_met, llm_profile.thresholds()),
+        (&jev_met, jev_fixture.profile.thresholds()),
+        (&decisions_met, decisions_fixture.profile.thresholds()),
+    ] {
+        assert_eq!(result.condition_id(), fixture_ids.condition_a);
+        assert_eq!(result.condition_version(), condition_version);
+        assert_eq!(result.target_version(), target_version);
+        assert_eq!(result.profile(), binding);
+        assert_eq!(
+            result.evidence(),
+            &[fixture_ids.evidence_a, fixture_ids.evidence_b]
+        );
+        assert_eq!(result.reported_verdict(), ConditionVerdict::Met);
+        assert_eq!(
+            result.adopted_verdict(thresholds),
+            Some(ConditionVerdict::Met)
+        );
+        assert!(
+            result.supports_completion(condition_version, target_version, binding, thresholds,)
+        );
+    }
+    assert_eq!(
+        llm_met.provenance().provider_kind(),
+        ProviderKind::NormalLlm
+    );
+    assert_eq!(jev_met.provenance().provider_kind(), ProviderKind::Jev);
+    assert_eq!(
+        decisions_met.provenance().provider_kind(),
+        ProviderKind::Decisions
+    );
+    match llm_met.outcome() {
+        AssessmentOutcome::NormalLlm { verdict, .. } => {
+            assert_eq!(*verdict, ConditionVerdict::Met)
+        }
+        _ => panic!("normal LLM must not borrow a Decision outcome"),
+    }
+    match jev_met.outcome() {
+        AssessmentOutcome::Decision { selected, .. } => {
+            assert_eq!(*selected, ConditionVerdict::Met)
+        }
+        _ => panic!("Jev must use its own Decision outcome"),
+    }
+    match decisions_met.outcome() {
+        AssessmentOutcome::Decision { selected, .. } => {
+            assert_eq!(*selected, ConditionVerdict::Met)
+        }
+        _ => panic!("Decisions must use its own Decision outcome"),
+    }
+
+    let llm_insufficient = condition_answer(vec![condition_entry(
+        fixture_ids.condition_a,
+        "insufficient",
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b],
+        "fixture rationale",
+        None,
+    )]);
+    llm_server.push(MockResponse::json(
+        200,
+        responses_envelope(&llm_insufficient.to_string()),
+    ));
+    jev_server.push(MockResponse::json(
+        200,
+        jev_response(
+            &jev_question_id(&jev_fixture.request),
+            "insufficient",
+            0.01,
+            0.01,
+            0.98,
+            0.9,
+        ),
+    ));
+    decisions_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(
+            &decisions_question_id(&decisions_fixture.request),
+            "insufficient",
+            0.01,
+            0.01,
+            0.98,
+            0.9,
+        ),
+    ));
+
+    let llm_insufficient = llm_adapter
+        .assess(
+            &llm_request,
+            &llm_entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("llm assessment")
+        .into_result();
+    let jev_insufficient = jev_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("jev assessment")
+        .into_result();
+    let decisions_insufficient = decisions_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("decisions assessment")
+        .into_result();
+
+    for (result, thresholds) in [
+        (&llm_insufficient, llm_profile.thresholds()),
+        (&jev_insufficient, jev_fixture.profile.thresholds()),
+        (
+            &decisions_insufficient,
+            decisions_fixture.profile.thresholds(),
+        ),
+    ] {
+        assert_eq!(result.condition_id(), fixture_ids.condition_a);
+        assert_eq!(result.profile(), binding);
+        assert_eq!(result.reported_verdict(), ConditionVerdict::Insufficient);
+        assert_eq!(result.adopted_verdict(thresholds), None);
+        assert!(!result.supports_completion(
+            condition_version,
+            target_version,
+            binding,
+            thresholds,
+        ));
+    }
+
+    let llm_body = llm_server
+        .requests()
+        .last()
+        .expect("llm request")
+        .json_body();
+    let jev_body = jev_server
+        .requests()
+        .last()
+        .expect("jev request")
+        .json_body();
+    let decisions_body = decisions_server
+        .requests()
+        .last()
+        .expect("decisions request")
+        .json_body();
+    assert!(llm_body.get("questions").is_none());
+    assert!(jev_body["questions"].is_object());
+    assert!(jev_body.get("input").is_none());
+    assert!(decisions_body["questions"].is_array());
+    assert!(decisions_body["questions"][0].get("choices").is_some());
+    assert!(decisions_body.get("state").is_none());
+    assert!(decisions_body["questions"][0].get("criteria").is_none());
+
+    decisions_server.push(MockResponse::json(
+        200,
+        jev_system_one_response(
+            DECISIONS_REQUEST_MODEL,
+            &decisions_question_id(&decisions_fixture.request),
+            decisions_choice_answer("met", 0.96, 0.03, 0.01, 0.8),
+        ),
+    ));
+    let assessment = decisions_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_decisions_rejected(&assessment, DecisionsRejection::SchemaViolation);
+
+    jev_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(
+            &jev_question_id(&jev_fixture.request),
+            "met",
+            0.96,
+            0.03,
+            0.01,
+            0.8,
+        ),
+    ));
+    let assessment = jev_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("assessment");
+    assert_jev_rejected(&assessment, JevRejection::SchemaViolation);
+    assert_eq!(llm_other.count(), 0);
+    assert_eq!(jev_other.count(), 0);
+    assert_eq!(decisions_other.count(), 0);
 }

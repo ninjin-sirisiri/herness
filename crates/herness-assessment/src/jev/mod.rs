@@ -28,6 +28,7 @@ use herness_supervision::profiles::{
 };
 
 use crate::error::{AssessmentError, AssessmentErrorKind};
+use crate::image::StillImageFormat;
 use crate::llm::{EvidenceContent, EvidenceDocument};
 use crate::transport::{
     AssessmentRequest as TransportRequest, AssessmentTransport, ImageInput, TransportControl,
@@ -525,26 +526,15 @@ fn profile_error(reason: ProfileUnavailable) -> AssessmentError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ImageFormat {
-    Png,
-    Jpeg,
-}
-
 fn validate_image(image: &ImageInput) -> Result<(), AssessmentError> {
-    let format = match image.media_type() {
-        "image/png" => ImageFormat::Png,
-        "image/jpeg" => ImageFormat::Jpeg,
-        _ => return Err(AssessmentError::new(AssessmentErrorKind::InvalidEvidence)),
-    };
+    let format = StillImageFormat::from_media_type(image.media_type())
+        .ok_or_else(|| AssessmentError::new(AssessmentErrorKind::InvalidEvidence))?;
     if image.bytes().len() > MAX_IMAGE_BYTES {
         return Err(AssessmentError::new(AssessmentErrorKind::InputTooLarge));
     }
-    let (width, height) = match format {
-        ImageFormat::Png => png_dimensions(image.bytes()),
-        ImageFormat::Jpeg => jpeg_dimensions(image.bytes()),
-    }
-    .ok_or_else(|| AssessmentError::new(AssessmentErrorKind::InvalidEvidence))?;
+    let (width, height) = format
+        .dimensions(image.bytes())
+        .ok_or_else(|| AssessmentError::new(AssessmentErrorKind::InvalidEvidence))?;
     let pixels = u64::from(width) * u64::from(height);
     if !(MIN_IMAGE_DIMENSION..=MAX_IMAGE_DIMENSION).contains(&width)
         || !(MIN_IMAGE_DIMENSION..=MAX_IMAGE_DIMENSION).contains(&height)
@@ -553,94 +543,6 @@ fn validate_image(image: &ImageInput) -> Result<(), AssessmentError> {
         return Err(AssessmentError::new(AssessmentErrorKind::InvalidEvidence));
     }
     Ok(())
-}
-
-/// Reads PNG dimensions and rejects animated PNGs, truncated files, and files
-/// that do not contain both image data and an end marker.
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    if bytes.get(..8)? != SIGNATURE.as_slice() {
-        return None;
-    }
-    if bytes.get(8..12)? != 13_u32.to_be_bytes().as_slice() {
-        return None;
-    }
-    if bytes.get(12..16)? != b"IHDR".as_slice() {
-        return None;
-    }
-    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
-    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
-
-    let mut offset = 8_usize;
-    let mut saw_image_data = false;
-    let mut saw_end = false;
-    while offset.saturating_add(12) <= bytes.len() {
-        let length = u32::from_be_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?) as usize;
-        let kind = bytes.get(offset + 4..offset + 8)?;
-        if kind == b"acTL".as_slice() {
-            // Animated PNGs are not still images.
-            return None;
-        }
-        if kind == b"IDAT".as_slice() {
-            saw_image_data = true;
-        }
-        if kind == b"IEND".as_slice() {
-            saw_end = true;
-            break;
-        }
-        offset = offset.checked_add(12)?.checked_add(length)?;
-        if offset > bytes.len() {
-            return None;
-        }
-    }
-    if !saw_image_data || !saw_end {
-        return None;
-    }
-    Some((width, height))
-}
-
-/// Reads JPEG dimensions from the first start-of-frame marker.
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    let mut offset = 2_usize;
-    while offset.saturating_add(4) <= bytes.len() {
-        if bytes[offset] != 0xFF {
-            return None;
-        }
-        let mut marker = bytes[offset + 1];
-        offset += 2;
-        while marker == 0xFF {
-            marker = *bytes.get(offset)?;
-            offset += 1;
-        }
-        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
-            continue;
-        }
-        if marker == 0xDA {
-            break;
-        }
-        let length = u16::from_be_bytes([*bytes.get(offset)?, *bytes.get(offset + 1)?]) as usize;
-        if length < 2 || offset.saturating_add(length) > bytes.len() {
-            return None;
-        }
-        if matches!(
-            marker,
-            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
-        ) {
-            if length < 7 {
-                return None;
-            }
-            let height =
-                u16::from_be_bytes([*bytes.get(offset + 3)?, *bytes.get(offset + 4)?]) as u32;
-            let width =
-                u16::from_be_bytes([*bytes.get(offset + 5)?, *bytes.get(offset + 6)?]) as u32;
-            return Some((width, height));
-        }
-        offset = offset.saturating_add(length);
-    }
-    None
 }
 
 #[cfg(test)]

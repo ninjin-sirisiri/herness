@@ -483,6 +483,121 @@ pub fn jev_system_one_response(
     })
 }
 
+/// Decisions completion profile at `version` with the fixture adapter/rubric.
+pub fn decisions_completion_profile_for(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+) -> AssessmentProfile {
+    decisions_completion_profile_with_inputs(
+        project,
+        connection,
+        model,
+        version,
+        ProfileInputs::text_only(),
+    )
+}
+
+/// Decisions completion profile with explicit required inputs.
+pub fn decisions_completion_profile_with_inputs(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(version).expect("version"),
+        ProfilePurpose::Completion,
+        ProviderKind::Decisions,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-decisions-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-decisions-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::decisions(),
+    )
+    .expect("decisions completion profile")
+}
+
+/// Profile entry for a Decisions profile and its registered connection.
+pub fn decisions_profile_entry(
+    settings: &ConnectionSettings,
+    profile: AssessmentProfile,
+) -> ProfileEntry {
+    ProfileEntry::new(
+        profile,
+        settings.capabilities().expect("connection capabilities"),
+        ConnectionStatus::Available,
+        false,
+    )
+}
+
+/// A per-condition Decisions assessment request.
+pub fn decisions_assessment_request(
+    project: ProjectId,
+    condition: ConditionId,
+    profile: &AssessmentProfile,
+    evidence_ids: Vec<EvidenceId>,
+) -> AssessmentRequest {
+    let ids = ids(project);
+    AssessmentRequest::new(
+        ids.decision,
+        ids.supervision,
+        condition,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "The fixture condition is met when the recorded check passes.",
+        profile.binding(),
+        AdapterVersion::new("fixture-decisions-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-decisions-rubric-1").expect("rubric"),
+        evidence_ids,
+    )
+    .expect("decisions assessment request")
+}
+
+/// Synthetic Decisions choice answer with ordered probabilities.
+pub fn decisions_choice_answer(
+    choice: &str,
+    met: f64,
+    unmet: f64,
+    insufficient: f64,
+    confidence: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "choice",
+        "choice": choice,
+        "confidence": confidence,
+        "probabilities": [
+            {"value": "met", "probability": met},
+            {"value": "unmet", "probability": unmet},
+            {"value": "insufficient", "probability": insufficient},
+        ],
+    })
+}
+
+/// Synthetic Decisions response with one named answer and usage details.
+pub fn decisions_response(
+    model: &str,
+    question_id: &str,
+    answer: serde_json::Value,
+) -> serde_json::Value {
+    let mut answer = answer;
+    answer["name"] = serde_json::json!(question_id);
+    serde_json::json!({
+        "model": model,
+        "answers": [answer],
+        "usage": {
+            "input_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30},
+            "output_tokens": 12,
+        },
+    })
+}
+
 /// Completion profile entry whose profile and connection match.
 pub fn completion_entry(
     project: ProjectId,
