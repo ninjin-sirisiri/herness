@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use herness_core::{
-    AbsolutePath, AuthMethod, BashExecutor, ConnectionDirectory, ConnectionId, CoreError,
-    CredentialPort, EngineEvent, EngineInput, EnginePort, EngineStart, EvaluationContext,
-    FileFailure, FileLockRegistry, FileToolOutput, FrozenOperation, GrantScope, NativeFileTools,
-    OperationId, PermissionOutcome, PermissionPolicy, ProcessSupervisor, ProjectRoot, Provider,
-    ProviderFailureKind, RunId, RunState, ShellFailure, StopReason, StopReport, StorePort,
-    SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
+    AbsolutePath, AuthMethod, BashExecutor, ConnectionDirectory, ConnectionId, ConversationFailure,
+    CoreError, CredentialPort, EngineEvent, EngineInput, EnginePort, EngineStart,
+    EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput, FrozenOperation, GrantScope,
+    NativeFileTools, OperationId, PermissionOutcome, PermissionPolicy, ProcessSupervisor,
+    ProjectRoot, Provider, ProviderFailureKind, RunId, RunState, ShellFailure, StopReason,
+    StopReport, StorePort, SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
 };
 use pi_embedded::SessionStatus;
 use pi_embedded::{
@@ -33,15 +33,25 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{
-    checkpoint_unavailable, engine_invalid_response, engine_unavailable, provider_failure,
-    sanitized_detail,
+    engine_invalid_response, engine_unavailable, provider_failure, sanitized_detail,
 };
 use crate::events::{EventQueue, EventTranslator};
 use crate::session_store::{
-    ENGINE_TOOL_AWAITING_EVENT_KIND, ENGINE_TOOL_DENIED_EVENT_KIND, EngineSessionStore,
-    EngineStore, RunAuditMetadata,
+    ENGINE_TOOL_AWAITING_EVENT_KIND, ENGINE_TOOL_DENIED_EVENT_KIND, EngineCheckpoint,
+    EngineSessionStore, EngineStore, RunAuditMetadata,
 };
 use crate::stream::{ChatGptCatalog, ChatGptModel, ProviderEndpoints, StreamBridge, model_for};
+
+/// How a run's SDK session is opened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreKind {
+    /// A new empty session with the system prompt.
+    Create,
+    /// Reopen this run's durable checkpoint.
+    Resume,
+    /// Copy a stable previous conversation into a new run.
+    Continuation,
+}
 
 /// Adapter configuration owned by the trusted host composition.
 #[derive(Debug, Clone)]
@@ -175,7 +185,8 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
     fn build_run(
         &self,
         start: EngineStart,
-        restore: Option<crate::session_store::EngineCheckpoint>,
+        restore: Option<EngineCheckpoint>,
+        kind: RestoreKind,
     ) -> Result<Arc<RunContext<S>>, CoreError> {
         let settings = self
             .directory
@@ -207,8 +218,17 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             cwd: start.cwd().clone(),
             instructions: start.instructions().to_owned(),
         };
-        let store = EngineStore::new(Arc::clone(&self.store), audit.clone());
-        if let Some(restore) = &restore {
+        let store = match (&restore, kind) {
+            (Some(restore), RestoreKind::Continuation) => EngineStore::seeded(
+                Arc::clone(&self.store),
+                audit.clone(),
+                restore.snapshot.clone(),
+            ),
+            _ => EngineStore::new(Arc::clone(&self.store), audit.clone()),
+        };
+        if let Some(restore) = &restore
+            && kind != RestoreKind::Continuation
+        {
             store.set_snapshot(restore.snapshot.clone());
         }
         let queue = EventQueue::new();
@@ -307,6 +327,181 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
     }
 }
 
+impl<S: StorePort + Send + 'static> PiEngine<S> {
+    fn latest_checkpoint(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<herness_core::Checkpoint>, CoreError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.load_checkpoint(run)
+    }
+
+    /// Validates a continuation without starting anything. The returned
+    /// checkpoint is the previous conversation copied into the new run.
+    fn validate_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &herness_core::Checkpoint,
+    ) -> Result<EngineCheckpoint, CoreError> {
+        let previous_run = previous.run_id();
+        if previous_run == start.run_id() {
+            return Err(CoreError::InvalidValue {
+                field: "runId".to_owned(),
+                violation: herness_core::ArgumentViolation::Invalid {
+                    detail: "a continuation run must have a new run identifier".to_owned(),
+                },
+            });
+        }
+        let Some(stored) = self.latest_checkpoint(&previous_run)? else {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::MissingCheckpoint,
+            ));
+        };
+        if stored.format_version() != previous.format_version()
+            || stored.payload().as_bytes() != previous.payload().as_bytes()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::CheckpointNotLatest,
+            ));
+        }
+        let parsed = crate::session_store::parse_checkpoint(previous, previous_run)
+            .map_err(|_| not_continuable(previous_run, ConversationFailure::CorruptCheckpoint))?;
+        if parsed.meta.project_id != start.project_id()
+            || parsed.meta.agent_id != start.agent_id()
+            || parsed.meta.session_id != start.session_id()
+            || parsed.meta.connection != start.connection()
+            || parsed.meta.cwd != *start.cwd()
+            || parsed.meta.instructions != start.instructions()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::ScopeMismatch,
+            ));
+        }
+        if let Some(context) = self.runs.get(&previous_run) {
+            let live = context.session.snapshot();
+            if live.status != SessionStatus::Idle || live.needs_response || live.partial.is_some() {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::PreviousRunNotStable,
+                ));
+            }
+            if !context.tools.supervisor.active_groups().is_empty() {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::ManagedProcess,
+                ));
+            }
+            if live
+                .invocations
+                .iter()
+                .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+            {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::PendingInvocation,
+                ));
+            }
+        }
+        let snapshot = &parsed.snapshot;
+        if snapshot.status != SessionStatus::Idle
+            || snapshot.needs_response
+            || snapshot.partial.is_some()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::PreviousRunNotStable,
+            ));
+        }
+        if snapshot
+            .invocations
+            .iter()
+            .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::PendingInvocation,
+            ));
+        }
+        Ok(parsed)
+    }
+
+    /// Validates a resume without opening a session or sending anything.
+    fn validate_resume(
+        &self,
+        run: &RunId,
+        checkpoint: &herness_core::Checkpoint,
+    ) -> Result<EngineCheckpoint, CoreError> {
+        if checkpoint.run_id() != *run {
+            return Err(CoreError::MismatchedRun {
+                expected: *run,
+                found: checkpoint.run_id(),
+            });
+        }
+        let parsed = crate::session_store::parse_checkpoint(checkpoint, *run)?;
+        let Some(stored) = self.latest_checkpoint(run)? else {
+            return Err(not_resumable(run, ConversationFailure::MissingCheckpoint));
+        };
+        if stored.format_version() != checkpoint.format_version()
+            || stored.payload().as_bytes() != checkpoint.payload().as_bytes()
+        {
+            return Err(not_resumable(run, ConversationFailure::CheckpointNotLatest));
+        }
+        if let Some(context) = self.runs.get(run) {
+            let snapshot = context.session.snapshot();
+            if matches!(
+                snapshot.status,
+                SessionStatus::Running | SessionStatus::AwaitingApproval
+            ) {
+                return Err(not_resumable(run, ConversationFailure::StopUnconfirmed));
+            }
+            if !context.tools.supervisor.active_groups().is_empty() {
+                return Err(not_resumable(run, ConversationFailure::ManagedProcess));
+            }
+            ensure_resumable_snapshot(*run, &snapshot)?;
+        } else {
+            ensure_resumable_snapshot(*run, &parsed.snapshot)?;
+        }
+        Ok(parsed)
+    }
+}
+
+fn ensure_resumable_snapshot(
+    run: RunId,
+    snapshot: &pi_embedded::SessionSnapshot,
+) -> Result<(), CoreError> {
+    if snapshot.status == SessionStatus::Disposed {
+        return Err(not_resumable(
+            &run,
+            ConversationFailure::PreviousRunNotStable,
+        ));
+    }
+    if snapshot
+        .invocations
+        .iter()
+        .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+    {
+        return Err(not_resumable(&run, ConversationFailure::PendingInvocation));
+    }
+    Ok(())
+}
+
+fn not_continuable(previous_run: RunId, reason: ConversationFailure) -> CoreError {
+    CoreError::NotContinuable {
+        previous_run,
+        reason,
+    }
+}
+
+fn not_resumable(run: &RunId, reason: ConversationFailure) -> CoreError {
+    CoreError::NotResumable { run: *run, reason }
+}
+
 impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
     fn tool_execution_authority(&self) -> herness_core::ToolExecutionAuthority {
         herness_core::ToolExecutionAuthority::Adapter
@@ -317,12 +512,35 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         if self.runs.contains_key(&run_id) {
             return Err(engine_invalid_response());
         }
-        let context = self.build_run(start, None)?;
+        let context = self.build_run(start, None, RestoreKind::Create)?;
         self.runs.insert(run_id, context.clone());
         context
             .queue
             .push(EngineEvent::StateChanged(RunState::Idle));
         Ok(())
+    }
+
+    fn start_continuation(
+        &mut self,
+        start: EngineStart,
+        previous: herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        let parsed = self.validate_continuation(&start, &previous)?;
+        let run_id = start.run_id();
+        if self.runs.contains_key(&run_id) {
+            return Err(engine_invalid_response());
+        }
+        let context = self.build_run(start, Some(parsed), RestoreKind::Continuation)?;
+        self.runs.insert(run_id, context);
+        Ok(())
+    }
+
+    fn check_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        self.validate_continuation(start, previous).map(|_| ())
     }
 
     fn send_input(&mut self, run: &RunId, input: EngineInput) -> Result<(), CoreError> {
@@ -394,37 +612,25 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         Ok(report)
     }
 
+    fn check_resume(
+        &self,
+        run: &RunId,
+        checkpoint: &herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        self.validate_resume(run, checkpoint).map(|_| ())
+    }
+
     fn resume(
         &mut self,
         run: &RunId,
         checkpoint: herness_core::Checkpoint,
     ) -> Result<(), CoreError> {
+        let parsed = self.validate_resume(run, &checkpoint)?;
         if self.runs.contains_key(run) {
-            return Err(engine_unavailable());
-        }
-        if checkpoint.run_id() != *run {
-            return Err(CoreError::MismatchedRun {
-                expected: *run,
-                found: checkpoint.run_id(),
-            });
-        }
-        let parsed = crate::session_store::parse_checkpoint(&checkpoint, *run)?;
-        let stored = {
-            let store = self
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            store.load_checkpoint(run)?
-        };
-        let Some(stored) = stored else {
-            return Err(checkpoint_unavailable());
-        };
-        if stored.format_version() != checkpoint.format_version()
-            || stored.payload().as_bytes() != checkpoint.payload().as_bytes()
-        {
-            // The supplied checkpoint is not the durable latest state. Never
-            // restore an older snapshot or discard the newer one.
-            return Err(checkpoint_unavailable());
+            // The live session was confirmed stopped and has no unfinished
+            // invocation. Reuse it without restoring a second session, sending
+            // input, or executing a tool.
+            return Ok(());
         }
         let meta = parsed.meta.clone();
         let start = EngineStart::new(
@@ -436,7 +642,7 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             meta.cwd.clone(),
             meta.instructions.clone(),
         )?;
-        let context = self.build_run(start, Some(parsed))?;
+        let context = self.build_run(start, Some(parsed), RestoreKind::Resume)?;
         self.runs.insert(*run, context);
         Ok(())
     }

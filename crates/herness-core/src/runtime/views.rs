@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::connection::{ConnectionId, ConnectionInfo};
 use crate::contracts::events::Event;
-use crate::contracts::ids::{AgentId, IdKind, OperationId, ProjectId, RunId, SessionId};
+use crate::contracts::ids::{AgentId, IdKind, InputId, OperationId, ProjectId, RunId, SessionId};
 use crate::contracts::operation::{FrozenOperation, OperationOutcome};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
@@ -532,6 +532,53 @@ impl StopOutcome {
     /// Whether a checkpoint was persisted with the stop.
     pub const fn checkpoint_saved(&self) -> bool {
         self.checkpoint_saved
+    }
+}
+
+/// Whether a run's engine state belongs to this process or was restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMode {
+    /// The run was started or resumed in this process, so the live engine
+    /// session may be reused after a confirmed stop.
+    SameProcess,
+    /// The run was restored from durable state in this process. Its engine
+    /// session must be rebuilt from the checkpoint.
+    Restored,
+}
+
+impl RecoveryMode {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SameProcess => "same_process",
+            Self::Restored => "restored",
+        }
+    }
+}
+
+/// Result of starting a new run that continues a previous conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuationOutcome {
+    run: RunView,
+    input_id: InputId,
+}
+
+impl ContinuationOutcome {
+    /// Creates a continuation outcome.
+    pub(crate) const fn new(run: RunView, input_id: InputId) -> Self {
+        Self { run, input_id }
+    }
+
+    /// New run that carries the conversation.
+    pub const fn run(&self) -> &RunView {
+        &self.run
+    }
+
+    /// Accepted input submitted to the new run.
+    pub const fn input_id(&self) -> InputId {
+        self.input_id
     }
 }
 

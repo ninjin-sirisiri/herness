@@ -21,7 +21,7 @@
 //! * restore never starts engines, sends model requests, executes tools, or
 //!   reuses prior approvals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -29,10 +29,13 @@ use serde_json::json;
 
 use crate::connections::{ConnectionDirectory, ConnectionSettings};
 use crate::contracts::connection::{ConnectionId, ConnectionInfo, ConnectionStatus};
-use crate::contracts::errors::{ArgumentViolation, CoreError};
+use crate::contracts::errors::{
+    ArgumentViolation, ConversationFailure, CoreError, EngineFailureKind,
+};
 use crate::contracts::events::{Event, EventDraft, EventKind, EventPayload};
 use crate::contracts::history::HistoryLimit;
-use crate::contracts::ids::{AgentId, IdKind, ProjectId, RunId, SessionId};
+use crate::contracts::ids::{AgentId, IdKind, InputId, ProjectId, RunId, SessionId};
+use crate::contracts::input::{ContinuationRequest, InputPhase, InputProgress};
 use crate::contracts::operation::FrozenOperation;
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
@@ -42,15 +45,17 @@ use crate::permissions::{
     PermissionRule, PolicyAdmin,
 };
 use crate::ports::engine::{EngineEvent, EngineInput, EnginePort, EngineStart, StopReport};
-use crate::ports::{PermissionEvaluatorPort, RuntimeStore};
+use crate::ports::{ContinuationPort, PermissionEvaluatorPort, RuntimeStore};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 use crate::runtime::state::{
-    AgentRecord, HOST_STATE_KEY, HostState, ProjectRecord, RunRecord, ShutdownRecord, StoredGrant,
+    AgentRecord, HOST_STATE_KEY, HostState, InputRecord, ProjectRecord, RunRecord, ShutdownRecord,
+    StoredGrant,
 };
 use crate::runtime::tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 use crate::runtime::views::{
-    AgentView, DenialOutcome, PendingApproval, ProjectView, RunView, RuntimeSnapshot, StopOutcome,
+    AgentView, ContinuationOutcome, DenialOutcome, PendingApproval, ProjectView, RecoveryMode,
+    RunView, RuntimeSnapshot, StopOutcome,
 };
 use crate::skills::{
     CapabilityStatus, HostCapabilities, HostCapability, ToolchainConfig, ToolchainDetector,
@@ -192,6 +197,10 @@ where
     /// in-process only; it never contains credentials or model output and is
     /// discarded by explicit shutdown and restart reconciliation.
     deferred_continuations: BTreeMap<RunId, Vec<String>>,
+    /// Runs whose engine session was created in this process. A run restored
+    /// from host state is absent, which is how recovery distinguishes the
+    /// same-process stop/resume path from a checkpoint rebuild.
+    process_runs: BTreeSet<RunId>,
 }
 
 impl<S, E, T> Runtime<S, E, T>
@@ -244,6 +253,7 @@ where
             state,
             shutting_down: false,
             deferred_continuations: BTreeMap::new(),
+            process_runs: BTreeSet::new(),
         };
         let report = runtime.reconcile()?;
         Ok((runtime, report))
@@ -942,6 +952,8 @@ where
             policy_version: policy.version(),
             created_at: now,
             updated_at: now,
+            inputs: Vec::new(),
+            continuation_of: None,
         };
         let event = event_draft(
             project,
@@ -990,6 +1002,7 @@ where
             return Err(RuntimeError::Engine { error });
         }
 
+        self.process_runs.insert(run_id);
         Ok(run_view(project, run_id, &record))
     }
 
@@ -1002,7 +1015,7 @@ where
     /// Sends one explicit host-approved text turn to a running engine.
     ///
     /// This is the human "start" input for a run. It validates the run state,
-    /// records that an input was submitted without copying the text into the
+    /// records that an input was accepted without copying the text into the
     /// audit payload (the engine checkpoint holds the conversation), and then
     /// hands the text to the engine. A failed submission moves the run to
     /// `interrupted`; it is never retried automatically.
@@ -1012,6 +1025,22 @@ where
         run: RunId,
         text: impl Into<String>,
     ) -> Result<(), RuntimeError> {
+        self.submit_input_with_id(project, run, text).map(|_| ())
+    }
+
+    /// Submits input and returns the identifier that correlates acceptance,
+    /// engine start, and completion.
+    ///
+    /// Acceptance is durable before the engine receives the text. The input is
+    /// only completed by a later engine `idle` when the engine previously
+    /// reported `running` for this accepted input; a startup idle leaves it
+    /// incomplete.
+    pub fn submit_input_with_id(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        text: impl Into<String>,
+    ) -> Result<InputId, RuntimeError> {
         let text = text.into();
         if text.trim().is_empty() {
             return Err(RuntimeError::InvalidValue {
@@ -1027,6 +1056,25 @@ where
                 to: RunState::Running,
             });
         }
+        let input_id = InputId::new(project);
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        let stored = next
+            .projects_mut()
+            .get_mut(&project)
+            .ok_or(RuntimeError::UnknownProject { project })?
+            .runs
+            .get_mut(&run)
+            .ok_or(RuntimeError::UnknownRun { run })?;
+        stored.inputs.push(InputRecord {
+            input_id,
+            phase: InputPhase::Accepted,
+            accepted_at: now,
+            dispatched_at: Some(now),
+            started_at: None,
+            finished_at: None,
+        });
+        stored.updated_at = now;
         let event = event_draft(
             project,
             record.agent_id,
@@ -1034,19 +1082,521 @@ where
             run,
             None,
             "run.input_submitted",
-            json!({ "source": "human", "unicodeScalars": text.chars().count() }),
+            json!({
+                "inputId": input_id.to_string(),
+                "phase": InputPhase::Accepted,
+                "source": "human",
+                "unicodeScalars": text.chars().count(),
+            }),
         )?;
-        self.commit_state(self.state.clone(), vec![event])?;
+        self.commit_state(next, vec![event])?;
         if let Err(error) = self.engine.send_input(&run, EngineInput::Text(text)) {
-            self.mark_interrupted(
+            self.fail_input(
                 project,
                 run,
                 &record,
-                "input_failed",
+                input_id,
+                "input_send_failed",
                 json!({ "failure": error }),
             )?;
             return Err(RuntimeError::Engine { error });
         }
+        Ok(input_id)
+    }
+
+    /// Starts a new run that continues a stable previous conversation.
+    ///
+    /// The previous run must be `idle` with no unresolved operation, pending
+    /// approval, or managed process. A new run identifier and input identifier
+    /// are created, acceptance and the run record are durable before the engine
+    /// is called, and the submitted text is sent to the new run. The previous
+    /// input text is never resent.
+    pub fn continue_run(
+        &mut self,
+        project: ProjectId,
+        previous_run: RunId,
+        text: impl Into<String>,
+    ) -> Result<ContinuationOutcome, RuntimeError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::InvalidValue {
+                field: "input".to_owned(),
+                violation: ArgumentViolation::Empty,
+            });
+        }
+        let previous = self.run_record(project, previous_run)?.clone();
+        let policy = self.policy.policy().clone();
+        let input_id = InputId::new(project);
+        let run_id = RunId::new(project);
+        let request = ContinuationRequest::new(
+            project,
+            input_id,
+            previous_run,
+            run_id,
+            previous.agent_id,
+            previous.session_id,
+            policy.mode(),
+            policy.version(),
+        )
+        .map_err(RuntimeError::invalid_value)?;
+        self.start_continuation_run(&request)?;
+        self.send_accepted_input(project, run_id, input_id, text)?;
+        let view = self.run(project, run_id)?;
+        Ok(ContinuationOutcome::new(view, input_id))
+    }
+
+    /// Sends text for an input that is already durably accepted.
+    ///
+    /// This is the delivery half of [`ContinuationPort::continue_run`]. It
+    /// refuses an unknown, consumed, or cross-project input identifier.
+    pub fn send_accepted_input(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        input_id: InputId,
+        text: impl Into<String>,
+    ) -> Result<(), RuntimeError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::InvalidValue {
+                field: "input".to_owned(),
+                violation: ArgumentViolation::Empty,
+            });
+        }
+        if input_id.project_id() != project {
+            return Err(RuntimeError::CrossProject {
+                id_kind: IdKind::Input,
+                expected: project,
+                found: input_id.project_id(),
+            });
+        }
+        self.ensure_accepting()?;
+        let record = self.run_record(project, run)?.clone();
+        let input = record
+            .inputs
+            .iter()
+            .find(|input| input.input_id == input_id)
+            .ok_or_else(|| RuntimeError::InvalidValue {
+                field: "inputId".to_owned(),
+                violation: ArgumentViolation::Invalid {
+                    detail: "input is not recorded for this run".to_owned(),
+                },
+            })?;
+        if input.phase != InputPhase::Accepted {
+            return Err(RuntimeError::InvalidValue {
+                field: "inputId".to_owned(),
+                violation: ArgumentViolation::Invalid {
+                    detail: "input is not in the accepted phase".to_owned(),
+                },
+            });
+        }
+        if input.dispatched_at.is_some() {
+            return Err(RuntimeError::InvalidValue {
+                field: "inputId".to_owned(),
+                violation: ArgumentViolation::Invalid {
+                    detail: "input was already dispatched and is not sent twice".to_owned(),
+                },
+            });
+        }
+        if !matches!(record.state, RunState::Running | RunState::Idle) {
+            return Err(RuntimeError::InvalidRunTransition {
+                from: record.state,
+                to: RunState::Running,
+            });
+        }
+        // Record the dispatch intent before the engine call. A crash or send
+        // failure leaves the input incomplete and must not cause a retry.
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        if let Some(input) = next
+            .projects_mut()
+            .get_mut(&project)
+            .and_then(|project| project.runs.get_mut(&run))
+            .and_then(|run| {
+                run.inputs
+                    .iter_mut()
+                    .find(|input| input.input_id == input_id)
+            })
+        {
+            input.dispatched_at = Some(now);
+        }
+        self.commit_state(next, Vec::new())?;
+        if let Err(error) = self.engine.send_input(&run, EngineInput::Text(text)) {
+            self.fail_input(
+                project,
+                run,
+                &record,
+                input_id,
+                "input_send_failed",
+                json!({ "failure": error }),
+            )?;
+            return Err(RuntimeError::Engine { error });
+        }
+        Ok(())
+    }
+
+    /// Returns the latest acceptance/start/completion progress for an input.
+    pub fn input_progress(&self, input: InputId) -> Result<Option<InputProgress>, RuntimeError> {
+        let project = input.project_id();
+        let Some(project_record) = self.state.projects().get(&project) else {
+            return Ok(None);
+        };
+        Ok(project_record
+            .runs
+            .values()
+            .find_map(|run| run.input_progress(input)))
+    }
+
+    /// Whether a run's engine session belongs to this process or was restored.
+    pub fn recovery_mode(&self, run: RunId) -> Result<RecoveryMode, RuntimeError> {
+        self.run_record(run.project_id(), run)?;
+        Ok(if self.process_runs.contains(&run) {
+            RecoveryMode::SameProcess
+        } else {
+            RecoveryMode::Restored
+        })
+    }
+
+    /// Validates and starts the new run of a continuation without sending the
+    /// submitted text. The caller delivers the text with
+    /// [`Self::send_accepted_input`].
+    fn start_continuation_run(
+        &mut self,
+        request: &ContinuationRequest,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_accepting()?;
+        let project = request.project_id();
+        let previous_run = request.previous_run_id();
+        // A repeated request with the same new-run and input identifiers is
+        // one continuation, not a second run. A different run that happens to
+        // reuse the identifier is refused instead of overwritten.
+        if let Some(existing) = self
+            .state
+            .projects()
+            .get(&project)
+            .and_then(|project| project.runs.get(&request.run_id()))
+        {
+            if existing.continuation_of == Some(previous_run)
+                && existing
+                    .inputs
+                    .iter()
+                    .any(|input| input.input_id == request.input_id())
+            {
+                return Ok(());
+            }
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::ScopeMismatch,
+            });
+        }
+        if self.input_progress(request.input_id())?.is_some() {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::InputUnavailable,
+            });
+        }
+        let previous = self.run_record(project, previous_run)?.clone();
+        if previous.state != RunState::Idle {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::PreviousRunNotStable,
+            });
+        }
+        if previous
+            .inputs
+            .last()
+            .is_some_and(|input| matches!(input.phase, InputPhase::Accepted | InputPhase::Started))
+        {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::PendingInput,
+            });
+        }
+        if previous.agent_id != request.agent_id() || previous.session_id != request.session_id() {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::ScopeMismatch,
+            });
+        }
+        let project_record = self.project_record(project)?.clone();
+        let agent_record = project_record
+            .agents
+            .get(&request.agent_id())
+            .cloned()
+            .ok_or(RuntimeError::UnknownAgent {
+                agent: request.agent_id(),
+            })?;
+        let status = self.connection_status(previous.connection)?;
+        if status != ConnectionStatus::Available {
+            return Err(RuntimeError::ConnectionUnavailable {
+                connection: previous.connection,
+                status,
+            });
+        }
+        let policy = self.policy.policy().clone();
+        if request.permission_mode() != policy.mode()
+            || request.policy_version() != policy.version()
+        {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::ScopeMismatch,
+            });
+        }
+        self.ensure_mode_usable(&policy)?;
+        self.ensure_capabilities(&agent_record)?;
+        let grant = match &agent_record.grant {
+            Some(stored) => {
+                let grant = stored.to_scope(project)?;
+                if grant.policy_version() != policy.version() {
+                    return Err(RuntimeError::PermissionContextStale {
+                        detail: format!(
+                            "agent grant is at policy version {}, current version is {}",
+                            grant.policy_version(),
+                            policy.version()
+                        ),
+                    });
+                }
+                if grant.mode() != policy.mode() {
+                    return Err(RuntimeError::PermissionContextStale {
+                        detail: "agent grant mode differs from the current policy".to_owned(),
+                    });
+                }
+                grant
+            }
+            None => GrantScope::for_run(project, &policy),
+        };
+        if project_record
+            .approvals
+            .values()
+            .any(|approval| approval.run_id == previous_run)
+        {
+            return Err(RuntimeError::NotContinuable {
+                previous_run,
+                reason: ConversationFailure::PendingApproval,
+            });
+        }
+        {
+            let store = lock_store(&self.store)?;
+            let unresolved = store
+                .unresolved_operations(&project)
+                .map_err(RuntimeError::store)?;
+            if unresolved
+                .iter()
+                .any(|record| record.intent().operation().run_id() == previous_run)
+            {
+                return Err(RuntimeError::NotContinuable {
+                    previous_run,
+                    reason: ConversationFailure::UnresolvedOperation,
+                });
+            }
+        }
+        let checkpoint = {
+            let store = lock_store(&self.store)?;
+            store
+                .load_checkpoint(&previous_run)
+                .map_err(RuntimeError::store)?
+                .ok_or(RuntimeError::NotContinuable {
+                    previous_run,
+                    reason: ConversationFailure::MissingCheckpoint,
+                })?
+        };
+        let start = EngineStart::new(
+            project,
+            request.agent_id(),
+            request.session_id(),
+            request.run_id(),
+            previous.connection,
+            project_record.path.clone(),
+            previous.instructions.clone(),
+        )
+        .map_err(RuntimeError::engine)?;
+        self.engine
+            .check_continuation(&start, &checkpoint)
+            .map_err(|error| continuation_error(previous_run, error))?;
+
+        let now = Timestamp::now();
+        let record = RunRecord {
+            agent_id: request.agent_id(),
+            session_id: request.session_id(),
+            connection: previous.connection,
+            state: RunState::Running,
+            instructions: previous.instructions.clone(),
+            grant: StoredGrant::from_scope(&grant),
+            mode: policy.mode(),
+            policy_version: policy.version(),
+            created_at: now,
+            updated_at: now,
+            inputs: vec![InputRecord {
+                input_id: request.input_id(),
+                phase: InputPhase::Accepted,
+                accepted_at: now,
+                dispatched_at: None,
+                started_at: None,
+                finished_at: None,
+            }],
+            continuation_of: Some(previous_run),
+        };
+        let started = event_draft(
+            project,
+            request.agent_id(),
+            request.session_id(),
+            request.run_id(),
+            None,
+            "run.started",
+            json!({
+                "state": record.state.as_str(),
+                "connection": record.connection.to_string(),
+                "mode": record.mode.to_string(),
+                "policyVersion": record.policy_version.get(),
+                "continuationOf": previous_run.to_string(),
+            }),
+        )?;
+        let accepted = event_draft(
+            project,
+            request.agent_id(),
+            request.session_id(),
+            request.run_id(),
+            None,
+            "run.input_submitted",
+            json!({
+                "inputId": request.input_id().to_string(),
+                "phase": InputPhase::Accepted,
+                "source": "continuation",
+            }),
+        )?;
+        let mut next = self.state.clone();
+        next.projects_mut()
+            .get_mut(&project)
+            .ok_or(RuntimeError::UnknownProject { project })?
+            .runs
+            .insert(request.run_id(), record.clone());
+        self.commit_state(next, vec![started, accepted])?;
+
+        if let Err(error) = self.engine.start_continuation(start, checkpoint) {
+            let failure = continuation_error(previous_run, error.clone());
+            self.mark_continuation_failed(
+                project,
+                request.run_id(),
+                &record,
+                request.input_id(),
+                "engine_continuation_start",
+                json!({ "failure": error }),
+            )?;
+            return Err(failure);
+        }
+        self.process_runs.insert(request.run_id());
+        Ok(())
+    }
+
+    /// Marks an accepted input failed and the run interrupted. No retry is
+    /// scheduled.
+    fn fail_input(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        record: &RunRecord,
+        input_id: InputId,
+        stage: &str,
+        detail: serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        if let Some(project_record) = next.projects_mut().get_mut(&project)
+            && let Some(stored) = project_record.runs.get_mut(&run)
+        {
+            if let Some(input) = stored
+                .inputs
+                .iter_mut()
+                .find(|input| input.input_id == input_id)
+            {
+                input.phase = InputPhase::Failed;
+                input.finished_at = Some(now);
+            }
+            stored.state = RunState::Interrupted;
+            stored.updated_at = now;
+        }
+        self.deferred_continuations.remove(&run);
+        let input_event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            None,
+            "run.input_failed",
+            json!({
+                "inputId": input_id.to_string(),
+                "phase": InputPhase::Failed,
+                "stage": stage,
+            }),
+        )?;
+        let state_event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            None,
+            "run.state_changed",
+            json!({
+                "from": record.state.as_str(),
+                "to": RunState::Interrupted.as_str(),
+                "stage": stage,
+                "detail": detail,
+            }),
+        )?;
+        self.commit_state(next, vec![input_event, state_event])?;
+        Ok(())
+    }
+
+    /// Records a continuation run whose engine start failed. The new run and
+    /// its accepted input stay visible as failed; no input was sent.
+    fn mark_continuation_failed(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        record: &RunRecord,
+        input_id: InputId,
+        stage: &str,
+        detail: serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        if let Some(project_record) = next.projects_mut().get_mut(&project)
+            && let Some(stored) = project_record.runs.get_mut(&run)
+        {
+            if let Some(input) = stored
+                .inputs
+                .iter_mut()
+                .find(|input| input.input_id == input_id)
+            {
+                input.phase = InputPhase::Failed;
+                input.finished_at = Some(now);
+            }
+            stored.state = RunState::Failed;
+            stored.updated_at = now;
+        }
+        let input_event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            None,
+            "run.input_failed",
+            json!({
+                "inputId": input_id.to_string(),
+                "phase": InputPhase::Failed,
+                "stage": stage,
+            }),
+        )?;
+        let failed = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            None,
+            "run.failed",
+            json!({ "state": "failed", "stage": stage, "detail": detail }),
+        )?;
+        self.commit_state(next, vec![input_event, failed])?;
         Ok(())
     }
 
@@ -1154,6 +1704,7 @@ where
                 to: RunState::Running,
             });
         }
+        let recovery = self.recovery_mode(run)?;
         let project_record = self.project_record(project)?.clone();
         let agent_record = project_record.agents.get(&record.agent_id).cloned().ok_or(
             RuntimeError::UnknownAgent {
@@ -1177,6 +1728,35 @@ where
             });
         }
 
+        // Recovery gate: a pending approval, an operation without a durable
+        // result, or an adapter-owned unsafe snapshot must be refused before
+        // the run is marked running. None of these checks sends input or runs a
+        // tool.
+        if project_record
+            .approvals
+            .values()
+            .any(|approval| approval.run_id == run)
+        {
+            return Err(RuntimeError::NotResumable {
+                run,
+                reason: ConversationFailure::PendingApproval,
+            });
+        }
+        {
+            let store = lock_store(&self.store)?;
+            let unresolved = store
+                .unresolved_operations(&project)
+                .map_err(RuntimeError::store)?;
+            if unresolved
+                .iter()
+                .any(|record| record.intent().operation().run_id() == run)
+            {
+                return Err(RuntimeError::NotResumable {
+                    run,
+                    reason: ConversationFailure::UnresolvedOperation,
+                });
+            }
+        }
         let checkpoint = {
             let store = lock_store(&self.store)?;
             store
@@ -1184,6 +1764,9 @@ where
                 .map_err(RuntimeError::store)?
                 .ok_or(RuntimeError::NoCheckpoint { run })?
         };
+        self.engine
+            .check_resume(&run, &checkpoint)
+            .map_err(|error| resume_error(run, error))?;
 
         self.gateway.service_mut().invalidate_run(run);
         self.deferred_continuations.remove(&run);
@@ -1207,11 +1790,52 @@ where
             run,
             None,
             "run.resumed",
-            json!({ "from": record.state.as_str(), "to": "running" }),
+            json!({
+                "from": record.state.as_str(),
+                "to": "running",
+                "recovery": recovery.as_str(),
+            }),
         )?;
         self.commit_state(next, vec![event])?;
 
         if let Err(error) = self.engine.resume(&run, checkpoint) {
+            if let CoreError::NotResumable {
+                reason,
+                run: refused_run,
+            } = &error
+                && *refused_run == run
+            {
+                // The adapter rejected the state after the preflight. Return
+                // the run to the state the human saw instead of claiming a
+                // running or failed run.
+                let mut next = self.state.clone();
+                if let Some(stored) = next
+                    .projects_mut()
+                    .get_mut(&project)
+                    .and_then(|project| project.runs.get_mut(&run))
+                {
+                    stored.state = record.state;
+                    stored.updated_at = Timestamp::now();
+                }
+                let refused = event_draft(
+                    project,
+                    record.agent_id,
+                    record.session_id,
+                    run,
+                    None,
+                    "run.resume_refused",
+                    json!({
+                        "from": RunState::Running.as_str(),
+                        "to": record.state.as_str(),
+                        "reason": reason,
+                    }),
+                )?;
+                self.commit_state(next, vec![refused])?;
+                return Err(RuntimeError::NotResumable {
+                    run,
+                    reason: *reason,
+                });
+            }
             let mut next = self.state.clone();
             if let Some(stored) = next
                 .projects_mut()
@@ -1235,6 +1859,7 @@ where
             return Err(RuntimeError::Engine { error });
         }
 
+        self.process_runs.insert(run);
         let stored = self.run_record(project, run)?.clone();
         Ok(run_view(project, run, &stored))
     }
@@ -1385,6 +2010,7 @@ where
         };
         let now = Timestamp::now();
         let mut next = self.state.clone();
+        let mut input_event: Option<(InputId, InputPhase)> = None;
         if let Some(stored) = next
             .projects_mut()
             .get_mut(&project)
@@ -1392,8 +2018,26 @@ where
         {
             stored.state = target;
             stored.updated_at = now;
+            // Only the accepted input of this run can become started, and only
+            // a started input can become completed. Startup idle leaves an
+            // accepted input incomplete.
+            if target == RunState::Running
+                && let Some(input) = stored.open_input_mut()
+                && input.phase == InputPhase::Accepted
+            {
+                input.phase = InputPhase::Started;
+                input.started_at = Some(now);
+                input_event = Some((input.input_id, InputPhase::Started));
+            } else if target == RunState::Idle
+                && let Some(input) = stored.open_input_mut()
+                && input.phase == InputPhase::Started
+            {
+                input.phase = InputPhase::Completed;
+                input.finished_at = Some(now);
+                input_event = Some((input.input_id, InputPhase::Completed));
+            }
         }
-        let event = event_draft(
+        let mut events = vec![event_draft(
             project,
             record.agent_id,
             record.session_id,
@@ -1401,8 +2045,26 @@ where
             None,
             "run.state_changed",
             json!({ "from": record.state.as_str(), "to": target.as_str() }),
-        )?;
-        let receipt = self.commit_state(next, vec![event])?;
+        )?];
+        if let Some((input_id, phase)) = input_event {
+            events.push(event_draft(
+                project,
+                record.agent_id,
+                record.session_id,
+                run,
+                None,
+                match phase {
+                    InputPhase::Started => "run.input_started",
+                    InputPhase::Completed => "run.input_completed",
+                    _ => "run.input_phase_changed",
+                },
+                json!({
+                    "inputId": input_id.to_string(),
+                    "phase": phase,
+                }),
+            )?);
+        }
+        let receipt = self.commit_state(next, events)?;
         if state == RunState::Idle && matches!(target, RunState::Idle | RunState::Running) {
             self.flush_deferred(project, run)?;
         }
@@ -2612,6 +3274,80 @@ struct ExecutedOperation {
     continuation: Option<String>,
     failure_message: Option<String>,
     uncertain: bool,
+}
+
+impl<S, E, T> ContinuationPort for Runtime<S, E, T>
+where
+    S: RuntimeStore,
+    E: EnginePort,
+    T: RuntimeToolExecutor,
+{
+    fn continue_run(&mut self, request: &ContinuationRequest) -> Result<(), CoreError> {
+        self.start_continuation_run(request)
+            .map_err(runtime_error_to_core)
+    }
+
+    fn input_progress(&self, input: &InputId) -> Result<Option<InputProgress>, CoreError> {
+        Runtime::input_progress(self, *input).map_err(runtime_error_to_core)
+    }
+}
+
+/// Maps a rejected continuation into the stable adapter error without hiding
+/// the reason behind a generic engine failure.
+fn continuation_error(_previous_run: RunId, error: CoreError) -> RuntimeError {
+    match error {
+        CoreError::NotContinuable {
+            previous_run: reported,
+            reason,
+        } => RuntimeError::NotContinuable {
+            previous_run: reported,
+            reason,
+        },
+        other => RuntimeError::Engine { error: other },
+    }
+}
+
+/// Maps a rejected resume into the stable runtime error.
+fn resume_error(run: RunId, error: CoreError) -> RuntimeError {
+    match error {
+        CoreError::NotResumable {
+            run: reported,
+            reason,
+        } => RuntimeError::NotResumable {
+            run: reported,
+            reason,
+        },
+        CoreError::EngineUnavailable {
+            failure: EngineFailureKind::CheckpointUnavailable,
+        } => RuntimeError::NotResumable {
+            run,
+            reason: ConversationFailure::CorruptCheckpoint,
+        },
+        other => RuntimeError::Engine { error: other },
+    }
+}
+
+/// Converts a runtime refusal for the `ContinuationPort` boundary.
+fn runtime_error_to_core(error: RuntimeError) -> CoreError {
+    match error {
+        RuntimeError::NotContinuable {
+            previous_run,
+            reason,
+        } => CoreError::NotContinuable {
+            previous_run,
+            reason,
+        },
+        RuntimeError::Engine { error } | RuntimeError::Store { error } => error,
+        RuntimeError::InvalidRunTransition { from, to } => {
+            CoreError::InvalidRunTransition { from, to }
+        }
+        other => CoreError::InvalidValue {
+            field: "continuation".to_owned(),
+            violation: ArgumentViolation::Invalid {
+                detail: other.to_string(),
+            },
+        },
+    }
 }
 
 fn lock_store<S>(store: &Arc<Mutex<S>>) -> Result<MutexGuard<'_, S>, RuntimeError> {

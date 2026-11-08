@@ -11,14 +11,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use herness_core::runtime::{
+    AgentSpec, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor, ToolExecution,
+};
 use herness_core::{
     AbsolutePath, AgentId, AuthMethod, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
-    ConnectionAdmin, ConnectionDirectory, ConnectionId, ConnectionSettings, CredentialAvailability,
-    CredentialKind, CredentialPort, CredentialService, CredentialVault, Endpoint, EngineEvent,
-    EngineInput, EnginePort, EngineStart, HistoryLimit, MatchMethod, OperationOutcome,
+    CheckpointPayload, ConnectionAdmin, ConnectionDirectory, ConnectionId, ConnectionSettings,
+    ConversationFailure, CoreError, CredentialAvailability, CredentialKind, CredentialPort,
+    CredentialService, CredentialVault, Endpoint, EngineEvent, EngineFailureKind, EngineInput,
+    EnginePort, EngineStart, FrozenOperation, HistoryLimit, MatchMethod, OperationOutcome,
     PermissionPolicy, PermissionRule, PolicyAdmin, ProjectId, Provider, ResolvedCredential,
     RuleTarget, RunId, RunState, SecretString, SessionId, StopReason, StopReport, StorePort,
-    ToolName, VaultAccount, VaultFailure,
+    ToolExecutor, ToolName, VaultAccount, VaultFailure,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -2606,4 +2610,787 @@ fn chatgpt_inference_auth_failure_is_reported_without_success() {
     let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
     assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
     assert!(!events.contains(&EngineEvent::StateChanged(RunState::Idle)));
+}
+
+// ---------------------------------------------------------------------------
+// H2 continuation and recovery gates
+// ---------------------------------------------------------------------------
+
+fn rewritten_checkpoint(
+    checkpoint: &Checkpoint,
+    run: RunId,
+    mutate: impl FnOnce(&mut Value),
+) -> Checkpoint {
+    let mut value: Value =
+        serde_json::from_slice(checkpoint.payload().as_bytes()).expect("checkpoint envelope");
+    value["runId"] = json!(run.to_string());
+    mutate(&mut value);
+    Checkpoint::new(
+        run,
+        checkpoint.format_version(),
+        CheckpointPayload::new(serde_json::to_vec(&value).expect("rewritten envelope")),
+    )
+}
+
+fn continuation_start(previous: &EngineStart, run: RunId) -> EngineStart {
+    EngineStart::new(
+        previous.project_id(),
+        previous.agent_id(),
+        previous.session_id(),
+        run,
+        previous.connection(),
+        previous.cwd().clone(),
+        previous.instructions(),
+    )
+    .expect("continuation start")
+}
+
+#[test]
+fn continuation_preserves_the_previous_conversation_in_a_new_run() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_text("The access code is ORANGE-42."),
+        responses_text("The access code is ORANGE-42."),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-continuation"),
+        connection_id: Some(connection),
+    });
+    let (_, _, run1, start1) = engine_start(&fixture, "You are a test agent.");
+    let mut engine = fixture.engine;
+
+    engine.start(start1.clone()).expect("first start");
+    let _ = engine.poll_events(&run1);
+    engine
+        .send_input(
+            &run1,
+            EngineInput::Text("Remember this fact: the access code is ORANGE-42.".to_owned()),
+        )
+        .expect("first input");
+    let first_events = collect_until_terminal(&mut engine, &run1, Duration::from_secs(10));
+    assert_eq!(text_of(&first_events), "The access code is ORANGE-42.");
+    let checkpoint1 = engine
+        .checkpoint(&run1)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+
+    let run2 = RunId::new(start1.project_id());
+    let start2 = continuation_start(&start1, run2);
+    assert_ne!(run1, run2);
+    engine
+        .check_continuation(&start2, &checkpoint1)
+        .expect("continuation preflight");
+    engine
+        .start_continuation(start2, checkpoint1.clone())
+        .expect("continuation start");
+
+    // The new run's recovery publication is a startup idle, never completion.
+    let startup = engine.poll_events(&run2).expect("startup events");
+    assert!(startup.contains(&EngineEvent::StateChanged(RunState::Idle)));
+
+    engine
+        .send_input(
+            &run2,
+            EngineInput::Text("What is the access code?".to_owned()),
+        )
+        .expect("second input");
+    let second_events = collect_until_terminal(&mut engine, &run2, Duration::from_secs(10));
+    assert_eq!(text_of(&second_events), "The access code is ORANGE-42.");
+    assert_eq!(server.request_count(), 2);
+
+    let requests = server.requests();
+    let second_request = requests[1].json().to_string();
+    assert!(
+        second_request.contains("ORANGE-42"),
+        "the second request must see the first run's conversation: {second_request}"
+    );
+    assert!(
+        second_request.contains("Remember this fact"),
+        "the first user turn must be preserved"
+    );
+
+    let checkpoint2 = engine
+        .checkpoint(&run2)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+    let envelope1: Value =
+        serde_json::from_slice(checkpoint1.payload().as_bytes()).expect("first envelope");
+    let envelope2: Value =
+        serde_json::from_slice(checkpoint2.payload().as_bytes()).expect("second envelope");
+    assert_eq!(envelope1["runId"], json!(run1.to_string()));
+    assert_eq!(envelope2["runId"], json!(run2.to_string()));
+    assert_eq!(
+        envelope2["sessionId"],
+        json!(start1.session_id().to_string())
+    );
+    assert!(
+        envelope2["snapshot"]["messages"]
+            .to_string()
+            .contains("ORANGE-42"),
+        "the new run's checkpoint must carry the conversation"
+    );
+    assert_eq!(
+        engine.checkpoint(&run1).unwrap().unwrap().run_id(),
+        run1,
+        "the previous run's checkpoint must not be rewritten"
+    );
+}
+
+#[test]
+fn continuation_tool_events_and_checkpoints_belong_to_the_new_run() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_text("first answer"),
+        responses_tool_call(
+            "call_cont_write",
+            "fc_cont_write",
+            "write",
+            json!({
+                "path": "created.txt",
+                "content": "tool facts",
+                "rationale": "record a continuation tool fact"
+            }),
+        ),
+        responses_text("file written"),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-continuation-tool"),
+        connection_id: Some(connection),
+    });
+    std::fs::write(fixture.project.join("notes.txt"), "tool facts").expect("notes");
+    let (_, _, run1, start1) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let project = fixture.project_id;
+    let mut engine = fixture.engine;
+
+    engine.start(start1.clone()).expect("first start");
+    let _ = engine.poll_events(&run1);
+    engine
+        .send_input(&run1, EngineInput::Text("first turn".to_owned()))
+        .expect("first input");
+    let _ = collect_until_terminal(&mut engine, &run1, Duration::from_secs(10));
+    let checkpoint1 = engine
+        .checkpoint(&run1)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+
+    let run2 = RunId::new(project);
+    let start2 = continuation_start(&start1, run2);
+    engine
+        .start_continuation(start2, checkpoint1)
+        .expect("continuation start");
+    let _ = engine.poll_events(&run2);
+    engine
+        .send_input(&run2, EngineInput::Text("write the notes".to_owned()))
+        .expect("second input");
+    let _ = collect_until_terminal(&mut engine, &run2, Duration::from_secs(10));
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.join("created.txt")).expect("created file"),
+        "tool facts"
+    );
+
+    let events = {
+        let store = store.lock().expect("store");
+        store
+            .events_after(&project, None, HistoryLimit::new(500).expect("limit"))
+            .expect("events")
+    };
+    let intents: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind().as_str() == "engine.tool.intent")
+        .collect();
+    assert_eq!(intents.len(), 1, "one tool call in the continuation run");
+    assert_eq!(
+        intents[0].run_id(),
+        Some(run2),
+        "the tool operation must belong to the new run"
+    );
+    assert!(intents[0].operation_id().is_some());
+
+    let checkpoint2 = engine
+        .checkpoint(&run2)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+    let envelope2: Value =
+        serde_json::from_slice(checkpoint2.payload().as_bytes()).expect("second envelope");
+    assert_eq!(envelope2["runId"], json!(run2.to_string()));
+    assert_eq!(engine.checkpoint(&run1).unwrap().unwrap().run_id(), run1);
+}
+
+#[test]
+fn continuation_refuses_missing_unstable_or_pending_checkpoints_without_sending() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![responses_text("stable answer")]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-continuation-refuse"),
+        connection_id: Some(connection),
+    });
+    let (_, _, run1, start1) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let mut engine = fixture.engine;
+    engine.start(start1.clone()).expect("start");
+    let _ = engine.poll_events(&run1);
+    engine
+        .send_input(&run1, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let _ = collect_until_terminal(&mut engine, &run1, Duration::from_secs(10));
+    let checkpoint1 = engine
+        .checkpoint(&run1)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+    let requests_before = server.request_count();
+
+    // Missing durable checkpoint: the previous run is not in the store.
+    let missing = RunId::new(start1.project_id());
+    let missing_start = continuation_start(&start1, RunId::new(start1.project_id()));
+    let missing_checkpoint = rewritten_checkpoint(&checkpoint1, missing, |_| {});
+    let error = engine
+        .check_continuation(&missing_start, &missing_checkpoint)
+        .expect_err("missing checkpoint must be refused");
+    assert!(matches!(
+        error,
+        herness_core::CoreError::NotContinuable {
+            previous_run,
+            reason: ConversationFailure::MissingCheckpoint,
+        } if previous_run == missing
+    ));
+    assert!(
+        engine
+            .start_continuation(missing_start, missing_checkpoint)
+            .is_err()
+    );
+
+    // Idle but not a completed input.
+    let run2 = RunId::new(start1.project_id());
+    let start2 = continuation_start(&start1, run2);
+    let unstable = rewritten_checkpoint(&checkpoint1, run1, |value| {
+        value["snapshot"]["needsResponse"] = json!(true);
+    });
+    store
+        .lock()
+        .expect("store")
+        .commit_checkpoint(
+            CheckpointCommit::new(unstable.clone(), None, Vec::new()).expect("commit"),
+        )
+        .expect("save unstable checkpoint");
+    let error = engine
+        .check_continuation(&start2, &unstable)
+        .expect_err("an unfinished input must be refused");
+    assert!(matches!(
+        error,
+        herness_core::CoreError::NotContinuable {
+            reason: ConversationFailure::PreviousRunNotStable,
+            ..
+        }
+    ));
+    assert!(engine.start_continuation(start2.clone(), unstable).is_err());
+
+    // A pending tool invocation could execute twice if continued.
+    let pending = rewritten_checkpoint(&checkpoint1, run1, |value| {
+        let session = value["snapshot"]["id"].clone();
+        value["snapshot"]["invocations"] = json!([{
+            "sessionId": session,
+            "id": "pending-call",
+            "name": "read",
+            "args": {"path": "notes.txt"},
+            "effect": "read",
+            "phase": "executing"
+        }]);
+    });
+    store
+        .lock()
+        .expect("store")
+        .commit_checkpoint(
+            CheckpointCommit::new(pending.clone(), None, Vec::new()).expect("commit"),
+        )
+        .expect("save pending checkpoint");
+    let error = engine
+        .check_continuation(&start2, &pending)
+        .expect_err("a pending invocation must be refused");
+    assert!(
+        matches!(
+            error,
+            herness_core::CoreError::NotContinuable {
+                reason: ConversationFailure::PendingInvocation,
+                ..
+            }
+        ),
+        "unexpected pending error: {error:?}"
+    );
+    assert!(engine.start_continuation(start2, pending).is_err());
+
+    assert_eq!(
+        server.request_count(),
+        requests_before,
+        "refused continuations must not send a model request"
+    );
+}
+
+#[test]
+fn same_process_resume_reuses_the_live_session_and_restore_is_distinct() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_text("first answer").delayed(Duration::from_millis(300)),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-resume"),
+        connection_id: Some(connection),
+    });
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let credentials = Arc::clone(&fixture.credentials);
+    let directory = fixture.directory.clone();
+    let endpoints = fixture.endpoints.clone();
+    let policy = fixture.policy.clone();
+    let mut engine = fixture.engine;
+
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("slow question".to_owned()))
+        .expect("input");
+    wait_for_requests(&server, 1);
+    let report = engine
+        .request_stop(&run, StopReason::UserRequest)
+        .expect("stop");
+    assert_eq!(report, StopReport::Stopped);
+    let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Interrupted)));
+    let checkpoint = engine
+        .checkpoint(&run)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+    let requests_before = server.request_count();
+
+    // Same-process: the live session is confirmed stopped and reused. No
+    // restore event, model request, input, or tool is produced.
+    engine
+        .check_resume(&run, &checkpoint)
+        .expect("same-process preflight");
+    engine
+        .resume(&run, checkpoint.clone())
+        .expect("same-process resume");
+    assert!(
+        engine.poll_events(&run).expect("poll").is_empty(),
+        "reusing the live session must not publish a second recovery state"
+    );
+    assert_eq!(server.request_count(), requests_before);
+    assert!(
+        engine
+            .send_input(&run, EngineInput::Text("another turn".to_owned()))
+            .is_err(),
+        "the incomplete response must not be replayed as new input"
+    );
+    assert_eq!(server.request_count(), requests_before);
+
+    // Cross-process: a new adapter rebuilds from the durable checkpoint. It
+    // publishes the recovered state and still makes no request.
+    let mut restarted = restart_engine(store, credentials, directory, endpoints, policy);
+    restarted
+        .check_resume(&run, &checkpoint)
+        .expect("cross-process preflight");
+    restarted
+        .resume(&run, checkpoint)
+        .expect("cross-process resume");
+    let restored = restarted.poll_events(&run).expect("poll");
+    assert!(restored.contains(&EngineEvent::StateChanged(RunState::Interrupted)));
+    assert_eq!(
+        server.request_count(),
+        requests_before,
+        "restoring must not send a model request"
+    );
+    assert!(
+        restarted
+            .send_input(&run, EngineInput::Text("another turn".to_owned()))
+            .is_err()
+    );
+    assert_eq!(server.request_count(), requests_before);
+}
+
+#[test]
+fn unsafe_checkpoint_state_is_explicitly_not_resumable() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![responses_text("answer")]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-unsafe"),
+        connection_id: Some(connection),
+    });
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let credentials = Arc::clone(&fixture.credentials);
+    let directory = fixture.directory.clone();
+    let endpoints = fixture.endpoints.clone();
+    let policy = fixture.policy.clone();
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let _ = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    let checkpoint = engine
+        .checkpoint(&run)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+    let requests_before = server.request_count();
+
+    let pending = rewritten_checkpoint(&checkpoint, run, |value| {
+        let session = value["snapshot"]["id"].clone();
+        value["snapshot"]["invocations"] = json!([{
+            "sessionId": session,
+            "id": "unsafe-call",
+            "name": "read",
+            "args": {"path": "notes.txt"},
+            "effect": "read",
+            "phase": "executing"
+        }]);
+    });
+    {
+        let mut store = store.lock().expect("store");
+        store
+            .commit_checkpoint(
+                CheckpointCommit::new(pending.clone(), None, Vec::new()).expect("commit"),
+            )
+            .expect("save unsafe checkpoint");
+    }
+
+    let store_for_check = Arc::clone(&store);
+    let mut restarted = restart_engine(store, credentials, directory, endpoints, policy);
+    let error = restarted
+        .check_resume(&run, &pending)
+        .expect_err("pending invocation must not be resumable");
+    assert!(matches!(
+        error,
+        herness_core::CoreError::NotResumable {
+            reason: ConversationFailure::PendingInvocation,
+            ..
+        }
+    ));
+    let error = restarted
+        .resume(&run, pending.clone())
+        .expect_err("resume must refuse the unsafe snapshot");
+    assert!(matches!(
+        error,
+        herness_core::CoreError::NotResumable {
+            reason: ConversationFailure::PendingInvocation,
+            ..
+        }
+    ));
+    assert!(
+        restarted.poll_events(&run).expect("poll").is_empty(),
+        "a refused resume must not start an engine session"
+    );
+    assert_eq!(
+        server.request_count(),
+        requests_before,
+        "a refused resume must not send a model request"
+    );
+    let stored = {
+        let store = store_for_check.lock().expect("store");
+        store
+            .load_checkpoint(&run)
+            .expect("checkpoint")
+            .expect("checkpoint present")
+    };
+    assert_eq!(
+        stored.payload().as_bytes(),
+        pending.payload().as_bytes(),
+        "the unsafe checkpoint must not be rewritten or discarded"
+    );
+}
+
+struct HostNoopExecutor;
+
+impl RuntimeToolExecutor for HostNoopExecutor {
+    fn enter_run(&mut self, _context: RunToolContext) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+impl ToolExecutor for HostNoopExecutor {
+    type Output = ToolExecution;
+
+    fn execute(&mut self, _operation: &FrozenOperation) -> Result<ToolExecution, CoreError> {
+        Err(CoreError::EngineUnavailable {
+            failure: EngineFailureKind::Unavailable,
+        })
+    }
+}
+
+type EngineTestHost = Runtime<Store, PiEngine<Store>, HostNoopExecutor>;
+
+fn poll_host_until_completed(
+    host: &mut EngineTestHost,
+    project: ProjectId,
+    run: RunId,
+    input: herness_core::InputId,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        host.poll_run(project, run).expect("host poll");
+        if host
+            .input_progress(input)
+            .expect("input progress")
+            .is_some_and(|progress| progress.is_completed())
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for input completion");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn host_continuation_preserves_conversation_and_input_ids_with_real_pi() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_text("The access code is ORANGE-42."),
+        responses_text("It is ORANGE-42."),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-host-continuation"),
+        connection_id: Some(connection),
+    });
+    let store = Arc::clone(&fixture.store);
+    let directory = fixture.directory.clone();
+    let credentials = Arc::clone(&fixture.credentials);
+    let project_path = fixture.project.clone();
+    let engine = fixture.engine;
+    let deps = RuntimeDependencies::new(
+        Arc::clone(&store),
+        engine,
+        credentials,
+        directory,
+        PolicyAdmin::new(),
+        HostNoopExecutor,
+    );
+    let (mut host, _) = Runtime::restore(deps).expect("host restore");
+    let project = host
+        .open_project(&project_path)
+        .expect("project")
+        .project_id();
+    let agent = host
+        .create_agent(project, AgentSpec::new("worker", "implementer", connection))
+        .expect("agent");
+    let run1 = host
+        .start_run(project, agent.agent_id(), "test instructions")
+        .expect("first run");
+    let input1 = host
+        .submit_input_with_id(
+            project,
+            run1.run_id(),
+            "Remember this fact: the access code is ORANGE-42.",
+        )
+        .expect("first input");
+
+    // The startup idle is queued before the submitted turn starts. It must not
+    // complete the accepted input.
+    host.poll_run(project, run1.run_id()).expect("startup poll");
+    assert!(
+        !host
+            .input_progress(input1)
+            .expect("progress")
+            .expect("accepted")
+            .is_completed(),
+        "startup idle must not complete the input"
+    );
+    poll_host_until_completed(&mut host, project, run1.run_id(), input1);
+    assert_eq!(
+        host.run(project, run1.run_id()).unwrap().state(),
+        RunState::Idle
+    );
+
+    let outcome = host
+        .continue_run(project, run1.run_id(), "What is the access code?")
+        .expect("continuation");
+    let run2 = outcome.run().run_id();
+    let input2 = outcome.input_id();
+    assert_ne!(run1.run_id(), run2);
+    assert!(!host.input_progress(input2).unwrap().unwrap().is_completed());
+    poll_host_until_completed(&mut host, project, run2, input2);
+
+    assert_eq!(server.request_count(), 2);
+    let requests = server.requests();
+    let second = requests[1].json().to_string();
+    assert!(
+        second.contains("ORANGE-42"),
+        "the continuation request must include the previous conversation: {second}"
+    );
+
+    let checkpoint = {
+        let store = store.lock().expect("store");
+        store
+            .load_checkpoint(&run2)
+            .expect("checkpoint")
+            .expect("checkpoint present")
+    };
+    let envelope: Value =
+        serde_json::from_slice(checkpoint.payload().as_bytes()).expect("envelope");
+    assert_eq!(envelope["runId"], json!(run2.to_string()));
+
+    let events = host
+        .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
+        .expect("subscribe")
+        .events()
+        .to_vec();
+    let started = events
+        .iter()
+        .find(|event| event.run_id() == Some(run2) && event.kind().as_str() == "run.input_started")
+        .expect("started input event");
+    let completed = events
+        .iter()
+        .find(|event| {
+            event.run_id() == Some(run2) && event.kind().as_str() == "run.input_completed"
+        })
+        .expect("completed input event");
+    assert_eq!(
+        started.payload().as_value()["inputId"],
+        json!(input2.to_string())
+    );
+    assert_eq!(
+        completed.payload().as_value()["inputId"],
+        json!(input2.to_string())
+    );
+    assert!(started.sequence() < completed.sequence());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.run_id() == Some(run2) && event.kind().as_str() == "run.started")
+    );
+}
+
+#[test]
+fn cross_process_continuation_restores_the_previous_conversation() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_text("The access code is ORANGE-42."),
+        responses_text("It is still ORANGE-42."),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, "sk-cross-continuation"),
+        connection_id: Some(connection),
+    });
+    let (_, _, run1, start1) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let credentials = Arc::clone(&fixture.credentials);
+    let directory = fixture.directory.clone();
+    let endpoints = fixture.endpoints.clone();
+    let policy = fixture.policy.clone();
+    let mut engine = fixture.engine;
+    engine.start(start1.clone()).expect("first start");
+    let _ = engine.poll_events(&run1);
+    engine
+        .send_input(
+            &run1,
+            EngineInput::Text("Remember: ORANGE-42 is the access code.".to_owned()),
+        )
+        .expect("first input");
+    let _ = collect_until_terminal(&mut engine, &run1, Duration::from_secs(10));
+    let checkpoint1 = engine
+        .checkpoint(&run1)
+        .expect("checkpoint")
+        .expect("checkpoint present");
+
+    // A new process has no live session for the previous run. It must rebuild
+    // the conversation from the durable checkpoint before starting the new run.
+    let mut restarted = restart_engine(store, credentials, directory, endpoints, policy);
+    let run2 = RunId::new(start1.project_id());
+    let start2 = continuation_start(&start1, run2);
+    restarted
+        .check_continuation(&start2, &checkpoint1)
+        .expect("cross-process continuation preflight");
+    restarted
+        .start_continuation(start2, checkpoint1)
+        .expect("cross-process continuation");
+    let _ = restarted.poll_events(&run2);
+    restarted
+        .send_input(&run2, EngineInput::Text("What is the code?".to_owned()))
+        .expect("second input");
+    let _ = collect_until_terminal(&mut restarted, &run2, Duration::from_secs(10));
+
+    assert_eq!(server.request_count(), 2);
+    let second = server.requests()[1].json().to_string();
+    assert!(
+        second.contains("ORANGE-42"),
+        "the new process must restore the previous conversation: {second}"
+    );
 }

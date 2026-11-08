@@ -54,8 +54,42 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 ### host-state format
 
-- 読込みはformat 1・2・3。新規書込みはformat 3のみ。format 1がformat 2の`connections`/`shutdown`を持つ場合は拒否し、未知formatと未知fieldは解釈しない。
-- format 2の全record（projects・agents・runs・approvals・connections・shutdown）をformat 3へ移行してもJSON値は保持される。format 3は現在format 2と同じfieldを持ち、将来のformat 3固有fieldは古いformatで明示的に拒否する。
+- 読込みはformat 1・2・3。新規書込みはformat 3のみ。format 1がformat 2の`connections`/`shutdown`を持つ場合、またはformat 1・2がformat 3の`inputs`/`continuationOf`を持つ場合は拒否し、未知formatと未知fieldは解釈しない。
+- format 2の全record（projects・agents・runs・approvals・connections・shutdown）をformat 3へ移行してもJSON値は保持される。format 3はrunごとの入力受理recordと、継続元runの`continuationOf`を持つ。将来のformat 3固有fieldも古いformatで明示的に拒否する。
+
+## Task 3で追加した継続・入力対応・復旧gate
+
+### 入力IDの対応
+
+- `Runtime::submit_input` は既存の署名を維持し、`submit_input_with_id` が `InputId` を返す。受理recordはengine送信前にhost-stateへ保存し、`run.input_submitted` は受理phaseだけを記録する（入力本文は保存しない）。
+- engineの`StateChanged(Running)`が最初の`Accepted`入力を`Started`へ進め、`StateChanged(Idle)`は`Started`の入力だけを`Completed`へ進める。run作成直後のstartup idleや、まだ開始していない`Accepted`入力は完結しない。
+- 送信失敗は`run.input_failed`と`run.state_changed`で入力を`Failed`、runを`interrupted`にし、自動再試行しない。`Runtime::input_progress` と `ContinuationPort::input_progress` は同じ保存recordを返す。
+- 復旧後のrunは状態だけを戻し、以前の入力本文を再送しない。
+
+### 会話を保つ追加run
+
+- `EnginePort::start_continuation(start, previous)` は新しいrun IDで同じagent/sessionの会話・system promptを引き継ぐ。`check_continuation` はrunやcheckpointを書く前の副作用なし検査で、missing/latestでないcheckpoint、pending invocation、未完了入力、managed process、scope不一致を明示的な `NotContinuable` で拒否する。
+- `Runtime::continue_run(project, previous, text)` は直前runが`idle`で、そのrunの未解決操作・承認・managed processがない場合だけ新runを作る。新run recordと`InputId`受理を永続化してからengineを開始し、その後に入力本文を送る。`run.started` は`continuationOf`を持ち、新runの全tool・event・checkpointは新run IDへ属する。
+- `ContinuationPort::continue_run` は新runの開始までを担い、入力本文は `Runtime::send_accepted_input` で渡す。hostの `Runtime::continue_run` は両方を一度に行う。古い承認は新runへ複製せず、直前入力も再送しない。
+
+### 復旧gate
+
+- `Runtime::resume_run` は同一processのrunと再起動後のrunを `RecoveryMode` で区別し、`run.resumed` payloadへ`same_process`/`restored`を記録する。どちらも未解決操作・pending approval・現接続/許可・checkpointの一致を先に検査する。
+- `EnginePort::check_resume` はrunを`running`にする前の副作用なし検査。live sessionはconfirmed stop（`running`/`awaiting_approval`でない）で、未完了invocationやmanaged processがなければ再利用する。別processはcheckpointを再構築するが、pending invocation、disposed、latestでないcheckpointは `NotResumable` として拒否し、model要求・tool実行・入力再送を行わない。
+- restoreだけではengineを開始せず、model要求0・tool実行0を維持する。
+
+### Task 3のテスト
+
+`tests/runtime/tests/engine.rs` は実Pi＋loopback modelで次を確認する。
+
+- 前runの会話にしかない事実を2回目の要求が参照できる。新runのcheckpoint envelopeとtool intent eventは新run IDを持つ。
+- missing checkpoint、未完了入力、pending invocationを持つcheckpointの継続は `NotContinuable` で拒否され、要求0。
+- 同一processのconfirmed stop後はlive sessionを再利用し、復旧state eventを二重にpublishedしない。別processはcheckpointから再構築し、どちらも要求0で、未完了応答を新入力として再送しない。
+- pending invocationを持つcheckpointの再開は `NotResumable` で、要求0・checkpoint保持。
+- host runtime＋実Pi経路でも `InputId` がaccepted→started→completedとなり、startup idleが完結にならず、継続後も会話が保持される。
+
+`tests/runtime/tests/host.rs` はfake engineでhost側の受理・開始・完結、送信失敗、継続のrun/checkpoint/input対応、running・未解決操作・managed processの拒否、`same_process`/`restored`の復旧gateと`NotResumable`拒否を確認する。
+
 
 ## テストコマンド
 
@@ -72,6 +106,14 @@ Task 2の受入で実行するコマンド:
 cargo test -p herness-store --locked
 cargo test -p herness-runtime-tests --test store --locked
 cargo check --workspace --locked
+```
+
+Task 3の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-runtime-tests --test engine --locked
+cargo test -p herness-runtime-tests --test host --locked
+cargo check --workspace --all-targets --locked
 ```
 
 `tests/runtime/tests/store.rs`は次を確認する。

@@ -9,7 +9,7 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::contracts::connection::{ConnectionId, ConnectionStatus};
-use crate::contracts::errors::{ArgumentViolation, CoreError};
+use crate::contracts::errors::{ArgumentViolation, ConversationFailure, CoreError};
 use crate::contracts::ids::{IdKind, OperationId, ProjectId, RunId};
 use crate::contracts::run::RunState;
 use crate::permissions::{ApprovalError, GrantWidening, InvalidationReason, PermissionMode};
@@ -136,6 +136,20 @@ pub enum RuntimeError {
         /// Run without a checkpoint.
         run: RunId,
     },
+    /// The saved state cannot be resumed without replaying input or a tool.
+    NotResumable {
+        /// Run that was not resumed.
+        run: RunId,
+        /// Sanitized reason.
+        reason: ConversationFailure,
+    },
+    /// A stable conversation cannot be continued as a new run.
+    NotContinuable {
+        /// Previous run whose conversation was refused.
+        previous_run: RunId,
+        /// Sanitized reason.
+        reason: ConversationFailure,
+    },
     /// Persisted host state could not be interpreted.
     CorruptState {
         /// Sanitized explanation.
@@ -243,6 +257,16 @@ impl fmt::Display for RuntimeError {
             Self::Approval { error } => write!(f, "approval failed: {error}"),
             Self::GrantWidening { error } => write!(f, "child grant was rejected: {error:?}"),
             Self::NoCheckpoint { run } => write!(f, "run {run} has no saved checkpoint"),
+            Self::NotResumable { run, reason } => {
+                write!(f, "run {run} is not resumable: {reason:?}")
+            }
+            Self::NotContinuable {
+                previous_run,
+                reason,
+            } => write!(
+                f,
+                "the conversation of run {previous_run} cannot be continued: {reason:?}"
+            ),
             Self::CorruptState { detail } => write!(f, "host state is corrupt: {detail}"),
             Self::Store { error } => write!(f, "store failed: {error}"),
             Self::Engine { error } => write!(f, "engine failed: {error}"),

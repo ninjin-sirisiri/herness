@@ -27,6 +27,6 @@ pub use reconcile::{
 pub use shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 pub use tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 pub use views::{
-    AgentView, ApprovalOutcome, DenialOutcome, EventBatch, PendingApproval, ProjectView, RunView,
-    RuntimeSnapshot, StopOutcome, SubscriptionCursor,
+    AgentView, ApprovalOutcome, ContinuationOutcome, DenialOutcome, EventBatch, PendingApproval,
+    ProjectView, RecoveryMode, RunView, RuntimeSnapshot, StopOutcome, SubscriptionCursor,
 };

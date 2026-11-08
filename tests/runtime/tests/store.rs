@@ -2317,6 +2317,27 @@ fn host_state_formats_one_and_two_migrate_to_format_three_without_losing_records
     .expect_err("format 1 must not carry format 2 fields");
     assert!(error.contains("format 1 must not contain format 2 fields"));
 
+    // A format-3 run field in an older document is rejected before the run is
+    // reinterpreted. The raw check runs before typed deserialization.
+    for field in ["inputs", "continuationOf"] {
+        let document = json!({
+            "format": 2,
+            "projects": {
+                "placeholder": {
+                    "path": "/tmp",
+                    "agents": {},
+                    "runs": {"placeholder": {(field): []}},
+                    "approvals": {}
+                }
+            }
+        });
+        let error = host_state_test_support::migrate(
+            &serde_json::to_vec(&document).expect("format 2 fixture"),
+        )
+        .expect_err("format 2 must not carry format 3 fields");
+        assert!(error.contains("format 2 must not contain format 3 fields"));
+    }
+
     let error = host_state_test_support::migrate(br#"{"format":2,"projects":{},"sections":{}}"#)
         .expect_err("unknown format fields are rejected");
     assert!(error.contains("host-state JSON"));

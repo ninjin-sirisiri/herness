@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::ConnectionSettings;
 use crate::contracts::connection::ConnectionId;
-use crate::contracts::ids::{AgentId, OperationId, ProjectId, RunId, SessionId};
+use crate::contracts::ids::{AgentId, InputId, OperationId, ProjectId, RunId, SessionId};
+use crate::contracts::input::{InputPhase, InputProgress};
 use crate::contracts::operation::FrozenOperation;
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
@@ -35,9 +36,10 @@ pub(crate) const HOST_STATE_KEY: &str = "herness.runtime.host-state";
 ///
 /// Format 2 adds non-secret connection settings and the last shutdown record.
 /// Format 3 is the first H2-era format and is the only format this build
-/// writes. It currently carries the same fields as format 2; a future format-3
-/// field must also reject the field in older formats explicitly.
-/// Format 1 documents are still read; they contain neither format-2 field.
+/// writes. It adds per-run input-acceptance records and the previous run of a
+/// continued conversation. Format 1 documents are still read; they contain
+/// neither format-2 nor format-3 fields. A format-1/2 document that carries a
+/// format-3 field is rejected instead of being reinterpreted.
 pub(crate) const HOST_STATE_FORMAT: u32 = 3;
 /// Formats this build can read.
 const SUPPORTED_HOST_STATE_FORMATS: [u32; 3] = [1, 2, 3];
@@ -68,27 +70,48 @@ impl Default for HostState {
 impl HostState {
     /// Parses host state, rejecting unknown formats and unknown fields.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, RuntimeError> {
-        let state: Self =
+        let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|error| RuntimeError::CorruptState {
                 detail: format!("host-state JSON: {error}"),
             })?;
-        if !SUPPORTED_HOST_STATE_FORMATS.contains(&state.format) {
+        let format = value
+            .get("format")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| RuntimeError::CorruptState {
+                detail: "host-state JSON has no numeric format".to_owned(),
+            })?;
+        let format = u32::try_from(format).map_err(|_| RuntimeError::CorruptState {
+            detail: format!("unsupported host-state format {format}"),
+        })?;
+        if !SUPPORTED_HOST_STATE_FORMATS.contains(&format) {
             return Err(RuntimeError::CorruptState {
                 detail: format!(
-                    "unsupported host-state format {}; this build supports {:?}",
-                    state.format, SUPPORTED_HOST_STATE_FORMATS
+                    "unsupported host-state format {format}; this build supports {:?}",
+                    SUPPORTED_HOST_STATE_FORMATS
                 ),
             });
         }
+        if format < 3
+            && (contains_run_field(&value, "inputs")
+                || contains_run_field(&value, "continuationOf"))
+        {
+            return Err(RuntimeError::CorruptState {
+                detail: format!("host-state format {format} must not contain format 3 fields"),
+            });
+        }
+        let state: Self =
+            serde_json::from_value(value).map_err(|error| RuntimeError::CorruptState {
+                detail: format!("host-state JSON: {error}"),
+            })?;
         if state.format == 1 && (!state.connections.is_empty() || state.shutdown.is_some()) {
             return Err(RuntimeError::CorruptState {
                 detail: "host-state format 1 must not contain format 2 fields".to_owned(),
             });
         }
-        // Format 3 currently adds no fields. It is still a distinct write
-        // version so an older application rejects it instead of reinterpreting
-        // the document. `deny_unknown_fields` keeps format 1/2 documents from
-        // carrying fields introduced by later formats.
+        // Format 3 is a distinct write version so an older application rejects
+        // it instead of reinterpreting the document. `deny_unknown_fields`
+        // keeps format 1/2 documents from carrying fields introduced by later
+        // formats.
         Ok(state)
     }
 
@@ -138,6 +161,25 @@ impl HostState {
             .find(|(_, project)| project.path == *path)
             .map(|(project, _)| *project)
     }
+}
+
+/// Finds a run-level field in a raw host-state document.
+fn contains_run_field(value: &serde_json::Value, field: &str) -> bool {
+    let Some(projects) = value.get("projects").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    for project in projects.values() {
+        let Some(runs) = project.get("runs").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if runs
+            .values()
+            .any(|run| run.get(field).is_some_and(|value| !value.is_null()))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// One opened project.
@@ -192,6 +234,48 @@ pub(crate) struct RunRecord {
     pub(crate) policy_version: PolicyVersion,
     pub(crate) created_at: Timestamp,
     pub(crate) updated_at: Timestamp,
+    /// Submitted inputs in acceptance order. The last open record is the
+    /// currently submitted input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inputs: Vec<InputRecord>,
+    /// Previous run whose conversation this run continues, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) continuation_of: Option<RunId>,
+}
+
+impl RunRecord {
+    /// The most recent input when it has not reached a terminal phase.
+    pub(crate) fn open_input_mut(&mut self) -> Option<&mut InputRecord> {
+        self.inputs
+            .last_mut()
+            .filter(|input| matches!(input.phase, InputPhase::Accepted | InputPhase::Started))
+    }
+
+    /// Progress for one input of this run.
+    pub(crate) fn input_progress(&self, input: InputId) -> Option<InputProgress> {
+        self.inputs
+            .iter()
+            .find(|record| record.input_id == input)
+            .map(|record| InputProgress::new(record.input_id, record.phase))
+    }
+}
+
+/// Durable acceptance/start/completion record for one submitted input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InputRecord {
+    pub(crate) input_id: InputId,
+    pub(crate) phase: InputPhase,
+    pub(crate) accepted_at: Timestamp,
+    /// Set before the engine send is attempted. It makes a repeated request
+    /// for the same input refuse rather than send twice, and a crash after
+    /// this point is not treated as "never submitted".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dispatched_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<Timestamp>,
 }
 
 /// One persisted pending approval.

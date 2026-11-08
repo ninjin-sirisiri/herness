@@ -21,8 +21,9 @@ pub use connection::{
     ConnectionUsage, EndpointClass, InputCapabilities, InputModality, Provider,
 };
 pub use errors::{
-    ArgumentViolation, CoreError, CredentialFailureKind, EngineFailureKind, EvaluationFailureKind,
-    FileFailure, PathViolation, PortFeature, ProviderFailureKind, ShellFailure, StoreFailureKind,
+    ArgumentViolation, ConversationFailure, CoreError, CredentialFailureKind, EngineFailureKind,
+    EvaluationFailureKind, FileFailure, PathViolation, PortFeature, ProviderFailureKind,
+    ShellFailure, StoreFailureKind,
 };
 pub use events::{
     Event, EventDraft, EventKind, EventPayload, EventSubject, HostActivitySubject, RunSubject,

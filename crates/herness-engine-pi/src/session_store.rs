@@ -79,6 +79,10 @@ pub(crate) struct EngineStore<S> {
     store: Arc<Mutex<S>>,
     audit: RunAuditMetadata,
     snapshot: Arc<Mutex<Option<SessionSnapshot>>>,
+    /// Initial conversation copied from a previous run. It is used only when
+    /// this run has no durable checkpoint yet, which is the first restore of a
+    /// continuation.
+    seed: Option<SessionSnapshot>,
 }
 
 impl<S> Clone for EngineStore<S> {
@@ -87,6 +91,7 @@ impl<S> Clone for EngineStore<S> {
             store: Arc::clone(&self.store),
             audit: self.audit.clone(),
             snapshot: Arc::clone(&self.snapshot),
+            seed: self.seed.clone(),
         }
     }
 }
@@ -98,6 +103,23 @@ impl<S: StorePort> EngineStore<S> {
             store,
             audit,
             snapshot: Arc::new(Mutex::new(None)),
+            seed: None,
+        }
+    }
+
+    /// Creates a handle whose first restore loads a conversation copied from a
+    /// previous run. The copy is never used after this run has its own durable
+    /// checkpoint.
+    pub(crate) fn seeded(
+        store: Arc<Mutex<S>>,
+        audit: RunAuditMetadata,
+        seed: SessionSnapshot,
+    ) -> Self {
+        Self {
+            store,
+            audit,
+            snapshot: Arc::new(Mutex::new(Some(seed.clone()))),
+            seed: Some(seed),
         }
     }
 
@@ -317,14 +339,29 @@ impl<S: StorePort> EngineStore<S> {
     }
 
     /// Loads and validates the latest checkpoint for this run.
+    ///
+    /// A continuation with no durable checkpoint yet falls back to the
+    /// conversation copied from the previous run. The first restore save then
+    /// writes it under this run's identifier, so the copy cannot be confused
+    /// with the previous run's own checkpoint.
     pub(crate) fn load_engine_checkpoint(&self) -> Result<Option<EngineCheckpoint>, CoreError> {
         let checkpoint = self.load_raw_checkpoint()?;
-        let Some(checkpoint) = checkpoint else {
+        if let Some(checkpoint) = checkpoint {
+            let parsed = parse_checkpoint(&checkpoint, self.audit.run_id)?;
+            self.set_snapshot(parsed.snapshot.clone());
+            return Ok(Some(parsed));
+        }
+        let Some(seed) = &self.seed else {
             return Ok(None);
         };
-        let parsed = parse_checkpoint(&checkpoint, self.audit.run_id)?;
-        self.set_snapshot(parsed.snapshot.clone());
-        Ok(Some(parsed))
+        if seed.id != self.audit.session_id.to_string() || seed.version != 1 {
+            return Err(checkpoint_error());
+        }
+        self.set_snapshot(seed.clone());
+        Ok(Some(EngineCheckpoint {
+            meta: self.audit.clone(),
+            snapshot: seed.clone(),
+        }))
     }
 
     /// Loads the opaque latest checkpoint without interpreting it.

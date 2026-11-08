@@ -174,11 +174,57 @@ pub trait EnginePort {
     /// Starts an independent engine run.
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError>;
 
+    /// Starts a new run that continues the conversation in `previous`.
+    ///
+    /// The new run must use `start.run_id()` for every new tool operation,
+    /// event, and checkpoint while keeping the previous conversation and system
+    /// prompt. Implementations must not re-send previous input, reuse a previous
+    /// approval, or fall back to a fresh unrelated session when the conversation
+    /// cannot be preserved. A build without this capability returns the
+    /// explicit unsupported error.
+    fn start_continuation(
+        &mut self,
+        start: EngineStart,
+        previous: Checkpoint,
+    ) -> Result<(), CoreError> {
+        let _ = (start, previous);
+        Err(CoreError::UnsupportedPortFeature {
+            feature: crate::contracts::errors::PortFeature::Continuation,
+        })
+    }
+
+    /// Checks whether `start` can continue `previous` without side effects.
+    ///
+    /// The host calls this before persisting the new run so a conversation that
+    /// cannot be preserved is refused without creating a run or sending input.
+    /// The default accepts the preflight because an adapter without checkpoint
+    /// semantics has nothing to validate; adapters that own SDK snapshots must
+    /// return an explicit `NotContinuable` error instead of guessing.
+    fn check_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &Checkpoint,
+    ) -> Result<(), CoreError> {
+        let _ = (start, previous);
+        Ok(())
+    }
+
     /// Sends input to an existing run.
     fn send_input(&mut self, run: &RunId, input: EngineInput) -> Result<(), CoreError>;
 
     /// Requests a coordinated stop. The caller must handle `Unconfirmed`.
     fn request_stop(&mut self, run: &RunId, reason: StopReason) -> Result<StopReport, CoreError>;
+
+    /// Checks whether `run` can be restored from `checkpoint` without a model
+    /// request or a tool execution.
+    ///
+    /// The host calls this before changing the run to `running`. The default
+    /// accepts the preflight; adapters that own SDK snapshots must return
+    /// `CoreError::NotResumable` when the snapshot could replay input or a tool.
+    fn check_resume(&self, run: &RunId, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        let _ = (run, checkpoint);
+        Ok(())
+    }
 
     /// Resumes a run from an adapter-owned checkpoint.
     fn resume(&mut self, run: &RunId, checkpoint: Checkpoint) -> Result<(), CoreError>;

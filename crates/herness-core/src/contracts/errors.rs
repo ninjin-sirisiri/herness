@@ -208,6 +208,54 @@ pub enum CoreError {
         /// State the caller attempted to enter.
         to: RunState,
     },
+    /// A paused or interrupted run cannot be restored without replaying input
+    /// or a tool.
+    NotResumable {
+        /// Run whose saved state is not safely resumable.
+        run: RunId,
+        /// Sanitized reason. No SDK snapshot or provider text is carried.
+        reason: ConversationFailure,
+    },
+    /// A stable previous conversation cannot be continued as a new run.
+    NotContinuable {
+        /// Previous run whose conversation cannot be carried forward.
+        previous_run: RunId,
+        /// Sanitized reason. No SDK snapshot or provider text is carried.
+        reason: ConversationFailure,
+    },
+}
+
+/// Why a conversation cannot be continued or resumed safely.
+///
+/// These labels are stable, non-secret contract data. They never contain SDK
+/// snapshot bodies, model text, credentials, or provider responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationFailure {
+    /// The previous run has no durable checkpoint.
+    MissingCheckpoint,
+    /// The supplied checkpoint is not the durable latest state.
+    CheckpointNotLatest,
+    /// The checkpoint envelope could not be validated for the requested run.
+    CorruptCheckpoint,
+    /// The previous run is not idle/stable.
+    PreviousRunNotStable,
+    /// A stop was not confirmed for the live engine session.
+    StopUnconfirmed,
+    /// An input was accepted but not completed.
+    PendingInput,
+    /// A tool invocation is not completed. Resuming could execute it again.
+    PendingInvocation,
+    /// A human approval is still recorded for the previous run.
+    PendingApproval,
+    /// A managed process still needs reconciliation.
+    ManagedProcess,
+    /// A tool operation intent has no durable result.
+    UnresolvedOperation,
+    /// The supplied continuation scope does not match the previous run.
+    ScopeMismatch,
+    /// The requested input is unknown or was already consumed.
+    InputUnavailable,
 }
 
 /// Validation failure for a free-form argument value.
@@ -687,6 +735,16 @@ impl fmt::Display for CoreError {
             Self::InvalidRunTransition { from, to } => {
                 write!(f, "run cannot transition from {from} to {to}")
             }
+            Self::NotResumable { run, reason } => {
+                write!(f, "run {run} is not resumable: {reason:?}")
+            }
+            Self::NotContinuable {
+                previous_run,
+                reason,
+            } => write!(
+                f,
+                "the conversation of run {previous_run} cannot be continued: {reason:?}"
+            ),
         }
     }
 }
