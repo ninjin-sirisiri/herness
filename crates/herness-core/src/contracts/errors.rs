@@ -12,6 +12,7 @@ use crate::contracts::connection::{ConnectionId, Provider};
 use crate::contracts::ids::{IdKind, OperationId, ProjectId, RunId};
 use crate::contracts::run::RunState;
 use crate::permissions::PermissionMode;
+use crate::skills::{SkillFailure, SkillId};
 use crate::tools::ToolName;
 use crate::tools::arguments::FileVersion;
 use crate::tools::reason::{ReasonField, ReasonViolation};
@@ -183,6 +184,14 @@ pub enum CoreError {
         tool: ToolName,
         /// Structured, non-secret failure detail.
         failure: ShellFailure,
+    },
+    /// A skill could not be loaded, revalidated, or used for its declared
+    /// flow.
+    SkillFailed {
+        /// Skill involved.
+        skill: SkillId,
+        /// Structured, non-secret failure detail.
+        failure: SkillFailure,
     },
     /// A run is not in a state that permits the requested transition.
     InvalidRunTransition {
@@ -609,6 +618,9 @@ impl fmt::Display for CoreError {
             }
             Self::ShellToolFailed { tool, failure } => {
                 write!(f, "{tool} failed: {failure}")
+            }
+            Self::SkillFailed { skill, failure } => {
+                write!(f, "skill {skill} failed: {failure}")
             }
             Self::InvalidRunTransition { from, to } => {
                 write!(f, "run cannot transition from {from} to {to}")

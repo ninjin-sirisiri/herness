@@ -41,6 +41,7 @@ cargo test -p herness-runtime-tests
 cargo test -p herness-runtime-tests --test permissions
 cargo test -p herness-runtime-tests --test files --locked
 cargo test -p herness-runtime-tests --test shell --locked
+cargo test -p herness-runtime-tests --test skills --locked
 cargo fmt --all -- --check
 ```
 
@@ -51,7 +52,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-- testはnetwork・外部service・実資格情報を必要としない。依存取得後の通常実行はofflineで完結する。
+- testはnetwork・外部service・実資格情報を必要としない。依存取得後の通常実行はofflineで完結する。`skills` testは存在する場合に `/Users/h-uma/Documents/sdd` をread-onlyで読み、fingerprintとtoolchainを報告するが、packを変更しない。
 - `tests/runtime` のlibrary部は `herness-core` にだけ依存する。black-box test targetは `herness-store`（`test-support` feature付き）、`serde_json`、`tempfile`、`rusqlite`、`sha2` をdev-dependencyとして使う。storeのfault injectionとfile toolの実ファイル操作は一時project・一時DBだけで行う。
 - 後続Taskでstore・engine・Tauriを追加しても、`herness-core` からそれらへの依存を追加しない。workspace全体のtestは `cargo test --workspace --locked` で実行する。
 - 実接続・実Keychain・実Tauriの確認はTask 13の別途許可まで行わない。mock成功を実接続成功として扱わない。
@@ -91,6 +92,22 @@ cargo test --workspace --locked
 - **再起動:** `reconcile_shell_operation(record, events)` はcommand・purpose・cwd・timeoutMs・pid/pgid（result observationまたは `shell.spawned` eventから）・startedAt・outcome・stopStatus・不確実flagを返す。pending intentは `shellOutcomeUnknown: true`、outcomeなしのまま。native fileのhash一致をshell成功の証拠にしない。restart後の再実行は `DuplicateOperation` でspawnしない。
 - **test:** `tests/runtime/tests/shell.rs` は実store・一時project・実processで、子/孫の停止、SIGTERM無視時のSIGKILL、output floodと切詰め永続化、停止後のresult保存失敗、拒否・未承認・空白purpose・事前保存失敗のspawn回数0、file変更理由の非捏造、timeout、再起動非再送、detached子の非保証を確認する。
 - **fault injection:** storeの `CommitFault::{BeforeRows,BeforeCommit}` はintent transactionに、`ResultFault::BeforeUpdate` はresult記録に使う。どちらも `test-support` feature限定で、production hostは有効にしない。
+
+## Task 6で固定したSDD pack・skill指紋・toolchain検出の契約
+
+実装は `crates/herness-core/src/skills/{pack,digest,overlay,capability,context,toolchain}.rs`、fixtureは `tests/runtime/fixtures/skills/`、testは `tests/runtime/tests/skills.rs`。新しいcrate依存は追加せず、`sha2` をdigestに再利用する。
+
+- **pack root:** hostが明示する絶対パスだけを受け付け、`SkillPack::open` でcanonicalizeする。暗黙の `../sdd` 探索やpackのコピーは行わない。`SkillId` は `<pack-root>/skills/<id>/SKILL.md` の1 path componentで、個別にコピーした `SKILL.md` を正本にしない。
+- **原文digest:** `SkillDocument` は `skillId`・canonicalな `skillPath`・pack root・`SKILL.md` 原文bytesのSHA-256 lowercase hexを記録する。digestは改行やrendered textの正規化前のbytesに対して計算する。
+- **相対参照:** skill内のMarkdown link `](target)` と、load時に明示した参照（例: 散文でだけ言及される `implementer-prompt.md`）を、skillのあるdirectory基準で解決する。解決先はpack内にcanonicalizeできなければ拒否し、pack外escapeは `OutsidePack` とする。cwd・project・コピー先は基準にしない。存在しない自動linkは無視し、明示参照の不在は `NotFound` とする。fingerprintの `relativePath` はpack root基準の `/` 区切りで記録する。参照先は `references[]` に絶対path・digest・byte数を持つ。
+- **複合fingerprint:** `combined` は `herness.skill.fingerprint.v1\0`、長さprefix付きdocument digest、参照件数、各参照の長さprefix付きpack-relative pathとdigestのSHA-256。参照はpack-relative path順で、同一pathは1回だけ含む。
+- **run途中の変更:** `SkillDocument::revalidate()` は元のexplicit参照を保ったまま再読込みし、`DocumentChanged` / `ReferenceChanged` / `ReferenceAdded` / `ReferenceRemoved` と新旧fingerprintを返す。`ensure_current()` と `SkillRunContext::ensure_current()` は変更時に `SkillFailure::ChangedDuringRun` を返す。古いfingerprintを同一視して再利用しない。`SkillRunContext::revalidate()` は全skillの変更を報告する。
+- **host overlay:** `HostOverlay` は `skillId`・`provenance: "host"`・`addedText`・任意の `removedText` を持つ。`apply` はpack本文に削除と追加をin-memoryで適用するだけで、packを書き換えない。`removedText` はtrim後に非空ならちょうど1回出現する必要があり、不在・複数回は構造化errorにする。overlayはrun contextのsource fingerprintと並べて記録する。
+- **run context:** `SkillRunContext::build(packRoot, documents, overlays, flows, capabilities)` は同一pack root・重複なしを検証し、skill id順のentryに原文・fingerprint・overlay・flowを保持する。読み込み（`ReadOnly`）とworker flowの実行を区別する。
+- **capability:** `HostCapabilities::h1()` は `SkillRead` を `Available`、`HtmlWorker` と `SddTaskController` を `Unavailable { reason: NotImplementedInH1 }` とする。`require_execution` は利用不能なworker flowに `SkillFailure::CapabilityUnavailable` を返し、親モデルdispatchや別validatorへのfallbackをしない。skill本文の読み込み自体は継続できる。
+- **toolchain:** `ToolchainConfig` は明示的な実行パス、設定search directory、capture済み `PATH` snapshotを持つ。明示pathがあるtoolはその候補だけを使い、別の実行ファイルで黙って置換しない。明示pathがなければ設定directory→`PATH` の順で探す。Gitは `--version`、Pythonは `--version` をparseし、最小3.11.0と比較する。`html-docs` は実行可能なscriptと3.11+のPython interpreterの両方を必要とし、`python -B <script>` を引数なしでprobeして終了codeと応答有無を記録する。probeの終了codeはvalidator成功の主張ではない。PATHが `/usr/bin:/bin:/usr/sbin:/sbin` のFinder相当でも、明示pathのtoolは検出できる。
+- **不足時:** 不在は `Missing`、非実行fileは `NotExecutable`、旧Pythonは `InsufficientVersion { found, minimum }`、interpreter不在のvalidatorは `InterpreterMissing` を返す。`ToolchainReport::deficiencies()` / `require()` がcapability不足結果を返し、自動install・別validatorへの置換・成功扱いをしない。`pip install` 等は実行しない。
+- **実pack:** `/Users/h-uma/Documents/sdd` はread-onlyでだけ開く。testは `skills/sdd-execute`（`implementer-prompt.md` を明示参照）と `skills/sdd` の実fingerprint、`SkillRead` と `SddTaskController` の可用性、実toolchainの検出結果を出力し、packを変更しない。packが存在しない場合は理由を明示してskipする。
 
 ## Task 1で固定した契約と検証
 

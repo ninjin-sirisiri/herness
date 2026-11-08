@@ -9,6 +9,7 @@
 pub mod contracts;
 pub mod permissions;
 pub mod ports;
+pub mod skills;
 pub mod tools;
 
 pub use contracts::*;
@@ -21,6 +22,15 @@ pub use permissions::{
     PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget, SimpleCommand,
 };
 pub use ports::*;
+pub use skills::{
+    CapabilityStatus, CapabilityUnavailableReason, HostCapabilities, HostCapability, HostOverlay,
+    MINIMUM_PYTHON_VERSION, OverlayProvenance, PythonVersion, SkillChange, SkillContextEntry,
+    SkillContextRevalidation, SkillDigest, SkillDocument, SkillExecutionFlow, SkillExecutionStatus,
+    SkillFailure, SkillFingerprint, SkillId, SkillPack, SkillReference, SkillRevalidation,
+    SkillRunContext, SkillSource, ToolAvailability, ToolDetection, ToolRequirement,
+    ToolchainConfig, ToolchainDeficiency, ToolchainDetector, ToolchainReport, ValidatorDetection,
+    ValidatorProbe,
+};
 pub use tools::{
     BashArgs, DEFAULT_READ_LIMIT, DEFAULT_SEARCH_RESULTS, EditArgs, FILE_CHANGE_EVENT_KIND,
     FILE_CHANGE_INTENDED_EVENT_KIND, FileChange, FileDiff, FileLockGuard, FileLockRegistry,
