@@ -3,6 +3,7 @@
 pub mod credential;
 pub mod engine;
 pub mod evaluator;
+pub mod runtime_store;
 pub mod store;
 
 pub use credential::{
@@ -10,4 +11,5 @@ pub use credential::{
 };
 pub use engine::{EngineEvent, EngineInput, EnginePort, EngineStart, StopReason, StopReport};
 pub use evaluator::{EvaluationRequest, PermissionEvaluatorPort};
+pub use runtime_store::RuntimeStore;
 pub use store::{CheckpointCommit, CommitReceipt, StorePort};

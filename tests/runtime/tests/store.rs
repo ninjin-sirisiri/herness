@@ -432,7 +432,7 @@ fn newer_schema_version_is_rejected_and_the_database_is_untouched() {
         error,
         StoreError::UnsupportedSchemaVersion {
             found: 999,
-            supported: 2
+            supported: 3
         }
     ));
     assert_eq!(fs::read(&database).unwrap(), before);
@@ -615,7 +615,7 @@ fn failing_migration_rolls_back_and_preserves_the_existing_database() {
     }
 
     let mut reopened = harness.open();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     assert_eq!(
         reopened.load_checkpoint(&fixture.run_id).unwrap(),
         Some(stored_checkpoint)
@@ -670,7 +670,7 @@ fn failing_first_migration_on_a_fresh_database_leaves_no_partial_schema() {
     }
 
     let store = harness.open();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
 }
 
 #[test]

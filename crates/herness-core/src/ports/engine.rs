@@ -105,7 +105,8 @@ pub enum StopReason {
 }
 
 /// Result of a stop request. Unconfirmed stops are never reported as stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReport {
     /// The engine acknowledged the stop.
     Stopped,

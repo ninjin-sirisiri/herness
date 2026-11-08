@@ -46,6 +46,7 @@ cargo test -p herness-runtime-tests --test skills --locked
 cargo test -p herness-runtime-tests --test connections --locked
 cargo test -p herness-runtime-tests --test oauth --locked
 cargo test -p herness-runtime-tests --test engine --locked
+cargo test -p herness-runtime-tests --test host --locked
 cargo test -p herness-desktop --lib --locked
 cargo fmt --all -- --check
 ```
@@ -166,6 +167,20 @@ cargo test --workspace --locked
 - **ChatGPT:** `GET https://api.openai.com/v1/models` の`models`配列から`visibility == "list"`だけをserver順で取得し、`slug`を選択modelとして使う。選択modelがcatalogに無ければrunを開始せず、別model・別providerへfallbackしない。Responsesはpublic `POST https://api.openai.com/v1/responses`へ`store: false`・`stream: true`で送る。`response.completed`前の切断、`response.incomplete`、`response.failed`（usage-limit codeを含む）、明示errorは失敗とし、`length`終端もengine errorへ変換する。`backend-api` endpointは使わない。catalogはhost所有の狭いHTTP GETで、redirectは`redirect_auth_decision`で判定する。restore時はcatalog GETも含めnetwork requestを送らない。
 - **secret:** credentialは各requestで解決し、SDKのmodel・provider error文、diagnostics、snapshotの`error`は保存前にsanitizeする。canary testでAPIキーがcheckpoint・event・DB・WALへ出ないことを確認する。tokenはprovider streamのheaderだけに使い、event・checkpoint・logへ出さない。
 - **test:** `cargo test -p herness-engine-pi` はenvelope/unknown version/duplicate save、audit checkpoint置換、intent+checkpoint同一transaction、operation ID、event変換と再配送dedupe、catalog filter、provider mappingを確認する。`cargo test -p herness-runtime-tests --test engine --locked` はloopback mockだけで、OpenAI・Anthropic・OpenAI互換・ChatGPTのtext/tool往復、request形状、terminal、cancel、auth失敗、ChatGPTのcatalog・`response.completed`必須・incomplete/failed/early disconnect・backend-api非使用・model非fallback、複数session非混入、SQLiteのintent先行とengine checkpoint、event/history再配送の非再実行、tool ID重複、途中停止とrestore非再送、未知checkpoint形式の拒否と保持、secret canary、requestごとのcredential解決を確認する。実provider・実Keychain・実loginはTask 13の許可まで実行しない。
+
+## Task 10で固定したhost runtimeの契約
+
+実装は `crates/herness-core/src/runtime/`、testは `tests/runtime/tests/host.rs`。`Runtime<S, E, T>` はstore・engine・credential・evaluator・tool実装を外側から注入され、`herness-core` から `herness-store` / `herness-engine-pi` / Tauriへの依存を追加しない。
+
+- **project:** `open_project` は実パスをcanonicalizeし、読めるdirectoryだけを受け付ける。同一のcanonical real pathは同じ `ProjectId` に戻り、別pathは別projectになる。返す `ProjectView` は接続の非secret状態、`HostCapabilities::h1()`、toolchain検出結果（不足を含む）を持つ。読めないpath・directoryでないpathは拒否し、capability不足を隠さない。
+- **agent / run:** agentはhostが作り、独立した `AgentId`/`SessionId` を持つ。runは既存agentに紐づく別の `RunId`。`start_run` は選択接続の現在status、`PermissionMode`（automaticは利用可能なevaluator必須）、agentの要求capabilityを `EnginePort::start` より前に確認する。run stateと `run.started` eventは同じtransactionで永続化してからengineをstartする。拒否時はengine request 0件。
+- **run state:** `running` / `awaiting_approval` / `paused` / `interrupted` / `idle` / `failed` を区別する。`idle` はengineがquiescentである事実だけで、Task/goal完了や新runの自動開始を意味しない。`stop_run` は `Stopped`/`NotRunning` を `paused`、`Unconfirmed` を `interrupted` に写像してcheckpointを保存し、`failed` とは区別する。`resume_run` は明示的な人間操作で、現在のcredential・connection・mode・run grantを再確認し、保存checkpointからのみ復元する。model inputの自動再送はしない。`idle` runはresumeできず、追加実行は新runにする。
+- **approval:** `PermissionOutcome::AwaitingApproval` ではfrozen operationと承認待ちをhost stateへ永続化し、runを `awaiting_approval` にしてから戻る。executorは呼ばない。`approve(operation_id)` は保存済みoperation・project・policy version・mode・args/cwd bindingを再確認し、現在のpolicy・credential・connectionを再確認してから、gatewayのsingle-use authorizationを消費してexecutorを一度だけ呼ぶ。結果とaudit eventを保存し、host作成のcontinuation inputでengineへ結果を伝える（SDKのtool-result frameを捏造しない）。2回目、deny後、引数変更、policy/mode変更、run resume、restart後の承認はexecutorに到達しない。`deny` はeventだけを保存し、executorを呼ばない。`pending_approvals` はrestored/reusable flag付きでUIへ返す。
+- **child agent:** hostだけがagentを作れ、親model向けのdispatch toolは登録しない。`AgentSpec::child_of` は親のgrantから `GrantScope::derive_child` でsubsetだけを受け付け、広いscopeは `GrantWidening` で拒否する。
+- **restore:** `Runtime::restore` はhost stateを読み、running/awaiting_approvalを `interrupted` にし、既存の承認を `restored` かつ再利用不可にする。`unresolved_operations` を読み、native fileは現在内容と意図の比較で `applied`/`not_applied`/`unverifiable`、bashは `shell uncertainty`、read/searchは副作用なしとして照合する。engine start・model request・tool実行・承認再利用は行わない（testはrequest 0件を確認）。`resume_run` は照合後の明示的な人間操作としてのみ提供する。
+- **subscription:** `subscribe(project, cursor, limit)` はproject-bound `SubscriptionCursor` のsequenceより後のcommit済みeventだけを昇順で返し、`last_sequence` を返す。`snapshot` はrun状態・pending approval・last sequenceを返す。storeにcommitされる前のeventは返さない。再配送は購読の読み直しであり、操作を再実行しない。別projectのcursorは `CrossProject` で拒否する。
+- **永続化:** storeのschema 3で `host_state (key TEXT PRIMARY KEY, value BLOB)` を追加した。値はformat 1のversioned JSONで、project path、agent/session/run metadata、run state、child grant mirror、pending approvalのfrozen operation/reason/restored flagだけを持ち、secret・token・checkpoint・provider raw errorを含めない。未知format/未知fieldは黙って解釈せず `CorruptState` にする。既存schema 1/2からのmigrationはadditiveで、既存table・event・operation・checkpointを変更しない。
+- **test:** `cargo test -p herness-runtime-tests --test host --locked`。実SQLite store、一時project、scripted `EnginePort`、fake credential、実 `NativeFileTools` のcounting wrapperを使い、2 project・複数agent分離、start拒否、承認前side effect 0、approve 1回、deny 0回、stale approval、停止・再開、idleとfailed/interruptedの区別、restore request 0、照合分類、購読再接続の重複・欠落なし、再配送非再実行、cross-project拒否を確認する。network・実Keychain・実provider・Tauriは使わない。
 
 ## Task 1で固定した契約と検証
 

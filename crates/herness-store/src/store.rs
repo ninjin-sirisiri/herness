@@ -17,7 +17,8 @@ use herness_core::{
     CommitReceipt, ContractVersion, CoreError, Event, EventDraft, EventKind, EventPayload,
     FrozenOperation, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery, OperationEvidence,
     OperationId, OperationIntent, OperationOutcome, OperationRecord, OperationResult,
-    PermissionMode, PolicyVersion, ProjectId, RunId, StorePort, Timestamp, ToolArguments, ToolName,
+    PermissionMode, PolicyVersion, ProjectId, RunId, RuntimeStore, StorePort, Timestamp,
+    ToolArguments, ToolName,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -129,6 +130,14 @@ impl Store {
     /// This is the inherent form of [`StorePort::commit_checkpoint`] with the
     /// full store error detail.
     pub fn commit(&mut self, commit: CheckpointCommit) -> Result<CommitReceipt, StoreError> {
+        self.commit_with_state(None, commit)
+    }
+
+    fn commit_with_state(
+        &mut self,
+        state: Option<(&str, &[u8])>,
+        commit: CheckpointCommit,
+    ) -> Result<CommitReceipt, StoreError> {
         let checkpoint = commit.checkpoint();
         let run = checkpoint.run_id();
         let project = run.project_id();
@@ -191,6 +200,10 @@ impl Store {
 
         if let Some(intent) = commit.operation() {
             insert_operation(&transaction, intent)?;
+        }
+
+        if let Some((key, value)) = state {
+            write_host_state(&transaction, key, value)?;
         }
 
         if self.fault.commit == Some(CommitPoint::BeforeCommit) {
@@ -271,7 +284,7 @@ impl Store {
         operation: &OperationId,
         result: OperationResult,
     ) -> Result<OperationRecord, StoreError> {
-        self.record_result(operation, result, Vec::new())
+        self.record_result(operation, result, Vec::new(), None)
             .map(|(record, _)| record)
     }
 
@@ -287,7 +300,21 @@ impl Store {
         result: OperationResult,
         events: Vec<EventDraft>,
     ) -> Result<CommitReceipt, StoreError> {
-        self.record_result(operation, result, events)
+        self.record_result(operation, result, events, None)
+            .map(|(_, receipt)| receipt)
+    }
+
+    /// Records an operation result, its events, and private host state in one
+    /// transaction.
+    pub fn record_operation_result_with_state(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+        state_key: &str,
+        state_value: &[u8],
+    ) -> Result<CommitReceipt, StoreError> {
+        self.record_result(operation, result, events, Some((state_key, state_value)))
             .map(|(_, receipt)| receipt)
     }
 
@@ -296,6 +323,7 @@ impl Store {
         operation: &OperationId,
         result: OperationResult,
         events: Vec<EventDraft>,
+        state: Option<(&str, &[u8])>,
     ) -> Result<(OperationRecord, CommitReceipt), StoreError> {
         let transaction = self
             .conn
@@ -361,6 +389,9 @@ impl Store {
 
         let (events, _) = append_events(&transaction, &intent.project_id(), &events)?;
         let max_sequence = events.last().map_or(0, Event::sequence);
+        if let Some((key, value)) = state {
+            write_host_state(&transaction, key, value)?;
+        }
         transaction.commit().map_err(StoreError::database)?;
         let record = OperationRecord::new(record.intent().clone(), Some(result));
         Ok((record, CommitReceipt::new(events, max_sequence)))
@@ -421,6 +452,70 @@ impl Store {
             events.push(event_from_row(row, *project)?);
         }
         Ok(events)
+    }
+
+    /// Loads one private host-state value. Values are opaque to the store.
+    pub fn load_host_state(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT value FROM host_state WHERE key = ?1",
+                [key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(StoreError::database)
+    }
+
+    /// Persists one private host-state value.
+    pub fn save_host_state(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_host_state(&transaction, key, value)?;
+        transaction.commit().map_err(StoreError::database)
+    }
+
+    /// Persists host state and appends committed events atomically.
+    ///
+    /// All events must belong to one project; an empty list persists only the
+    /// state value.
+    pub fn save_host_state_and_events(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, StoreError> {
+        let project = events.first().map(EventDraft::project_id);
+        if events
+            .iter()
+            .any(|event| Some(event.project_id()) != project)
+        {
+            return Err(StoreError::corrupt(
+                "host-state events must belong to one project",
+            ));
+        }
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_host_state(&transaction, key, value)?;
+        let (events, _) = match project {
+            Some(project) => append_events(&transaction, &project, &events)?,
+            None => (Vec::new(), 0),
+        };
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(CommitReceipt::new(events, max_sequence))
+    }
+
+    /// Persists host state and a checkpoint commit atomically.
+    pub fn save_host_state_and_checkpoint(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        commit: CheckpointCommit,
+    ) -> Result<CommitReceipt, StoreError> {
+        self.commit_with_state(Some((key, value)), commit)
     }
 
     fn history_page(&self, query: HistoryQuery) -> Result<HistoryPage, StoreError> {
@@ -543,6 +638,75 @@ impl StorePort for Store {
         Store::record_operation_result_with_events(self, operation, result, events)
             .map_err(Into::into)
     }
+}
+
+impl RuntimeStore for Store {
+    fn events_after(
+        &self,
+        project: &ProjectId,
+        after_sequence: Option<u64>,
+        limit: HistoryLimit,
+    ) -> Result<Vec<Event>, CoreError> {
+        Store::events_after(self, project, after_sequence, limit).map_err(Into::into)
+    }
+
+    fn unresolved_operations(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<OperationRecord>, CoreError> {
+        Store::unresolved_operations(self, project).map_err(Into::into)
+    }
+
+    fn load_host_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
+        Store::load_host_state(self, key).map_err(Into::into)
+    }
+
+    fn save_host_state(&mut self, key: &str, value: &[u8]) -> Result<(), CoreError> {
+        Store::save_host_state(self, key, value).map_err(Into::into)
+    }
+
+    fn save_host_state_and_events(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError> {
+        Store::save_host_state_and_events(self, key, value, events).map_err(Into::into)
+    }
+
+    fn save_host_state_and_checkpoint(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        commit: CheckpointCommit,
+    ) -> Result<CommitReceipt, CoreError> {
+        Store::save_host_state_and_checkpoint(self, key, value, commit).map_err(Into::into)
+    }
+
+    fn record_operation_result_with_state(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError> {
+        Store::record_operation_result_with_state(self, operation, result, events, key, value)
+            .map_err(Into::into)
+    }
+}
+
+fn write_host_state(
+    transaction: &Transaction<'_>,
+    key: &str,
+    value: &[u8],
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO host_state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 fn prepare_location(config: &StoreConfig) -> Result<(), StoreError> {
