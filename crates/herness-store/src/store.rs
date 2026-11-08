@@ -14,17 +14,17 @@ use std::time::Duration;
 
 use herness_core::{
     AbsolutePath, Checkpoint, CheckpointCommit, CheckpointFormatVersion, CheckpointPayload,
-    CommitReceipt, ContractVersion, CoreError, Event, EventKind, EventPayload, FrozenOperation,
-    HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery, OperationId, OperationIntent,
+    CommitReceipt, ContractVersion, CoreError, Event, EventDraft, EventKind, EventPayload,
+    FrozenOperation, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery, OperationEvidence,
+    OperationId, OperationIntent, OperationOutcome, OperationRecord, OperationResult,
     PermissionMode, PolicyVersion, ProjectId, RunId, StorePort, Timestamp, ToolArguments, ToolName,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::config::StoreConfig;
 use crate::error::StoreError;
-use crate::fault::{CommitPoint, FaultPlan};
+use crate::fault::{CommitPoint, FaultPlan, ResultPoint};
 use crate::migrations;
-use crate::operation::{OperationEvidence, OperationOutcome, OperationRecord, OperationResult};
 
 const EVENT_COLUMNS: &str = "contract_version, agent_id, session_id, run_id, operation_id, \
                               sequence, kind, occurred_at, payload";
@@ -163,21 +163,7 @@ impl Store {
             }
         }
 
-        let next_sequence = next_sequence(&transaction, &project)?;
-        let mut events = Vec::with_capacity(commit.events().len());
-        for (index, draft) in commit.events().iter().enumerate() {
-            let offset =
-                u64::try_from(index).map_err(|_| StoreError::corrupt("event index overflow"))?;
-            let sequence = next_sequence
-                .checked_add(offset)
-                .ok_or_else(|| StoreError::corrupt("project sequence overflow"))?;
-            events.push(
-                draft
-                    .clone()
-                    .into_event(sequence)
-                    .map_err(|error| StoreError::corrupt(format!("event draft: {error}")))?,
-            );
-        }
+        let (events, next_sequence) = append_events(&transaction, &project, commit.events())?;
 
         let max_sequence = events.last().map_or(0, Event::sequence);
         let last_sequence = if events.is_empty() {
@@ -205,44 +191,6 @@ impl Store {
 
         if let Some(intent) = commit.operation() {
             insert_operation(&transaction, intent)?;
-        }
-
-        if !events.is_empty() {
-            let mut statement = transaction.prepare(
-                "INSERT INTO events (project_id, sequence, contract_version, agent_id, session_id,
-                                     run_id, operation_id, kind, occurred_at, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for event in &events {
-                statement.execute(params![
-                    event.project_id().to_string(),
-                    sequence_to_sql(event.sequence())?,
-                    i64::from(event.contract_version().get()),
-                    event.agent_id().to_string(),
-                    event.session_id().to_string(),
-                    event.run_id().to_string(),
-                    event.operation_id().map(|operation| operation.to_string()),
-                    event.kind().as_str(),
-                    i64::try_from(event.occurred_at().as_unix_millis()).map_err(|_| {
-                        StoreError::corrupt("event timestamp does not fit in sqlite")
-                    })?,
-                    serde_json::to_string(event.payload()).map_err(StoreError::codec)?,
-                ])?;
-            }
-            drop(statement);
-
-            transaction.execute(
-                "INSERT INTO project_sequences (project_id, next_sequence) VALUES (?1, ?2)
-                 ON CONFLICT(project_id) DO UPDATE SET next_sequence = excluded.next_sequence",
-                params![
-                    project.to_string(),
-                    sequence_to_sql(
-                        next_sequence
-                            .checked_add(events.len() as u64)
-                            .ok_or_else(|| StoreError::corrupt("project sequence overflow"))?,
-                    )?,
-                ],
-            )?;
         }
 
         if self.fault.commit == Some(CommitPoint::BeforeCommit) {
@@ -323,18 +271,71 @@ impl Store {
         operation: &OperationId,
         result: OperationResult,
     ) -> Result<OperationRecord, StoreError> {
+        self.record_result(operation, result, Vec::new())
+            .map(|(record, _)| record)
+    }
+
+    /// Records the durable result and appends events in one transaction.
+    ///
+    /// This is how a file tool persists "the result happened and here is its
+    /// notification" without a window where one exists without the other.
+    /// Re-recording an identical result appends no events and returns an empty
+    /// receipt. A different result conflicts.
+    pub fn record_operation_result_with_events(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, StoreError> {
+        self.record_result(operation, result, events)
+            .map(|(_, receipt)| receipt)
+    }
+
+    fn record_result(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<(OperationRecord, CommitReceipt), StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(mut record) = load_operation_record(&transaction, &operation.to_string())? else {
+
+        if self.fault.result == Some(ResultPoint::BeforeUpdate) {
+            return Err(StoreError::InjectedFault {
+                point: ResultPoint::BeforeUpdate.as_str(),
+            });
+        }
+
+        let Some(record) = load_operation_record(&transaction, &operation.to_string())? else {
             return Err(StoreError::UnknownOperation {
                 operation: *operation,
             });
         };
 
-        if let Some(existing) = &record.result {
+        let intent = record.intent().operation();
+        for event in &events {
+            if event.project_id() != intent.project_id() {
+                return Err(StoreError::CrossProjectReference {
+                    expected: intent.project_id(),
+                    found: event.project_id(),
+                });
+            }
+            if event.run_id() != intent.run_id() {
+                return Err(StoreError::corrupt(
+                    "operation result event belongs to another run",
+                ));
+            }
+            if event.operation_id().is_some_and(|id| id != *operation) {
+                return Err(StoreError::corrupt(
+                    "operation result event belongs to another operation",
+                ));
+            }
+        }
+
+        if let Some(existing) = record.result() {
             if existing == &result {
-                return Ok(record);
+                return Ok((record, CommitReceipt::new(Vec::new(), 0)));
             }
             return Err(StoreError::OperationResultConflict {
                 operation: *operation,
@@ -358,9 +359,11 @@ impl Store {
             });
         }
 
+        let (events, _) = append_events(&transaction, &intent.project_id(), &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
         transaction.commit().map_err(StoreError::database)?;
-        record.result = Some(result);
-        Ok(record)
+        let record = OperationRecord::new(record.intent().clone(), Some(result));
+        Ok((record, CommitReceipt::new(events, max_sequence)))
     }
 
     /// Returns operations whose outcome is still pending or unverifiable.
@@ -479,7 +482,7 @@ impl Store {
         while let Some(row) = rows.next()? {
             let record = operation_record_from_row(row)?;
             if record.result().is_none() {
-                intents.push(record.intent);
+                intents.push(record.intent().clone());
             }
         }
         Ok(intents)
@@ -489,6 +492,12 @@ impl Store {
     #[cfg(feature = "test-support")]
     pub fn set_commit_fault(&mut self, fault: Option<crate::test_support::CommitFault>) {
         self.fault.commit = fault.map(Into::into);
+    }
+
+    /// Test-support fault injection for the next operation-result recording.
+    #[cfg(feature = "test-support")]
+    pub fn set_result_fault(&mut self, fault: Option<crate::test_support::ResultFault>) {
+        self.fault.result = fault.map(Into::into);
     }
 }
 
@@ -509,6 +518,30 @@ impl StorePort for Store {
 
     fn pending_operations(&self, project: &ProjectId) -> Result<Vec<OperationIntent>, CoreError> {
         self.pending_intents(project).map_err(Into::into)
+    }
+
+    fn operation(&self, operation: &OperationId) -> Result<Option<OperationRecord>, CoreError> {
+        Store::operation(self, operation).map_err(Into::into)
+    }
+
+    fn record_operation_result(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+    ) -> Result<(), CoreError> {
+        Store::record_operation_result(self, operation, result)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    fn record_operation_result_with_events(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError> {
+        Store::record_operation_result_with_events(self, operation, result, events)
+            .map_err(Into::into)
     }
 }
 
@@ -565,6 +598,70 @@ fn next_sequence(transaction: &Transaction<'_>, project: &ProjectId) -> Result<u
 fn sequence_to_sql(sequence: u64) -> Result<i64, StoreError> {
     i64::try_from(sequence)
         .map_err(|_| StoreError::corrupt("sequence does not fit in sqlite integer"))
+}
+
+/// Assigns project sequences to drafts, inserts them, and advances the project
+/// sequence counter. Returns the committed events and the sequence observed
+/// before the first draft.
+fn append_events(
+    transaction: &Transaction<'_>,
+    project: &ProjectId,
+    drafts: &[EventDraft],
+) -> Result<(Vec<Event>, u64), StoreError> {
+    let next_sequence = next_sequence(transaction, project)?;
+    let mut events = Vec::with_capacity(drafts.len());
+    for (index, draft) in drafts.iter().enumerate() {
+        let offset =
+            u64::try_from(index).map_err(|_| StoreError::corrupt("event index overflow"))?;
+        let sequence = next_sequence
+            .checked_add(offset)
+            .ok_or_else(|| StoreError::corrupt("project sequence overflow"))?;
+        events.push(
+            draft
+                .clone()
+                .into_event(sequence)
+                .map_err(|error| StoreError::corrupt(format!("event draft: {error}")))?,
+        );
+    }
+
+    if !events.is_empty() {
+        let mut statement = transaction.prepare(
+            "INSERT INTO events (project_id, sequence, contract_version, agent_id, session_id,
+                                 run_id, operation_id, kind, occurred_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for event in &events {
+            statement.execute(params![
+                event.project_id().to_string(),
+                sequence_to_sql(event.sequence())?,
+                i64::from(event.contract_version().get()),
+                event.agent_id().to_string(),
+                event.session_id().to_string(),
+                event.run_id().to_string(),
+                event.operation_id().map(|operation| operation.to_string()),
+                event.kind().as_str(),
+                i64::try_from(event.occurred_at().as_unix_millis())
+                    .map_err(|_| StoreError::corrupt("event timestamp does not fit in sqlite"))?,
+                serde_json::to_string(event.payload()).map_err(StoreError::codec)?,
+            ])?;
+        }
+        drop(statement);
+
+        transaction.execute(
+            "INSERT INTO project_sequences (project_id, next_sequence) VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET next_sequence = excluded.next_sequence",
+            params![
+                project.to_string(),
+                sequence_to_sql(
+                    next_sequence
+                        .checked_add(events.len() as u64)
+                        .ok_or_else(|| StoreError::corrupt("project sequence overflow"))?,
+                )?,
+            ],
+        )?;
+    }
+
+    Ok((events, next_sequence))
 }
 
 fn insert_operation(
@@ -685,7 +782,7 @@ fn operation_record_from_row(row: &rusqlite::Row<'_>) -> Result<OperationRecord,
         }
     };
 
-    Ok(OperationRecord { intent, result })
+    Ok(OperationRecord::new(intent, result))
 }
 
 fn event_from_row(row: &rusqlite::Row<'_>, project: ProjectId) -> Result<Event, StoreError> {

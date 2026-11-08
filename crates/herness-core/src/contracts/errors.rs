@@ -13,6 +13,7 @@ use crate::contracts::ids::{IdKind, OperationId, ProjectId, RunId};
 use crate::contracts::run::RunState;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolName;
+use crate::tools::arguments::FileVersion;
 use crate::tools::reason::{ReasonField, ReasonViolation};
 
 /// Structured herness error. `kind` is stable public contract data.
@@ -169,6 +170,13 @@ pub enum CoreError {
         /// Sanitized failure reason.
         failure: ProviderFailureKind,
     },
+    /// A native file tool could not complete safely.
+    FileToolFailed {
+        /// Tool that failed.
+        tool: ToolName,
+        /// Structured, non-secret failure detail.
+        failure: FileFailure,
+    },
     /// A run is not in a state that permits the requested transition.
     InvalidRunTransition {
         /// State before the attempted transition.
@@ -290,6 +298,117 @@ pub enum ProviderFailureKind {
     Refused,
     /// Another sanitized provider failure.
     Unknown,
+}
+
+/// Structured, non-secret reason a native file tool failed.
+///
+/// These failures are decided by host path resolution and version checks. They
+/// do not claim OS sandbox isolation; the project root is a trusted-project
+/// boundary only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum FileFailure {
+    /// The requested path resolves outside the canonical project root.
+    PathOutsideProject {
+        /// Rejected path as supplied.
+        path: String,
+    },
+    /// A symlink was the target, or a not-yet-created file had a symlinked
+    /// parent.
+    SymlinkNotAllowed {
+        /// Rejected path.
+        path: String,
+    },
+    /// A required file or directory did not exist.
+    NotFound {
+        /// Missing path.
+        path: String,
+    },
+    /// The target existed but was not a regular file.
+    NotAFile {
+        /// Rejected path.
+        path: String,
+    },
+    /// A required parent existed but was not a directory.
+    NotADirectory {
+        /// Rejected path.
+        path: String,
+    },
+    /// `write` creates files only; the target already existed.
+    AlreadyExists {
+        /// Existing path.
+        path: String,
+    },
+    /// A not-yet-created file had no existing parent directory.
+    ParentMissing {
+        /// Missing parent path.
+        path: String,
+    },
+    /// A not-yet-created file had a parent that was not a directory.
+    ParentNotDirectory {
+        /// Rejected parent path.
+        path: String,
+    },
+    /// A text tool read bytes that were not valid UTF-8.
+    InvalidUtf8 {
+        /// Path whose contents were rejected.
+        path: String,
+    },
+    /// The observed file version did not match the caller's expectation.
+    VersionConflict {
+        /// Path whose version changed.
+        path: String,
+        /// Version the caller expected.
+        expected: FileVersion,
+        /// Version observed now.
+        actual: FileVersion,
+    },
+    /// `edit.oldText` was empty.
+    EditTextEmpty,
+    /// `edit.oldText` did not occur in the file.
+    EditTextNotFound {
+        /// Path that was searched.
+        path: String,
+    },
+    /// `edit.oldText` occurred more than once.
+    EditTextNotUnique {
+        /// Path that was searched.
+        path: String,
+        /// Number of non-overlapping occurrences observed.
+        occurrences: u64,
+    },
+    /// `edit` would not change the file.
+    NoChange {
+        /// Path that was not changed.
+        path: String,
+    },
+    /// The intent could not be recorded, so no side effect was performed.
+    NotExecutable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The side effect happened but its durable result could not be recorded.
+    /// Reconciliation is required; the host did not roll back or retry.
+    Unverifiable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The local filesystem rejected the operation.
+    Io {
+        /// Path involved.
+        path: String,
+        /// Sanitized error kind.
+        error_kind: String,
+    },
+    /// This file executor does not handle the requested tool.
+    Unsupported {
+        /// Requested tool.
+        tool: ToolName,
+    },
 }
 
 impl fmt::Display for IdKind {
@@ -422,8 +541,67 @@ impl fmt::Display for CoreError {
             Self::ProviderFailure { provider, failure } => {
                 write!(f, "provider {provider} failed: {failure:?}")
             }
+            Self::FileToolFailed { tool, failure } => {
+                write!(f, "{tool} failed: {failure}")
+            }
             Self::InvalidRunTransition { from, to } => {
                 write!(f, "run cannot transition from {from} to {to}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for FileFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathOutsideProject { path } => {
+                write!(f, "path {path:?} is outside the project root")
+            }
+            Self::SymlinkNotAllowed { path } => {
+                write!(f, "path {path:?} is a symlink or has a symlinked parent")
+            }
+            Self::NotFound { path } => write!(f, "path {path:?} does not exist"),
+            Self::NotAFile { path } => write!(f, "path {path:?} is not a regular file"),
+            Self::NotADirectory { path } => write!(f, "path {path:?} is not a directory"),
+            Self::AlreadyExists { path } => {
+                write!(f, "path {path:?} already exists; write creates files only")
+            }
+            Self::ParentMissing { path } => {
+                write!(f, "parent directory {path:?} does not exist")
+            }
+            Self::ParentNotDirectory { path } => {
+                write!(f, "parent path {path:?} is not a directory")
+            }
+            Self::InvalidUtf8 { path } => write!(f, "path {path:?} is not valid UTF-8"),
+            Self::VersionConflict {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "path {path:?} changed: expected version {expected}, observed {actual}"
+            ),
+            Self::EditTextEmpty => f.write_str("edit oldText must not be empty"),
+            Self::EditTextNotFound { path } => {
+                write!(f, "edit oldText was not found in {path:?}")
+            }
+            Self::EditTextNotUnique { path, occurrences } => write!(
+                f,
+                "edit oldText occurs {occurrences} times in {path:?}; expected exactly one"
+            ),
+            Self::NoChange { path } => write!(f, "edit would not change {path:?}"),
+            Self::NotExecutable { detail } => {
+                write!(f, "operation was not executed: {detail}")
+            }
+            Self::Unverifiable { detail } => write!(
+                f,
+                "side effect may be applied but the result is not durable; reconciliation required: {detail}"
+            ),
+            Self::Io { path, error_kind } => {
+                write!(f, "filesystem error at {path:?}: {error_kind}")
+            }
+            Self::Unsupported { tool } => {
+                write!(f, "{tool} is not handled by the native file executor")
             }
         }
     }

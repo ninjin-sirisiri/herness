@@ -100,6 +100,12 @@ impl<E> ToolGateway<E> {
         &self.executor
     }
 
+    /// Mutable executor reference, for host/test configuration such as fault
+    /// injection. Permission checks still run in [`Self::execute`].
+    pub const fn executor_mut(&mut self) -> &mut E {
+        &mut self.executor
+    }
+
     /// Pending human approvals.
     pub fn pending_approvals(&self) -> Vec<ApprovalRequest> {
         self.service.pending_approvals()

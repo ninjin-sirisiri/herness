@@ -150,6 +150,33 @@ impl StorePort for FakeStore {
     fn pending_operations(&self, _project: &ProjectId) -> Result<Vec<OperationIntent>, CoreError> {
         Ok(Vec::new())
     }
+
+    fn operation(&self, _operation: &OperationId) -> Result<Option<OperationRecord>, CoreError> {
+        Ok(None)
+    }
+
+    fn record_operation_result(
+        &mut self,
+        _operation: &OperationId,
+        _result: OperationResult,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn record_operation_result_with_events(
+        &mut self,
+        _operation: &OperationId,
+        _result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError> {
+        let events = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, draft)| draft.into_event(index as u64 + 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+        Ok(CommitReceipt::new(events, max_sequence))
+    }
 }
 
 struct FakeCredential {

@@ -16,4 +16,5 @@ herness-core = { path = "../../crates/herness-core" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true

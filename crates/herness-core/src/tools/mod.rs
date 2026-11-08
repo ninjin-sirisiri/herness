@@ -1,9 +1,16 @@
-//! Native tool argument schemas, shared reason validation, and the gateway
-//! permission boundary.
+//! Native tool argument schemas, shared reason validation, the gateway
+//! permission boundary, and the native file tools.
 
 pub mod arguments;
+pub mod diff;
+pub mod edit;
+pub mod files;
 pub mod gateway;
+pub mod path;
+pub mod read;
 pub mod reason;
+pub mod search;
+pub mod write;
 
 use std::fmt;
 
@@ -12,8 +19,19 @@ use serde::{Deserialize, Serialize};
 pub use arguments::{
     BashArgs, EditArgs, FileVersion, NonEmptyText, ReadArgs, SearchArgs, ToolArguments, WriteArgs,
 };
+pub use diff::{FileDiff, MAX_DIFF_BYTES};
+pub use files::{
+    FILE_CHANGE_EVENT_KIND, FILE_CHANGE_INTENDED_EVENT_KIND, FileChange, FileLockGuard,
+    FileLockRegistry, FileToolOutput, NativeFileTools, hash_bytes,
+};
 pub use gateway::{GatewayError, ToolExecutor, ToolGateway};
+pub use path::{ProjectRoot, ResolvedPath};
+pub use read::{DEFAULT_READ_LIMIT, MAX_READ_LIMIT, ReadOutput};
 pub use reason::{MAX_REASON_SCALARS, Purpose, Rationale, ReasonField, ReasonViolation};
+pub use search::{
+    DEFAULT_SEARCH_RESULTS, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_FILES, MAX_SEARCH_RESULTS,
+    SearchMatch, SearchOutput, glob_matches,
+};
 
 /// The five native tools available in H1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

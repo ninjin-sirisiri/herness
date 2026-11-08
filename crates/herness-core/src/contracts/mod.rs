@@ -16,7 +16,7 @@ pub use checkpoint::{Checkpoint, CheckpointFormatVersion, CheckpointPayload};
 pub use connection::{AuthMethod, ConnectionId, ConnectionInfo, ConnectionStatus, Provider};
 pub use errors::{
     ArgumentViolation, CoreError, CredentialFailureKind, EngineFailureKind, EvaluationFailureKind,
-    PathViolation, ProviderFailureKind, StoreFailureKind,
+    FileFailure, PathViolation, ProviderFailureKind, StoreFailureKind,
 };
 pub use events::{Event, EventDraft, EventKind, EventPayload};
 pub use history::{
@@ -27,7 +27,10 @@ pub use ids::{
     AgentId, AgentKind, IdKind, OperationId, OperationKind, ProjectId, ProjectScope, RunId,
     RunKind, ScopedId, ScopedIdKind, SessionId, SessionKind,
 };
-pub use operation::{FrozenOperation, OperationIntent};
+pub use operation::{
+    FileObservation, FrozenOperation, OperationEvidence, OperationIntent, OperationOutcome,
+    OperationRecord, OperationResult,
+};
 pub use path::AbsolutePath;
 pub use run::RunState;
 pub use time::Timestamp;

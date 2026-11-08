@@ -11,7 +11,6 @@ mod config;
 mod error;
 mod fault;
 mod migrations;
-mod operation;
 mod store;
 
 #[cfg(feature = "test-support")]
@@ -19,7 +18,7 @@ pub mod test_support;
 
 pub use config::{DATABASE_FILE_NAME, StoreConfig};
 pub use error::{ConfigViolation, StoreError};
-pub use operation::{
+pub use herness_core::{
     FileObservation, OperationEvidence, OperationOutcome, OperationRecord, OperationResult,
 };
 pub use store::{CheckpointRecord, Store};

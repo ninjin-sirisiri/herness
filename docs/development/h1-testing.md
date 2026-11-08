@@ -37,6 +37,7 @@ Task 1の受入で実行するコマンド:
 cargo test -p herness-core
 cargo test -p herness-runtime-tests
 cargo test -p herness-runtime-tests --test permissions
+cargo test -p herness-runtime-tests --test files --locked
 cargo fmt --all -- --check
 ```
 
@@ -48,8 +49,28 @@ cargo test --workspace --locked
 ```
 
 - testはnetwork・外部service・実資格情報を必要としない。依存取得後の通常実行はofflineで完結する。
+- `tests/runtime` のlibrary部は `herness-core` にだけ依存する。black-box test targetは `herness-store`（`test-support` feature付き）、`serde_json`、`tempfile`、`rusqlite`、`sha2` をdev-dependencyとして使う。storeのfault injectionとfile toolの実ファイル操作は一時project・一時DBだけで行う。
 - 後続Taskでstore・engine・Tauriを追加しても、`herness-core` からそれらへの依存を追加しない。workspace全体のtestは `cargo test --workspace --locked` で実行する。
 - 実接続・実Keychain・実Tauriの確認はTask 13の別途許可まで行わない。mock成功を実接続成功として扱わない。
+
+## Task 4で固定したnative file toolの契約
+
+実装は `crates/herness-core/src/tools/{path,read,search,write,edit,files}.rs`、testは `tests/runtime/tests/files.rs`。
+
+- **rootと実パス:** すべてのfile toolはfrozen cwdに対してpathを解決し、lexicalに `.`/`..` を畳んだ後に、既存部分をcanonicalizeする。project rootは起動時にcanonicalizeした実パスで、root外、`..` escape、root配下のsymlink component（target fileと未作成fileのparentを含む）を拒否する。read・searchもwrite・editと同じ検査とpermission境界を通る。absolute引数はcanonical rootの配下にlexicalに一致する必要がある。hard linkはpathから判別しない。これは信頼するprojectの境界であり、OS sandboxではない。
+- **writeはcreate-only:** 既存file・directory・symlinkへのwriteは `AlreadyExists`/`SymlinkNotAllowed` で失敗し、上書きしない。既存fileの変更は `edit` だけが行う。
+- **edit:** 既存regular fileが必須。`oldText` は空でなく、非overlapでちょうど1回出現する必要がある（0回と複数回は別error）。`expectedVersion` が指定された場合は現在のhashと一致しなければならず、未指定でも `oldText` の一致が内容の前提になる。
+- **版:** native fileの `FileVersion` はfile bytesのSHA-256 hex（64文字）。作成時のbeforeは `None`、editはbefore/afterを記録する。
+- **順序:** freeze済み引数 → gatewayのpermission authorize → lock取得 → before版とdiff確定 → checkpoint + `OperationIntent` + `file.change.intended` eventを1 transactionで保存 → 実パス/版を再確認 → 同一directory内のtemp file + renameでatomicに書く（editは既存permissionを維持）→ 変更後hashを確認 → `Applied` result + `file.change` eventを1 transactionで保存 → 成功を返す。
+- **保存失敗:** 事前保存失敗はfileを変更せず `NotExecutable`。書き込み後のresult保存失敗はrollbackもretryもせず `Unverifiable` として照合待ちにし、intentだけが残る。duplicate operation IDは `DuplicateOperation` を返し、再適用しない。
+- **直列化:** process内のcanonical path単位のlock registryでwrite/editを直列化する。別processや外部editorが最終再確認とrenameの間に変更するraceは排除しない。Task 10以降、同一processの複数executorで書き込みを直列化する場合は、1つの `Arc<FileLockRegistry>` を共有して構築する。executorごとの既定registryはそのexecutor内だけを直列化する。
+- **read:** UTF-8のみ。1-based `offset`（既定1）、`limit`（既定2,000、上限10,000）行を返し、`totalLines` と `truncated` を返す。file全体のversionも返す。
+- **search:** ripgrep不要。case-sensitiveなliteral substringを各行で探し、project-relativeでglob filterする。globは `*`（`/`以外）、`**`（`/`も含む）、`?`（`/`以外の1文字）で、それ以外はliteral。結果はpath・1-based line・1-based Unicode scalar column・bounded preview。traversalはfile名sortのdepth-firstで、symlinkを辿らず、regular file以外・4 MiB超・非UTF-8をskipする。既定100件、上限1,000件、scan上限20,000 fileで `truncated` を立てる。
+- **diff:** common prefix/suffix + 3行contextのunified-style。32 KiBを超える場合は `[diff truncated: ...]` を末尾に明示する。
+- **永続通知:** `file.change` のpayloadは `path`（absolute）、`operationId`、`tool`、`created`、`beforeVersion`、`afterVersion`、`diff`、`diffTruncated`、`rationale`。`rationale` はmodelの説明であり、権限や事実の証明ではない。watcher・HTML著作・外部編集者のactor推測は実装しない。
+- **checkpoint:** 現時点のfile toolは `herness.file-operation`（format 1、stage `intent`）のhost監査用opaque checkpointをintent transactionで書く。engineの会話checkpointはTask 9が供給する。result + `file.change` は同じtransactionで保存するがcheckpointの `lastSequence` はintent時点のままなので、checkpointからの再購読で通知が再配送され得る。再配送を操作の再実行として扱わない。
+- **fault injection:** storeの `CommitFault::{BeforeRows,BeforeCommit}` はintent transactionに、`ResultFault::BeforeUpdate` はresult記録に使う。どちらも `test-support` feature限定で、production hostは有効にしない。
+
 
 ## Task 1で固定した契約と検証
 

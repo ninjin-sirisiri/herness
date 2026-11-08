@@ -8,8 +8,8 @@ use crate::contracts::checkpoint::Checkpoint;
 use crate::contracts::errors::CoreError;
 use crate::contracts::events::{Event, EventDraft};
 use crate::contracts::history::{HistoryPage, HistoryQuery};
-use crate::contracts::ids::{ProjectId, RunId};
-use crate::contracts::operation::OperationIntent;
+use crate::contracts::ids::{OperationId, ProjectId, RunId};
+use crate::contracts::operation::{OperationIntent, OperationRecord, OperationResult};
 
 /// One atomic checkpoint commit.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,4 +105,30 @@ pub trait StorePort {
 
     /// Returns operation intents that have no durable result yet.
     fn pending_operations(&self, project: &ProjectId) -> Result<Vec<OperationIntent>, CoreError>;
+
+    /// Loads one operation record, including its result when recorded.
+    fn operation(&self, operation: &OperationId) -> Result<Option<OperationRecord>, CoreError>;
+
+    /// Records the durable result of an operation.
+    ///
+    /// Re-recording the same result is idempotent. Recording a different result
+    /// for an already resolved operation conflicts and must not be treated as a
+    /// new execution.
+    fn record_operation_result(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+    ) -> Result<(), CoreError>;
+
+    /// Records the durable result and appends notification events in one
+    /// transaction.
+    ///
+    /// Re-recording an identical result appends no events and returns an empty
+    /// receipt. A different result conflicts.
+    fn record_operation_result_with_events(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError>;
 }

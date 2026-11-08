@@ -5,7 +5,7 @@
 
 use crate::config::StoreConfig;
 use crate::error::StoreError;
-use crate::fault::{CommitPoint, MigrationPoint};
+use crate::fault::{CommitPoint, MigrationPoint, ResultPoint};
 use crate::store::Store;
 
 /// Commit failure point for a store test.
@@ -22,6 +22,21 @@ impl From<CommitFault> for CommitPoint {
         match value {
             CommitFault::BeforeRows => Self::BeforeRows,
             CommitFault::BeforeCommit => Self::BeforeCommit,
+        }
+    }
+}
+
+/// Operation-result recording failure point for a store test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultFault {
+    /// Fail after opening the write transaction but before updating the result.
+    BeforeUpdate,
+}
+
+impl From<ResultFault> for ResultPoint {
+    fn from(value: ResultFault) -> Self {
+        match value {
+            ResultFault::BeforeUpdate => Self::BeforeUpdate,
         }
     }
 }
