@@ -32,6 +32,7 @@ pub mod decisions;
 pub mod error;
 pub mod jev;
 pub mod llm;
+pub mod permission;
 pub mod transport;
 
 pub use decisions::{
@@ -45,6 +46,10 @@ pub use jev::{
 };
 pub use llm::{
     EvidenceContent, EvidenceDocument, InconclusiveReason, LlmAssessment, LlmAssessmentAdapter,
+};
+pub use permission::{
+    PermissionBudgetScope, PermissionConsentHandle, PermissionEvaluator, PermissionEvaluatorConfig,
+    SharedModelRequestGate, permission_question_id,
 };
 pub use transport::{
     AssessmentEndpoints, AssessmentRequest, AssessmentResponse, AssessmentTransport, CancelToken,

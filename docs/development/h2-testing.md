@@ -631,3 +631,38 @@ Task 13の追加確認:
 - `an_unconfirmed_stop_blocks_new_runs_and_reassessment` は、停止未確認なら`stopped(stopUnconfirmed)`とし、追加run・再判定を開始しないことを確認する。`a_failed_child_run_is_unrecoverable_and_blocks_completion` は、H1 runの失敗を`failed(targetUnstable)`として完了より優先する。
 - 監視controllerはsupervision crate内の決定的な同期処理であり、store CASと同時にjournalへtick eventを記録する。保存成功後だけownerへ通知し、stale revision・重複event・遅延結果では追加のrun・判定・停止・通知を行わない。
 - 実provider・実credential・実Keychain・実Tauriは未使用のまま未確認とする。Task 14の許可評価器、Task 15の復旧、Task 16のUIはこのTaskに含めない。
+
+## Task 14で追加した許可評価器
+
+### 配置とH1への引継ぎ
+
+- `crates/herness-assessment/src/permission/` はH1の`PermissionEvaluatorPort`を実装する`PermissionEvaluator`を提供する。入力は`EvaluationRequest`の`FrozenOperation`、依頼作業、許可境界、証拠だけであり、完了条件の`AssessmentRequest`や会話・repositoryを読まない。
+- `PermissionEvaluatorConfig`はpermission用途の`ProfileEntry`、`DisclosureConsent`、接続先`ProviderOrigin`、`TargetVersion`、`AssessmentTransport`、`SharedModelRequestGate`、`PermissionBudgetScope`を持つ。`PermissionEvaluator::into_shared()`を`RuntimeDependencies::with_shared_evaluator`へ、`into_boxed()`を`RuntimeDependencies::with_evaluator`へ渡せる。Task 16のUI/profile選択はこの構成を使う。
+- `SharedModelRequestGate`は同じ`BudgetRequestGate`/`BudgetLedger`への共有ハンドルである。エージェントのmodel要求と許可評価を同じgateへ通す場合、`shared.boxed()`をPiの`set_request_gate`へ、`shared`を評価器へ渡す。
+- 監督対象では`PermissionBudgetScope::Supervised`を使い、時間・金額の同じ予算を共有する。非監督の通常runでは`RunScoped { max_requests: 1 }`を使い、runごとに高々1回だけ許可評価を送る。どちらも有限のgateが無ければ`availability()`はUnavailableになり、送信しない。
+- `PermissionConsentHandle`はhostが実行中に同意を取消し・差替えするための共有ハンドルである。評価器は送信前と応答後の両方で現在の同意を照合し、評価中の取消しをaskにする。
+
+### 問いと応答
+
+- 通常LLMは「decision（allow/deny/ask）、operationId、argumentsDigest、cwd、policyVersion、mode、rationale、uncertainty」だけを持つclosed schemaを要求する。全bindingがfrozen operationと一致し、rationaleが非空で、uncertaintyが無い明示的allow/denyだけを採用する。未知field（自己申告confidence等）、欠落、不正JSON、完了条件schema、確率fieldはaskにする。確率は作らない。
+- Jevは固定`jev-1.14.0`の`POST /v1/systemone`、Decisionsは固定`gpt-6-luna`の`POST /v1/decisions`へ、`allow`/`deny`/`ask`のchoice 1件を送る。応答は`model`完全一致、質問名1件、choice type、3値完全一致、有限0〜1、合計誤差0.001以内、選択が最大確率を要求する。選択されたallow/denyはprofileのpermission threshold（既定0.99）以上だけ採用し、それ未満・ask・refusal・不正応答はaskにする。native confidenceは別に検証するだけで採用に使わない。
+- 入力はoperation、argumentsDigest、cwd、policy version、mode、依頼作業、許可境界、呼出し元が渡した証拠だけである。会話全体・repository・file一覧・tool outputを追加しない。`tools`/`tool_choice`は送らない。
+- 送信前にpermission用途の同意をproject・origin・purpose・data kind・target scope versionへ照合する。同意なし・取消し・別origin/purpose・target version変更・data kind拡大ではHTTPもcredential解決も行わない。失敗・timeout・cancel・不正応答・低確度・stale bindingはallowにせず、H1にはaskまたはsanitized errorを返す。provider本文・credential・request bodyをerror/Debug/結果へ含めない。
+
+### Task 14のテスト
+
+`tests/supervision/tests/permissions.rs`はloopback mockとin-memory credentialだけで、通常LLM・Jev・Decisionsのvalid allow/deny/ask、0.99境界、分布の欠落・余分・重複・合計外・選択最大違反、通常LLMのschema違反・operation binding違反・uncertainty・自己申告confidence、refusal・低確度、完了結果の非流用、同意なし/取消し/別用途/別origin/target version/data kind拡大のHTTP 0件、gate拒否/予算なしのask、実`BudgetLedger`を共有した2秒上限の枯渇、run-scoped 1回制限、意図しない会話canaryの非送信、secret/応答canaryの非表示を確認する。
+
+`tests/runtime/tests/permissions.rs`は実`Runtime`+`PiEngine`とloopback serverで、3方式それぞれの許可でappendが1回だけ実行されること、deny/askで0回、low confidence・malformed・stale digest・provider failureで0回かつ人間待ち、評価中のpolicy変更で0回、同意取消しで許可HTTP 0件、許可評価が1回だけ行われ追加の子agent継続loopが無いことを確認する。実Piの起動・streamに観測されたtest flakeを吸収するため、各caseは最大3回の新しいRuntime試行を許すが、許可要求を観測した後のassertは再試行しない。
+
+Task 14の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test permissions --locked
+cargo test -p herness-runtime-tests --test permissions --locked
+cargo check --workspace --all-targets --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+実provider・実credential・実Keychain・実Tauriは使わず、mock成功を実接続の受入へ流用しない。Task 15の復旧、Task 16のUI/profile選択、Task 17のfixtures/受入はこのTaskに含めない。

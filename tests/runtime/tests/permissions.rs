@@ -2024,3 +2024,1202 @@ fn model_authored_instructions_cannot_bypass_explicit_deny_or_ask() {
     assert_eq!(evaluator.calls, 0);
     assert_eq!(calls.get(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Real Pi + loopback permission-evaluator integration
+// ---------------------------------------------------------------------------
+
+mod real_pi_permission_evaluator {
+    use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use herness_assessment::{
+        AssessmentEndpoints, AssessmentTransport, PermissionBudgetScope, PermissionConsentHandle,
+        PermissionEvaluator, PermissionEvaluatorConfig, RetryPolicy, SharedModelRequestGate,
+    };
+    use herness_core::runtime::{
+        AgentSpec, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor, ToolExecution,
+    };
+    use herness_core::*;
+    use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
+    use herness_store::{Store, StoreConfig};
+    use herness_supervision::{
+        AdapterVersion, ApprovalActor, AssessmentProfile, ConsentId, DisclosureConsent,
+        DisclosureDataKind, DisclosureScope, ProfileEntry, ProfileId, ProfileInputs,
+        ProfilePurpose, ProfileThresholds, ProfileVersion, ProviderKind, ProviderOrigin,
+        RubricVersion, TargetVersion,
+    };
+    use serde_json::{Value, json};
+
+    const JEV_MODEL: &str = "jev-1.14.0";
+    const DECISIONS_MODEL: &str = "gpt-6-luna";
+    const LLM_MODEL: &str = "permission-llm";
+    const CANARY: &str = "provider-body-canary-real-pi";
+
+    // -----------------------------------------------------------------------
+    // Loopback mock
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        #[allow(dead_code)]
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl MockResponse {
+        fn json(status: u16, value: Value) -> Self {
+            Self {
+                status,
+                content_type: "application/json",
+                body: serde_json::to_vec(&value).expect("mock body"),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn sse(body: String) -> Self {
+            Self {
+                status: 200,
+                content_type: "text/event-stream",
+                body: body.into_bytes(),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+    }
+
+    struct MockServer {
+        address: SocketAddr,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        stop: Arc<AtomicBool>,
+        accept_thread: Option<JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn start<F>(handler: F) -> Arc<Self>
+        where
+            F: Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking mock server");
+            let address = listener.local_addr().expect("mock address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handler: Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync> =
+                Arc::new(handler);
+            let thread_requests = Arc::clone(&requests);
+            let thread_stop = Arc::clone(&stop);
+            let accept_thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _peer)) => {
+                            let handler = Arc::clone(&handler);
+                            let requests = Arc::clone(&thread_requests);
+                            thread::spawn(move || handle_connection(stream, handler, requests));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Arc::new(Self {
+                address,
+                requests,
+                stop,
+                accept_thread: Some(accept_thread),
+            })
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        fn openai_base(&self) -> String {
+            format!("{}/v1", self.url())
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.accept_thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn handle_connection(
+        mut stream: TcpStream,
+        handler: Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    ) {
+        let Some(request) = read_request(&mut stream) else {
+            return;
+        };
+        requests.lock().expect("requests").push(request.clone());
+        let response = handler(&request);
+        if !response.delay.is_zero() {
+            thread::sleep(response.delay);
+        }
+        let header = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            reason(response.status),
+            response.content_type,
+            response.body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&response.body);
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn reason(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            500 => "Internal Server Error",
+            _ => "Status",
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position;
+            }
+            if buffer.len() > 1024 * 1024 {
+                return None;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        let mut lines = head.lines();
+        let request_line = lines.next()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?.to_owned();
+        let path = parts.next()?.to_owned();
+        let mut content_length = 0usize;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = buffer[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        Some(RecordedRequest { method, path, body })
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent stream fixtures
+    // -----------------------------------------------------------------------
+
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    fn responses_text(text: &str) -> MockResponse {
+        let mut body = String::new();
+        body.push_str(&sse(
+            "response.created",
+            json!({"type": "response.created", "response": {"id": "resp_1"}}),
+        ));
+        body.push_str(&sse(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_1"}}),
+        ));
+        body.push_str(&sse(
+            "response.output_text.delta",
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": text}),
+        ));
+        body.push_str(&sse(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": text}]}
+            }),
+        ));
+        body.push_str(&sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [{"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": text}]}]
+                }
+            }),
+        ));
+        MockResponse::sse(body)
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization script
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Method {
+        Llm,
+        Jev,
+        Decisions,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Scenario {
+        Allow,
+        Deny,
+        Ask,
+        LowConfidence,
+        Malformed,
+        StaleDigest,
+        ProviderFailure,
+        SlowAllow,
+    }
+
+    fn handler_for(
+        method: Method,
+        scenario: Scenario,
+    ) -> impl Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static {
+        let agent_requests = Arc::new(AtomicUsize::new(0));
+        move |request| match request.path.as_str() {
+            "/v1/responses" => {
+                let count = agent_requests.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    responses_bash_call("call_bash_once")
+                } else {
+                    responses_text("run finished")
+                }
+            }
+            "/v1/chat/completions" if method == Method::Llm => {
+                llm_permission_response(request, scenario)
+            }
+            "/v1/systemone" if method == Method::Jev => jev_permission_response(request, scenario),
+            "/v1/decisions" if method == Method::Decisions => {
+                decisions_permission_response(request, scenario)
+            }
+            _ => MockResponse::json(404, json!({"error": "unexpected path"})),
+        }
+    }
+
+    fn llm_permission_response(request: &RecordedRequest, scenario: Scenario) -> MockResponse {
+        if scenario == Scenario::ProviderFailure {
+            return MockResponse::json(500, json!({"error": {"message": CANARY}}));
+        }
+        if scenario == Scenario::Malformed {
+            return llm_wire("not-json");
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+            .unwrap_or(Value::Null);
+        let decision = match scenario {
+            Scenario::Deny => "deny",
+            Scenario::Ask => "ask",
+            _ => "allow",
+        };
+        let mut answer = json!({
+            "decision": decision,
+            "operationId": payload["operationId"].clone(),
+            "argumentsDigest": payload["argumentsDigest"].clone(),
+            "cwd": payload["cwd"].clone(),
+            "policyVersion": payload["policyVersion"].clone(),
+            "mode": payload["permissionMode"].clone(),
+            "rationale": "The operation is inside the requested boundary.",
+            "uncertainty": null,
+        });
+        if scenario == Scenario::StaleDigest {
+            answer["argumentsDigest"] = json!("stale-arguments-digest");
+        }
+        let response = llm_wire(&answer.to_string());
+        if scenario == Scenario::SlowAllow {
+            response.delay(Duration::from_millis(200))
+        } else {
+            response
+        }
+    }
+
+    fn llm_wire(content: &str) -> MockResponse {
+        MockResponse::json(
+            200,
+            json!({
+                "model": LLM_MODEL,
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": content},
+                }],
+            }),
+        )
+    }
+
+    fn jev_permission_response(request: &RecordedRequest, scenario: Scenario) -> MockResponse {
+        if scenario == Scenario::ProviderFailure {
+            return MockResponse::json(500, json!({"error": {"message": CANARY}}));
+        }
+        if scenario == Scenario::Malformed {
+            return MockResponse::json(200, json!({}));
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let question = body["questions"]
+            .as_object()
+            .and_then(|questions| questions.keys().next())
+            .cloned()
+            .unwrap_or_default();
+        let (choice, allow, deny, ask) = permission_probabilities(scenario);
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            question,
+            json!({
+                "type": "choice",
+                "choice": choice,
+                "confidence": 0.9,
+                "probabilities": {"allow": allow, "deny": deny, "ask": ask},
+            }),
+        );
+        MockResponse::json(
+            200,
+            json!({
+                "model": JEV_MODEL,
+                "answers": Value::Object(answers),
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        )
+    }
+
+    fn decisions_permission_response(
+        request: &RecordedRequest,
+        scenario: Scenario,
+    ) -> MockResponse {
+        if scenario == Scenario::ProviderFailure {
+            return MockResponse::json(500, json!({"error": {"message": CANARY}}));
+        }
+        if scenario == Scenario::Malformed {
+            return MockResponse::json(200, json!({}));
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let question = body["questions"]
+            .as_array()
+            .and_then(|questions| questions.first())
+            .and_then(|question| question["name"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let (choice, allow, deny, ask) = permission_probabilities(scenario);
+        MockResponse::json(
+            200,
+            json!({
+                "model": DECISIONS_MODEL,
+                "answers": [{
+                    "type": "choice",
+                    "name": question,
+                    "choice": choice,
+                    "confidence": 0.9,
+                    "probabilities": [
+                        {"value": "allow", "probability": allow},
+                        {"value": "deny", "probability": deny},
+                        {"value": "ask", "probability": ask},
+                    ],
+                }],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }),
+        )
+    }
+
+    fn permission_probabilities(scenario: Scenario) -> (&'static str, f64, f64, f64) {
+        match scenario {
+            Scenario::Allow | Scenario::StaleDigest | Scenario::SlowAllow => {
+                ("allow", 0.995, 0.003, 0.002)
+            }
+            Scenario::Deny => ("deny", 0.003, 0.995, 0.002),
+            Scenario::Ask => ("ask", 0.001, 0.002, 0.997),
+            Scenario::LowConfidence => ("allow", 0.98, 0.01, 0.01),
+            Scenario::Malformed | Scenario::ProviderFailure => ("allow", 0.99, 0.005, 0.005),
+        }
+    }
+
+    fn assessment_path(method: Method) -> &'static str {
+        match method {
+            Method::Llm => "/v1/chat/completions",
+            Method::Jev => "/v1/systemone",
+            Method::Decisions => "/v1/decisions",
+        }
+    }
+
+    fn assessment_count(server: &MockServer, method: Method) -> usize {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path == assessment_path(method))
+            .count()
+    }
+
+    /// Serializes the real-Pi tests so several host runtimes and loopback
+    /// servers do not contend for test-process resources.
+    static REAL_PI_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        REAL_PI_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime fixture
+    // -----------------------------------------------------------------------
+
+    struct FakeCredential {
+        calls: AtomicUsize,
+    }
+
+    impl FakeCredential {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl CredentialPort for FakeCredential {
+        fn availability(
+            &self,
+            _connection: &ConnectionId,
+        ) -> Result<CredentialAvailability, CoreError> {
+            Ok(CredentialAvailability::Available)
+        }
+
+        fn resolve(&self, _connection: &ConnectionId) -> Result<ResolvedCredential, CoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedCredential::new(
+                CredentialKind::ApiKey,
+                SecretString::new("sk-real-pi-permission-canary").expect("secret"),
+            ))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingGate {
+        state: Arc<Mutex<GateState>>,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        purposes: Vec<String>,
+        observations: usize,
+    }
+
+    impl CountingGate {
+        fn shared(&self) -> SharedModelRequestGate {
+            SharedModelRequestGate::new(Box::new(self.clone()))
+        }
+
+        fn purposes(&self) -> Vec<String> {
+            self.state.lock().expect("gate").purposes.clone()
+        }
+    }
+
+    impl ModelRequestGatePort for CountingGate {
+        fn admit(&mut self, intent: &RequestGateIntent) -> Result<RequestGateOutcome, CoreError> {
+            let mut state = self.state.lock().expect("gate");
+            state.purposes.push(intent.purpose().as_str().to_owned());
+            Ok(RequestGateOutcome::Admit)
+        }
+
+        fn observe(&mut self, _observation: &ModelRequestObservation) -> Result<(), CoreError> {
+            self.state.lock().expect("gate").observations += 1;
+            Ok(())
+        }
+    }
+
+    struct HostExecutor;
+
+    impl RuntimeToolExecutor for HostExecutor {
+        fn enter_run(&mut self, _context: RunToolContext) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    impl ToolExecutor for HostExecutor {
+        type Output = ToolExecution;
+
+        fn execute(&mut self, _operation: &FrozenOperation) -> Result<ToolExecution, CoreError> {
+            Err(CoreError::EngineUnavailable {
+                failure: EngineFailureKind::Unavailable,
+            })
+        }
+    }
+
+    struct PolicyChangingEvaluator {
+        inner: PermissionEvaluator,
+        admin: Arc<Mutex<Option<PolicyAdmin>>>,
+        rule: PermissionRule,
+    }
+
+    impl PermissionEvaluatorPort for PolicyChangingEvaluator {
+        fn availability(&self) -> EvaluatorAvailability {
+            self.inner.availability()
+        }
+
+        fn evaluate(
+            &mut self,
+            request: &EvaluationRequest,
+        ) -> Result<PermissionDecision, CoreError> {
+            let decision = self.inner.evaluate(request)?;
+            if decision == PermissionDecision::Allow
+                && let Some(admin) = self.admin.lock().expect("policy admin").as_mut()
+            {
+                admin
+                    .add_rule(self.rule.clone())
+                    .expect("bump policy version");
+            }
+            Ok(decision)
+        }
+    }
+
+    struct RuntimeFixture {
+        project_dir: PathBuf,
+        project_id: ProjectId,
+        agent: AgentId,
+        host: Runtime<Store, PiEngine<Store>, HostExecutor>,
+        run: Option<RunId>,
+        input: Option<InputId>,
+        gate: CountingGate,
+        consent: PermissionConsentHandle,
+        // Dropped last so the host and engine stop before the project directory
+        // is deleted.
+        _temp: tempfile::TempDir,
+    }
+
+    impl RuntimeFixture {
+        fn new(
+            method: Method,
+            server: &MockServer,
+            gate: CountingGate,
+            policy_change: bool,
+        ) -> Self {
+            let temp = tempfile::tempdir().expect("temp");
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).expect("project dir");
+            let store =
+                Store::open(StoreConfig::new(temp.path().join("app")).expect("store config"))
+                    .expect("store");
+            let store = Arc::new(Mutex::new(store));
+            let admin = ConnectionAdmin::new();
+            let directory = admin.directory();
+            let credentials = FakeCredential::new();
+            let project_id = ProjectId::new();
+            let agent_connection = ConnectionId::new();
+            admin
+                .add(
+                    ConnectionSettings::new(
+                        agent_connection,
+                        Provider::OpenAi,
+                        "gpt-test",
+                        AuthMethod::ApiKey,
+                        None,
+                        None,
+                    )
+                    .expect("agent settings"),
+                )
+                .expect("register agent connection");
+            let (settings, provider, model) = match method {
+                Method::Llm => (
+                    ConnectionSettings::new_with_capabilities(
+                        ConnectionId::new(),
+                        Provider::OpenAiCompatible,
+                        LLM_MODEL,
+                        AuthMethod::ApiKey,
+                        Some(Endpoint::parse(&server.openai_base()).expect("endpoint")),
+                        None,
+                        ConnectionCapabilityDeclaration::new(
+                            EndpointClass::OpenAiCompletions,
+                            InputCapabilities::text_only(),
+                        ),
+                    )
+                    .expect("llm settings"),
+                    ProviderKind::NormalLlm,
+                    LLM_MODEL,
+                ),
+                Method::Jev => (
+                    ConnectionSettings::new_with_capabilities(
+                        ConnectionId::new(),
+                        Provider::TypeSafe,
+                        JEV_MODEL,
+                        AuthMethod::ApiKey,
+                        None,
+                        None,
+                        ConnectionCapabilityDeclaration::new(
+                            EndpointClass::TypeSafeSystemOne,
+                            InputCapabilities::text_only(),
+                        ),
+                    )
+                    .expect("jev settings"),
+                    ProviderKind::Jev,
+                    JEV_MODEL,
+                ),
+                Method::Decisions => (
+                    ConnectionSettings::new_with_capabilities(
+                        ConnectionId::new(),
+                        Provider::OpenAi,
+                        DECISIONS_MODEL,
+                        AuthMethod::ApiKey,
+                        None,
+                        None,
+                        ConnectionCapabilityDeclaration::new(
+                            EndpointClass::OpenAiDecisions,
+                            InputCapabilities::text_only(),
+                        ),
+                    )
+                    .expect("decisions settings"),
+                    ProviderKind::Decisions,
+                    DECISIONS_MODEL,
+                ),
+            };
+            admin
+                .add(settings.clone())
+                .expect("register evaluator connection");
+            let profile = AssessmentProfile::new(
+                ProfileId::new(project_id),
+                ProfileVersion::new(1).expect("profile version"),
+                ProfilePurpose::Permission,
+                provider,
+                settings.connection_id(),
+                ModelId::new(model).expect("model"),
+                AdapterVersion::new("task-14-permission-adapter-1").expect("adapter"),
+                RubricVersion::new("task-14-permission-rubric-1").expect("rubric"),
+                ProfileInputs::text_only(),
+                ProfileThresholds::for_provider(provider),
+            )
+            .expect("permission profile");
+            let profile = ProfileEntry::new(
+                profile,
+                settings.capabilities().expect("capabilities"),
+                ConnectionStatus::Available,
+                false,
+            );
+            let agent_endpoints =
+                ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+                    .expect("agent endpoints");
+            let assessment_endpoints =
+                AssessmentEndpoints::for_loopback(server.url(), server.openai_base(), server.url())
+                    .expect("assessment endpoints");
+            let transport = AssessmentTransport::new(
+                credentials.clone(),
+                directory.clone(),
+                assessment_endpoints,
+            )
+            .expect("assessment transport")
+            .with_retry_policy(RetryPolicy::with_base_delays([
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ]));
+            let origin = ProviderOrigin::parse(server.url()).expect("origin");
+            let scope = DisclosureScope::new(
+                ProfilePurpose::Permission,
+                BTreeSet::from([DisclosureDataKind::Text, DisclosureDataKind::Code]),
+                vec!["once.txt".to_owned()],
+                TargetVersion::new(1).expect("target version"),
+            )
+            .expect("disclosure scope");
+            let consent = PermissionConsentHandle::new(
+                DisclosureConsent::grant(
+                    ApprovalActor::Human,
+                    ConsentId::new(project_id),
+                    origin.clone(),
+                    scope,
+                    Timestamp::now(),
+                )
+                .expect("consent"),
+            );
+            let config = PermissionEvaluatorConfig::new(
+                profile,
+                None,
+                origin,
+                TargetVersion::new(1).expect("target version"),
+                transport,
+            )
+            .with_consent_handle(consent.clone())
+            .with_budget_gate(gate.shared())
+            .with_budget_scope(PermissionBudgetScope::RunScoped { max_requests: 1 });
+            let evaluator = PermissionEvaluator::new(config).expect("permission evaluator");
+            let admin_slot = Arc::new(Mutex::new(None));
+            let evaluator: Box<dyn PermissionEvaluatorPort + Send + Sync> = if policy_change {
+                Box::new(PolicyChangingEvaluator {
+                    inner: evaluator,
+                    admin: Arc::clone(&admin_slot),
+                    rule: PermissionRule::allow(
+                        RuleTarget::Tool {
+                            tool: ToolName::Read,
+                        },
+                        MatchMethod::AnyInvocation,
+                    )
+                    .expect("stale-policy rule"),
+                })
+            } else {
+                Box::new(evaluator)
+            };
+            let mut policy_admin = PolicyAdmin::new();
+            policy_admin
+                .set_mode(PermissionMode::Automatic, EvaluatorAvailability::Available)
+                .expect("automatic policy");
+            let policy = policy_admin.policy().clone();
+            let mut engine = PiEngine::new(
+                Arc::clone(&store),
+                credentials.clone(),
+                directory.clone(),
+                PiEngineConfig::new(policy.clone()).with_endpoints(agent_endpoints),
+            )
+            .expect("pi engine");
+            engine.set_request_gate(Box::new(gate.clone()));
+            let dependencies = RuntimeDependencies::new(
+                store,
+                engine,
+                credentials,
+                directory,
+                policy_admin,
+                HostExecutor,
+            )
+            .with_shared_evaluator(SharedPermissionEvaluator::new(evaluator));
+            let (mut host, _) = Runtime::restore(dependencies).expect("host restore");
+            let project_id = host
+                .open_project(&project_dir)
+                .expect("open project")
+                .project_id();
+            let agent = host
+                .create_agent(
+                    project_id,
+                    AgentSpec::new("worker", "implementer", agent_connection),
+                )
+                .expect("agent")
+                .agent_id();
+            if policy_change {
+                let shared = host.policy_handle();
+                let mut extra = PolicyAdmin::new();
+                extra
+                    .set_mode(PermissionMode::Automatic, EvaluatorAvailability::Available)
+                    .expect("automatic policy");
+                *admin_slot.lock().expect("policy slot") = Some(extra.with_shared(shared));
+            }
+            Self {
+                project_dir,
+                project_id,
+                agent,
+                host,
+                run: None,
+                input: None,
+                gate,
+                consent,
+                _temp: temp,
+            }
+        }
+
+        fn begin(&mut self) {
+            let run = self
+                .host
+                .start_run(self.project_id, self.agent, "You are a test agent.")
+                .expect("start run");
+            self.run = Some(run.run_id());
+        }
+
+        fn submit(&mut self, input: &str) {
+            let run = self.run.expect("run started");
+            let input = self
+                .host
+                .submit_input_with_id(self.project_id, run, input)
+                .expect("submit input");
+            self.input = Some(input);
+        }
+
+        fn run(&mut self, input: &str) {
+            self.begin();
+            self.submit(input);
+        }
+
+        fn poll_once(&mut self) {
+            if let Some(run) = self.run {
+                let _ = self.host.poll_run(self.project_id, run);
+            }
+        }
+
+        fn poll_for(&mut self, duration: Duration) {
+            let deadline = Instant::now() + duration;
+            loop {
+                self.poll_once();
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn poll_until(&mut self, timeout: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.poll_once();
+                if done(self) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn poll_until_assessment(
+            &mut self,
+            server: &MockServer,
+            method: Method,
+            timeout: Duration,
+        ) -> bool {
+            self.poll_until(timeout, |_| assessment_count(server, method) >= 1)
+        }
+
+        fn poll_until_approval(&mut self, timeout: Duration) -> bool {
+            self.poll_until(timeout, |fixture| fixture.pending_approvals() >= 1)
+        }
+
+        fn pending_approvals(&self) -> usize {
+            self.host
+                .pending_approvals(self.project_id)
+                .expect("pending approvals")
+                .len()
+        }
+
+        fn revoke_consent(&self) {
+            self.consent
+                .revoke(Timestamp::now())
+                .expect("revoke permission consent");
+        }
+
+        fn gate_purposes(&self) -> Vec<String> {
+            self.gate.purposes()
+        }
+    }
+
+    fn assert_allow_once(method: Method) {
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(method, Scenario::Allow));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(method, &server, gate.clone(), false);
+            fixture.run("write the file once");
+            let path = fixture.project_dir.join("once.txt");
+            if !fixture.poll_until(Duration::from_secs(5), |_| path.exists()) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            assert_eq!(std::fs::read_to_string(&path).expect("once file"), "x");
+            assert_eq!(assessment_count(&server, method), 1);
+            assert_eq!(fixture.pending_approvals(), 0);
+            assert!(
+                fixture
+                    .gate_purposes()
+                    .iter()
+                    .any(|purpose| purpose == "permission_evaluation")
+            );
+            fixture.poll_for(Duration::from_millis(200));
+            assert_eq!(
+                assessment_count(&server, method),
+                1,
+                "no repeated permission evaluation"
+            );
+            let snapshot = fixture
+                .host
+                .snapshot(fixture.project_id)
+                .expect("runtime snapshot");
+            assert_eq!(
+                snapshot.runs().len(),
+                1,
+                "normal chat must not start a child continuation run"
+            );
+            return;
+        }
+        panic!("{method:?}: the allowed operation did not execute after retries");
+    }
+
+    fn assert_deny_or_ask(method: Method, scenario: Scenario) {
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(method, scenario));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(method, &server, gate, false);
+            fixture.run("write the file once");
+            if !fixture.poll_until_assessment(&server, method, Duration::from_secs(5)) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            if scenario == Scenario::Ask {
+                assert!(
+                    fixture.poll_until_approval(Duration::from_secs(5)),
+                    "timed out waiting for the human approval"
+                );
+            } else {
+                fixture.poll_for(Duration::from_millis(300));
+            }
+            assert!(!fixture.project_dir.join("once.txt").exists());
+            if scenario == Scenario::Ask {
+                assert_eq!(fixture.pending_approvals(), 1);
+            } else {
+                assert_eq!(fixture.pending_approvals(), 0);
+            }
+            assert_eq!(assessment_count(&server, method), 1);
+            return;
+        }
+        panic!("{method:?} {scenario:?}: the permission evaluation did not run after retries");
+    }
+
+    fn assert_ask_without_execution(method: Method, scenario: Scenario) {
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(method, scenario));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(method, &server, gate, false);
+            fixture.run("write the file once");
+            if !fixture.poll_until_assessment(&server, method, Duration::from_secs(5)) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            assert!(
+                fixture.poll_until_approval(Duration::from_secs(5)),
+                "{method:?} {scenario:?}: no human approval"
+            );
+            assert!(!fixture.project_dir.join("once.txt").exists());
+            assert_eq!(fixture.pending_approvals(), 1);
+            return;
+        }
+        panic!("{method:?} {scenario:?}: no permission request after retries");
+    }
+
+    #[test]
+    fn real_pi_llm_permission_evaluator_allows_and_executes_once() {
+        let _serial = serial();
+        assert_allow_once(Method::Llm);
+    }
+
+    #[test]
+    fn real_pi_jev_permission_evaluator_allows_and_executes_once() {
+        let _serial = serial();
+        assert_allow_once(Method::Jev);
+    }
+
+    #[test]
+    fn real_pi_decisions_permission_evaluator_allows_and_executes_once() {
+        let _serial = serial();
+        assert_allow_once(Method::Decisions);
+    }
+
+    #[test]
+    fn real_pi_llm_permission_evaluator_deny_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Llm, Scenario::Deny);
+    }
+
+    #[test]
+    fn real_pi_llm_permission_evaluator_ask_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Llm, Scenario::Ask);
+    }
+
+    #[test]
+    fn real_pi_jev_permission_evaluator_deny_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Jev, Scenario::Deny);
+    }
+
+    #[test]
+    fn real_pi_jev_permission_evaluator_ask_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Jev, Scenario::Ask);
+    }
+
+    #[test]
+    fn real_pi_decisions_permission_evaluator_deny_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Decisions, Scenario::Deny);
+    }
+
+    #[test]
+    fn real_pi_decisions_permission_evaluator_ask_executes_zero() {
+        let _serial = serial();
+        assert_deny_or_ask(Method::Decisions, Scenario::Ask);
+    }
+
+    #[test]
+    fn real_pi_decisions_low_confidence_asks_without_execution() {
+        let _serial = serial();
+        assert_ask_without_execution(Method::Decisions, Scenario::LowConfidence);
+    }
+
+    #[test]
+    fn real_pi_llm_malformed_answer_asks_without_execution() {
+        let _serial = serial();
+        assert_ask_without_execution(Method::Llm, Scenario::Malformed);
+    }
+
+    #[test]
+    fn real_pi_llm_stale_digest_asks_without_execution() {
+        let _serial = serial();
+        assert_ask_without_execution(Method::Llm, Scenario::StaleDigest);
+    }
+
+    #[test]
+    fn real_pi_provider_failure_asks_without_execution() {
+        let _serial = serial();
+        assert_ask_without_execution(Method::Llm, Scenario::ProviderFailure);
+    }
+
+    #[test]
+    fn real_pi_policy_change_during_evaluation_never_executes() {
+        let _serial = serial();
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(Method::Llm, Scenario::Allow));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(Method::Llm, &server, gate, true);
+            fixture.run("write the file once");
+            if !fixture.poll_until_assessment(&server, Method::Llm, Duration::from_secs(5)) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            fixture.poll_for(Duration::from_millis(300));
+            assert!(
+                !fixture.project_dir.join("once.txt").exists(),
+                "a policy change during evaluation must not execute"
+            );
+            return;
+        }
+        panic!("the stale-policy evaluation did not run after retries");
+    }
+
+    #[test]
+    fn real_pi_revoked_consent_before_evaluation_sends_no_permission_http() {
+        let _serial = serial();
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(Method::Llm, Scenario::Allow));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(Method::Llm, &server, gate, false);
+            fixture.begin();
+            fixture.revoke_consent();
+            fixture.submit("write the file once");
+            if !fixture.poll_until_approval(Duration::from_secs(5)) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            assert!(!fixture.project_dir.join("once.txt").exists());
+            assert_eq!(assessment_count(&server, Method::Llm), 0);
+            assert_eq!(fixture.pending_approvals(), 1);
+            assert!(
+                fixture
+                    .gate_purposes()
+                    .iter()
+                    .all(|purpose| purpose != "permission_evaluation")
+            );
+            return;
+        }
+        panic!("a revoked consent did not ask after retries");
+    }
+
+    #[test]
+    fn real_pi_consent_revoked_during_evaluation_never_executes() {
+        let _serial = serial();
+        for _ in 0..3 {
+            let server = MockServer::start(handler_for(Method::Llm, Scenario::SlowAllow));
+            let gate = CountingGate::default();
+            let mut fixture = RuntimeFixture::new(Method::Llm, &server, gate, false);
+            fixture.run("write the file once");
+            if !fixture.poll_until_assessment(&server, Method::Llm, Duration::from_secs(5)) {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            fixture.revoke_consent();
+            assert!(fixture.poll_until_approval(Duration::from_secs(5)));
+            assert!(!fixture.project_dir.join("once.txt").exists());
+            assert_eq!(fixture.pending_approvals(), 1);
+            return;
+        }
+        panic!("the in-flight consent revocation did not ask after retries");
+    }
+
+    fn responses_bash_call(call_id: &str) -> MockResponse {
+        let arguments = json!({
+            "command": "printf x >> once.txt",
+            "purpose": "prove one execution",
+        })
+        .to_string();
+        let item = |arguments: &str| {
+            json!({
+                "type": "function_call",
+                "id": format!("fc_{call_id}"),
+                "call_id": call_id,
+                "name": "bash",
+                "arguments": arguments,
+            })
+        };
+        let mut body = String::new();
+        body.push_str(&sse(
+            "response.created",
+            json!({"type": "response.created", "response": {"id": "resp_tool"}}),
+        ));
+        body.push_str(&sse(
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": 0, "item": item("")}),
+        ));
+        body.push_str(&sse(
+            "response.function_call_arguments.delta",
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": arguments}),
+        ));
+        body.push_str(&sse(
+            "response.output_item.done",
+            json!({"type": "response.output_item.done", "output_index": 0, "item": item(&arguments)}),
+        ));
+        body.push_str(&sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_tool", "status": "completed", "output": [item(&arguments)]}
+            }),
+        ));
+        MockResponse::sse(body)
+    }
+}

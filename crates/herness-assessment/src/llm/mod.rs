@@ -13,6 +13,9 @@
 mod request;
 mod wire;
 
+pub(crate) use request::Route;
+pub(crate) use wire::extract_text as extract_envelope_text;
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
@@ -33,7 +36,6 @@ use crate::transport::{
     AssessmentRequest as TransportRequest, AssessmentTransport, ImageInput, TransportControl,
 };
 
-use self::request::Route;
 use self::wire::ParsedCondition;
 
 const MAX_EVIDENCE_DOCUMENTS: usize = 64;

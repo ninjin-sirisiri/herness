@@ -14,9 +14,11 @@ herness-core = { path = "../../crates/herness-core", features = ["test-support"]
 
 [dev-dependencies]
 base64 = "0.22.1"
+herness-assessment = { path = "../../crates/herness-assessment" }
 herness-desktop = { path = "../../src-tauri" }
 herness-engine-pi = { path = "../../crates/herness-engine-pi" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+herness-supervision = { path = "../../crates/herness-supervision" }
 ring = "0.17.14"
 rusqlite.workspace = true
 serde_json.workspace = true

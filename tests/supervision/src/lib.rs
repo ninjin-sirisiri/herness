@@ -639,6 +639,76 @@ pub fn permission_entry(project: ProjectId) -> ProfileEntry {
     ProfileEntry::new(profile, connection, ConnectionStatus::Available, true)
 }
 
+/// Permission profile for one provider kind and connection.
+pub fn permission_profile_for_provider(
+    project: ProjectId,
+    provider: ProviderKind,
+    connection: ConnectionId,
+    model: &str,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    let (adapter, rubric) = match provider {
+        ProviderKind::NormalLlm => (
+            "fixture-permission-llm-adapter-1",
+            "fixture-permission-rubric-1",
+        ),
+        ProviderKind::Jev => (
+            "fixture-permission-jev-adapter-1",
+            "fixture-permission-rubric-1",
+        ),
+        ProviderKind::Decisions => (
+            "fixture-permission-decisions-adapter-1",
+            "fixture-permission-rubric-1",
+        ),
+    };
+    AssessmentProfile::new(
+        ids.permission_profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Permission,
+        provider,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new(adapter).expect("adapter"),
+        RubricVersion::new(rubric).expect("rubric"),
+        required_inputs,
+        ProfileThresholds::for_provider(provider),
+    )
+    .expect("permission profile")
+}
+
+/// Profile entry for a permission profile and its registered connection.
+pub fn permission_entry_for(
+    settings: &ConnectionSettings,
+    profile: AssessmentProfile,
+    structured_output: bool,
+) -> ProfileEntry {
+    ProfileEntry::new(
+        profile,
+        settings.capabilities().expect("connection capabilities"),
+        ConnectionStatus::Available,
+        structured_output,
+    )
+}
+
+/// Human-approved consent for an explicit synthetic origin.
+pub fn consent_for_origin(
+    project: ProjectId,
+    purpose: ProfilePurpose,
+    target_version: u64,
+    origin: ProviderOrigin,
+) -> DisclosureConsent {
+    let ids = ids(project);
+    DisclosureConsent::grant(
+        ApprovalActor::Human,
+        ids.consent,
+        origin,
+        disclosure_scope(purpose, target_version),
+        now(),
+    )
+    .expect("consent")
+}
+
 /// A catalog with both fixture profiles available.
 pub fn profile_catalog(project: ProjectId) -> ProfileCatalog {
     let mut catalog = ProfileCatalog::for_project(project);

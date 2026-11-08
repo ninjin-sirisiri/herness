@@ -1368,10 +1368,12 @@ name = "herness-runtime-tests"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "herness-assessment",
  "herness-core",
  "herness-desktop",
  "herness-engine-pi",
  "herness-store",
+ "herness-supervision",
  "ring",
  "rusqlite",
  "serde_json",
