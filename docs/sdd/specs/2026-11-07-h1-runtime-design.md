@@ -1,0 +1,207 @@
+# H1: 実行基盤と変更理由の記録
+
+**Classification:** architectural
+
+**Status:** レビュー待ち。本specの承認まではsdd-plan・本実装に進まない。
+
+**Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用候補とする。Node runtimeは初期構成に含めない。これはspec承認を求める提案であり、基盤の正式採用は承認後とする。
+
+本specは[ロードマップ](2026-11-07-herness-roadmap.md)のH1を扱う。用語は[CONTEXT.md](../../../CONTEXT.md)、選定の証拠と限界は[spike結果](../../research/2026-11-07-pi-rust-spike.md)を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。
+
+## Goals
+
+- macOS上のTauriから、hostが作成した独立した会話コンテキストのエージェントを実行・停止・再開できる。
+- 作成・編集ツールに短い変更理由を必須化し、対象・差分・実行結果と関連付けて永続化する。後続の別画面から取得できる。
+- 設定権限モードと自動判定モードを切り替える契約を定める。自動判定の実モデル接続はH2が追加する。
+- OpenAI・Anthropic・OpenAI互換接続のAPIキーと、ChatGPTログインを扱う認証境界を用意する。
+- ウィンドウ閉鎖から実行を独立させ、終了・異常中断後も不確実な変更を再実行せずに復旧できる。
+
+## Non-goals
+
+- 完了条件までの再実行、判定モデルの実装、HTML同期・再構成、SDD Taskの進行、完成版UI・配布。これらはH2〜H5が所有する。
+- Electron、必須のNode sidecar、Piの全機能互換、JavaScript拡張・既存CLIの互換再現。
+- MCP管理や任意の拡張コードの自動読込み、親モデルに任意のTask実行agentを起動させる機能。
+- 未信頼コードをOSで強制隔離する保証。信頼するプロジェクトが対象であり、許可済みシェルはOS権限を持つ。
+- 専用の削除・移動・undo機能、自動push・merge・公開、アプリ終了後の常駐agentサービス。
+
+## Approach
+
+1. **Tauri＋pi-rustの小さい埋め込み境界を使う案を推奨する。** Piとの近さを残しつつ、独自ツールと実行制御をhostへ寄せられる。spikeではTauriとの実接続まで確認した。一方、coding harness全体は流用せず、skill接続・認証の橋渡し・記録をhernessが実装する。
+2. **Tauri＋Rig**は、さらにhost中心で組む代替案。採用するkernelやpluginに応じた統合と、Pi由来の機能を組み立てる範囲が増える。
+3. **Tauri＋Goose**は既存harnessを再利用する代替案。ネイティブGDKはalphaであり、process protocolを使う案では独自ツール・許可・保存への介入範囲を追加検証する必要がある。
+
+Pi adapterの初期検証基準は`yannelli/pi-rust` v0.12.11 / commit `4294dba7ac3646477912cc778536fdff0a912d6e`、Tauriは2.12.5とする。実装は依存を固定し、更新時はadapterの互換・復旧テストを再実行する。未検証のmain追従やfork・全面移植は既定の作業にしない。
+
+## Architecture
+
+TauriのRust側にアプリ寿命のhostを置き、各agentを独立したSDKセッションと非同期タスクとして管理する。WebViewは実行や保存の所有者にしない。初期のagent間分離は会話・状態・権限コンテキストの分離であり、agentごとのOSプロセス分離やsandboxではない。
+
+hostはengine adapter、許可サービス、ツール実行境界、認証サービス、ローカルのtransactional storeを持つ。SDK型やcheckpoint形式をUI・H2〜H5の契約に漏らさず、SDKは交換可能な内部依存とする。シェルはhostが管理する子プロセスとして起動する。
+
+保存先はプロジェクト外のアプリデータ領域とし、host所有のSQLite storeを使う。SDKのSessionStoreをこのstoreへ接続し、checkpointと対応する操作記録を同一transactionで保存する。SDKのJSONはadapter内部のversion付きデータとして扱う。資格情報はDBに入れず、macOS Keychainに保存する。
+
+H1は自動許可判定の入力・結果・失敗時の扱いを定める。H2がその境界へ軽量LLM・Decisionモデルの実装を注入する。H1が未作成のH2のAPIを呼ぶ設計にはせず、評価器不在の自動モードを無条件許可に置き換えない。
+
+## Components
+
+- **Desktop host:** プロジェクト・agent・runの所有、TauriのIPC、ウィンドウとアプリ終了の分離。
+- **Engine adapter:** `pi-embedded`の作成・入力・停止・再開・イベントをhernessの契約へ変換し、`pi-ai`のprovider・認証層をStreamFnで接続する。
+- **Tool gateway:** schema検証、最終引数の確定、許可照合、変更理由、ファイルの版確認、シェル管理、結果の確定。
+- **Permission service:** 人間が設定したルール、run開始時の許可、許可モード、確認待ちと評価器の接続。
+- **State store:** 会話checkpoint、操作意図・結果、差分、許可の版、履歴と復旧情報。
+- **Connection service:** 接続先・モデルの識別、APIキー・OAuthの保存と更新、ログイン要求、秘密情報を含まない接続状態。
+- **Skill source / toolchain resolver:** SDD pack全体への参照、skillの読込みと指紋、host capabilityの照合、Git・Python等の検出。
+
+## Shared contract
+
+### Sessions and runs
+
+- **Project**は利用者が開いたローカルディレクトリ。実パスと識別IDを保持し、別プロジェクトの状態や許可を流用しない。
+- **Agent / session**はhostが作る会話コンテキスト。親モデルの会話とは分離し、役割・プロジェクト・接続の参照を保持する。worktreeを自動作成する意味ではない。
+- **Run**はhostから開始した一回のengine実行。中断・再開では同じrunを追跡し、engineが落ち着いた後に追加実行する場合は別runとする。Taskやgoal全体の識別・進行はH2・H4が所有する。
+- Runの状態は`running`、`awaiting_approval`、`paused`、`interrupted`、`idle`、`failed`。`idle`はengineが追加の応答・toolを実行していない状態であり、Taskやgoalの達成を意味しない。
+
+| 操作 | 成功時 | 主な失敗・待機 |
+| --- | --- | --- |
+| Projectを開く | ID、実パス、利用可能な接続・toolchain情報を返す | 読めないパスは拒否。ツール不足を隠さない |
+| Agentを作りrunを開始 | 独立contextとrun IDを作り、永続イベントを発行 | 接続・許可・capability不足なら実行しない |
+| Runを停止 | 新規toolを止め、協調停止と状態保存を行う | 結果不明の変更を成功や未実行と決め付けない |
+| Runを再開 | 現在の許可と接続を確認して再開 | 変更結果が不明なら先に照合が必要 |
+| 操作を承認・拒否 | 指定した操作IDと最終引数にだけ適用 | 古い・変更済み・解決済みの操作を実行しない |
+| 履歴・状態を取得 | 安定したIDとsequenceで返す | 別projectや秘密情報への参照は拒否 |
+
+### Tools and rationale
+
+初期のnative toolはread・search・write・edit・bashとする。write・editはファイル単位の`rationale`を必須とし、空白のみの理由も拒否する。bashにはコマンド単位の`purpose`を必須とする。変更理由はモデルが明示する説明であり、内部思考の取得・事実の証明・権限承認ではない。
+
+- write・editは対象、意図した差分、変更前の版、実行結果、確認できた変更後の版を操作IDと結び付ける。作成と既存ファイルの編集を区別する。
+- 変更前の永続記録に失敗したら書かない。実ファイル変更後の記録失敗では、無断で元へ戻さず結果不明として照合待ちにする。
+- ファイルごとの書込みをhostで直列化し、実行直前に版を確認する。外部変更や競合を検知したら上書きせず、新しい内容に対する編集と許可の再評価を求める。
+- native file toolでは実パス・symlink・許可対象のrootを照合する。SDD packの読込み許可を、同packへの書込み許可として扱わない。
+- シェルのpurposeと出力は別に記録する。シェルが変更した各ファイルや、外部編集の理由を推測して付けない。H3へ渡すファイル変更通知も、確認できないactorを断定しない。
+- 停止は既に行った変更の巻戻しではない。読み書きするプロジェクトの内容とローカル検証結果は、実行を許可した接続先モデルのcontextになり得る。起動だけで全ファイルを外部送信しない。
+
+### Permission modes
+
+許可は基本的にrun開始時に与え、その範囲を子agentにも引き継ぐ。子agentが勝手に権限を広げたり、自動モードへ変更したりすることはできない。モード・ルールの変更は利用者の操作で行い、版を記録する。
+
+1. 実行直前のtool名・最終引数・cwd・project・許可の版を確定する。
+2. schema、権限を変更するための保護境界、明示的denyを検査する。拒否はどちらのモードでも優先する。
+3. 明示的askはどちらのモードでも人間待ちにする。
+4. 設定権限モードではallowに一致すれば実行し、それ以外は人間待ちにする。自動判定モードでは、deny・askで処理されなかったすべての操作を評価器へ渡す。allowを理由に自動モードの評価を黙って省略しない。
+5. 評価器は`allow`・`deny`・`ask`を返す。未対応、timeout、拒否応答、不正な応答、低い確度等で判定不能なら実行せず人間待ちにする。確度の数値と判定規則はH2が定める。
+
+評価器への入力は操作・依頼された作業・許可境界・必要な証拠であり、変更理由や読んだファイル内の指示を権限の正本にしない。評価結果は対象操作と許可の版へ結び付ける。引数・cwd・ルール・モードが変われば未実行の判断を再利用しない。切替は開始済みの操作を取り消したことにはならない。
+
+ルールはhostが解釈する構造化設定とし、shellの許可照合を単純なコマンド接頭辞で安全とみなさない。とはいえ、許可済みscriptや任意コードの全副作用は証明しない。設定やclassifierによる照合はOS sandboxではなく、悪意あるshell・拡張からの強制隔離は保証しない。
+
+初期モードは設定権限モード。H2の評価器が利用できるまで自動モードは利用不可と表示し、勝手な別モデルへのfallbackはしない。判定用providerへの送信範囲・利用同意はH2で、実接続を有効にする前に確定する。
+
+### Models and credentials
+
+- 初期対象はOpenAI・Anthropic・OpenAI互換接続のAPIキーとChatGPTログイン。実行モデル、接続先URL、資格情報の参照を利用者が選ぶ。別provider・別接続へ無断でfallbackしない。
+- OpenAI互換接続は利用者が指定したHTTP(S) endpointとモデルを扱い、全機能互換を約束しない。HTTPのリモート接続は危険性を明示して確認し、別originへのredirectへ資格情報を転送しない。モデルやskillに接続先・秘密情報を変更させない。
+- 保存するAPIキーとOAuth tokenはmacOS Keychainに置き、DB・checkpoint・イベント・ログへ入れない。APIキー入力は信頼された設定画面からの一時的入力に限定し、保存後は再取得表示しない。通常ファイルの履歴はprivateなアプリ領域に保存し、任意の秘密値を完全に検出できるとは約束しない。
+- OAuthはシステムブラウザとhost所有のcallbackで行う。WebView内でOpenAIのパスワードを収集しない。実装時に確認したproviderの認可フローを使い、別クライアントの資格情報・利用条件を利用できると仮定しない。
+- token更新は接続ごとに直列化し、要求ごとに有効な資格情報を解決する。失敗時は`auth_required`等で停止し、agentが秘密ファイルを探索して補うことはしない。
+- 公開するのは接続ID、provider、モデル、認証方式、利用可能・要ログイン等の状態だけ。OAuth port競合は明示し、providerが認めないredirectへ勝手に変更しない。
+
+### Skills and documents
+
+SDD packは全体を参照し、初期の設定先は利用者が指定した`../sdd`とする。個々のSKILL.mdだけを独立コピーして別の正本にしない。skill読込み時のパス・原文の指紋・host適用差分をrunに関連付ける。指示内の相対パスはpackの位置に対して解決する。
+
+H1はskillの読込みとhost capabilityの照合を提供するが、HTML自動著作やSDD Task実行が未実装なのにフロー全体を利用可能とは表示しない。H3・H4の連携定義が整う前に、親モデルへその責務を黙って戻す代替動作を入れない。
+
+既存SDD validatorにはPython 3.11+が必要である。Git・Python・利用者のbuild/testツールは、Finder起動時のPATHだけに依存せず検出・設定できるようにする。不足時はcapability不足を返す。Pythonの同梱や最低macOS、Intel対応、配布方法はH5の配布設計で決め、Rust版validatorを独自に作って代替しない。
+
+H3は、本specの永続化済み変更通知と許可境界を利用し、全文情報を保持するHTML再構成・図解・評価を実装する。H1では原文の順序固定をイベントやUIの契約に埋め込まない。共通SDD policyの具体的変更はH3が所有する。
+
+### Events and audit
+
+イベントは`contractVersion`、project・agent・session・runのID、必要時の操作ID、project内で単調増加する`sequence`、種別、時刻、payloadを持つ。時刻だけで並べず、対応する状態を永続化してから通知する。toolの生イベントは、hernessの意味へ変換してから公開する。
+
+変更・許可・状態遷移は欠落なく追跡できるようにする。streamの表示用deltaはまとめてもよいが、再接続時にはcheckpointと最後のsequenceから整合を回復できなければならない。通知の再配送を操作の再実行として扱わない。
+
+履歴はprojectを明示して取得し、新しいsequenceから降順で返す。ページのcursorは取得時の上限sequenceを固定し、次ページに新しい項目を混ぜて重複させない。liveイベントは昇順で扱う。H5の変更理由画面はこの履歴を使い、チャット本文から理由を抽出し直さない。
+
+H2はrunの安定状態と検証証拠を消費するが、`idle`や正常終了だけを達成の証拠にしない。H4は独自のTask IDとrun群を関連付ける。H3の同期完了、H4のTask完了を、H1の状態として偽造しない。
+
+### Lifecycle and recovery
+
+- 最後のウィンドウを閉じてもhostは生存し、実行を継続する。再表示したUIは状態を読み直す。通常のbackgroundingをSDKのSuspend lifecycleへ直結しない。
+- 明示的なアプリ終了では新規実行を停止し、stream・承認待ち・管理下の子プロセスへ停止を要求してcheckpointを保存する。再開用の停止を、SDKの復元不能なdisposeに置き換えない。
+- 停止猶予を超えたら待機継続か強制終了かを人間に確認する。強制終了は変更を取り消す操作ではなく、完了できなかった処理は次回に不確実な状態として扱う。
+- シェルは管理下のprocess groupと停止経路を持つ。ただし意図的に切り離されたプロセスまで捕捉できるという保証はしない。停止を確認できない状態を「すべて停止済み」と表示しない。
+- 再起動時は保存状態を復元するだけで、勝手に実行・再送信しない。人間の再開操作で現在の資格情報・許可を確認する。過去の承認を復元しただけで再利用しない。
+- 実行意図が残り、結果の永続化がない操作は、保存済みの差分・版・toolの照合結果から判断する。証拠が不足したまま成功・未適用と決めず、照合待ちに留める。
+
+## Data flow
+
+1. 利用者がproject・接続・モデル・許可モードを選び、必要な実行範囲を承認する。
+2. hostがagent/sessionとrunを作り、skillや依頼を選択したengineへ渡す。秘密情報は要求時にだけ解決する。
+3. tool要求をschema検証し、最終引数と操作IDを確定する。許可規則・必要時の人間または評価器の判断を適用する。
+4. checkpointと操作意図を永続化してから実行する。fileの版確認・書込み直列化、shellの管理はhostが担う。
+5. 実際の結果・差分・状態を保存して通知する。原文の作成・編集をH3が後で購読できる形にする。
+6. engineがidleになったらH1はその事実を返す。追加のgoal継続やTask進行はH2・H4が判断する。
+
+## Error handling
+
+| 分類 | 利用者・後続phaseへの結果 |
+| --- | --- |
+| 引数不正・変更理由なし | 副作用前に拒否。何が不足したか返す |
+| native fileのscope外・版競合 | 書かずに拒否または人間確認。古い引数を自動承認し直さない |
+| 明示拒否・人間確認 | 拒否またはawaiting_approval。modelで迂回しない |
+| 評価器不在・失敗・判定不能 | 実行せず確認待ち。無条件許可や黙ったprovider切替はしない |
+| 保存失敗 | 副作用前なら実行しない。副作用後なら結果不明として照合する |
+| provider・認証の失敗 | 資格情報を伏せた接続状態と再試行可能性を返す。Task達成を主張しない |
+| 中断・engine異常・再利用されたtool ID | interruptedまたはfailed。失敗した操作を勝手に再実行しない |
+| toolchain・SDD capability不足 | 不足内容と設定方法を返し、別の実行方式へ黙ってfallbackしない |
+
+モデルへのtool結果とUI向けの構造化errorは、同じ失敗の事実を表す。providerの生のerror body、token、秘密のheaderをそのまま保存・表示しない。
+
+## Numeric defaults
+
+| 項目 | 初期値・制約 |
+| --- | --- |
+| 公開する契約の版 | 1。未知の版を黙って解釈しない |
+| rationale / purpose | trim後に空でない、最大1,000 Unicode文字 |
+| 履歴ページ | 既定100件、上限500件 |
+| 通常終了の停止猶予 | 10秒。その後は人間に待機継続・強制終了を確認 |
+| 初期許可モード | 設定権限モード。自動モードは利用可能な評価器が必要 |
+| 自動のgoal継続・判定閾値・費用上限 | H1では定めない。H2が定義する |
+
+## Testing and acceptance
+
+- **Unit:** schema・空白理由・上限、版とpath検証、symlink escape、許可ルール優先、切替での古い判断失効、secretの非公開、provider選択とerror変換を検証する。
+- **Store / integration:** 永続化前の副作用禁止、file変更後の保存失敗、同一file競合、checkpointとauditのtransaction、結果不明の照合、再開時の再許可、履歴ページの安定性をfault injectionで確認する。
+- **Engine adapter:** 独立した複数セッション、実skillのcontext、途中停止、toolの拒否・確認、同じイベントの再配送、SDK更新時のsnapshot互換を確認する。mock evaluatorでH1の境界を検証し、実判定モデルの精度をH1の成功条件にしない。
+- **Connection:** OpenAI・Anthropic・OpenAI互換の各経路をローカルmockで検証する。ChatGPTのcallback・state・refresh・取消し・port競合を確認し、接続ごとの秘密と同時refreshを分離する。
+- **Tauri / security:** 信頼されたmain UIだけが許可変更・実行・資格情報保存を呼べることを確認する。custom app commandの公開範囲も明示し、将来の文書previewやremote originからのinvokeを拒否する。生成HTMLを権限付きアプリDOMへ挿入しない。
+- **Lifecycle:** 実ウィンドウ閉鎖後の継続、quit中の承認待ち・shell・stream停止、保存と別プロセス復元、強制終了後の照合待ちを確認する。停止や保存の失敗を成功として表示しない。
+- **実接続の受入:** 利用者が許可した検証用接続で、対象API経路とChatGPTログイン・更新・取消し・実要求を確認する。資格情報や料金の許可が得られない間、mock成功を実接続成功として扱わず、この項目は未確認と表示する。
+
+H1の受入には、上記の自動検証、実Tauriと選定adapterの接続、実接続の確認結果が必要。spikeの73件成功は設計選択の証拠であり、これから作るherness実装のテスト結果として使い回さない。残る外部確認を免除する場合も、未確認の認証経路を利用可能・完成済みと主張しないよう人間と範囲を再合意する。
+
+## Consuming paths
+
+既存のアプリコードはない。次は本specで提案する配置であり、ファイルを作成済みという意味ではない。
+
+- `src-tauri/`: Tauri起動、信頼されたIPC、lifecycleと接続設定。
+- `crates/herness-core/`: project・agent・run、許可、tool gateway、公開契約。
+- `crates/herness-engine-pi/`: pi-rustとpi-aiのadapter、認証とstreamの橋渡し。
+- `crates/herness-store/`: checkpoint・操作記録・履歴・復旧。
+- `tests/runtime/`: engine・store・permission・lifecycleの契約テスト。
+- `../sdd/skills/`、`../sdd/scripts/`: 既存packの正本。H1が勝手に既存host向け動作を書き換える対象ではない。
+
+H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTask進行、H5は操作画面と配布で、このH1契約を参照する。共有契約を変える場合は本specを先に更新し、利用側だけで別の定義を持たせない。
+
+## Open items and resolution
+
+- **実ChatGPT認証と利用条件:** spikeはmockだけである。H1の接続実装前に現行の公式認可フローを再確認し、実ログイン・実要求には別途利用者の許可を得る。満たせなければ当該接続は未確認・利用不可とし、方式を再検討する。
+- **自動判定への送信と閾値:** H2で、送信する証拠・providerごとの入力能力・同意・費用・timeout・低確度時の扱いを決める。それまでH1は接続境界とmockだけを提供し、自動モードを利用可能と偽らない。
+- **配布と軽さの数値目標:** H5の配布設計で最低macOS・Intel対応・署名・更新・Python同梱を決める。H1の実装ではプロセス全体の常駐・実行中メモリと起動を記録し、spikeの小さいheadless値を製品予算に流用しない。初期の検証環境は現在のarm64開発機であり、古いOSの動作を保証しない。
+- **SDK更新・保存形式:** 実装開始時に依存とtoolchainを固定し、SDK snapshotのversionとherness側migrationを明記する。未知の形式を破棄したり、黙って上書きしたりしない。
+
+## Approval
+
+この文書はH1の設計レビュー用である。利用者はTauri・Rust優先、必要な接続と許可モード、spike、Git初期化と文書のcommitを許可しているが、H1の本実装はまだ承認していない。保存・検証・文書commit後に本specのレビューを求め、承認後にのみsdd-planへ進む。

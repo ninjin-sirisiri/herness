@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
+<meta name="sdd-source-digest" content="sha256:72e71e9e6324e5634635034d4fc2723a69837e07b4aa97e5e6a4f4ea87249653">
+<title>herness Context</title>
+<link rel="stylesheet" href="docs/sdd/assets/sdd.css">
+</head>
+<body data-document-kind="glossary">
+<a class="skip-link" href="#content">本文へ移動</a>
+<header class="document-header" data-document-kind="glossary">
+<p class="document-kind">Glossary / 用語集</p>
+</header>
+<div class="document-layout">
+<aside class="document-outline" aria-labelledby="outline-label">
+<details open>
+<summary id="outline-label">この文書の構成</summary>
+<nav aria-label="文書内の目次">
+<ol><li><a href="#terms">Terms</a></li></ol>
+</nav>
+</details>
+</aside>
+<main id="content" tabindex="-1">
+<h1 id="herness-context">herness Context</h1>
+<p>SDDに基づく開発をデスクトップ上で進めるエージェントハーネスの用語を定義する。</p>
+<section>
+<h2 id="terms">Terms</h2>
+<dl>
+<div class="term-entry">
+<dt>herness</dt>
+<dd>
+<p>SDDのskillsを利用し、エージェントによる開発をデスクトップ上で進めるためのエージェントハーネス。</p>
+<p class="avoid-terms"><em>Avoid</em>: CLI版herness</p>
+</dd>
+</div>
+<div class="term-entry">
+<dt>変更理由</dt>
+<dd>
+<p>ファイルを作成・編集する際に、なぜその変更を行うのかをエージェントが明示する短い説明。タスクの完了判定や、操作に対する人間の承認とは区別する。</p>
+<p class="avoid-terms"><em>Avoid</em>: 判断、内部思考、完了判定</p>
+</dd>
+</div>
+<div class="term-entry">
+<dt>許可モード</dt>
+<dd>
+<p>hernessがツール操作の実行可否を扱う方式。設定済みの権限ルールを使う「設定権限モード」と、軽量LLMやDecisionモデルで評価する「自動判定モード」を切り替えられる。</p>
+<p class="avoid-terms"><em>Avoid</em>: 完了判定モード、無条件実行モード</p>
+</dd>
+</div>
+</dl>
+</section>
+</main>
+</div>
+</body>
+</html>
