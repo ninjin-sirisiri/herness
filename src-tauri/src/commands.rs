@@ -396,17 +396,15 @@ pub fn poll_project(
         .snapshot(project)
         .map_err(|error| error.to_string())?;
     let mut events = Vec::new();
+    // Drain every run, including one whose last observed host state is `idle`.
+    // An adapter can publish its idle echo before the first model turn starts;
+    // skipping idle runs would lose later tool/approval events.
     for run in snapshot.runs() {
-        if matches!(
-            run.state(),
-            herness_core::RunState::Running | herness_core::RunState::AwaitingApproval
-        ) {
-            events.extend(
-                host.runtime_mut()
-                    .poll_run(project, run.run_id())
-                    .map_err(|error| error.to_string())?,
-            );
-        }
+        events.extend(
+            host.runtime_mut()
+                .poll_run(project, run.run_id())
+                .map_err(|error| error.to_string())?,
+        );
     }
     let snapshot = host
         .runtime()
