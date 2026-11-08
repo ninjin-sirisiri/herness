@@ -148,6 +148,67 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 - UI pollも `poll_run` も使わず、`DesktopHost::pump` だけでhidden runと非選択projectのrunが `run.text_completed` まで進み、再表示用snapshot/historyが最新sequenceを返す。
 - 長い単発要求のdeadline到達でpumpがrunを停止し、`run.stopped` を記録し、HTTP 1回のまま再試行しない。
 
+## Task 6で追加した監督契約・承認・profile・送信同意
+
+### crate境界
+
+- `crates/herness-supervision` は `herness-core` とworkspace共通のserde/uuid/sha2だけに依存する。store・engine-pi・assessment・Tauri・SQLite・実HTTPへ依存せず、I/Oも行わない。契約・検証・portだけを持つ。
+- `tests/supervision` はworkspace member `herness-supervision-tests` として登録し、`src/lib.rs` に合成fixture（project/condition/evidence/profile/consent、in-memoryの `SupervisionStorePort`）を置く。fixtureはsecret・実provider body・実会話を含まない。
+- 新規の公開監督契約はversion 2を書き、`SupervisionContract` と `SupervisionRecord` は `ContractVersion` を持つ。version 1の監督recordは存在せず、推測しない。H1のrun状態は変更しない。
+
+### 完了契約と承認
+
+- `SupervisionContract` はproject・agent/session・opaque owner参照・condition版・実行scope・必須check・条件別rubric・証拠target scope・固定profile版・固定同意版・有限budget・run groupを持つ。IDはproject-scopedで、`SupervisionScopedId` が別project参照を拒否する。
+- `ConditionSet` はversionと内容digestを持ち、`ConditionApproval` はproject・version・digestへ束縛する。承認basisは「人間の明示確認」と「H3承認済み設定/H4承認済みplanからの継承」を別variantで表す。
+- model actorは条件・profile・budget・実行scope・同意を承認/変更できない。model提案条件は人間または承認済みownerの確認までunapprovedである。fake/foreign/expired/stale digest/owner-source不一致の承認は拒否する。H3/H4 ownerの変更actorはsubject ownerと一致しなければならない。
+- condition version変更は現在の判定を `invalidatedDecisions` へ移し、completionを消し、`waiting_human` と `conditionsChanged` 理由にする。旧versionのassessmentは適用せずhistoryだけに残す。target/profile/consent変更も同じ規則で失効する。
+- `SupervisionRecord` はready/running/verifying/assessing/waiting_human/stopped/failed/cancelled/completed、理由、未達条件、現在のrequired checks、run groupを持つ。stopped・waiting_human・limit・unrecoverable・cancelledと未達条件はcompletionより優先し、completion snapshotのversion・profile・同意・必須checkが一致しない場合は完了できない。
+
+### 用途別profile
+
+- `AssessmentProfile` はpurpose（completion/html/permission）、provider kind（通常LLM/Jev/Decisions）、connection、model、adapter版、rubric版、必要入力（text/image/structured output）、thresholdsを持つ。profile versionは監督開始時に `ProfileBinding` として固定する。
+- H2既定値はcompletion met/unmet 0.95、permission allow/deny 0.99、分布sum誤差0.001。通常LLMには確率thresholdを捏造せず、provider-native confidenceは `NativeConfidence` として確率と別に保持する。これらは安全・正答率の保証ではなく、評価前の保守的な初期値である。
+- `ProfileCatalog` はpurposeごとの完全一致だけを解決する。未設定は `Unset`、connection unavailable/login required、text/image/structured output不足、provider-kindとendpoint classの不一致は利用不可であり、実行model・別provider・別purpose・別versionへfallbackしない。
+- Decision分布は有限・0〜1・選択肢完全一致・sumが1から0.001以内を要求し、無断で補正しない。completionのmet/unmet、permissionのallow/denyは閾値未満なら採用しない。insufficient・ask・uncertain・low confidenceは完了/実行の根拠にしない。
+
+### 送信同意
+
+- `DisclosureConsent` はproject・provider origin（scheme/host/port）・purpose・data種別（text/code/diff/log/image）・target-scope版へ束縛する。初回grantは人間だけが行い、同じscopeの継続は再確認なしで許可される。
+- revoke、別origin、別purpose、target版変更、data種別の追加、画像追加は未送信要求を止め、新しい人間確認を要求する。空scope・wildcard・repository rootは無効で、全会話・全repositoryの既定送信は存在しない。
+- `ProviderOrigin` はpath/query/fragment/userinfo/credentialを受け付けず、consent recordにsecretを含めない。
+
+### 証拠・assessment・budget・冪等要求
+
+- `EvidenceRecord` はID、取得者（child/CI/human）、正確なcommand/equivalent operation、実結果（exit/signal/timeout/truncation）、target版とcontent fingerprint、scope/limits、sequenceを持つ。必須check結果はpass/fail/not_run/unavailable/inconclusiveを区別し、exit 0やH1 operation成功をpassへ変換しない。passにはevidence IDが必要である。
+- `AssessmentRequest`/`AssessmentResult` は条件ごとのquestion・rubric・evidence ID・met/unmet/insufficient・短いrationale/uncertainty・provider/model/adapter/rubric版を持つ。resultはrequestに含まれないevidence IDを参照できない。
+- `BudgetPolicy::h2_default()` はcumulative active 7,200秒・追加30 run（初回込み最大31）・金額上限なし。金額上限は有限USDと `PriceVersion` を必須とし、見積りなし・上限超過は送信不可。人間待ち・明示pause・アプリ停止はactive timeに計上せず、再開で消費量を戻さない。Task 9がledgerを実装する。
+- `SupervisionRequest` はstart/stop/reassess/resume/changeのhost-owned request IDを持ち、`execute_command` は同じIDの再送に記録済みresultを返し、mutationを再実行しない。store portはCASとresult記録の原子的境界を提供する。
+- portは `ClockPort`・`EvidenceStorePort`・`AssessmentPort`・`SupervisionStorePort`。このTaskでは具体I/Oを実装しない。
+
+### Task 6のテスト
+
+`tests/supervision/tests/contracts.rs`:
+
+- fake/foreign/expired/stale-digest/source-owner-mismatch承認の拒否と、人間承認とH4継承承認の区別。
+- modelによる条件・profile・budget・scope・同意の承認/変更拒否、model提案条件の人間確認。
+- 別projectのsubject/run group/request/evidence/condition参照の拒否。
+- condition version変更でapplied decisionがhistoryへ移り、completionが消え、旧assessmentが適用されないこと。
+- 同意取消し・別origin・別purpose・scope追加・画像追加・target版変更・空/unbounded scopeの拒否と再確認要求。
+- 同一request IDの再送が同じresultを返し、store mutationとCASが1回だけであること。同じIDの別commandを拒否すること。
+- 7,200秒/30/31 run、有限金額とprice version、見積り不足、人間待ち除外、評価timeoutの短い方。
+- pass/fail/not_run/unavailable/inconclusiveの区別、exit 0のinconclusiveがpassでないこと、passにevidenceが必要なこと。
+- stopped/waiting/limit/unrecoverable/cancelledと未達条件がcompletionに優先すること、必須check欠落を拒否すること。
+- state/reasonの一致、record/contractのJSON round-trip、contract version 2。
+
+`tests/supervision/tests/profiles.rs`:
+
+- H2 threshold初期値、通常LLMに確率thresholdがないこと、未設定profileがunusableでfallbackしないこと。
+- text-only connectionへのimage要求、login required、structured output不足、provider-kind/endpoint不一致のunusable。
+- native confidenceが確率でないこと、uncertainが完了を支持しないこと。
+- Decision分布の有限性・範囲・sum誤差・0.95採用、permission 0.99とask、低確率・uncertainが実行を支持しないこと。
+- 固定profile versionと異なるversionのunusable、project外profileの拒否、Jev/Decisions接続の一致。
+
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -186,6 +247,15 @@ Task 5の受入で実行するコマンド:
 ```sh
 cargo test -p herness-runtime-tests --test engine --locked
 cargo test -p herness-runtime-tests --test desktop --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 6の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision --locked
+cargo test -p herness-supervision-tests --test contracts --locked
+cargo test -p herness-supervision-tests --test profiles --locked
 cargo check --workspace --all-targets --locked
 ```
 

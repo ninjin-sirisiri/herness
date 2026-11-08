@@ -1377,6 +1377,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "herness-supervision"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "herness-supervision-tests"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-supervision",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
