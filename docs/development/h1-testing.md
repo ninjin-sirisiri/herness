@@ -216,3 +216,69 @@ HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --smoke-t
 ```
 
 `--smoke-test` は実Tauriアプリを起動し、main windowの表示と、信頼されたUIからの `frontend_state` → `ui_ready` IPC往復を確認して0で終了する。GUI操作の人間による全確認やmacOSのclose/reopen/quitの実動作はTask 12・13の範囲とする。
+
+## Task 12で固定した明示quit・別プロセス復旧・製品計測
+
+実装は `src-tauri/src/lifecycle/`（`mod.rs` と `quit.rs`）、runtimeの `crates/herness-core/src/runtime/{host,shutdown,state,reconcile}.rs`、`src-tauri/src/{app,commands,host}.rs`、testは `tests/runtime/tests/desktop.rs` と `tests/runtime/tests/host.rs`。
+
+### 明示quitの契約
+
+- **ウィンドウ閉鎖とquitを分ける。** `CloseRequested` は従来どおり `prevent_close` + `hide` で、Rust hostをdisposeしない。macOS Reopenは同じwindowを表示し、`window.location.reload()` でページ状態を捨てる。明示quitは `quit_app` command、Cmd+Q等の `RunEvent::ExitRequested { code: None }`、`--quit-test` の3経路が同じ `QuitCoordinator` に入る。
+- **受付停止。** `Runtime::begin_shutdown` は以後の `start_run` / `submit_input` / `resume_run` / `approve` / `deny` / `create_agent` を `RuntimeError::ShuttingDown` で拒否し、`host_state` に `shutdown.outcome = in_progress` を保存する。保存に失敗した場合は成功として扱わない。
+- **協調停止。** `Runtime::stop_all_for_shutdown` は active（`running` / `awaiting_approval`）の全runに `StopReason::ApplicationQuit` を送り、SDKのcancelに任せる。`stop_run` と同じく `Stopped`/`NotRunning` は `paused`、`Unconfirmed` は `interrupted` に写像し、engine checkpointを取得できた場合だけ `checkpointSaved: true` とする。SDKのdisposeを保存可能な停止の代用にしない。PiEngineの `request_stop` は `ProcessSupervisor::begin_stop` の後に `stop_all(DEFAULT_STOP_GRACE)` を実行し、SIGTERMを無視する管理groupもSIGKILLまで進め、groupを確認できなければ `Unconfirmed` を返す。`explicit_shutdown_stops_a_managed_shell_group` は allowed `bash sleep` 中にquitし、管理groupの消滅と `shell.finished` の非成功記録を確認する。
+- **猶予と人間の選択。** productionは10秒（`DEFAULT_QUIT_GRACE`）。`QuitCoordinator` は注入可能な `QuitClock` を持ち、testはmanual clockと短いgraceを使う。10秒を超えてactive runが残る場合、main windowを表示し、`quit_state` が `awaiting_choice` と残run・unconfirmed・save失敗・「keep waiting」可否を返す。`quit_choice` の `keep_waiting` は新しいgraceを開始し、`force_quit` は明示的に `force_quitting` へ遷移する。10秒後に黙って強制終了しない。
+- **強制終了。** `Runtime::force_shutdown` は残runを `interrupted` にし、checkpoint保存・停止成功を主張しない。結果未記録の操作はresolve・rollback・再実行しない。`quit_choice(force_quit)` は最大300msだけ `force_shutdown` の永続化を試み、host lockが取れなくてもexitする。この場合shutdown recordは `in_progress` のまま残り、次回起動で「前回のquitが完了していない」として照合される。
+- **終了code（証拠用）。** `0`: 全active runが停止し、checkpoint保存も確認。`3`: 停止はterminalだが `Unconfirmed` またはcheckpoint保存失敗がある（成功と表示しない）。`2`: 人間が強制終了を選んだ。`4`: `--quit-test` の待機がtimeoutした。product UIはcodeを表示しないが、reportはこれを記録する。
+- **deferred host-result messages。** 承認・拒否後のhost結果がまだengine turn中のため送れなかった場合のin-memory queueは、quit時に再送せず破棄する。破棄件数を `shutdown.discardedDeferredMessages` と `ReconciliationReport.discardedDeferredMessages` / `previousShutdown.discardedDeferredMessages` に残す。再起動後に古いtool結果をengineへ再投入しない。
+- **test-only注入。** `QuitClock` と短いgraceはRustのconstructor引数でだけ注入でき、IPC commandは受け付けない。`--quit-test` は実TauriプロセスでUI ready後に同じproduction quit controllerを起動するautomation launcherで、production IPCではない。
+
+### 永続化と照合
+
+- **host state format 2。** 既存の `projects` に加え、非secretの `connections`（`ConnectionSettings` 全体、ChatGPTの `vaultAccount` 選択を含む）と `shutdown` recordを保存する。format 1は引き続き読めるが、format 2 fieldを持てば拒否する。未知format・未知fieldは `CorruptState` で拒否する。常にformat 2で書き出す。secretは引き続きKeychainだけで、`ConnectionSettings` にtoken/API key fieldはない。
+- **接続設定の復元。** `DesktopHost::open` は永続化済み設定を `ConnectionAdmin` へ戻し、registryと保存値が同じIDで食い違えばerrorにする。in-memoryだけの設定はopen時、`add_connection` 時、ChatGPT login状態確認時、quit時に保存する。復元reportのconnection statusも再計算する。実ChatGPT token exchangeは未接続のままで、選択accountの非secret mappingだけを保持する。
+- **照合report。** `ReconciliationReport` は `previousShutdown`（outcome・started/finished・stopped run数・unconfirmed/remaining run ID・破棄message数・save失敗数）を持つ。各projectはrunのprevious/current state、未解決操作の `applied` / `not_applied` / `unverifiable` と証拠source、復元承認の `restored` / `reusable=false` を返す。UIはこのreportをtextとして表示する。
+- **file適用直後crash。** 新しいprocessはintentだけを読み、native fileの現在内容とfrozen intentを比較して `applied` + `NativeFileContent` と分類する。これは証拠であり、storeへresultを捏造しない。shellは `ShellUncertain` / `Unverifiable` のまま人間の照合に残す。
+- **起動時の非実行。** restoreはmodel request・tool実行・approval再利用・engine resumeをしない。人間の `resume_run` が現在のcredentialとpolicyを再確認してから保存checkpointを使う。
+
+### 別プロセスfixture
+
+`tests/runtime/tests/desktop.rs` の統合test binaryは、環境変数 `HERNESS_TASK12_WORKER=<mode>` を設定して `--exact task12_worker_entrypoint` で自分自身を再実行する。test-only process fixtureであり、production binary・IPC・featureではない。real SQLite fileと実project directoryを共有する。
+
+| mode | 内容 | 期待exit |
+| --- | --- | --- |
+| `normal-quit` | 実 `DesktopHost` + 実 `PiEngine` + loopback mockでapproval待ちを作り、`begin_shutdown` → `stop_all_for_shutdown` → `finish_shutdown`。PID・run state・checkpoint有無・sequenceを出力 | 0 |
+| `unconfirmed-quit` | scripted engineが `StopReport::Unconfirmed` を返す。runは `interrupted`、保存成功を主張しない | 3 |
+| `force-quit` | 実storeにshell intentを残したまま `force_shutdown`。resultなし・run interrupted | 2 |
+| `crash-after-apply` | 実 `NativeFileTools` でfile write intentを保存・applyした直後、result記録の直前に `std::process::exit(70)`。resultは書かない | 70 |
+
+各parent testはworkerのPID・exit code・sequenceをassertし、別プロセスでstoreを開き直して、`previousShutdown`、run state、未解決操作、file内容、起動時request数0を確認する。`normal-quit` はさらに、credential unavailableでは `resume_run` が `ConnectionUnavailable`、credential availableでは保存checkpointからresumeでき、その間のmodel requestが0であることを確認する。
+
+### 検証コマンド
+
+```sh
+cargo test -p herness-runtime-tests --test desktop --locked
+cargo test -p herness-runtime-tests --test host --locked
+cargo test -p herness-desktop --lib --locked
+cargo build -p herness-desktop --locked
+HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --smoke-test
+HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --close-reopen-test
+HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --quit-test
+```
+
+`--smoke-test` は既存の起動確認に加えて `SMOKE_READY: pid=... startup_ms=...` を出力する。`HERNESS_SMOKE_HOLD_MS` はready後もprocessを保持し、外部からのRSS samplingを可能にするmeasurement専用envで、productionの挙動を変えない。`--close-reopen-test` は実際の `WebviewWindow::close`（close buttonと同じ `CloseRequested`）→ `prevent_close` + hide → show + reload → 新しい `ui_ready` を確認し、`CLOSE_REOPEN_HIDDEN` / `CLOSE_REOPEN_OK` を出力する。`--quit-test` はUI ready後にproduction quit controllerを起動し、`QUIT_TEST_READY`、`QUIT_OK` / `QUIT_INCOMPLETE` / `QUIT_FORCED` を出力する。
+
+### 計測結果（2026-11-08、現在の開発機）
+
+- **環境:** macOS 27.2 (build 26B123), Apple M5, arm64, 16 GiB。toolchainは `rustc 1.97.1 (8bab26f4f 2026-07-14)` / `cargo 1.97.1 (c980f4866 2026-06-30)`。
+- **build mode:** `cargo build -p herness-desktop --locked` のdebug build（unoptimized、debuginfoあり）。release build・署名・配布は未検証。
+- **起動時間:** `--smoke-test` を3回実行し、`app::run` 開始から信頼UIの `ui_ready` 完了までの `startup_ms` は 394、333、337 ms（中央値337 ms）。プロセスexec前のdyld・binary loadは含まない。性能目標・product promiseではない。
+- **idle RSS:** `--smoke-test` + `HERNESS_SMOKE_HOLD_MS=5000` で起動し、`ps -o rss=` を2回sample。app processは135,040 KB、137,632 KB（約131.9–134.4 MiB）で、sample間に約2.5 MBの変動があった。同時に新規出現したsystem-managed WebKit XPC processは GPU 24,288 KB、WebContent 39,168 KB、Networking 8,336 KB、合計71,792 KB（約70.1 MiB）。2回目sample時点のapp + WebKit合計は209,424 KB（約204.5 MiB）。WebKit processはappの直接childではなく、起動前後のPID差分で対応付けた。
+- **running RSS:** 実Tauri appで実model runを動かすには実接続の許可が必要なため、Task 12では測っていない。代わりに別processのhost composition fixture（`measure_running_host_rss`、実store・実PiEngine・loopback mock・fake credential・allowed `bash sleep 20`）で、host process 25,696 KB（約25.1 MiB、2 sampleで安定）、管理下 `sleep` child 960 KBを記録した。これはWebViewを含まないhost runtimeの値であり、上のTauri app値と同一視しない。spikeのheadless値も流用しない。
+- **未確認:** 実model実行中のTauri app + WebView RSS、release build、署名・配布、Intel Mac・古いmacOS、実ChatGPT login/token exchange。
+
+### GUI・未確認事項
+
+- `--quit-test` は実Tauri processで「UI ready → 明示quit → 保存確認 → exit 0」を確認した。active runが10秒を超えた場合のGUI上の「keep waiting / force quit」操作そのものは自動化していない。controllerのgrace・keep waiting・force選択はmanual clockのunit testで、unconfirmed停止・強制終了・crash復旧は別process fixtureで確認する。
+- `--close-reopen-test` は実際の `WebviewWindow::close` で `CloseRequested` を発火し、windowがhideされ、process/hostが生存し、show + reload後に信頼UIが再度readyになることを確認した。close buttonの人間クリックやmacOS dock reopenのOS操作そのものは自動化していない。window非依存でrun・auditが進み、reopen相当のsnapshot/historyが最新を返すことはruntime testで確認する。実際の人間操作はTask 13の受入で確認する。
+- `--quit-test` はactive runがない場合だけ自動完了する。active workがある状態でhuman choiceが必要になれば `QUIT_TEST_NEEDS_HUMAN` を出してexit 4にし、成功を装わない。
+- 計測値はdebug build・現在のarm64開発機の記録であり、H5の配布・軽さの目標値ではない。secret・実token・実provider errorは計測artifactに含めていない。
