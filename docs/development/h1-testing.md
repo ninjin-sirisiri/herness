@@ -282,3 +282,96 @@ HERNESS_APP_DATA_ROOT=<absolute-temp-dir> target/debug/herness-desktop --quit-te
 - `--close-reopen-test` は実際の `WebviewWindow::close` で `CloseRequested` を発火し、windowがhideされ、process/hostが生存し、show + reload後に信頼UIが再度readyになることを確認した。close buttonの人間クリックやmacOS dock reopenのOS操作そのものは自動化していない。window非依存でrun・auditが進み、reopen相当のsnapshot/historyが最新を返すことはruntime testで確認する。実際の人間操作はTask 13の受入で確認する。
 - `--quit-test` はactive runがない場合だけ自動完了する。active workがある状態でhuman choiceが必要になれば `QUIT_TEST_NEEDS_HUMAN` を出してexit 4にし、成功を装わない。
 - 計測値はdebug build・現在のarm64開発機の記録であり、H5の配布・軽さの目標値ではない。secret・実token・実provider errorは計測artifactに含めていない。
+
+## Task 13 Phase Aで固定した実接続境界・実ChatGPT transport・受入手順
+
+Task 13 Phase Aは、現在のherness実装で自動検証・実Tauri検証を実行し、実接続だけをPhase Bの明示的な許可へ残す。Phase AではOpenAI・Anthropic・OpenAI互換・ChatGPTのいずれの実hostへも接続せず、既存Keychain項目も読まず、実Keychain項目も作成・削除しない。実接続の結果はすべて**UNVERIFIED**であり、H1受入は完了していない。
+
+### 依存とtransport
+
+- `herness-engine-pi` の `reqwest` 0.12.28（`Cargo.lock`で固定）へ `blocking` featureを追加した。既存の `rustls-tls` とwebpki rootsを使い、独自CA・OS trust store・proxyへのfallbackはしない。
+- `HttpsTokenTransport` は `https://auth.openai.com/api/accounts/oauth/token` へform-encoded `authorization_code` / `refresh_token` grantを送る。client secretは送らない。`scope` はrefreshで送らず、granted scopeを維持する。
+- `DiscoveryJwksSource` は `https://auth.openai.com/.well-known/openid-configuration` を取得し、issuer一致・`jwks_uri` のHTTPS性を検証してからJWKSを取得する。`Cache-Control: max-age` を尊重し、既定300秒・上限3,600秒でcacheする。`no-store` はcacheしない。
+- token・discovery・JWKSのHTTP clientはredirectを無効化し、3xxを失敗として扱う。token requestのform bodyを別originへ転送しない。`Authorization` headerをJWKS/discoveryへ付けない。
+- sign-outはdiscoveryの `revocation_endpoint` へ `token`・`token_type_hint=refresh_token`・issued `client_id` をform-encoded POSTする。**空のHTTP 200だけ**を `RemoteRevokeStatus::Confirmed` とし、200以外の2xx・空でない200・network失敗はconfirmedにしない。endpointが取得できない場合もunverified。
+- `LoginManager` はcallback待機とtoken exchangeを専用のhost worker threadで行う。WebViewへtoken・code・authorization URLを渡さない。完了状態は `chatgpt_login_status` のpollingで `available` / `auth_required` / 失敗理由（sanitized）として表示する。
+- `ChatGptAuth::credential_port()` をdesktop hostのengineへ共有し、期限切れChatGPT tokenのrefreshをTask 7のconnection別gateで行う。APIキー接続とChatGPT接続のどちらも、別provider・別modelへのfallbackはしない。
+- 信頼UIへ `chatgpt_models`（catalog GET）と `set_connection_model`（model名だけの更新）を追加した。どちらもmain window限定ACLとcommand guardを通り、provider・endpoint・auth method・credentialを変更しない。`set_connection_model` はmodelがcatalogにない場合でも接続を壊さず、run開始時/real-check時にcatalog照合で拒否する。
+- `LoginManager::force_refresh` と `ChatGptAuth::sign_out_selected` は、再起動後のcontroller processでもin-memory account directoryに依存せず、保存済みの非secret settingsとKeychain token setから対象accountを再構成する。強制refreshは `CredentialBroker::refresh_at` を使い、未期限切れのaccess tokenでも同じconnection別gateの下で1回だけrefreshし、新しいtoken setを検証・保存してから返す。
+- 用条件gateは従来どおり `ChatGptAuthConfig::new` の既定 `Closed(ConditionsUnconfirmed)`。desktopの `LoginManager::new` だけが `TermsConfirmation::local_unpublished()` を明示する。Phase Bでも公開・配布・商用・remote hostingへ進まない。
+
+### opt-in real-check
+
+`herness-desktop` のcontroller専用CLIであり、Tauriを起動せず、通常のworkspace test・smoke test・UI・IPCからは呼ばれない。
+
+```sh
+HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --real-check <connection-id>
+HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --real-check <connection-id> --list-models
+HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --real-check <connection-id> --refresh
+HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --real-check <connection-id> --sign-out
+HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --forget-connection <connection-id>
+```
+
+- 対象は保存済みの1 connectionだけ。provider・model・endpoint・credentialをCLIから指定・変更できない。catalogに選択modelがない場合は `model_not_in_catalog` で停止し、別modelを選ばない。
+- request modeは `pi-ai` のengineと同じroute（`openai-responses` / `anthropic-messages` / `openai-completions` / ChatGPT public Responses）へ、合成prompt `Reply with the single word: herness-ok.` を1回だけ送る。`max_tokens=32`、`max_retries=0`、timeout 120秒。ChatGPTは先に `/v1/models` を読み、`visibility=list` のslugだけをcatalogとして扱う。
+- evidenceは `<app-data-root>/real-check/real-check-<unix-ms>-<connection-id>-<mode>.json` へmode `0600` で書く。含むのはschema version、時刻、connection ID、provider、auth method、model、mode、endpoint class（custom endpointはoriginのみ）、terminal status、固定的なfailure label、latency、catalog latency/count、provider-reported usage、catalogのslug/display name、ChatGPTのremote revoke status、local credential削除flagだけ。token・APIキー・ID token・authorization URL・provider error body・raw provider textは含めない。
+- exit code: `0` 成功、`2` 引数・接続・model選択・構成の失敗、`3` credential欠落/期限切れ/読取不能、`4` provider要求の失敗または不完全終端、`5` 予約（現在はrefreshを3で返す）、`6` sign-out/credential削除/forget失敗、`7` evidence書込み失敗。
+- `--forget-connection` はChatGPTなら先にsign-out（remote revokeを試行）し、APIキーならKeychain itemを削除してから、host stateからconnectionを除く。削除失敗を成功として表示しない。
+- `tests/runtime/tests/acceptance.rs` は、通常のwindow automation flagがreal-checkを選ばないこと、modeごとに明示的なconnection IDが必要なこと、real-checkとforgetが排他であることを確認する。providerへは接続しない。
+
+### Phase B runbook（人間の許可後にだけ実行する）
+
+#### 0. 前提と許可記録
+
+1. 対象revision・OS/toolchain・build modeを記録する。Phase Aのcommitをcheckoutし、`cargo build -p herness-desktop --locked` でdebug binaryを作る。
+2. 専用のabsolute app-data rootを決める（例: `ROOT=$(mktemp -d /tmp/herness-h1-accept.XXXXXX)`）。UIとcontrollerで同じ `HERNESS_APP_DATA_ROOT` を使う。既存のcredentialを探索しない。
+3. 人間へ次を提示して許可を得る: 接続ID、provider、account、model、送信する合成prompt、最大出力32 tokens、予想される料金/利用枠、検証で作るKeychain account、login/refresh/sign-out/revokeの実行、evidenceの保存先。
+4. 許可が得られない経路は実行せず、UNVERIFIEDのまま残す。providerやmodelを黙って変更しない。
+
+#### 1. APIキー経路（OpenAI・Anthropic・OpenAI互換）
+
+1. `HERNESS_APP_DATA_ROOT="$ROOT" target/debug/herness-desktop` を起動する。
+2. 「Connection and model」でproviderを選び、最も安い利用可能modelを入力する。OpenAI互換はendpointも入力し、remote HTTPなら危険確認を明示的に行う。「Add connection」で追加し、表示されたconnection IDを記録する。
+3. 追加したconnectionを選択し、write-onlyのAPI key欄へ**その場で入力した検証用キー**を入れ、「Save key」を押す。表示が保存成功になり、入力欄が空になったことを確認する。既存Keychain項目は使わない。
+4. controllerで `--real-check <connection-id>` を実行する。成功はexit 0かつ `REAL_CHECK_OK: ... terminal=completed`、evidenceのprovider/model/endpointClass/usageを確認する。
+5. exit 3ならcredentialを直して再実行する。exit 4ならfailure labelとevidenceを記録し、別provider/modelへ切り替えない。Anthropic/OpenAI互換も同じ手順を独立したconnectionで繰り返す。
+
+#### 2. ChatGPT経路（login・catalog・stream・refresh・sign-out）
+
+1. provider OpenAI、auth method ChatGPT login、modelは仮のslug（例: `gpt-5.1`）でconnectionを追加し、IDを記録する。
+2. connectionを選択し「Start ChatGPT login」を押す。macOSのsystem browserが `https://auth.openai.com/...` を開く。**アプリのWebViewへOpenAIのpasswordを入力しない。**
+3. browserで検証用accountのloginを完了し、アプリへ戻って「Refresh」を押す。`state: available` とaccount表示、`token exchange: https_configured_unverified` を確認する。失敗時はsanitizedな `last attempt` を記録し、成功を装わない。
+4. 「List ChatGPT models」を押す。`visibility=list` のmodelだけがdisplay nameとslugで表示される。取得できなければ停止し、modelを推測しない。
+5. 一番安いmodelをdropdownで選び「Use selected model」を押す。connection一覧のmodelが変わったことを確認する。
+6. `--real-check <id> --list-models` を実行する。exit 0、`terminalStatus: listed`、evidenceの `models` を確認する。
+7. `--real-check <id>` を実行する。catalog GETの後にResponsesへ1回だけ送る。exit 0、`terminalStatus: completed`、`response.completed` 相当の終端、catalog count、usageを確認する。
+8. `--real-check <id> --refresh` を実行する。exit 0、`terminalStatus: refreshed` を確認する。refreshでrefresh tokenが回転した場合はKeychainのaccount-scoped itemが置き換わる。同時に別のrefreshを実行しない。
+9. `--real-check <id> --sign-out` を実行する。exit 0、`terminalStatus: signed_out`、`localCredentialsRemoved: true`、`remoteRevoke` を確認する。`remoteRevoke` が `confirmed` 以外なら、provider側の取消しは**未確認**として記録する。local削除が失敗した場合はexit 6で、接続を残す。sign-out後はこのconnectionでrunを開始しない。
+10. アプリを通常quitしてから `--forget-connection <id>` を実行する。controller processは保存状態からconnectionを除く。再度アプリを起動し、connection一覧に残っていないことを確認する。
+
+#### 3. 検証用Keychain項目の作成・削除
+
+- APIキー: account `connection/<connection-id>/api_key`。作成は信頼UIの「Save key」だけ。値は表示も再取得もしない。
+- ChatGPT: account `connection/<connection-id>/chatgpt_login/<issued-client-id>/<sha256(subject)>`。作成はsystem browser loginの完了時だけ。
+- 削除は各connectionの `--forget-connection <id>` が行う。ChatGPTは先にsign-outを実行し、`remoteRevoke` の結果をevidenceへ残す。
+- 削除確認は `security find-generic-password -s com.herness.credentials -a "<account>"` が「could not be found」（exit 44）を返すこと。`security dump-keychain` や既存項目の列挙は行わない。
+- 接続状態を失った孤立項目だけは、記録済みのaccountを `security delete-generic-password -s com.herness.credentials -a "<account>"` で削除する。これは検証用項目の後始末であり、結果をreportへ記録する。
+
+#### 4. 後始末
+
+1. UIから通常quitする（`Quit herness`）。強制終了した場合は次回起動のreconciliationを記録する。
+2. 全検証connectionへ `--forget-connection` を実行し、Keychain項目の不在を確認する。
+3. evidence JSONをreportの証拠へコピーし、`$ROOT` のDB・host ID・一時projectを削除する。secretはコピーしない。
+4. 実接続の成功・失敗・未確認をprovider/routeごとにreportへ記録し、H1受入の完了/未完了を更新する。実接続が未確認の間はTask 13とH1受入を完了にしない。
+
+### Phase Bで確認する未確認項目
+
+- OpenAI APIキー経路の実request・usage・料金。
+- Anthropic APIキー経路の実request・usage・料金。
+- OpenAI互換endpointの実request（endpoint固有のmodel/制限を含む）。
+- ChatGPTの実login・callback・token exchange・ID token/JWKS検証・plan scope。
+- ChatGPTの実catalog取得、選択modelでの `response.completed`、usage。
+- ChatGPTの実refresh（回転refresh token・保存）。
+- ChatGPTのsign-outとremote revocation（空HTTP 200の確認可否を含む）。
+- 実Keychain項目の作成・削除・不在確認。
+- 実providerの料金・利用枠・認可条件。
