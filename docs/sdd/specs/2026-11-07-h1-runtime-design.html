@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:7b9d308b000220f0286f9c50df2a41fb231f15919c86b1839df399b6bfb85f80">
+<meta name="sdd-source-digest" content="sha256:54cce2cc494833747ea037fab0ac0a949b6a41c464a73c4743fbdfe967fc69bd">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -49,8 +49,8 @@
 <main id="content" tabindex="-1">
 <h1 id="h1-実行基盤と変更理由の記録">H1: 実行基盤と変更理由の記録</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> レビュー待ち。本specの承認まではsdd-plan・本実装に進まない。</p>
-<p class="metadata"><strong>Chosen approach:</strong> TauriのRustホストに<code>pi-embedded</code>と<code>pi-ai</code>を接続し、hernessが実行・許可・記録・保存を所有する案を採用候補とする。Node runtimeは初期構成に含めない。これはspec承認を求める提案であり、基盤の正式採用は承認後とする。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が承認。H1のsdd-planへ進む。本実装はまだ開始しない。</p>
+<p class="metadata"><strong>Chosen approach:</strong> TauriのRustホストに<code>pi-embedded</code>と<code>pi-ai</code>を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH1を扱う。用語は<a href="../../../CONTEXT.md">CONTEXT.md</a>、選定の証拠と限界は<a href="../../research/2026-11-07-pi-rust-spike.md">spike結果</a>を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。</p>
 <section>
 <h2 id="goals">Goals</h2>
@@ -267,7 +267,7 @@
 </section>
 <section>
 <h2 id="approval">Approval</h2>
-<p>この文書はH1の設計レビュー用である。利用者はTauri・Rust優先、必要な接続と許可モード、spike、Git初期化と文書のcommitを許可しているが、H1の本実装はまだ承認していない。保存・検証・文書commit後に本specのレビューを求め、承認後にのみsdd-planへ進む。</p>
+<p>2026-11-08、設計文書の保存・検証・commit後のレビュー依頼に対し、利用者が「ok」と回答し、本specと基盤選定を承認した。H1のsdd-planへ進む。これは本実装の開始、実アカウントへのログイン・モデル送信、有料API呼び出し、H2〜H5の設計・実装を自動で許可するものではない。</p>
 </section>
 </main>
 </div>

@@ -2,9 +2,9 @@
 
 **Classification:** architectural
 
-**Status:** レビュー待ち。本specの承認まではsdd-plan・本実装に進まない。
+**Status:** 2026-11-08に利用者が承認。H1のsdd-planへ進む。本実装はまだ開始しない。
 
-**Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用候補とする。Node runtimeは初期構成に含めない。これはspec承認を求める提案であり、基盤の正式採用は承認後とする。
+**Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。
 
 本specは[ロードマップ](2026-11-07-herness-roadmap.md)のH1を扱う。用語は[CONTEXT.md](../../../CONTEXT.md)、選定の証拠と限界は[spike結果](../../research/2026-11-07-pi-rust-spike.md)を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。
 
@@ -204,4 +204,4 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 
 ## Approval
 
-この文書はH1の設計レビュー用である。利用者はTauri・Rust優先、必要な接続と許可モード、spike、Git初期化と文書のcommitを許可しているが、H1の本実装はまだ承認していない。保存・検証・文書commit後に本specのレビューを求め、承認後にのみsdd-planへ進む。
+2026-11-08、設計文書の保存・検証・commit後のレビュー依頼に対し、利用者が「ok」と回答し、本specと基盤選定を承認した。H1のsdd-planへ進む。これは本実装の開始、実アカウントへのログイン・モデル送信、有料API呼び出し、H2〜H5の設計・実装を自動で許可するものではない。
