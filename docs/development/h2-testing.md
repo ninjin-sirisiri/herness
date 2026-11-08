@@ -602,3 +602,32 @@ Task 12の追加確認:
 - `cargo test -p herness-supervision-tests --test adapters --locked` はloopback mockだけで、固定 `gpt-6-luna`、`POST /v1/decisions`、toolなし、質問ID、3 choices、証拠だけのinput、全拒否理由、0.95境界、native confidence分離、画像data URL、外部URL/`file_id`拒否、入力上限、429/5xx/Retry-After、送信不明timeoutの再送0、secret canary非表示、alias/version非再利用、三方式正規化を確認する。
 - `cargo test -p herness-supervision-tests --test profiles --locked` はTask 11のadditive field回帰と、Decisionsの結果が同じcondition/target/profile bindingへ適用されることを確認する。
 - 実OpenAI/Decisionsへの接続成功は主張しない。認証付き要求・model一覧・実送信は別途許可された実接続検証まで未確認である。
+
+Task 13の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test supervisor --locked
+cargo check --workspace --all-targets --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+Task 13の追加確認:
+
+- `cargo test -p herness-supervision-tests --test supervisor --locked` は実 `SupervisionRecord`・`BudgetLedger`・`ClockPort`・比較更新store契約と、fakeのruntime・required-check・assessment・evidence・notificationを使う。実provider・credential・Keychain・Tauri・外部processは使わない。
+- `normal_completion_waits_for_completed_input_and_notifies_once_after_save` は、作成直後のidleと未完結inputでは検証・評価を開始せず、対応するinputの完了とidleが揃ってから必須check→条件別評価→最終再照合→保存→通知の順に完了することを確認する。通知は1回だけで、store commitがnotifyより先に記録される。
+- `fixable_fail_and_unmet_continue_the_same_child_with_a_new_run_and_input` は、failしたcheckとunmet条件を同じ子の追加runへ返し、新しいrun/input ID、直前run、同じcondition/target/profile/consent、不足check・条件・証拠を確認する。旧runはrun groupに残り、旧inputは再利用されず、cycle 2では有効なcheck証拠が再実行なしで再利用される。
+- `a_required_check_fail_cannot_be_overridden_by_a_model_met` は、全条件にmodel `met`が返っても必須checkがfailの間は完了せず、同じ未進展cycleが続けばstagnationで停止することを確認する。
+- `startup_idle_normal_end_and_idle_without_completed_input_never_verify` は、作成直後idle、入力未完了のidle、入力完了後もrunがactiveな状態ではcheck/assessmentを0件に保ち、input完了とidleが対応した後だけverifyingへ進むことを確認する。
+- `assessment_is_refused_while_a_run_is_active` は、評価待ちのrecordでもH1 runがactiveなら判定要求を送らず、同じrevision・通知0件のまま拒否し、runがidleに戻ってからだけ送ることを確認する。
+- `a_change_during_assessment_is_history_only_and_never_completes` は、評価中にcondition・target・profile・consentのいずれかが改訂された場合、結果を`invalidatedDecisions`だけに残し、applied decision・完了・通知を増やさず、同じ入力の自動再評価もしないことを4通りで確認する。
+- `three_no_progress_cycles_stop_and_relevant_new_evidence_counts_as_progress` は、log時刻・tool回数・対象read-set外の変更を進展に数えず3連続cycleで`stopped(stagnation)`にすること、およびfile編集がなくても関連する新調査証拠が増えれば進展として継続することを確認する。
+- `duplicate_ticks_and_request_ids_do_not_repeat_side_effects` は、同じevent IDがjournalの記録を返し、CAS失敗後の再試行が同じruntime request IDでrunを二重開始せず、完了通知も1回だけであることを確認する。
+- `thirty_one_runs_are_allowed_and_the_thirty_second_is_refused_across_reopen` は、初回+追加30回の31 runを許し、32回目の開始を`stopped(budget.runCount)`として拒否し、budget ledgerを再openしても消費済み31回が維持されることを確認する。
+- `budget_time_and_human_wait_take_priority_over_completion` は、残り稼働時間0が完了より優先されること、inconclusive検証がassessmentなしで`waiting_human(reconcileRecovery)`になること、insufficient評価が追加runを起こさず`waiting_human(decideAssessment)`になることを確認する。
+- `a_stale_revision_does_not_double_mutate_or_notify` は、完了候補のCAS競合がstateを書かず通知0件で終わり、次のtickでだけ完了することを確認する。
+- `deterministic_conditions_complete_from_required_checks_without_model_assessment` は、assessment planがsemantic評価不要と示した条件を必須checkのpass証拠だけでhost側のmetとして記録し、model要求0件で完了することを確認する。`valid_child_ci_and_human_evidence_is_reused_without_reexecution` は、child/CI/humanのpass証拠を対象manifestへ再照合して再利用し、check実行0件で完了することを確認する。
+- `final_recheck_rejects_target_content_changed_after_assessment_and_reverifies` は、評価後の対象content変更を最終再照合で検出し、完了せずverifyingへ戻って再検証・再評価した後だけ新しいdigestで完了することを確認する。
+- `an_unconfirmed_stop_blocks_new_runs_and_reassessment` は、停止未確認なら`stopped(stopUnconfirmed)`とし、追加run・再判定を開始しないことを確認する。`a_failed_child_run_is_unrecoverable_and_blocks_completion` は、H1 runの失敗を`failed(targetUnstable)`として完了より優先する。
+- 監視controllerはsupervision crate内の決定的な同期処理であり、store CASと同時にjournalへtick eventを記録する。保存成功後だけownerへ通知し、stale revision・重複event・遅延結果では追加のrun・判定・停止・通知を行わない。
+- 実provider・実credential・実Keychain・実Tauriは未使用のまま未確認とする。Task 14の許可評価器、Task 15の復旧、Task 16のUIはこのTaskに含めない。

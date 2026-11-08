@@ -19,6 +19,7 @@ use crate::error::SupervisionError;
 use crate::evidence::{ContentDigest, TargetVersion};
 use crate::ids::{CheckId, ConditionId, EvidenceId, SupervisionId, verify_core_id, verify_scoped};
 use crate::profiles::{ProfileBinding, ProfileThresholds};
+use crate::supervisor::SupervisorState;
 use crate::version::current_contract_version;
 
 /// State of one supervised child-agent effort.
@@ -580,6 +581,8 @@ pub struct SupervisionRecord {
     completion: Option<CompletionSnapshot>,
     #[serde(default)]
     completion_stale: Option<StaleCompletion>,
+    #[serde(default)]
+    supervisor: SupervisorState,
 }
 
 impl SupervisionRecord {
@@ -611,6 +614,7 @@ impl SupervisionRecord {
             invalidated_decisions: Vec::new(),
             completion: None,
             completion_stale: None,
+            supervisor: SupervisorState::default(),
         }
     }
 
@@ -674,6 +678,11 @@ impl SupervisionRecord {
         &self.unmet_conditions
     }
 
+    /// Every condition in the current set.
+    pub fn condition_ids(&self) -> &[ConditionId] {
+        &self.condition_ids
+    }
+
     /// Required verification checks for the current condition set.
     pub fn required_checks(&self) -> &[CheckId] {
         &self.required_checks
@@ -697,6 +706,15 @@ impl SupervisionRecord {
     /// Related input change observed after completion, if any.
     pub fn completion_stale(&self) -> Option<&StaleCompletion> {
         self.completion_stale.as_ref()
+    }
+
+    /// Additive deterministic supervisor bookkeeping.
+    pub const fn supervisor(&self) -> &SupervisorState {
+        &self.supervisor
+    }
+
+    pub(crate) fn supervisor_mut(&mut self) -> &mut SupervisorState {
+        &mut self.supervisor
     }
 
     /// Marks the completion snapshot stale without changing the completed state
@@ -883,6 +901,100 @@ impl SupervisionRecord {
             self.applied_decisions.push(decision);
         }
         Ok(AssessmentApplication::Applied)
+    }
+
+    /// Applies a host-owned deterministic condition result.
+    ///
+    /// This is used only when every required check for the condition currently
+    /// passes with applicable evidence and the injected assessment plan marks
+    /// the condition as provable without a semantic model judgment. It records
+    /// the same applied-decision shape as an adopted model `met` result.
+    pub fn apply_deterministic_condition(
+        &mut self,
+        condition_id: ConditionId,
+        condition_version: ConditionVersion,
+        target_version: TargetVersion,
+        evidence: Vec<EvidenceId>,
+    ) -> Result<(), SupervisionError> {
+        verify_scoped(&condition_id, self.project_id)?;
+        if !self.condition_ids.contains(&condition_id) {
+            return Err(SupervisionError::UnknownConditionReference {
+                reference: condition_id.to_string(),
+            });
+        }
+        if condition_version != self.condition_version || target_version != self.target_version {
+            return Err(SupervisionError::StaleAssessment {
+                current_condition_version: self.condition_version.get(),
+                assessment_condition_version: condition_version.get(),
+                current_target_version: self.target_version.get(),
+                assessment_target_version: target_version.get(),
+            });
+        }
+        if evidence.is_empty() {
+            return Err(SupervisionError::EvidenceContractViolation {
+                field: "deterministicCondition.evidence".to_owned(),
+                detail: "a deterministic condition result must cite evidence".to_owned(),
+            });
+        }
+        for evidence_id in &evidence {
+            verify_scoped(evidence_id, self.project_id)?;
+        }
+        self.unmet_conditions.retain(|id| *id != condition_id);
+        let decision = AppliedDecision {
+            condition_id,
+            condition_version,
+            target_version,
+            profile: self.profile,
+            verdict: ConditionVerdict::Met,
+            evidence,
+        };
+        if let Some(existing) = self
+            .applied_decisions
+            .iter_mut()
+            .find(|existing| existing.condition_id == condition_id)
+        {
+            *existing = decision;
+        } else {
+            self.applied_decisions.push(decision);
+        }
+        Ok(())
+    }
+
+    /// Preserves an assessment result only as history.
+    ///
+    /// This is used when a result arrives after a condition, target, profile,
+    /// or consent revision. The current unmet set and applied decisions are
+    /// never changed by this method.
+    pub fn record_invalidated_assessment(
+        &mut self,
+        result: &AssessmentResult,
+        invalidation: DecisionInvalidation,
+    ) -> Result<(), SupervisionError> {
+        verify_scoped(&result.supervision_id(), self.project_id)?;
+        if result.project_id() != self.project_id {
+            return Err(SupervisionError::CrossProjectReference {
+                id_kind: "assessment".to_owned(),
+                expected: self.project_id,
+                found: result.project_id(),
+            });
+        }
+        if !self.condition_ids.contains(&result.condition_id()) {
+            return Err(SupervisionError::UnknownConditionReference {
+                reference: result.condition_id().to_string(),
+            });
+        }
+        self.invalidated_decisions.push(InvalidatedDecision {
+            decision: AppliedDecision {
+                condition_id: result.condition_id(),
+                condition_version: result.condition_version(),
+                target_version: result.target_version(),
+                profile: result.profile(),
+                verdict: result.reported_verdict(),
+                evidence: result.evidence().to_vec(),
+            },
+            invalidation,
+        });
+        Ok(())
     }
 
     /// Changes the condition version after a human or approved-owner decision.

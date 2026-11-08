@@ -1,5 +1,5 @@
 //! H2 supervision contracts, approval, profiles, disclosure consent, evidence,
-//! budget, assessment, state, and ports.
+//! budget, assessment, state, ports, and the deterministic supervisor.
 //!
 //! This crate depends only on `herness-core`. It contains no SQLite, engine,
 //! provider, or Tauri dependency and performs no I/O. H1 remains the owner of
@@ -22,6 +22,7 @@ pub mod ids;
 pub mod ports;
 pub mod profiles;
 pub mod state;
+pub mod supervisor;
 pub mod verification;
 pub mod version;
 
