@@ -23,7 +23,8 @@ use herness_core::{
     ToolArguments, ToolName,
 };
 use herness_supervision::{
-    CommandResult, EvidenceId, EvidenceRecord, EvidenceStorePort, SupervisionError, SupervisionId,
+    BudgetLedgerRecord, BudgetStorePort, CommandResult, EvidenceId, EvidenceRecord,
+    EvidenceStorePort, MoneyReservationState, StoredBudgetRecord, SupervisionError, SupervisionId,
     SupervisionRecord, SupervisionRequestId, SupervisionStorePort,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -1084,6 +1085,206 @@ impl Store {
         Ok(result.clone())
     }
 
+    /// Loads one durable budget ledger record.
+    pub fn load_budget_record(
+        &self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<StoredBudgetRecord>, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        load_budget_record(&self.conn, project, supervision_id)
+    }
+
+    /// Creates or updates one budget ledger with revision compare-and-set.
+    pub fn compare_and_swap_budget_record(
+        &mut self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+    ) -> Result<u64, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        validate_budget_record(next)?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        let current = load_budget_revision(&transaction, project, supervision_id)?;
+        check_revision(supervision_id, expected_revision, current)?;
+        let revision = next_budget_revision(current)?;
+        write_budget_record(&transaction, project, supervision_id, revision, next)?;
+        sync_budget_reservations(&transaction, project, supervision_id, next)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(revision)
+    }
+
+    /// Atomically writes a budget ledger change and its request intent.
+    ///
+    /// A crash cannot leave an admitted request without its reservation, or a
+    /// reservation for a request that was never admitted.
+    pub fn commit_budget_admission(
+        &mut self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        intent: &RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<u64, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        if intent.subject().project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: intent.subject().project_id(),
+            });
+        }
+        validate_budget_record(next)?;
+
+        let attempt = intent.attempt_id();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        let existing = load_model_request_record(&transaction, &attempt.to_string())?;
+        if let Some(existing) = &existing
+            && existing.intent() != intent
+        {
+            return Err(StoreError::RequestIntentConflict { attempt });
+        }
+        let current = load_budget_revision(&transaction, project, supervision_id)?;
+        check_revision(supervision_id, expected_revision, current)?;
+        let revision = next_budget_revision(current)?;
+        if existing.is_none() {
+            insert_model_request(&transaction, intent, recorded_at)?;
+        }
+        write_budget_record(&transaction, project, supervision_id, revision, next)?;
+        sync_budget_reservations(&transaction, project, supervision_id, next)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(revision)
+    }
+
+    /// Atomically writes a budget ledger change and one request observation.
+    pub fn commit_budget_observation(
+        &mut self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        observation: &ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<u64, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        if observation.request_id().project_id() != project
+            || observation.attempt_id().project_id() != project
+        {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: observation.request_id().project_id(),
+            });
+        }
+        validate_budget_record(next)?;
+
+        let attempt = observation.attempt_id();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        let Some(record) = load_model_request_record(&transaction, &attempt.to_string())? else {
+            return Err(StoreError::UnknownRequestAttempt { attempt });
+        };
+        if observation.request_id() != record.intent().request_id() {
+            return Err(StoreError::RequestObservationConflict { attempt });
+        }
+        let may_write = match &record.observation {
+            None => true,
+            Some(existing) if existing == observation => false,
+            Some(existing) => {
+                let may_advance = existing.outcome() == RequestOutcome::SendStarted
+                    && matches!(
+                        observation.outcome(),
+                        RequestOutcome::Completed
+                            | RequestOutcome::Cancelled
+                            | RequestOutcome::SendResultUnknown
+                    );
+                if !may_advance {
+                    return Err(StoreError::RequestObservationConflict { attempt });
+                }
+                true
+            }
+        };
+
+        let current = load_budget_revision(&transaction, project, supervision_id)?;
+        check_revision(supervision_id, expected_revision, current)?;
+        let revision = next_budget_revision(current)?;
+        if may_write {
+            let changed = transaction.execute(
+                "UPDATE model_requests SET observation = ?2, observed_at = ?3
+                 WHERE attempt_id = ?1",
+                params![
+                    attempt.to_string(),
+                    serde_json::to_string(observation).map_err(StoreError::codec)?,
+                    i64::try_from(observed_at.as_unix_millis()).map_err(
+                        |_| StoreError::corrupt("observation timestamp does not fit in sqlite")
+                    )?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::RequestObservationConflict { attempt });
+            }
+        }
+        write_budget_record(&transaction, project, supervision_id, revision, next)?;
+        sync_budget_reservations(&transaction, project, supervision_id, next)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(revision)
+    }
+
     fn history_page(&self, query: HistoryQuery) -> Result<HistoryPage, StoreError> {
         if let Some(cursor) = query.cursor()
             && cursor.project_id() != query.project_id()
@@ -1359,6 +1560,75 @@ impl SupervisionStorePort for Store {
             expected_revision,
             next,
             result,
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl BudgetStorePort for Store {
+    fn load_budget(
+        &self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<StoredBudgetRecord>, SupervisionError> {
+        Store::load_budget_record(self, project_id, supervision_id).map_err(Into::into)
+    }
+
+    fn compare_and_swap_budget(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+    ) -> Result<u64, SupervisionError> {
+        Store::compare_and_swap_budget_record(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+        )
+        .map_err(Into::into)
+    }
+
+    fn commit_budget_admission(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        intent: &RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<u64, SupervisionError> {
+        Store::commit_budget_admission(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+            intent,
+            recorded_at,
+        )
+        .map_err(Into::into)
+    }
+
+    fn commit_budget_observation(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        observation: &ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<u64, SupervisionError> {
+        Store::commit_budget_observation(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+            observation,
+            observed_at,
         )
         .map_err(Into::into)
     }
@@ -2202,6 +2472,141 @@ fn write_command_result(
     )?;
     if changed != 1 {
         return Err(StoreError::corrupt("command result write wrote no row"));
+    }
+    Ok(())
+}
+
+fn validate_budget_record(record: &BudgetLedgerRecord) -> Result<(), StoreError> {
+    record
+        .validate()
+        .map_err(|error| StoreError::corrupt(format!("budget record: {error}")))
+}
+
+fn next_budget_revision(current: Option<u64>) -> Result<u64, StoreError> {
+    current
+        .map(|revision| {
+            revision
+                .checked_add(1)
+                .ok_or_else(|| StoreError::corrupt("budget revision overflow"))
+        })
+        .transpose()
+        .map(|revision| revision.unwrap_or(1))
+}
+
+fn load_budget_revision(
+    conn: &Connection,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+) -> Result<Option<u64>, StoreError> {
+    let revision: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM budget_ledgers
+             WHERE project_id = ?1 AND supervision_id = ?2",
+            params![project.to_string(), supervision_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::corrupt("budget revision must be positive"))
+        })
+        .transpose()
+}
+
+fn load_budget_record(
+    conn: &Connection,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+) -> Result<Option<StoredBudgetRecord>, StoreError> {
+    let row: Option<(i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT revision, payload FROM budget_ledgers
+             WHERE project_id = ?1 AND supervision_id = ?2",
+            params![project.to_string(), supervision_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((revision, payload)) = row else {
+        return Ok(None);
+    };
+    let revision = u64::try_from(revision)
+        .map_err(|_| StoreError::corrupt("budget revision must be positive"))?;
+    let record: BudgetLedgerRecord = serde_json::from_slice(&payload).map_err(StoreError::codec)?;
+    record
+        .validate()
+        .map_err(|error| StoreError::corrupt(format!("budget record: {error}")))?;
+    StoredBudgetRecord::new(revision, record)
+        .map(Some)
+        .map_err(|error| StoreError::corrupt(format!("budget record: {error}")))
+}
+
+fn write_budget_record(
+    transaction: &Transaction<'_>,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+    revision: u64,
+    record: &BudgetLedgerRecord,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_vec(record).map_err(StoreError::codec)?;
+    let changed = transaction.execute(
+        "INSERT INTO budget_ledgers
+             (project_id, supervision_id, revision, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(project_id, supervision_id) DO UPDATE SET
+             revision = excluded.revision,
+             payload = excluded.payload",
+        params![
+            project.to_string(),
+            supervision_id.to_string(),
+            sequence_to_sql(revision)?,
+            payload,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::corrupt("budget record write wrote no row"));
+    }
+    Ok(())
+}
+
+fn sync_budget_reservations(
+    transaction: &Transaction<'_>,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+    record: &BudgetLedgerRecord,
+) -> Result<(), StoreError> {
+    for (attempt, reservation) in record.money_reservations() {
+        let (state, settled) = match reservation.state() {
+            MoneyReservationState::Reserved => ("reserved", None),
+            MoneyReservationState::Settled { amount } => {
+                ("settled", Some(sequence_to_sql(amount.micros())?))
+            }
+            MoneyReservationState::Unresolved => ("unresolved", None),
+            MoneyReservationState::Released => ("released", None),
+        };
+        transaction.execute(
+            "INSERT INTO budget_reservations
+                 (project_id, supervision_id, attempt_id, request_id,
+                  estimate_micros, price_version, state, settled_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(project_id, attempt_id) DO UPDATE SET
+                 supervision_id = excluded.supervision_id,
+                 request_id = excluded.request_id,
+                 estimate_micros = excluded.estimate_micros,
+                 price_version = excluded.price_version,
+                 state = excluded.state,
+                 settled_micros = excluded.settled_micros",
+            params![
+                project.to_string(),
+                supervision_id.to_string(),
+                attempt.to_string(),
+                reservation.request_id().to_string(),
+                sequence_to_sql(reservation.estimate().micros())?,
+                reservation.price_version().as_str(),
+                state,
+                settled,
+            ],
+        )?;
     }
     Ok(())
 }

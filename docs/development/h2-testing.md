@@ -274,6 +274,38 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 - 実 `PermissionService` + fake executorでallowがpass証拠を保存し、deny/askがexecutor 0回・証拠0件になること。child/CI/human証拠の再利用とhuman observer必須。
 - 実SQLiteでCAS conflict、duplicate requestの同一結果、異なるcommand resultの拒否、faultによるstate/evidence/command resultのrollback、cross-project拒否、reopen後のevidence/supervision/command result読み取り。
 
+## Task 9で追加した予算台帳
+
+### 契約と台帳
+
+- `BudgetLedgerRecord` は1監督対象のpolicy snapshot/version、`BudgetUsage`、clock state（Active/WaitingHuman/Paused/AppStopped）、open interval（wallとmonotonicの開始値）、run予約、money予約、未確定chargeを1つのJSON payloadとして持つ。`BudgetLedger` はwallとmonotonicを`BudgetClockPort`で、永続化を`BudgetStorePort`で注入され、自身ではI/O・時計取得をしない。
+- Activeだけが稼働時間へ加算される。実行・検証・assessment・許可評価・retry待機は同じActive区間として扱い、人間待ち・明示pause・アプリ停止の時間は加算しない。区間は秒未満を切り上げ、7,199/7,200/7,201秒の境界をそのまま記録する。
+- 再open時、Activeのまま残った区間はmonotonic差分とwall差分の大きい方で再開時刻まで保守的に計上する。monotonicがprocess再起動で戻ってもwall差分を使う。消費量は再開でリセットしない。
+- `reserve_run` はrun数を予約し、`start_run` は予約を消費（予約がなければ直接消費）する。初回を含む最大31で、32回目は`BudgetLimitReached { RunCount }`。同じ`BudgetRequestId`の再予約・再startは同じ結果を返し、二重消費しない。start意図の保存に失敗した場合は消費0で、再open後も消費済みrunは戻らない。
+- `reserve_money` はmoney capがある場合だけ使う。見積り・価格版を送信前に要求し、価格版不一致・見積り欠落・ChatGPTログイン（金額見積不能）は`BudgetPriceUnavailable`で拒否する。予約は`Reserved`→`Settled`（最低でも予約額、actualが上ならactual）/`Unresolved`/`Released`へ遷移する。usage欠落・`SendResultUnknown`・`Cancelled`は`Unresolved`のまま予約を保持し、capへの計上を続ける。`PreflightFailed`だけが`Released`になる。
+- 同じattemptの同一予約は冪等。settled/released後の再予約は`BudgetReservationConflict`。全model要求（agent実行・検証/assessment・許可評価）は同じledgerの同じcapを共有する。
+
+### 原子的なstore境界
+
+- migration `0008_budget_ledger` を追加し、`budget_ledgers`（project + supervisionごとのrevision付きpayload）と`budget_reservations`（attempt、request、estimate、price version、state、settled額）を持つ。0001〜0007は変更しない。`LATEST_SCHEMA_VERSION`は8。
+- `BudgetStorePort` は`load_budget`、`compare_and_swap_budget`、`commit_budget_admission`、`commit_budget_observation`を持つ。`herness-store::Store` は`commit_budget_admission` でbudget record・reservation・`model_requests` intentを1つのimmediate transactionへ書き、`commit_budget_observation` でobservationとsettlementを同じtransactionへ書く。faultは両方をrollbackし、admission前に失敗した場合はrequest intentも予約も残らない。
+- `BudgetLedger` はCAS競合を最大4回までreloadして再評価する。競合中に他のwriterが予約を増やした場合、再評価後のcap判定で拒否するか、収まる場合だけ書き込む。run/moneyの上限判定は書き込みと同じtransactionのrevision CASで保護される。
+- `BudgetRequestGate` は既存`ModelRequestGatePort`へそのまま取り付けられる。stop/deadlineはledgerへ触れる前に`Stopped`/`DeadlineReached`で拒否し、予算・price・persist失敗は`Admit`を返さない。observationはusage欠落を0にせず、未確定予約を保持する。
+
+### Task 9のテスト
+
+`tests/supervision/tests/budget.rs`:
+
+- 7,199/7,200/7,201秒の境界、人間待ち・pause・アプリ停止の除外、retry待機の加算、assessment timeoutのmin(60s, 残り)。
+- 初回+追加30回=31回の許可、32回目の拒否、予約→start、重複start、再open後の消費維持。
+- 2つのledgerによるmoney/run capの同時予約拒否、CAS競合後の再評価（cap超過は拒否、収まる場合は成功）。
+- 見積り欠落・価格版不一致・ChatGPTログインの拒否、4用途のmoney予約が同じcapを共有すること。
+- usage欠落・送信不明・取消しで予約が残り、完了で最低予約額へsettleし、preflight失敗だけがreleaseされること。重複observationで二重課金しないこと。
+- 実SQLiteのpersist faultでintent・record・reservationが残らず、fault解除後の再試行と再openで予約・intentが読めること。run startのfaultで消費0。
+- crashでopen intervalが残る場合のwall差分による保守的計上と、その後のadmission拒否。schema 8 migration faultのrollback。
+
+
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -380,3 +412,18 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - `tests/ports.rs` は、`ModelRequestGatePort`・`ContinuationPort`・`StopDeadlinePort` の未実装defaultが明示的な `UnsupportedPortFeature` を返し、run checkpointがhost activity eventを明示的に拒否することを確認する。
 - 既存のH1 v1 history fixture・store migration・runtime回帰は削除せず、version 2が既知の読込み版になったことに合わせて期待値だけを更新する。
 - 実credential・実Keychain・実provider・実Tauriは使わない。これらは後続Taskの別途許可された検証まで未確認とする。
+
+Task 9の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test budget --locked
+cargo test -p herness-store --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 9の追加確認:
+
+- `cargo test -p herness-supervision-tests --test budget --locked` はfake clockとfault注入で、稼働境界・31/32 run・再open維持・同時予約とCAS再評価・money capの見積り/価格版/ChatGPT拒否・未確定予約の保持・preflight release・実SQLiteのpersist faultと再openを確認する。
+- `cargo test -p herness-store --locked` はschema 8のmigration一覧と既存store単体テストの回帰を確認する。
+- `cargo test -p herness-runtime-tests --test store --locked` で既存schema 3→8 migration、v1 history、request/state/supervised-state回帰が維持されることを確認する。
+- 金額はローカル見積りであり、providerの請求額を厳密に保証しない。実provider・実credential・実Keychainは未使用のまま未確認とする。

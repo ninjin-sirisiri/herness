@@ -31,12 +31,18 @@ pub use assessment::{
     ConditionProbabilities, ConditionVerdict, NativeConfidence, PermissionAssessment,
     PermissionProbabilities, PermissionVerdict,
 };
+pub use budget::gate::{BudgetRequestGate, RequestBudgetEstimator};
+pub use budget::ledger::{
+    ActiveInterval, BUDGET_MAX_CAS_ATTEMPTS, BudgetClockPort, BudgetLedger, BudgetLedgerRecord,
+    ClockReading, MoneyReservation, MoneyReservationState, MoneySettlement, RunReservation,
+    RunReservationState,
+};
 pub use budget::{
-    BudgetClockState, BudgetLimit, BudgetPolicy, BudgetUsage, H2_ACTIVE_SECONDS,
+    BudgetClockState, BudgetLimit, BudgetPolicy, BudgetPriceReason, BudgetUsage, H2_ACTIVE_SECONDS,
     H2_ADDITIONAL_RUNS, H2_ASSESSMENT_TIMEOUT_SECONDS, H2_MAX_ADDITIONAL_RETRIES,
     H2_MAX_TOTAL_RUNS, H2_RETRY_DELAY_MILLIS, H2_STAGNATION_CYCLES, Money, MoneyCap, PriceVersion,
-    assessment_timeout_seconds, billed_active_seconds, chatgpt_login_allowed_with_money_cap,
-    validate_assessment_spend,
+    RequestBudgetEstimate, assessment_timeout_seconds, billed_active_seconds,
+    chatgpt_login_allowed_with_money_cap, validate_assessment_spend,
 };
 pub use command::{CommandResult, SupervisionCommand, SupervisionRequest, execute_command};
 pub use conditions::{
@@ -63,12 +69,12 @@ pub use freshness::{
     capture_manifest,
 };
 pub use ids::{
-    CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId, RunGroupId, SupervisionId,
-    SupervisionKeyKind, SupervisionRequestId, SupervisionScopedId,
+    BudgetRequestId, CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId,
+    RunGroupId, SupervisionId, SupervisionKeyKind, SupervisionRequestId, SupervisionScopedId,
 };
 pub use ports::{
-    AssessmentPort, ClockPort, EvidenceStorePort, SupervisionFeature, SupervisionStorePort,
-    unsupported,
+    AssessmentPort, BudgetStorePort, ClockPort, EvidenceStorePort, StoredBudgetRecord,
+    SupervisionFeature, SupervisionStorePort, unsupported,
 };
 pub use profiles::{
     AdapterVersion, AssessmentProfile, H2_COMPLETION_MET_THRESHOLD, H2_COMPLETION_UNMET_THRESHOLD,

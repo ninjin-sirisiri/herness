@@ -4,9 +4,10 @@
 //! call a provider, execute a verification command, or read the wall clock.
 //! Later tasks supply concrete implementations.
 
-use herness_core::contracts::{ProjectId, Timestamp};
+use herness_core::contracts::{ModelRequestObservation, ProjectId, RequestGateIntent, Timestamp};
 
 use crate::assessment::{AssessmentRequest, AssessmentResult};
+use crate::budget::ledger::BudgetLedgerRecord;
 use crate::command::CommandResult;
 use crate::error::SupervisionError;
 use crate::evidence::EvidenceRecord;
@@ -107,6 +108,87 @@ pub trait SupervisionStorePort {
             self.compare_and_swap(project_id, supervision_id, expected_revision, next)?;
         self.record_command_result(result)?;
         Ok(revision)
+    }
+}
+
+/// Durable budget records and atomic request-intent linkage.
+///
+/// A durable store commits [`BudgetStorePort::commit_budget_admission`] and
+/// [`BudgetStorePort::commit_budget_observation`] in one immediate transaction
+/// with the corresponding `model_requests` row. A crash therefore cannot leave
+/// an admitted model request without its reservation, or a reservation for a
+/// request that was never admitted.
+pub trait BudgetStorePort {
+    /// Loads one persisted ledger record.
+    fn load_budget(
+        &self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<StoredBudgetRecord>, SupervisionError>;
+
+    /// Creates (`None`) or updates (`Some(revision)`) one ledger record.
+    fn compare_and_swap_budget(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+    ) -> Result<u64, SupervisionError>;
+
+    /// Atomically writes the ledger changes and the request intent.
+    fn commit_budget_admission(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        intent: &RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<u64, SupervisionError>;
+
+    /// Atomically writes the ledger changes and the request observation.
+    fn commit_budget_observation(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &BudgetLedgerRecord,
+        observation: &ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<u64, SupervisionError>;
+}
+
+/// One loaded budget record with its durable revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBudgetRecord {
+    revision: u64,
+    record: BudgetLedgerRecord,
+}
+
+impl StoredBudgetRecord {
+    /// Creates a loaded record. Revisions start at one.
+    pub fn new(revision: u64, record: BudgetLedgerRecord) -> Result<Self, SupervisionError> {
+        if revision == 0 {
+            return Err(SupervisionError::StorageFailure {
+                detail: "a durable budget revision must be positive".to_owned(),
+            });
+        }
+        Ok(Self { revision, record })
+    }
+
+    /// Durable revision.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Persisted ledger payload.
+    pub const fn record(&self) -> &BudgetLedgerRecord {
+        &self.record
+    }
+
+    /// Consumes the wrapper and returns the payload.
+    pub fn into_record(self) -> BudgetLedgerRecord {
+        self.record
     }
 }
 

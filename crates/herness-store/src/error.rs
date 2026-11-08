@@ -144,6 +144,11 @@ pub enum StoreError {
         /// Request identifier whose stored result differs.
         request: String,
     },
+    /// A different budget reservation is already stored for the same attempt.
+    BudgetReservationConflict {
+        /// Reservation attempt identifier whose stored value differs.
+        attempt: String,
+    },
     /// Stored data failed an integrity check.
     CorruptData {
         /// Sanitized description of the failed check.
@@ -263,6 +268,12 @@ impl fmt::Display for StoreError {
                     "request {request} is already recorded with another result"
                 )
             }
+            Self::BudgetReservationConflict { attempt } => {
+                write!(
+                    f,
+                    "attempt {attempt} is already recorded with another budget reservation"
+                )
+            }
             Self::CrossProjectReference { expected, found } => write!(
                 f,
                 "history cursor belongs to project {found}, not the expected project {expected}"
@@ -320,6 +331,9 @@ impl From<StoreError> for herness_supervision::SupervisionError {
             StoreError::CommandResultConflict { request } => {
                 SupervisionError::DuplicateResultConflict { request }
             }
+            StoreError::BudgetReservationConflict { attempt } => {
+                SupervisionError::BudgetReservationConflict { attempt }
+            }
             other => SupervisionError::StorageFailure {
                 detail: other.to_string(),
             },
@@ -360,7 +374,8 @@ impl From<StoreError> for CoreError {
             | StoreError::RequestObservationConflict { .. }
             | StoreError::StaleRevision { .. }
             | StoreError::EvidenceRecordConflict { .. }
-            | StoreError::CommandResultConflict { .. } => CoreError::StoreUnavailable {
+            | StoreError::CommandResultConflict { .. }
+            | StoreError::BudgetReservationConflict { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }

@@ -46,6 +46,7 @@ key_kind!(RunGroupKind, "run_group", "run group");
 key_kind!(ConsentKind, "consent", "consent");
 key_kind!(ProfileKind, "profile", "profile");
 key_kind!(CommandKind, "command", "command");
+key_kind!(BudgetKind, "budget", "budget");
 
 /// A typed supervision identifier bound to exactly one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -163,6 +164,8 @@ pub type ConsentId = SupervisionScopedId<ConsentKind>;
 pub type ProfileId = SupervisionScopedId<ProfileKind>;
 /// Host-owned idempotent command identifier.
 pub type SupervisionRequestId = SupervisionScopedId<CommandKind>;
+/// Host-owned idempotent budget reservation identifier.
+pub type BudgetRequestId = SupervisionScopedId<BudgetKind>;
 
 /// Verifies that a core project-scoped identifier belongs to `project`.
 pub(crate) fn verify_core_id<K: ScopedIdKind>(

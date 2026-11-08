@@ -9,9 +9,13 @@
 
 use std::fmt;
 
+use herness_core::contracts::AuthMethod;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SupervisionError;
+
+pub mod gate;
+pub mod ledger;
 
 /// Cumulative active-time limit in seconds.
 pub const H2_ACTIVE_SECONDS: u64 = 7_200;
@@ -470,4 +474,63 @@ pub fn validate_assessment_spend(
 /// money cap is configured.
 pub const fn chatgpt_login_allowed_with_money_cap(policy: &BudgetPolicy) -> bool {
     policy.money_cap.is_none()
+}
+
+/// Why a money-capped request could not be priced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum BudgetPriceReason {
+    /// The caller supplied no estimate for a request under a money cap.
+    MissingEstimate,
+    /// The estimate used a price version other than the budget's fixed version.
+    PriceVersionMismatch {
+        /// Price version required by the budget.
+        expected: PriceVersion,
+        /// Price version supplied with the estimate.
+        found: PriceVersion,
+    },
+    /// The connection authenticates with a ChatGPT login, which has no local
+    /// price estimate.
+    ChatGptLoginWithMoneyCap,
+}
+
+/// One conservative local request-cost estimate supplied before a send.
+///
+/// This is the only shape the ledger accepts under a money cap. It is a local
+/// estimate, not a provider invoice guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestBudgetEstimate {
+    estimate: Money,
+    price_version: PriceVersion,
+    auth_method: AuthMethod,
+}
+
+impl RequestBudgetEstimate {
+    /// Creates a price estimate bound to one auth method and price version.
+    pub fn new(estimate: Money, price_version: PriceVersion, auth_method: AuthMethod) -> Self {
+        Self {
+            estimate,
+            price_version,
+            auth_method,
+        }
+    }
+
+    /// Estimated amount reserved before send.
+    pub const fn estimate(&self) -> Money {
+        self.estimate
+    }
+
+    /// Price version used for the estimate.
+    pub fn price_version(&self) -> &PriceVersion {
+        &self.price_version
+    }
+
+    /// Authentication method of the connection that would send the request.
+    pub const fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
 }

@@ -9,10 +9,10 @@ use std::fmt;
 use herness_core::contracts::ProjectId;
 use serde::{Deserialize, Serialize};
 
+use crate::budget::{BudgetClockState, BudgetLimit, BudgetPriceReason};
 use crate::consent::ConsentBlock;
 use crate::profiles::ProfileUnavailable;
 use crate::state::{CompletionBlocker, SupervisionState};
-
 /// Structured supervision contract error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -118,6 +118,31 @@ pub enum SupervisionError {
         field: String,
         /// Non-secret explanation.
         detail: String,
+    },
+    /// A finite budget limit would be exceeded.
+    BudgetLimitReached {
+        /// Limit that was reached.
+        limit: BudgetLimit,
+    },
+    /// A money-capped request has no usable local price estimate.
+    BudgetPriceUnavailable {
+        /// Structured reason.
+        reason: BudgetPriceReason,
+    },
+    /// The ledger is not Active, so no send or run may start.
+    BudgetInactive {
+        /// Current activity state.
+        state: BudgetClockState,
+    },
+    /// A different reservation is already recorded for the same attempt.
+    BudgetReservationConflict {
+        /// Reservation attempt identifier.
+        attempt: String,
+    },
+    /// An observation refers to an attempt with no recorded money reservation.
+    UnknownBudgetReservation {
+        /// Reservation attempt identifier.
+        attempt: String,
     },
     /// A condition or check reference is unknown in its set.
     UnknownConditionReference {
@@ -258,6 +283,21 @@ impl fmt::Display for SupervisionError {
             }
             Self::BudgetInvalid { field, detail } => {
                 write!(f, "invalid budget value {field}: {detail}")
+            }
+            Self::BudgetLimitReached { limit } => {
+                write!(f, "the {limit:?} budget limit has been reached")
+            }
+            Self::BudgetPriceUnavailable { reason } => {
+                write!(f, "budget price unavailable: {reason:?}")
+            }
+            Self::BudgetInactive { state } => {
+                write!(f, "the budget ledger is not active (state {state:?})")
+            }
+            Self::BudgetReservationConflict { attempt } => {
+                write!(f, "attempt {attempt} already has a different reservation")
+            }
+            Self::UnknownBudgetReservation { attempt } => {
+                write!(f, "attempt {attempt} has no recorded money reservation")
             }
             Self::UnknownConditionReference { reference } => {
                 write!(f, "unknown condition/check reference {reference}")
