@@ -3,6 +3,20 @@
 //! H1 starts in [`PermissionMode::Configured`]. [`PermissionMode::Automatic`]
 //! is only usable when an evaluator reports [`EvaluatorAvailability::Available`];
 //! there is no fallback to unconditional execution or another model.
+//!
+//! The human administration surface is [`PolicyAdmin`]. Model and tool input
+//! cannot reach it: rules and policies have no deserialization path, and an
+//! operation request carries only a [`crate::tools::ToolName`] plus validated
+//! arguments.
+
+pub mod approval;
+pub mod capability;
+pub mod decision;
+pub mod grant;
+pub mod policy;
+pub mod protected;
+pub mod rules;
+pub mod service;
 
 use std::fmt;
 
@@ -11,6 +25,18 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::errors::CoreError;
+
+pub use approval::{ApprovalError, ApprovalRequest, Authorization};
+pub use capability::{AutomaticModeCapability, AutomaticModeUnavailableReason};
+pub use decision::{ArgumentsDigest, DecisionBinding, DecisionStatus, InvalidationReason};
+pub use grant::{GrantScope, GrantWidening};
+pub use policy::{PermissionPolicy, PolicyAdmin};
+pub use protected::ProtectedBoundary;
+pub use rules::{MatchMethod, PermissionRule, RuleEffect, RuleTarget, SimpleCommand};
+pub use service::{
+    DenialReason, EvaluationContext, EvaluatorFailure, HumanWaitReason, PermissionOutcome,
+    PermissionService,
+};
 
 /// Monotonic version of the host-owned permission policy.
 ///

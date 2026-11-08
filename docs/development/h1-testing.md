@@ -10,12 +10,13 @@ H1のRust workspaceにおけるtoolchain、依存方針、テストコマンド�
 
 ## 依存方針
 
-`herness-core` の依存は次の3つに限定する。
+`herness-core` の依存は次の4つに限定する。
 
 | crate | 用途 | 理由 |
 | --- | --- | --- |
 | `serde` (`derive`) | 公開契約のJSON表現 | version付きevent・error・引数schemaの安定した直列化 |
 | `serde_json` | event payload | payloadを型付きenvelope内の構造化JSONとして保持 |
+| `sha2` | 最終tool引数のSHA-256 digest | 承認を人間が確認した最終引数へ束縛する。I/O・network・秘密の保存には使わない |
 | `uuid` (`v4`) | project・scoped ID・connection ID | 再起動をまたいで衝突しない安定ID |
 
 - async runtime、HTTP client、DB、Tauri、pi crate、時刻整形crateはTask 1のcoreへ入れない。checkpointはadapter所有のversion付きopaque bytesとして運び、coreは解釈しない。
@@ -35,6 +36,7 @@ Task 1の受入で実行するコマンド:
 ```sh
 cargo test -p herness-core
 cargo test -p herness-runtime-tests
+cargo test -p herness-runtime-tests --test permissions
 cargo fmt --all -- --check
 ```
 

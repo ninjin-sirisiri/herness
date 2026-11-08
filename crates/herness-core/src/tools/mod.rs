@@ -1,6 +1,8 @@
-//! Native tool argument schemas and shared reason validation.
+//! Native tool argument schemas, shared reason validation, and the gateway
+//! permission boundary.
 
 pub mod arguments;
+pub mod gateway;
 pub mod reason;
 
 use std::fmt;
@@ -10,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub use arguments::{
     BashArgs, EditArgs, FileVersion, NonEmptyText, ReadArgs, SearchArgs, ToolArguments, WriteArgs,
 };
+pub use gateway::{GatewayError, ToolExecutor, ToolGateway};
 pub use reason::{MAX_REASON_SCALARS, Purpose, Rationale, ReasonField, ReasonViolation};
 
 /// The five native tools available in H1.

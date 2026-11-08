@@ -86,6 +86,16 @@ pub enum CoreError {
         /// Rejected value.
         value: u64,
     },
+    /// An operation was frozen under a policy version that is not current.
+    ///
+    /// The operation must be frozen again before evaluation; an old decision
+    /// must not be reused.
+    StalePolicyVersion {
+        /// Policy version captured in the frozen operation.
+        frozen: crate::permissions::PolicyVersion,
+        /// Policy version that is current now.
+        current: crate::permissions::PolicyVersion,
+    },
     /// A history limit outside `1..=500` was supplied.
     InvalidHistoryLimit {
         /// Rejected value.
@@ -371,6 +381,10 @@ impl fmt::Display for CoreError {
             Self::InvalidPolicyVersion { value } => {
                 write!(f, "invalid policy version {value}; versions start at 1")
             }
+            Self::StalePolicyVersion { frozen, current } => write!(
+                f,
+                "operation was frozen at policy version {frozen}, current version is {current}"
+            ),
             Self::InvalidHistoryLimit { value, max } => {
                 write!(f, "invalid history limit {value}; expected 1..={max}")
             }

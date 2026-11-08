@@ -12,9 +12,17 @@ pub mod ports;
 pub mod tools;
 
 pub use contracts::*;
-pub use permissions::{EvaluatorAvailability, PermissionDecision, PermissionMode, PolicyVersion};
+pub use permissions::{
+    ApprovalError, ApprovalRequest, ArgumentsDigest, Authorization, AutomaticModeCapability,
+    AutomaticModeUnavailableReason, DecisionBinding, DecisionStatus, DenialReason,
+    EvaluationContext, EvaluatorAvailability, EvaluatorFailure, GrantScope, GrantWidening,
+    HumanWaitReason, InvalidationReason, MatchMethod, PermissionDecision, PermissionMode,
+    PermissionOutcome, PermissionPolicy, PermissionRule, PermissionService, PolicyAdmin,
+    PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget, SimpleCommand,
+};
 pub use ports::*;
 pub use tools::{
-    BashArgs, EditArgs, FileVersion, MAX_REASON_SCALARS, NonEmptyText, Purpose, Rationale,
-    ReadArgs, ReasonField, ReasonViolation, SearchArgs, ToolArguments, ToolName, WriteArgs,
+    BashArgs, EditArgs, FileVersion, GatewayError, MAX_REASON_SCALARS, NonEmptyText, Purpose,
+    Rationale, ReadArgs, ReasonField, ReasonViolation, SearchArgs, ToolArguments, ToolExecutor,
+    ToolGateway, ToolName, WriteArgs,
 };
