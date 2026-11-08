@@ -364,6 +364,17 @@ HERNESS_APP_DATA_ROOT=<absolute-root> target/debug/herness-desktop --forget-conn
 3. evidence JSONをreportの証拠へコピーし、`$ROOT` のDB・host ID・一時projectを削除する。secretはコピーしない。
 4. 実接続の成功・失敗・未確認をprovider/routeごとにreportへ記録し、H1受入の完了/未完了を更新する。実接続が未確認の間はTask 13とH1受入を完了にしない。
 
+### Phase B 実行記録（2026-11-08）
+
+Phase B runbookに沿って、利用者が信頼UIで設定した検証用接続だけを実行した。
+
+- **OpenAI互換**: `--real-check <connection>` → `terminal=completed`、1,324 ms、usage 41/23/64 tokens。`--forget-connection` でAPIキー項目を削除し、`security find-generic-password` がexit 44（不在）を返した。
+- **ChatGPT**: 実browser login → `state: available` → `--list-models`（8 models、`gpt-6-luna` を含む）→ `--real-check`（`terminal=completed`、3,059 ms、16/7/23 tokens）→ `--refresh`（`terminal=refreshed`）→ `--sign-out`（`remoteRevoke=confirmed`、`localCredentialsRemoved=true`）→ `--forget-connection`。Keychainのaccount-scoped itemはexit 44で不在を確認した。
+- **OpenAI / Anthropic APIキー**: 検証用キーがないため未実行。**UNVERIFIED**のまま残し、Task 13/H1受入は完了にしない。
+- Phase B中にnested tokio runtime panic（Tauri async command → engine `block_on`）を発見し、`03ad815`で修正した。修正後の通常quitは `QUIT_OK save=confirmed stop=confirmed`。多重Add防止は`403839b`。
+- 誤って追加した接続は`--forget-connection`で削除し、ログイン済みの1件はremote revoke confirmedでsign-outした。
+- evidenceは`.sdd/reports/phase-b-evidence/`（git管理外）に保存した。secret・token・ID token・生URL・provider error bodyは含まない。
+
 ### Phase Bで確認する未確認項目
 
 - OpenAI APIキー経路の実request・usage・料金。
