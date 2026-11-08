@@ -119,6 +119,8 @@ pub enum ConnectionStatus {
     Available,
     /// A human login is required before use.
     LoginRequired,
+    /// A credential must be saved, re-entered, or refreshed by a human.
+    AuthRequired,
     /// The connection is not usable.
     Unavailable,
 }

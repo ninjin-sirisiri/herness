@@ -268,6 +268,19 @@ pub enum CredentialFailureKind {
     RefreshFailed,
     /// The macOS Keychain could not be reached or refused access.
     KeychainUnavailable,
+    /// The macOS Keychain is locked.
+    KeychainLocked,
+    /// The operating system denied access to the Keychain item.
+    KeychainDenied,
+    /// A Keychain item could not be written or updated.
+    KeychainWriteFailed,
+    /// The Keychain accepted the item but reported a duplicate.
+    KeychainDuplicateItem,
+    /// The requested Keychain item is missing.
+    KeychainItemMissing,
+    /// The stored credential payload could not be decoded or had the wrong
+    /// kind for the connection's authentication method.
+    InvalidCredentialData,
 }
 
 /// Sanitized store failure kinds.

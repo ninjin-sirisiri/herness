@@ -42,6 +42,8 @@ cargo test -p herness-runtime-tests --test permissions
 cargo test -p herness-runtime-tests --test files --locked
 cargo test -p herness-runtime-tests --test shell --locked
 cargo test -p herness-runtime-tests --test skills --locked
+cargo test -p herness-runtime-tests --test connections --locked
+cargo test -p herness-desktop --lib --locked
 cargo fmt --all -- --check
 ```
 
@@ -108,6 +110,23 @@ cargo test --workspace --locked
 - **toolchain:** `ToolchainConfig` は明示的な実行パス、設定search directory、capture済み `PATH` snapshotを持つ。明示pathがあるtoolはその候補だけを使い、別の実行ファイルで黙って置換しない。明示pathがなければ設定directory→`PATH` の順で探す。Gitは `--version`、Pythonは `--version` をparseし、最小3.11.0と比較する。`html-docs` は実行可能なscriptと3.11+のPython interpreterの両方を必要とし、`python -B <script>` を引数なしでprobeして終了codeと応答有無を記録する。probeの終了codeはvalidator成功の主張ではない。PATHが `/usr/bin:/bin:/usr/sbin:/sbin` のFinder相当でも、明示pathのtoolは検出できる。
 - **不足時:** 不在は `Missing`、非実行fileは `NotExecutable`、旧Pythonは `InsufficientVersion { found, minimum }`、interpreter不在のvalidatorは `InterpreterMissing` を返す。`ToolchainReport::deficiencies()` / `require()` がcapability不足結果を返し、自動install・別validatorへの置換・成功扱いをしない。`pip install` 等は実行しない。
 - **実pack:** `/Users/h-uma/Documents/sdd` はread-onlyでだけ開く。testは `skills/sdd-execute`（`implementer-prompt.md` を明示参照）と `skills/sdd` の実fingerprint、`SkillRead` と `SddTaskController` の可用性、実toolchainの検出結果を出力し、packを変更しない。packが存在しない場合は理由を明示してskipする。
+
+## Task 7で固定した接続設定とKeychainのcredential境界
+
+実装は `crates/herness-core/src/connections/`、`src-tauri/src/credentials/`、testは `tests/runtime/tests/connections.rs` と `src-tauri` のadapter unit test。`src-tauri` はTask 7では `herness-desktop` というlibrary packageだけで、Tauri設定・window・IPC・binaryはTask 11が追加する。
+
+- **依存:** coreの依存はTask 1の5 crateから増やさない。`herness-desktop` はmacOSでのみ `security-framework` 3.7.0と `security-framework-sys` 2.17.0を使い、Keychain adapterのOSStatus変換に限定する。HTTP client・async runtime・TauriはTask 7へ追加しない。
+- **接続の種類:** OpenAI APIキー、Anthropic APIキー、OpenAI互換APIキー、ChatGPT OAuth（`Provider::OpenAi` + `AuthMethod::ChatGptLogin`）。OpenAI互換だけがcustom endpointを持ち、他のproviderへendpointを付けると構造化errorになる。ChatGPTの認可flow自体はTask 8。
+- **URL:** `Endpoint` は `http`/`https` のみを受け付け、`https` は常に許可する。`http` は `127.0.0.0/8`・`::1`・`localhost` だけ自動許可し、remote `http` は `InsecureRemoteHttp::Acknowledged` を設定へ記録しなければ拒否する。空host・userinfo・制御文字・空白・非HTTP scheme・query・fragmentを拒否し、scheme/hostを小文字化、default portと末尾slashを正規化する。
+- **redirect:** `redirect_auth_decision` はscheme・host・portが完全一致するsame-originだけ `AttachAuthorization` を返す。scheme downgrade、port変更、別host、不正targetではheaderをdropし、`requires_re_resolution: true` を返す。実際のHTTP redirectはTask 7では送らない。
+- **設定registry:** `ConnectionAdmin`（人間設定専用のwriter）と `ConnectionDirectory`（tool・engine向けのread-only view）を分ける。settingsはprovider・model・authMethod・endpoint・opaqueな `CredentialRef`・remote HTTP acknowledgmentだけで、secretを含まない。Task 7ではin-memoryで保持し、非secret settingsの永続化はTask 10/11が既存storeへ追加する。
+- **credential保存:** `CredentialWriter`（`CredentialAdmin`）はwrite-onlyで、`save_api_key` / `save_oauth_token_set` / `remove` だけを持つ。UI向けのread-back APIはない。`CredentialBroker` はengine用で、`CredentialPort::resolve` と非secret statusだけを提供する。
+- **vault:** `CredentialVault::{set,get,delete}` はbytesだけを扱い、`VaultFailure` を返す。macOS adapterはgeneric passwordをservice `com.herness.credentials`、account `connection/<connectionId>/<authMethod>` に保存する。denial・locked・unavailable・update failure・duplicate・missing・invalid dataは `CredentialFailureKind::{KeychainDenied,KeychainLocked,KeychainUnavailable,KeychainWriteFailed,KeychainDuplicateItem,KeychainItemMissing,InvalidCredentialData}` へ変換する。plaintext file・env・DBへのfallbackは実装しない。
+- **解決:** 選択された `ConnectionId` だけをregistryで引き、vaultの該当accountだけを読む。credentialが無い場合は `AuthenticationRequired`、期限切れ・refresh不能は `CredentialUnavailable`、vault失敗は対応する `CredentialFailureKind` で停止する。別provider・別connectionへのfallbackは行わない。
+- **refresh直列化:** connectionごとに独立したgateを持ち、同一connectionの同時resolveは最大1回だけrefreshする。別connectionは独立して進む。refresh失敗はfailureを返し、期限切れの旧tokenをfreshとして返さず、vaultのbytesも置き換えない。成功した新token setは使用前にvaultへ保存する。
+- **status:** `ConnectionStatus` に `AuthRequired` を追加した。`Available` / `LoginRequired` / `AuthRequired` / `Unavailable` を公開し、`ConnectionState::Unavailable { failure }` はsanitized `CredentialFailureKind` だけを持つ。`ConnectionInfo` の既存field（connectionId, provider, model, authMethod, status）は変えない。
+- **redaction:** `redact_url` はuserinfo・query・fragmentを落とし、不正URLはechoしない。`redact_header(s)` はAuthorization・Proxy-Authorization・Cookie・Set-Cookie・API key headerを `[REDACTED]` にする。`redact_known_secrets` / `redact_error` は合成errorのdetailに混入した既知secretを除去する。
+- **test:** `tests/runtime/tests/connections.rs` はfake vaultだけを使い、real Keychain・network・real credentialを参照しない。canaryがDB・checkpoint・event・fake vault以外のfileへ出ないこと、keychain denial/lock/update failureでfileが作られないこと、2接続間の非fallback、同一・別接続のrefresh分離、期限切れtokenの非公開、redirect origin表を確認する。`herness-desktop` のunit testはbackend fakeでOSStatus変換とround-tripを確認する。実KeychainはTask 13の許可された検証まで実行しない。
 
 ## Task 1で固定した契約と検証
 

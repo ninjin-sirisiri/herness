@@ -2,6 +2,7 @@
 members = [
     "crates/herness-core",
     "crates/herness-store",
+    "src-tauri",
     "tests/runtime",
 ]
 resolver = "3"
