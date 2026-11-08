@@ -20,7 +20,8 @@ use herness_core::{
     FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery,
     ModelRequestObservation, NativeFileTools, OperationEvidence, OperationId, OperationIntent,
     OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId,
-    ProjectRoot, RequestGateIntent, RunId, StorePort, Timestamp, ToolExecutor, ToolName,
+    ProjectRoot, RequestGateIntent, RunId, SharedPermissionEvaluator, StorePort, Timestamp,
+    ToolExecutor, ToolName,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -64,6 +65,55 @@ impl DesktopHost {
         credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
         endpoints: ProviderEndpoints,
     ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            None,
+            None,
+        )
+    }
+
+    /// Test-only composition seam for cross-phase loopback regression tests.
+    ///
+    /// This is deliberately not an IPC command and is never selected by the
+    /// desktop shell. It lets the Task 17 regression use the real runtime,
+    /// store, tool executor, request gate, and quit path while injecting
+    /// scripted required-check and assessment ports and a loopback permission
+    /// evaluator. The production `open` path always uses the real ports and no
+    /// permission evaluator.
+    #[doc(hidden)]
+    pub fn open_with_test_boundaries(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        evaluator: Option<SharedPermissionEvaluator>,
+        assessment: Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+        checks: Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            evaluator,
+            Some((assessment, checks)),
+        )
+    }
+
+    fn open_inner(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        evaluator: Option<SharedPermissionEvaluator>,
+        test_ports: Option<(
+            Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+            Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>,
+        )>,
+    ) -> Result<(Self, ReconciliationReport), String> {
         let config = StoreConfig::new(app_data_root.as_ref()).map_err(|error| error.to_string())?;
         let store = Store::open(config).map_err(|error| error.to_string())?;
         let store = Arc::new(Mutex::new(store));
@@ -81,7 +131,7 @@ impl DesktopHost {
             crate::supervision::gate::SupervisionAwareGate::new(store_handle.clone()).boxed(),
         );
         let executor = DesktopToolExecutor::new(Arc::clone(&store));
-        let dependencies = RuntimeDependencies::new(
+        let mut dependencies = RuntimeDependencies::new(
             Arc::clone(&store),
             engine,
             Arc::clone(&credentials),
@@ -89,6 +139,9 @@ impl DesktopHost {
             policy,
             executor,
         );
+        if let Some(evaluator) = evaluator {
+            dependencies = dependencies.with_shared_evaluator(evaluator);
+        }
         let (runtime, report) =
             Runtime::restore(dependencies).map_err(|error| error.to_string())?;
         let assessment_host = AssessmentHost {
@@ -96,17 +149,29 @@ impl DesktopHost {
             credentials: Arc::clone(&credentials),
         };
         let supervision_config = ConfigStore::new();
-        let assessment = HostAssessmentPort::new(
-            store_handle.clone(),
-            supervision_config.clone(),
-            assessment_host.clone(),
-        );
+        let (assessment, check_mode) = match test_ports {
+            Some((assessment, checks)) => {
+                (assessment, crate::supervision::CheckMode::Injected(checks))
+            }
+            None => {
+                let assessment = HostAssessmentPort::new(
+                    store_handle.clone(),
+                    supervision_config.clone(),
+                    assessment_host.clone(),
+                );
+                (
+                    Box::new(assessment)
+                        as Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+                    crate::supervision::CheckMode::Real,
+                )
+            }
+        };
         let supervision = SupervisionHost::with_config(
             store_handle,
             supervision_config,
             assessment_host,
-            Box::new(assessment),
-            crate::supervision::CheckMode::Real,
+            assessment,
+            check_mode,
         );
         let mut host = Self {
             runtime,

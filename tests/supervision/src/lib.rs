@@ -3,6 +3,8 @@
 //! Every value is local and deterministic. No credential, real provider body,
 //! production endpoint, or user conversation is included.
 
+pub mod fixtures;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use herness_core::ConnectionSettings;
