@@ -413,6 +413,10 @@ function bind() {
 
   byId("connection-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    const submit = event.currentTarget.querySelector("button[type='submit']");
+    if (submit) {
+      submit.disabled = true;
+    }
     try {
       const provider = byId("provider").value;
       const authMethod = byId("auth-method").value;
@@ -430,6 +434,10 @@ function bind() {
       await loadLoginStatus();
     } catch (error) {
       showError(errorText(error));
+    } finally {
+      if (submit) {
+        submit.disabled = false;
+      }
     }
   });
 
