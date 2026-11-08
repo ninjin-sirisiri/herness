@@ -517,6 +517,7 @@ fn history_limits_are_default_100_and_max_500() {
     let fixture = Fixture::new();
     let query = HistoryQuery::first(fixture.project);
     assert_eq!(query.limit().get(), 100);
+    assert_eq!(query.cursor(), None);
     assert_eq!(query.before_sequence(), None);
     let encoded = serde_json::to_value(query).unwrap();
     assert_eq!(encoded["projectId"], fixture.project.to_string());
@@ -524,16 +525,50 @@ fn history_limits_are_default_100_and_max_500() {
         serde_json::from_value::<HistoryQuery>(encoded).unwrap(),
         query
     );
-    assert!(HistoryQuery::new(fixture.project, Some(0), HistoryLimit::default()).is_err());
 
-    let page = HistoryPage::new(vec![fixture.event()], Some(7)).unwrap();
+    let cursor = HistoryCursor::new(fixture.project, 7).unwrap();
+    let query = HistoryQuery::new(fixture.project, Some(cursor), HistoryLimit::default()).unwrap();
+    assert_eq!(query.before_sequence(), Some(7));
+    let encoded = serde_json::to_value(query).unwrap();
+    assert_eq!(encoded["cursor"]["beforeSequence"], 7);
+    assert_eq!(
+        serde_json::from_value::<HistoryQuery>(encoded).unwrap(),
+        query
+    );
+    assert!(HistoryCursor::new(fixture.project, 0).is_err());
+    assert!(HistoryQuery::new(fixture.project, Some(cursor), HistoryLimit::default()).is_ok());
+
+    let other = Fixture::new();
+    let cross_project =
+        HistoryQuery::new(other.project, Some(cursor), HistoryLimit::default()).unwrap_err();
+    assert!(matches!(
+        cross_project,
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Project,
+            expected,
+            found,
+        } if expected == other.project && found == fixture.project
+    ));
+
+    let page = HistoryPage::new(vec![fixture.event()], Some(cursor)).unwrap();
     let encoded = serde_json::to_value(&page).unwrap();
-    assert_eq!(encoded["nextBeforeSequence"], 7);
+    assert_eq!(
+        encoded["nextCursor"]["projectId"],
+        fixture.project.to_string()
+    );
+    assert_eq!(encoded["nextCursor"]["beforeSequence"], 7);
     assert_eq!(
         serde_json::from_value::<HistoryPage>(encoded).unwrap(),
         page
     );
-    assert!(HistoryPage::new(Vec::new(), Some(0)).is_err());
+    assert!(HistoryPage::new(Vec::new(), Some(cursor)).is_err());
+    assert!(
+        HistoryPage::new(
+            vec![fixture.event()],
+            Some(HistoryCursor::new(other.project, 7).unwrap())
+        )
+        .is_err()
+    );
 }
 
 #[test]

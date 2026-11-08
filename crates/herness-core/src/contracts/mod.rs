@@ -20,7 +20,8 @@ pub use errors::{
 };
 pub use events::{Event, EventDraft, EventKind, EventPayload};
 pub use history::{
-    DEFAULT_HISTORY_LIMIT, HistoryLimit, HistoryPage, HistoryQuery, MAX_HISTORY_LIMIT,
+    DEFAULT_HISTORY_LIMIT, HistoryCursor, HistoryLimit, HistoryPage, HistoryQuery,
+    MAX_HISTORY_LIMIT,
 };
 pub use ids::{
     AgentId, AgentKind, IdKind, OperationId, OperationKind, ProjectId, ProjectScope, RunId,

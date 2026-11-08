@@ -9,7 +9,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::connection::{ConnectionId, Provider};
-use crate::contracts::ids::{IdKind, ProjectId, RunId};
+use crate::contracts::ids::{IdKind, OperationId, ProjectId, RunId};
 use crate::contracts::run::RunState;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolName;
@@ -111,6 +111,14 @@ pub enum CoreError {
         expected: RunId,
         /// Run found in the child value.
         found: RunId,
+    },
+    /// The store already recorded this operation id.
+    ///
+    /// The repeated commit must not be treated as a new execution. Callers can
+    /// read the recorded intent and, when present, its stored result.
+    DuplicateOperation {
+        /// Operation id already present in the store.
+        operation: OperationId,
     },
     /// Automatic permission mode was requested without an available evaluator.
     PermissionEvaluatorUnavailable {
@@ -374,6 +382,9 @@ impl fmt::Display for CoreError {
             }
             Self::MismatchedRun { expected, found } => {
                 write!(f, "run {found} does not match transaction run {expected}")
+            }
+            Self::DuplicateOperation { operation } => {
+                write!(f, "operation {operation} is already recorded")
             }
             Self::PermissionEvaluatorUnavailable { mode } => {
                 write!(f, "permission mode {mode} requires an available evaluator")
