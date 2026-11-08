@@ -14,6 +14,7 @@ herness-core = { path = "../../crates/herness-core" }
 
 [dev-dependencies]
 base64 = "0.22.1"
+herness-desktop = { path = "../../src-tauri" }
 herness-engine-pi = { path = "../../crates/herness-engine-pi" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
 ring = "0.17.14"

@@ -603,7 +603,7 @@ fn evaluator_absence_and_failures_wait_for_a_human_and_never_execute() {
                     &grant,
                     &operation,
                     &context(),
-                    Some(evaluator as &mut dyn PermissionEvaluatorPort),
+                    Some(evaluator as &mut (dyn PermissionEvaluatorPort + Send + Sync)),
                 )
                 .expect("evaluate"),
             None => gateway

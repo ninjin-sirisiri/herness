@@ -120,7 +120,7 @@ impl<E: ToolExecutor> ToolGateway<E> {
         grant: &GrantScope,
         operation: &FrozenOperation,
         context: &EvaluationContext,
-        evaluator: Option<&mut (dyn PermissionEvaluatorPort + 'static)>,
+        evaluator: Option<&mut (dyn PermissionEvaluatorPort + Send + Sync + 'static)>,
     ) -> Result<PermissionOutcome, CoreError> {
         self.service
             .evaluate(policy, grant, operation, context, evaluator)

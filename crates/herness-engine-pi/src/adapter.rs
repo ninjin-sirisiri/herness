@@ -220,6 +220,7 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             policy: Arc::clone(&self.policy),
             gateway: Mutex::new(gateway),
             store: store.clone(),
+            queue: queue.clone(),
             stopping: AtomicBool::new(false),
             supervisor,
         });
@@ -290,6 +291,10 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
 }
 
 impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
+    fn tool_execution_authority(&self) -> herness_core::ToolExecutionAuthority {
+        herness_core::ToolExecutionAuthority::Adapter
+    }
+
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError> {
         let run_id = start.run_id();
         if self.runs.contains_key(&run_id) {
@@ -447,6 +452,7 @@ struct ToolRuntime<S> {
     policy: Arc<RwLock<PermissionPolicy>>,
     gateway: Mutex<ToolGateway<HostExecutors<S>>>,
     store: EngineStore<S>,
+    queue: EventQueue,
     stopping: AtomicBool,
     supervisor: ProcessSupervisor,
 }
@@ -569,6 +575,12 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                     .map_err(|_| {
                         HostToolFailure::Known("tool policy audit could not be recorded".to_owned())
                     })?;
+                // Hand the exact frozen operation to the host. This adapter never
+                // executes an awaiting operation; the host records it and, only
+                // after an explicit human decision, executes it once.
+                self.queue.push(EngineEvent::ToolApprovalRequired {
+                    operation: operation.clone(),
+                });
                 return Err(HostToolFailure::Known(
                     "tool requires host approval and was not executed".to_owned(),
                 ));

@@ -1,6 +1,6 @@
 [package]
 name = "herness-desktop"
-description = "Desktop host adapters for herness. Task 7 registers the macOS Keychain credential adapter as a library; Task 11 adds the Tauri binary and configuration."
+description = "Desktop host adapters and the Tauri shell for herness. Task 7 registers the macOS Keychain credential adapter as a library; Task 11 adds the Tauri binary, IPC boundary, and minimal trusted UI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,24 @@ publish.workspace = true
 [lib]
 name = "herness_desktop"
 
+[[bin]]
+name = "herness-desktop"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
+[build-dependencies]
+tauri-build = "2.7.4"
+
 [dependencies]
 herness-core = { path = "../crates/herness-core" }
+herness-engine-pi = { path = "../crates/herness-engine-pi" }
+herness-store = { path = "../crates/herness-store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2.12.5", default-features = true }
+url = "2.5.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"

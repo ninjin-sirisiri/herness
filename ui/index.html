@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>herness</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>herness</h1>
+      <p id="policy-line" class="muted">Loading host state…</p>
+    </header>
+
+    <main>
+      <section>
+        <h2>Project</h2>
+        <div class="row">
+          <label for="project-path">Project path</label>
+          <input id="project-path" type="text" autocomplete="off" placeholder="/absolute/path/to/project" />
+          <button id="open-project" type="button">Open</button>
+        </div>
+        <ul id="project-list" class="list"></ul>
+        <p id="project-summary" class="muted"></p>
+      </section>
+
+      <section>
+        <h2>Connection and model</h2>
+        <form id="connection-form">
+          <div class="row">
+            <label for="provider">Provider</label>
+            <select id="provider">
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="openai_compatible">OpenAI-compatible</option>
+            </select>
+            <label for="model">Model</label>
+            <input id="model" type="text" autocomplete="off" placeholder="model name" />
+          </div>
+          <div class="row">
+            <label for="auth-method">Authentication</label>
+            <select id="auth-method">
+              <option value="api_key">API key</option>
+              <option value="chatgpt_login">ChatGPT login</option>
+            </select>
+            <label for="endpoint">Compatible endpoint</label>
+            <input id="endpoint" type="text" autocomplete="off" placeholder="compatible endpoint (absolute URL)" />
+          </div>
+          <div class="row">
+            <label class="checkbox">
+              <input id="insecure-http" type="checkbox" />
+              Acknowledge remote plain-HTTP credential risk
+            </label>
+            <button type="submit">Add connection</button>
+          </div>
+        </form>
+        <ul id="connection-list" class="list"></ul>
+
+        <div class="panel">
+          <div class="row">
+            <label for="api-key">API key (write-only)</label>
+            <input id="api-key" type="password" autocomplete="off" spellcheck="false" />
+            <button id="save-api-key" type="button">Save key</button>
+          </div>
+          <p id="credential-status" class="muted"></p>
+          <div class="row">
+            <button id="start-login" type="button">Start ChatGPT login</button>
+            <button id="cancel-login" type="button">Cancel login</button>
+          </div>
+          <p id="login-status" class="muted"></p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Run</h2>
+        <label for="instructions">Instructions</label>
+        <textarea id="instructions" rows="3" placeholder="Describe the work for this run"></textarea>
+        <div class="row">
+          <button id="start-run" type="button">Start run</button>
+          <button id="stop-run" type="button">Stop selected run</button>
+          <button id="resume-run" type="button">Resume selected run</button>
+        </div>
+        <ul id="run-list" class="list"></ul>
+      </section>
+
+      <section>
+        <h2>Pending approvals</h2>
+        <p class="warn">
+          Automatic decision unavailable (H2 evaluator is not connected). Every tool operation
+          needs an explicit human decision in this build.
+        </p>
+        <ul id="approval-list" class="list"></ul>
+      </section>
+
+      <section>
+        <h2>State and history</h2>
+        <div class="row">
+          <label for="history-limit">History limit</label>
+          <input id="history-limit" type="number" min="1" max="500" value="100" />
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+        <p id="status-line" class="muted"></p>
+        <p id="error-line" class="error" role="alert"></p>
+        <ul id="history-list" class="list history"></ul>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

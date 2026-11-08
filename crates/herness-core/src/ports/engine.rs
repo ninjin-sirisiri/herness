@@ -138,6 +138,17 @@ pub enum EngineEvent {
         /// Complete final arguments.
         arguments: ToolArguments,
     },
+    /// An adapter refused to execute a frozen tool operation because host
+    /// policy required a human decision.
+    ///
+    /// The adapter must not run this operation later. It reports the exact
+    /// frozen operation so the host can show it and, after an explicit human
+    /// approval, execute it once through the host runtime. The operation is
+    /// data only: no credential or model text is included.
+    ToolApprovalRequired {
+        /// Exact operation that was not executed.
+        operation: crate::contracts::operation::FrozenOperation,
+    },
     /// A sanitized engine failure.
     Failure {
         /// Failure kind with no raw SDK error text.
@@ -145,8 +156,30 @@ pub enum EngineEvent {
     },
 }
 
+/// Which component executes an allowed tool operation.
+///
+/// The host composition uses this to avoid two executors for one operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolExecutionAuthority {
+    /// The host runtime executes allowed operations through its own gateway.
+    Host,
+    /// The engine adapter executes allowed operations internally and reports
+    /// only awaiting-approval operations to the host.
+    Adapter,
+}
+
 /// Port implemented by the pi-rust engine adapter.
 pub trait EnginePort {
+    /// Authority for allowed tool execution.
+    ///
+    /// `Host` is the default so an adapter that delegates tools to the runtime
+    /// keeps working. An adapter that executes host tools internally must
+    /// return `Adapter`; the runtime then treats `ToolCall` frames as
+    /// observations and never executes the same operation again.
+    fn tool_execution_authority(&self) -> ToolExecutionAuthority {
+        ToolExecutionAuthority::Host
+    }
+
     /// Starts an independent engine run.
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError>;
 

@@ -339,7 +339,7 @@ type HostRuntime = Runtime<Store, FakeEngine, TestExecutor>;
 
 struct Options {
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort>>,
+    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
     credential: CredentialAvailability,
     register_connection: bool,
     stop_report: StopReport,
@@ -368,7 +368,7 @@ struct TestHost {
     connection: ConnectionId,
     calls: Arc<AtomicUsize>,
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort>>,
+    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
     stop_report: StopReport,
     runtime: HostRuntime,
 }

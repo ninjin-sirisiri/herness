@@ -1,7 +1,13 @@
-//! Desktop host adapters for herness.
+//! Desktop host adapters and Tauri shell for herness.
 //!
-//! Task 7 contains only the macOS Keychain credential adapter as a testable
-//! library. Application windows, IPC, Tauri capabilities, and the desktop
-//! binary are added by Task 11.
+//! The Keychain credential adapter is independent of Tauri and testable on its
+//! own. Task 11 adds the single host composition, the trusted command guard, the
+//! minimal main window, and the embedded static UI.
 
+pub mod app;
+pub mod commands;
 pub mod credentials;
+pub mod guard;
+pub mod host;
+pub mod lifecycle;
+pub mod login;

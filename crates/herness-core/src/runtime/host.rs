@@ -21,6 +21,7 @@
 //! * restore never starts engines, sends model requests, executes tools, or
 //!   reuses prior approvals.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -59,10 +60,10 @@ use crate::tools::{GatewayError, ToolArguments, ToolGateway, ToolName};
 pub struct RuntimeDependencies<S, E, T> {
     store: Arc<Mutex<S>>,
     engine: E,
-    credentials: Arc<dyn crate::ports::CredentialPort>,
+    credentials: Arc<dyn crate::ports::CredentialPort + Send + Sync>,
     directory: ConnectionDirectory,
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort>>,
+    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
     capabilities: HostCapabilities,
     toolchain: ToolchainConfig,
     executor: T,
@@ -74,7 +75,7 @@ impl<S, E, T> RuntimeDependencies<S, E, T> {
     pub fn new(
         store: Arc<Mutex<S>>,
         engine: E,
-        credentials: Arc<dyn crate::ports::CredentialPort>,
+        credentials: Arc<dyn crate::ports::CredentialPort + Send + Sync>,
         directory: ConnectionDirectory,
         policy: PolicyAdmin,
         executor: T,
@@ -95,7 +96,10 @@ impl<S, E, T> RuntimeDependencies<S, E, T> {
     /// Supplies the H2 evaluator. Without an available evaluator, automatic
     /// mode is refused.
     #[must_use]
-    pub fn with_evaluator(mut self, evaluator: Box<dyn PermissionEvaluatorPort>) -> Self {
+    pub fn with_evaluator(
+        mut self,
+        evaluator: Box<dyn PermissionEvaluatorPort + Send + Sync>,
+    ) -> Self {
         self.evaluator = Some(evaluator);
         self
     }
@@ -172,14 +176,18 @@ where
 {
     store: Arc<Mutex<S>>,
     engine: E,
-    credentials: Arc<dyn crate::ports::CredentialPort>,
+    credentials: Arc<dyn crate::ports::CredentialPort + Send + Sync>,
     directory: ConnectionDirectory,
     policy: PolicyAdmin,
-    evaluator: Option<Box<dyn PermissionEvaluatorPort>>,
+    evaluator: Option<Box<dyn PermissionEvaluatorPort + Send + Sync>>,
     capabilities: HostCapabilities,
     toolchain: ToolchainDetector,
     gateway: ToolGateway<T>,
     state: HostState,
+    /// Host-result messages waiting for an engine turn to become idle. This is
+    /// in-process only; it never contains credentials or model output and is
+    /// discarded by restart reconciliation.
+    deferred_continuations: BTreeMap<RunId, Vec<String>>,
 }
 
 impl<S, E, T> Runtime<S, E, T>
@@ -230,6 +238,7 @@ where
             toolchain: ToolchainDetector::new(toolchain),
             gateway: ToolGateway::new(executor),
             state,
+            deferred_continuations: BTreeMap::new(),
         };
         let report = runtime.reconcile()?;
         Ok((runtime, report))
@@ -577,6 +586,56 @@ where
         Ok(run_view(project, run, record))
     }
 
+    /// Sends one explicit host-approved text turn to a running engine.
+    ///
+    /// This is the human "start" input for a run. It validates the run state,
+    /// records that an input was submitted without copying the text into the
+    /// audit payload (the engine checkpoint holds the conversation), and then
+    /// hands the text to the engine. A failed submission moves the run to
+    /// `interrupted`; it is never retried automatically.
+    pub fn submit_input(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        text: impl Into<String>,
+    ) -> Result<(), RuntimeError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::InvalidValue {
+                field: "input".to_owned(),
+                violation: ArgumentViolation::Empty,
+            });
+        }
+        let record = self.run_record(project, run)?.clone();
+        if record.state != RunState::Running {
+            return Err(RuntimeError::InvalidRunTransition {
+                from: record.state,
+                to: RunState::Running,
+            });
+        }
+        let event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            None,
+            "run.input_submitted",
+            json!({ "source": "human", "unicodeScalars": text.chars().count() }),
+        )?;
+        self.commit_state(self.state.clone(), vec![event])?;
+        if let Err(error) = self.engine.send_input(&run, EngineInput::Text(text)) {
+            self.mark_interrupted(
+                project,
+                run,
+                &record,
+                "input_failed",
+                json!({ "failure": error }),
+            )?;
+            return Err(RuntimeError::Engine { error });
+        }
+        Ok(())
+    }
+
     /// Stops a run through the engine and records a checkpoint.
     ///
     /// A confirmed or already-inactive engine move to `paused`. An unconfirmed
@@ -626,6 +685,7 @@ where
                 .count()
         };
         self.gateway.service_mut().invalidate_run(run);
+        self.deferred_continuations.remove(&run);
 
         let now = Timestamp::now();
         let mut next = self.state.clone();
@@ -711,6 +771,7 @@ where
         };
 
         self.gateway.service_mut().invalidate_run(run);
+        self.deferred_continuations.remove(&run);
         let now = Timestamp::now();
         let mut next = self.state.clone();
         let project_record = next
@@ -859,7 +920,18 @@ where
                 Ok(receipt.events().to_vec())
             }
             EngineEvent::ToolCall { tool, arguments } => {
+                if self.engine.tool_execution_authority()
+                    == crate::ports::ToolExecutionAuthority::Adapter
+                {
+                    // The adapter executes allowed tools itself and reports
+                    // awaiting operations separately. Re-evaluating this frame
+                    // would create a second executor for the same operation.
+                    return Ok(Vec::new());
+                }
                 self.handle_tool_call(project, run, tool, arguments)
+            }
+            EngineEvent::ToolApprovalRequired { operation } => {
+                self.record_engine_approval(project, run, operation)
             }
             EngineEvent::StateChanged(state) => self.handle_state_changed(project, run, state),
             EngineEvent::Failure { failure } => {
@@ -916,6 +988,9 @@ where
             json!({ "from": record.state.as_str(), "to": target.as_str() }),
         )?;
         let receipt = self.commit_state(next, vec![event])?;
+        if state == RunState::Idle && matches!(target, RunState::Idle | RunState::Running) {
+            self.flush_deferred(project, run)?;
+        }
         Ok(receipt.events().to_vec())
     }
 
@@ -1015,43 +1090,7 @@ where
                 Ok(receipt.events().to_vec())
             }
             crate::permissions::PermissionOutcome::AwaitingApproval { request } => {
-                let approval = crate::runtime::state::ApprovalRecord {
-                    run_id: run,
-                    agent_id: record.agent_id,
-                    session_id: record.session_id,
-                    operation: operation.clone(),
-                    reason: approval_reason_label(request.reason()),
-                    requested_at: Timestamp::now(),
-                    restored: false,
-                };
-                let now = Timestamp::now();
-                let mut next = self.state.clone();
-                let project_record = next
-                    .projects_mut()
-                    .get_mut(&project)
-                    .ok_or(RuntimeError::UnknownProject { project })?;
-                project_record
-                    .approvals
-                    .insert(operation.operation_id(), approval);
-                if let Some(stored) = project_record.runs.get_mut(&run) {
-                    stored.state = RunState::AwaitingApproval;
-                    stored.updated_at = now;
-                }
-                let event = event_draft(
-                    project,
-                    record.agent_id,
-                    record.session_id,
-                    run,
-                    Some(operation.operation_id()),
-                    "run.awaiting_approval",
-                    json!({
-                        "operationId": operation.operation_id().to_string(),
-                        "tool": tool.as_str(),
-                        "state": RunState::AwaitingApproval.as_str(),
-                    }),
-                )?;
-                let receipt = self.commit_state(next, vec![event])?;
-                Ok(receipt.events().to_vec())
+                self.persist_awaiting_approval(project, run, &record, operation, request.reason())
             }
             crate::permissions::PermissionOutcome::Allow { authorization } => {
                 let mut committed = Vec::new();
@@ -1075,6 +1114,176 @@ where
                 Ok(committed)
             }
         }
+    }
+
+    /// Persists one human-wait decision exactly once for the run.
+    fn persist_awaiting_approval(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        record: &RunRecord,
+        operation: FrozenOperation,
+        reason: &crate::permissions::HumanWaitReason,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        let operation_id = operation.operation_id();
+        let approval = crate::runtime::state::ApprovalRecord {
+            run_id: run,
+            agent_id: record.agent_id,
+            session_id: record.session_id,
+            operation: operation.clone(),
+            reason: approval_reason_label(reason),
+            requested_at: Timestamp::now(),
+            restored: false,
+        };
+        let now = Timestamp::now();
+        let mut next = self.state.clone();
+        let project_record = next
+            .projects_mut()
+            .get_mut(&project)
+            .ok_or(RuntimeError::UnknownProject { project })?;
+        if project_record.approvals.contains_key(&operation_id) {
+            // A redelivered request is not a second decision.
+            return Ok(Vec::new());
+        }
+        project_record.approvals.insert(operation_id, approval);
+        if let Some(stored) = project_record.runs.get_mut(&run) {
+            stored.state = RunState::AwaitingApproval;
+            stored.updated_at = now;
+        }
+        let event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            Some(operation_id),
+            "run.awaiting_approval",
+            json!({
+                "operationId": operation_id.to_string(),
+                "tool": operation.tool().as_str(),
+                "state": RunState::AwaitingApproval.as_str(),
+            }),
+        )?;
+        let receipt = self.commit_state(next, vec![event])?;
+        Ok(receipt.events().to_vec())
+    }
+
+    /// Records a frozen operation that the trusted engine adapter refused to
+    /// execute because its host policy required a human decision.
+    ///
+    /// The runtime re-applies its own policy to the exact operation and records
+    /// the resulting human wait. It never executes here, and an operation that
+    /// the adapter or runtime would not leave waiting is rejected without a
+    /// side effect.
+    fn record_engine_approval(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        operation: FrozenOperation,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        if operation.project_id() != project || operation.run_id() != run {
+            return self.record_approval_rejection(project, run, None, "operation_scope_mismatch");
+        }
+        let operation_id = operation.operation_id();
+        let record = self.run_record(project, run)?.clone();
+        if record.state != RunState::Running {
+            let event = event_draft(
+                project,
+                record.agent_id,
+                record.session_id,
+                run,
+                Some(operation_id),
+                "run.tool_approval_ignored",
+                json!({
+                    "operationId": operation_id.to_string(),
+                    "state": record.state.as_str(),
+                }),
+            )?;
+            let receipt = self.commit_state(self.state.clone(), vec![event])?;
+            return Ok(receipt.events().to_vec());
+        }
+        if self
+            .project_record(project)?
+            .approvals
+            .contains_key(&operation_id)
+        {
+            // The adapter may redeliver the same request; one decision remains.
+            return Ok(Vec::new());
+        }
+        if self.operation_exists(operation_id)? {
+            return self.record_approval_rejection(
+                project,
+                run,
+                Some(operation_id),
+                "operation_already_recorded",
+            );
+        }
+
+        let policy = self.policy.policy().clone();
+        if operation.policy_version() != policy.version()
+            || operation.permission_mode() != policy.mode()
+        {
+            return self.record_approval_rejection(
+                project,
+                run,
+                Some(operation_id),
+                "stale_permission_context",
+            );
+        }
+        let grant = record.grant.to_scope(project)?;
+        if grant.policy_version() != policy.version() || grant.mode() != policy.mode() {
+            return self.record_approval_rejection(
+                project,
+                run,
+                Some(operation_id),
+                "stale_permission_context",
+            );
+        }
+
+        let outcome = self
+            .gateway
+            .authorize(
+                &policy,
+                &grant,
+                &operation,
+                &EvaluationContext::new(record.instructions.clone(), Vec::new()),
+                self.evaluator.as_deref_mut(),
+            )
+            .map_err(RuntimeError::store)?;
+        match outcome {
+            crate::permissions::PermissionOutcome::AwaitingApproval { request } => {
+                self.persist_awaiting_approval(project, run, &record, operation, request.reason())
+            }
+            crate::permissions::PermissionOutcome::Deny { .. } => {
+                self.record_approval_rejection(project, run, Some(operation_id), "policy_denied")
+            }
+            crate::permissions::PermissionOutcome::Allow { .. } => self.record_approval_rejection(
+                project,
+                run,
+                Some(operation_id),
+                "policy_allow_without_human_decision",
+            ),
+        }
+    }
+
+    fn record_approval_rejection(
+        &mut self,
+        project: ProjectId,
+        run: RunId,
+        operation: Option<crate::contracts::ids::OperationId>,
+        reason: &str,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        let record = self.run_record(project, run)?.clone();
+        let event = event_draft(
+            project,
+            record.agent_id,
+            record.session_id,
+            run,
+            operation,
+            "run.tool_approval_rejected",
+            json!({ "reason": reason }),
+        )?;
+        let receipt = self.commit_state(self.state.clone(), vec![event])?;
+        Ok(receipt.events().to_vec())
     }
 
     fn execute_authorized(
@@ -1312,15 +1521,74 @@ where
             json!({ "reason": "operation_continuation" }),
         )?;
         self.commit_state(self.state.clone(), vec![event])?;
-        if let Err(error) = self.engine.send_input(&run, EngineInput::Text(message)) {
-            self.mark_interrupted(
-                project,
-                run,
-                record,
-                "continuation_failed",
-                json!({ "failure": error }),
-            )?;
-            return Err(RuntimeError::Engine { error });
+        match self
+            .engine
+            .send_input(&run, EngineInput::Text(message.clone()))
+        {
+            Ok(()) => Ok(()),
+            Err(CoreError::InvalidRunTransition { .. }) => {
+                // The model is still finishing the turn that produced the
+                // approval request. Do not fail the human decision; deliver
+                // the host result when the engine reports idle.
+                self.deferred_continuations
+                    .entry(run)
+                    .or_default()
+                    .push(message);
+                let event = event_draft(
+                    project,
+                    record.agent_id,
+                    record.session_id,
+                    run,
+                    None,
+                    "run.host_message_deferred",
+                    json!({ "reason": "engine_active" }),
+                )?;
+                self.commit_state(self.state.clone(), vec![event])?;
+                Ok(())
+            }
+            Err(error) => {
+                self.mark_interrupted(
+                    project,
+                    run,
+                    record,
+                    "continuation_failed",
+                    json!({ "failure": error }),
+                )?;
+                Err(RuntimeError::Engine { error })
+            }
+        }
+    }
+
+    /// Delivers queued host results after the engine becomes idle.
+    fn flush_deferred(&mut self, project: ProjectId, run: RunId) -> Result<(), RuntimeError> {
+        let Some(messages) = self.deferred_continuations.remove(&run) else {
+            return Ok(());
+        };
+        let record = self.run_record(project, run)?.clone();
+        let mut remaining = messages.into_iter();
+        while let Some(message) = remaining.next() {
+            match self
+                .engine
+                .send_input(&run, EngineInput::Text(message.clone()))
+            {
+                Ok(()) => {}
+                Err(CoreError::InvalidRunTransition { .. }) => {
+                    let mut queued = vec![message];
+                    queued.extend(remaining);
+                    self.deferred_continuations.insert(run, queued);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.mark_interrupted(
+                        project,
+                        run,
+                        &record,
+                        "continuation_failed",
+                        json!({ "failure": error }),
+                    )?;
+                    return Err(RuntimeError::Engine { error });
+                }
+            }
         }
         Ok(())
     }
@@ -1356,6 +1624,12 @@ where
         stage: &str,
         detail: serde_json::Value,
     ) -> Result<(), RuntimeError> {
+        if matches!(
+            state,
+            RunState::Failed | RunState::Interrupted | RunState::Paused
+        ) {
+            self.deferred_continuations.remove(&run);
+        }
         let now = Timestamp::now();
         let mut next = self.state.clone();
         if let Some(stored) = next
