@@ -416,7 +416,12 @@ pub fn resume_run(
         .map_err(|error| error.to_string())
 }
 
-/// Drains engine events and returns a fresh project snapshot.
+/// Returns a fresh project snapshot.
+///
+/// This command is read-only with respect to execution. Engine events are
+/// drained by the host-owned pump, and committed events are read through
+/// `history`. The `events` field remains for the existing UI shape; it is
+/// always empty because the WebView is not the execution driver.
 #[tauri::command(async)]
 pub fn poll_project(
     window: tauri::WebviewWindow,
@@ -424,27 +429,15 @@ pub fn poll_project(
     project: ProjectId,
 ) -> Result<PollResult, String> {
     verify_source(&window)?;
-    let mut host = lock_host(&state)?;
+    let host = lock_host(&state)?;
     let snapshot = host
         .runtime()
         .snapshot(project)
         .map_err(|error| error.to_string())?;
-    let mut events = Vec::new();
-    // Drain every run, including one whose last observed host state is `idle`.
-    // An adapter can publish its idle echo before the first model turn starts;
-    // skipping idle runs would lose later tool/approval events.
-    for run in snapshot.runs() {
-        events.extend(
-            host.runtime_mut()
-                .poll_run(project, run.run_id())
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    let snapshot = host
-        .runtime()
-        .snapshot(project)
-        .map_err(|error| error.to_string())?;
-    Ok(PollResult { events, snapshot })
+    Ok(PollResult {
+        events: Vec::new(),
+        snapshot,
+    })
 }
 
 /// Returns the stable reconnect snapshot for one project.

@@ -11,16 +11,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use herness_core::runtime::{
-    ProjectView, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
+    ProjectView, PumpReport, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
     RuntimeToolExecutor, ShutdownReport, ToolExecution,
 };
 use herness_core::{
     ArgumentViolation, BashExecutor, Checkpoint, CheckpointCommit, ConnectionAdmin,
     ConnectionDirectory, ConnectionSettings, CoreError, EventDraft, FileLockRegistry,
-    FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery, NativeFileTools,
-    OperationEvidence, OperationId, OperationIntent, OperationRecord, OperationResult,
-    PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId, ProjectRoot, RunId, StorePort,
-    ToolExecutor, ToolName,
+    FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery,
+    ModelRequestObservation, NativeFileTools, OperationEvidence, OperationId, OperationIntent,
+    OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId,
+    ProjectRoot, RequestGateIntent, RunId, StorePort, Timestamp, ToolExecutor, ToolName,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -185,6 +185,16 @@ impl DesktopHost {
         self.runtime
             .force_shutdown()
             .map_err(|error| error.to_string())
+    }
+
+    /// Drains every project's engine events and applies run deadlines.
+    ///
+    /// The trusted desktop shell runs this from a host-owned worker thread so a
+    /// closed window or a non-selected project still makes progress. It uses the
+    /// single existing runtime, store, engine, and executor. During explicit
+    /// shutdown it performs no work and returns a skipped report.
+    pub fn pump(&mut self) -> Result<PumpReport, String> {
+        self.runtime.pump().map_err(|error| error.to_string())
     }
 
     /// Whether an explicit shutdown has begun.
@@ -403,6 +413,26 @@ impl StorePort for SharedStore {
             operation,
             result,
             events,
+        )
+    }
+
+    fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        <Store as StorePort>::record_model_request(&mut self.lock(), intent, recorded_at)
+    }
+
+    fn record_model_request_observation(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        <Store as StorePort>::record_model_request_observation(
+            &mut self.lock(),
+            observation,
+            observed_at,
         )
     }
 }

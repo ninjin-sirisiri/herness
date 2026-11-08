@@ -13,6 +13,7 @@ mod host;
 #[cfg(feature = "test-support")]
 pub mod host_state_test_support;
 pub mod reconcile;
+pub mod request_gate;
 pub mod shutdown;
 mod state;
 pub mod tools;
@@ -24,9 +25,11 @@ pub use reconcile::{
     OperationReconciliation, PermissionReconciliation, ProjectReconciliation, ReconciliationReport,
     ReconciliationSource, RunReconciliation, ShutdownSummary,
 };
+pub use request_gate::StoreModelRequestGate;
 pub use shutdown::{ShutdownOutcome, ShutdownReport, ShutdownRun};
 pub use tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 pub use views::{
     AgentView, ApprovalOutcome, ContinuationOutcome, DenialOutcome, EventBatch, PendingApproval,
-    ProjectView, RecoveryMode, RunView, RuntimeSnapshot, StopOutcome, SubscriptionCursor,
+    ProjectView, PumpReport, RecoveryMode, RunView, RuntimeSnapshot, StopOutcome,
+    SubscriptionCursor,
 };

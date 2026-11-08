@@ -20,11 +20,13 @@ use herness_core::{
     ConversationFailure, CoreError, CredentialAvailability, CredentialKind, CredentialPort,
     CredentialService, CredentialVault, Endpoint, EngineEvent, EngineFailureKind, EngineInput,
     EnginePort, EngineStart, EvaluationRequest, EvaluatorAvailability, FrozenOperation, GrantScope,
-    HistoryLimit, MatchMethod, OperationOutcome, PermissionDecision, PermissionEvaluatorPort,
-    PermissionMode, PermissionPolicy, PermissionRule, PolicyAdmin, ProjectId, Provider,
-    ResolvedCredential, RuleTarget, RunControl, RunId, RunPermissionContext, RunState,
-    SecretString, SessionId, SharedPermissionEvaluator, SharedPolicy, StopReason, StopReport,
-    StorePort, ToolExecutor, ToolName, VaultAccount, VaultFailure,
+    HistoryLimit, MatchMethod, ModelRequestGatePort, ModelRequestObservation, OperationOutcome,
+    PermissionDecision, PermissionEvaluatorPort, PermissionMode, PermissionPolicy, PermissionRule,
+    PolicyAdmin, ProjectId, Provider, RequestGateIntent, RequestGateOutcome, RequestGateRefusal,
+    RequestOutcome, ResolvedCredential, RuleTarget, RunControl, RunId, RunPermissionContext,
+    RunState, SecretString, SessionId, SharedPermissionEvaluator, SharedPolicy, StopReason,
+    StopReport, StoreFailureKind, StorePort, TokenCount, TokenUsage, ToolExecutor, ToolName,
+    VaultAccount, VaultFailure,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -270,6 +272,61 @@ fn responses_text(text: &str) -> MockResponse {
                 "id": "resp_1",
                 "status": "completed",
                 "output": [{"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": text}]}]
+            }
+        }),
+    ));
+    MockResponse::sse(body)
+}
+
+/// Responses terminal event that reports explicit usage.
+///
+/// `pi-ai` normalizes input tokens by subtracting cache reads and writes, so the
+/// raw `input_tokens` value includes both cache counts.
+fn responses_text_with_usage(
+    text: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> MockResponse {
+    let mut body = String::new();
+    body.push_str(&sse(
+        "response.created",
+        json!({"type": "response.created", "response": {"id": "resp_usage"}}),
+    ));
+    body.push_str(&sse(
+        "response.output_item.added",
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_usage"}}),
+    ));
+    body.push_str(&sse(
+        "response.output_text.delta",
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": text}),
+    ));
+    body.push_str(&sse(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_usage", "content": [{"type": "output_text", "text": text}]}
+        }),
+    ));
+    body.push_str(&sse(
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_usage",
+                "status": "completed",
+                "output": [{"type": "message", "id": "msg_usage", "content": [{"type": "output_text", "text": text}]}],
+                "usage": {
+                    "input_tokens": input + cache_read + cache_write,
+                    "output_tokens": output,
+                    "input_tokens_details": {
+                        "cached_tokens": cache_read,
+                        "cache_write_tokens": cache_write
+                    },
+                    "total_tokens": input + output + cache_read + cache_write
+                }
             }
         }),
     ));
@@ -812,6 +869,48 @@ fn engine_start(fixture: &Fixture, instructions: &str) -> (AgentId, SessionId, R
     .expect("engine start")
     .with_permission(engine_permission(fixture, run));
     (agent, session, run, start)
+}
+
+fn engine_start_with_control(
+    fixture: &Fixture,
+    instructions: &str,
+    control: RunControl,
+) -> (AgentId, SessionId, RunId, EngineStart) {
+    let project = fixture.project_id;
+    let agent = AgentId::new(project);
+    let session = SessionId::new(project);
+    let run = RunId::new(project);
+    let cwd = AbsolutePath::new(fixture.project.to_string_lossy().into_owned()).expect("cwd");
+    let permission = RunPermissionContext::new(
+        project,
+        run,
+        GrantScope::for_run(project, &fixture.policy),
+        SharedPolicy::new(fixture.policy.clone()),
+        None,
+        control,
+    )
+    .expect("permission context");
+    let start = EngineStart::new(
+        project,
+        agent,
+        session,
+        run,
+        fixture.connection,
+        cwd,
+        instructions,
+    )
+    .expect("engine start")
+    .with_permission(permission);
+    (agent, session, run, start)
+}
+
+fn request_records(fixture: &Fixture) -> Vec<herness_store::ModelRequestRecord> {
+    fixture
+        .store
+        .lock()
+        .expect("store lock")
+        .model_requests_for_project(&fixture.project_id)
+        .expect("model request records")
 }
 
 fn collect_until_terminal(
@@ -3227,6 +3326,37 @@ fn poll_host_until_completed<T: RuntimeToolExecutor>(
     }
 }
 
+/// Waits for a terminal stop/failure. A gate refusal after a deadline is a
+/// terminal engine failure, not a completed input; a startup idle echo is not
+/// treated as that terminal state.
+fn poll_host_until_terminal<T: RuntimeToolExecutor>(
+    host: &mut Runtime<Store, PiEngine<Store>, T>,
+    project: ProjectId,
+    run: RunId,
+) -> RunState {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        host.poll_run(project, run).expect("host poll");
+        let snapshot = host.snapshot(project).expect("snapshot");
+        let state = snapshot
+            .runs()
+            .iter()
+            .find(|view| view.run_id() == run)
+            .expect("run")
+            .state();
+        if matches!(
+            state,
+            RunState::Failed | RunState::Interrupted | RunState::Paused
+        ) {
+            return state;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for a terminal run state");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn host_continuation_preserves_conversation_and_input_ids_with_real_pi() {
     let connection = ConnectionId::new();
@@ -4429,12 +4559,16 @@ fn real_pi_deadline_bounds_evaluation_and_discards_a_late_allow() {
             Some(Instant::now() + Duration::from_millis(80)),
         )
         .expect("deadline");
-    let input = test
+    let _input = test
         .host
         .submit_input_with_id(project, run.run_id(), "write with a deadline")
         .expect("input");
     let started = Instant::now();
-    poll_host_until_completed(&mut test.host, project, run.run_id(), input);
+    let state = poll_host_until_terminal(&mut test.host, project, run.run_id());
+    assert!(
+        matches!(state, RunState::Failed | RunState::Interrupted),
+        "an expired deadline must end the run without starting a new request: {state:?}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the deadline must bound the evaluation, took {:?}",
@@ -4583,5 +4717,368 @@ fn real_pi_without_a_host_grant_refuses_to_authorize_tools() {
         server.requests()[1]
             .body
             .contains("host run permission context is unavailable")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: pre-send model request gate, observations, and usage.
+// ---------------------------------------------------------------------------
+
+struct RefusingRequestGate;
+
+impl ModelRequestGatePort for RefusingRequestGate {
+    fn admit(&mut self, _intent: &RequestGateIntent) -> Result<RequestGateOutcome, CoreError> {
+        Ok(RequestGateOutcome::Refuse {
+            reason: RequestGateRefusal::Stopped,
+        })
+    }
+
+    fn observe(&mut self, _observation: &ModelRequestObservation) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+struct IntentPersistenceFailureGate;
+
+impl ModelRequestGatePort for IntentPersistenceFailureGate {
+    fn admit(&mut self, _intent: &RequestGateIntent) -> Result<RequestGateOutcome, CoreError> {
+        Err(CoreError::StoreUnavailable {
+            failure: StoreFailureKind::Unavailable,
+        })
+    }
+
+    fn observe(&mut self, _observation: &ModelRequestObservation) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+struct SendStartedPersistenceFailureGate;
+
+impl ModelRequestGatePort for SendStartedPersistenceFailureGate {
+    fn admit(&mut self, _intent: &RequestGateIntent) -> Result<RequestGateOutcome, CoreError> {
+        Ok(RequestGateOutcome::Admit)
+    }
+
+    fn observe(&mut self, _observation: &ModelRequestObservation) -> Result<(), CoreError> {
+        Err(CoreError::StoreUnavailable {
+            failure: StoreFailureKind::Unavailable,
+        })
+    }
+}
+
+fn openai_fixture_for_task5(
+    server: &MockServer,
+    connection: ConnectionId,
+    secret: &str,
+) -> Fixture {
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    fixture_with(FixtureOptions {
+        provider: Provider::OpenAi,
+        model: "gpt-test",
+        auth: AuthMethod::ApiKey,
+        endpoint: None,
+        endpoints,
+        credentials: default_credentials(connection, secret),
+        connection_id: Some(connection),
+    })
+}
+
+#[test]
+fn a_gate_refusal_never_reaches_the_provider() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| responses_text("must not be sent"));
+    let mut fixture = openai_fixture_for_task5(&server, connection, "sk-gate-refused");
+    fixture
+        .engine
+        .set_request_gate(Box::new(RefusingRequestGate));
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    fixture.engine.start(start).expect("start");
+    let _ = fixture.engine.poll_events(&run);
+    fixture
+        .engine
+        .send_input(&run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut fixture.engine, &run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(
+        server.request_count(),
+        0,
+        "a refused request must not be sent"
+    );
+    assert!(
+        request_records(&fixture).is_empty(),
+        "the refusal test gate records nothing"
+    );
+}
+
+#[test]
+fn an_intent_persistence_failure_never_reaches_the_provider() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| responses_text("must not be sent"));
+    let mut fixture = openai_fixture_for_task5(&server, connection, "sk-gate-intent-fail");
+    fixture
+        .engine
+        .set_request_gate(Box::new(IntentPersistenceFailureGate));
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    fixture.engine.start(start).expect("start");
+    let _ = fixture.engine.poll_events(&run);
+    fixture
+        .engine
+        .send_input(&run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut fixture.engine, &run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(
+        server.request_count(),
+        0,
+        "an intent save failure must happen before HTTP"
+    );
+}
+
+#[test]
+fn a_send_started_persistence_failure_never_reaches_the_provider() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| responses_text("must not be sent"));
+    let mut fixture = openai_fixture_for_task5(&server, connection, "sk-gate-save-fail");
+    fixture
+        .engine
+        .set_request_gate(Box::new(SendStartedPersistenceFailureGate));
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    fixture.engine.start(start).expect("start");
+    let _ = fixture.engine.poll_events(&run);
+    fixture
+        .engine
+        .send_input(&run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut fixture.engine, &run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(
+        server.request_count(),
+        0,
+        "a send-started save failure must happen before HTTP"
+    );
+}
+
+#[test]
+fn a_stopped_or_expired_run_control_never_reaches_the_provider() {
+    let connection = ConnectionId::new();
+    let stopped_server = MockServer::start(move |_request| responses_text("must not be sent"));
+    let stopped_fixture = openai_fixture_for_task5(&stopped_server, connection, "sk-control-stop");
+    let stopped_control = RunControl::new();
+    stopped_control.request_stop(StopReason::UserRequest);
+    let (_, _, stopped_run, stopped_start) =
+        engine_start_with_control(&stopped_fixture, "stopped", stopped_control);
+    let mut engine = stopped_fixture.engine;
+    engine.start(stopped_start).expect("start");
+    let _ = engine.poll_events(&stopped_run);
+    engine
+        .send_input(&stopped_run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &stopped_run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(stopped_server.request_count(), 0);
+
+    let connection = ConnectionId::new();
+    let deadline_server = MockServer::start(move |_request| responses_text("must not be sent"));
+    let deadline_fixture =
+        openai_fixture_for_task5(&deadline_server, connection, "sk-control-deadline");
+    let deadline_control = RunControl::new();
+    deadline_control.set_deadline(Some(Instant::now() - Duration::from_millis(1)));
+    let (_, _, deadline_run, deadline_start) =
+        engine_start_with_control(&deadline_fixture, "expired", deadline_control);
+    let mut engine = deadline_fixture.engine;
+    engine.start(deadline_start).expect("start");
+    let _ = engine.poll_events(&deadline_run);
+    engine
+        .send_input(&deadline_run, EngineInput::Text("hello".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &deadline_run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(deadline_server.request_count(), 0);
+}
+
+#[test]
+fn a_tool_round_trip_captures_two_gated_requests_with_one_observation_each() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(vec![
+        responses_tool_call(
+            "call_gate_read",
+            "fc_gate_read",
+            "read",
+            json!({"path": "notes.txt"}),
+        ),
+        responses_text("finished after the gate"),
+    ]);
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let fixture = openai_fixture_for_task5(&server, connection, "sk-gate-round-trip");
+    std::fs::write(fixture.project.join("notes.txt"), "gate notes\n").expect("notes");
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let project_id = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("read notes".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    assert_eq!(text_of(&events), "finished after the gate");
+    assert_eq!(server.request_count(), 2);
+
+    let records = store
+        .lock()
+        .expect("store lock")
+        .model_requests_for_project(&project_id)
+        .expect("model request records");
+    assert_eq!(records.len(), 2, "each SDK request needs one intent");
+    assert_ne!(
+        records[0].intent().request_id(),
+        records[1].intent().request_id(),
+        "the request after a tool round trip needs a new host request ID"
+    );
+    assert_ne!(
+        records[0].intent().attempt_id(),
+        records[1].intent().attempt_id()
+    );
+    for record in &records {
+        assert_eq!(record.intent().connection(), connection);
+        assert_eq!(record.intent().purpose().as_str(), "agent_run");
+        assert_eq!(
+            record
+                .intent()
+                .subject()
+                .run()
+                .expect("run subject")
+                .run_id(),
+            run
+        );
+        let observation = record.observation().expect("terminal observation");
+        assert_eq!(observation.outcome(), RequestOutcome::Completed);
+        assert_eq!(observation.request_id(), record.intent().request_id());
+        assert_eq!(observation.attempt_id(), record.intent().attempt_id());
+    }
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.observation().is_some())
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn reported_usage_is_persisted_with_the_real_model_id() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| {
+        responses_text_with_usage("usage is known", 120, 30, 40, 5)
+    });
+    let fixture = openai_fixture_for_task5(&server, connection, "sk-usage-known");
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let project_id = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("measure usage".to_owned()))
+        .expect("input");
+    let _ = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+
+    let records = store
+        .lock()
+        .expect("store lock")
+        .model_requests_for_project(&project_id)
+        .expect("model request records");
+    assert_eq!(records.len(), 1);
+    let observation = records[0].observation().expect("observation");
+    assert_eq!(observation.outcome(), RequestOutcome::Completed);
+    assert_eq!(
+        observation.usage(),
+        TokenUsage::new(
+            TokenCount::Known(120),
+            TokenCount::Known(30),
+            TokenCount::Known(40),
+            TokenCount::Known(5)
+        )
+    );
+    assert_eq!(
+        observation.model_id().expect("model id").as_str(),
+        "gpt-test"
+    );
+}
+
+#[test]
+fn missing_usage_is_recorded_as_unknown_and_never_zero() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| responses_text("no usage reported"));
+    let fixture = openai_fixture_for_task5(&server, connection, "sk-usage-unknown");
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let project_id = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("finish without usage".to_owned()))
+        .expect("input");
+    let _ = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+
+    let records = store
+        .lock()
+        .expect("store lock")
+        .model_requests_for_project(&project_id)
+        .expect("model request records");
+    assert_eq!(records.len(), 1);
+    let observation = records[0].observation().expect("observation");
+    assert_eq!(observation.outcome(), RequestOutcome::Completed);
+    assert!(
+        observation.usage().is_unknown(),
+        "missing usage must stay unknown: {:?}",
+        observation.usage()
+    );
+    assert_eq!(observation.usage().input_tokens(), TokenCount::Unknown);
+    assert_eq!(observation.usage().output_tokens(), TokenCount::Unknown);
+    assert_ne!(observation.usage().input_tokens(), TokenCount::Known(0));
+}
+
+#[test]
+fn a_provider_failure_issues_exactly_one_request_and_one_attempt() {
+    let connection = ConnectionId::new();
+    let server = MockServer::start(move |_request| MockResponse::empty(500));
+    let fixture = openai_fixture_for_task5(&server, connection, "sk-no-hidden-retry");
+    let (_, _, run, start) = engine_start(&fixture, "You are a test agent.");
+    let store = Arc::clone(&fixture.store);
+    let project_id = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(
+            &run,
+            EngineInput::Text("trigger a provider error".to_owned()),
+        )
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    assert!(events.contains(&EngineEvent::StateChanged(RunState::Failed)));
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the SDK must not retry behind the host gate"
+    );
+    let records = store
+        .lock()
+        .expect("store lock")
+        .model_requests_for_project(&project_id)
+        .expect("model request records");
+    assert_eq!(records.len(), 1);
+    let observation = records[0].observation().expect("terminal observation");
+    assert_eq!(observation.outcome(), RequestOutcome::SendResultUnknown);
+    assert_eq!(
+        observation.failure(),
+        Some(herness_core::ProviderFailureKind::Unknown)
     );
 }

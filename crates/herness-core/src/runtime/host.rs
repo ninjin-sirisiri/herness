@@ -56,8 +56,8 @@ use crate::runtime::state::{
 };
 use crate::runtime::tools::{RunToolContext, RuntimeToolExecutor, ToolExecution};
 use crate::runtime::views::{
-    AgentView, ContinuationOutcome, DenialOutcome, PendingApproval, ProjectView, RecoveryMode,
-    RunView, RuntimeSnapshot, StopOutcome,
+    AgentView, ContinuationOutcome, DenialOutcome, PendingApproval, ProjectView, PumpReport,
+    RecoveryMode, RunView, RuntimeSnapshot, StopOutcome,
 };
 use crate::skills::{
     CapabilityStatus, HostCapabilities, HostCapability, ToolchainConfig, ToolchainDetector,
@@ -2045,6 +2045,64 @@ where
             committed.extend(self.handle_engine_event(project, run, event)?);
         }
         Ok(committed)
+    }
+
+    /// Drains every project's engine events and applies active-run deadlines.
+    ///
+    /// This is the host-owned monitoring path. It does not depend on a WebView,
+    /// on the selected project, or on an earlier `poll_run` call. An expired
+    /// deadline stops the run through the existing H1 cooperative stop path and
+    /// records the stop. Shutdown skips the pump entirely so quit work is not
+    /// delayed.
+    pub fn pump(&mut self) -> Result<PumpReport, RuntimeError> {
+        if self.shutting_down {
+            return Ok(PumpReport::skipped());
+        }
+        let projects: Vec<ProjectId> = self.state.projects().keys().copied().collect();
+        let mut report = PumpReport::default();
+        let mut first_failure: Option<RuntimeError> = None;
+        for project in projects {
+            report.note_project();
+            let runs: Vec<RunId> = match self.project_record(project) {
+                Ok(record) => record.runs.keys().copied().collect(),
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            for run in runs {
+                match self.poll_run(project, run) {
+                    Ok(committed) => report.note_run(committed.len()),
+                    Err(error) => {
+                        first_failure.get_or_insert(error);
+                        continue;
+                    }
+                }
+                let active = match self.run_record(project, run) {
+                    Ok(record) => record.state.is_active(),
+                    Err(error) => {
+                        first_failure.get_or_insert(error);
+                        continue;
+                    }
+                };
+                if !active {
+                    continue;
+                }
+                let control = self.run_controls.get(&run).cloned().unwrap_or_default();
+                if control.is_deadline_reached() && !control.is_stopped() {
+                    match self.stop_run(project, run, crate::ports::engine::StopReason::Policy) {
+                        Ok(_) => report.note_deadline_stop(run),
+                        Err(error) => {
+                            first_failure.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+        }
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(report),
+        }
     }
 
     fn handle_engine_event(

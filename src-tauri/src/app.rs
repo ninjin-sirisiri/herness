@@ -80,6 +80,10 @@ pub fn run(
                 reconciliation: Mutex::new(reconciliation),
             });
 
+            // Execution is host-owned: the pump drains every project's engine
+            // events and applies run deadlines even with no window and no
+            // non-selected project poll.
+            lifecycle::start_host_pump(app);
             lifecycle::create_main_window(app)?;
             if smoke_test {
                 lifecycle::start_smoke_test(app, started);

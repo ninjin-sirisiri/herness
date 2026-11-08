@@ -468,6 +468,24 @@ fn unimplemented_port_features_report_explicit_unsupported_errors() {
         }
     );
 
+    let mut store = FakeStore { last: None };
+    assert_eq!(
+        store
+            .record_model_request(intent.clone(), Timestamp::now())
+            .unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestGate
+        }
+    );
+    assert_eq!(
+        store
+            .record_model_request_observation(observation.clone(), Timestamp::now())
+            .unwrap_err(),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestObservation
+        }
+    );
+
     let continuation = ContinuationRequest::new(
         fixture.project,
         fixture.input(),

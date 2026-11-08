@@ -116,6 +116,38 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 `tests/runtime/tests/permissions.rs` はin-memoryで `BoundedPermissionEvaluator` のdeadline・stop・busy時の打切り、評価中のpolicy変更でallowがstaleになること、自動モードでもgrant上限が評価器より先に効くこと、明示deny/askがmodel指示で迂回されないことを確認する。
 
+## Task 5で追加したモデル要求gateとhost pump
+
+### 全モデル要求のgate
+
+- `PiEngine` は `ModelRequestGatePort` を注入できる。既定は同じstoreを使う `StoreModelRequestGate` で、SDKのtool往復後の次要求を含む各 `StreamFn` 呼出しが新しい `RequestId`/`AttemptId` を持つ `RequestGateIntent` を作る。
+- 送信前に adapter 自身も `RunControl` の停止・deadlineを確認し、次に gate の `admit` を呼ぶ。`Admit` 以外、gate error、intent保存失敗、停止、deadlineでは `pi_ai::stream` を呼ばない。`max_retries = 0` を維持し、隠れた再試行を追加しない。
+- intent保存後、credential解決前に `SendStarted` を保存する。`SendStarted` の保存に失敗した場合もHTTPを開始しない。
+- 終端では `Done` を `Completed`、停止・取消しを `Cancelled`、provider errorや途中終了を `SendResultUnknown` として保存する。実model IDはproviderが返した `response_model` を優先し、なければrequest modelを使う。
+- usageは `on_provider_stream_event` で生のprovider eventのusage fieldを観測し、providerが実際に報告したfieldだけ `Known` とする。未報告のfieldは `Unknown` で、0へ変換しない。`PreflightFailed` と `Cancelled`/`SendResultUnknown` はusageを主張しない。
+- request rowにはrequest/attempt ID、project、runまたはhost activity subject、connection、用途、停止・deadline snapshot、observationだけを保存する。SDK JSON、prompt、credential、provider bodyは保存・公開しない。
+
+### host所有のpump
+
+- `Runtime::pump` は全projectの全runのengine eventをdrainしてcommitし、active runのdeadlineを確認する。deadline到達時は既存の `Runtime::stop_run`（`StopReason::Policy`）でH1の協調停止を行い、`run.stopped` を記録する。rollbackや自動再試行はしない。
+- `shutting_down` 中のpumpは `PumpReport::is_skipped()` を返し、何もしない。quitの停止・猶予・保存経路は既存のまま。
+- `DesktopHost::pump` は同じruntimeを呼ぶ。`src-tauri` は `AppState` の単一hostを25ms間隔でpumpするhost-owned threadを起動し、windowや選択中projectに依存しない。新しいstore・engine・executorは作らない。
+- `poll_project` はsnapshotを返すだけで `poll_run` を呼ばない。`events` fieldは既存UI形のために残すが常に空で、committed eventは `history` から読む。
+
+### Task 5のテスト
+
+`tests/runtime/tests/engine.rs` は実Pi＋loopback modelで次を確認する。
+
+- gate拒否、`SendStarted` 保存失敗、停止済みcontrol、期限到達controlのいずれもprovider HTTP 0。
+- tool往復を含む2要求が別々のrequest/attempt IDで保存され、各attemptにterminal observationが1つだけある。
+- providerがusageを報告した場合はinput/output/cache read/writeの既知値とmodel IDが保存され、未報告のusageは `Unknown` のままで0にならない。
+- provider 500ではHTTP 1回・attempt 1件で、SDKの隠れた再試行がない。
+
+`tests/runtime/tests/desktop.rs` は実SQLite＋実Pi＋loopbackで次を確認する。
+
+- UI pollも `poll_run` も使わず、`DesktopHost::pump` だけでhidden runと非選択projectのrunが `run.text_completed` まで進み、再表示用snapshot/historyが最新sequenceを返す。
+- 長い単発要求のdeadline到達でpumpがrunを停止し、`run.stopped` を記録し、HTTP 1回のまま再試行しない。
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -146,6 +178,14 @@ Task 4の受入で実行するコマンド:
 ```sh
 cargo test -p herness-runtime-tests --test permissions --locked
 cargo test -p herness-runtime-tests --test engine --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 5の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-runtime-tests --test engine --locked
+cargo test -p herness-runtime-tests --test desktop --locked
 cargo check --workspace --all-targets --locked
 ```
 

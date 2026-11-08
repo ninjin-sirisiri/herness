@@ -14,14 +14,17 @@
 //!
 //! No pi type is re-exported from this crate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
 use herness_core::{
-    ArgumentViolation, AuthMethod, ConnectionDirectory, ConnectionId, ConnectionSettings,
-    CoreError, CredentialPort, Endpoint, Origin, Provider, ProviderFailureKind,
-    RedirectAuthDecision, redirect_auth_decision,
+    AgentId, ArgumentViolation, AttemptId, AuthMethod, ConnectionDirectory, ConnectionId,
+    ConnectionSettings, CoreError, CredentialPort, Endpoint, EventSubject, ModelId,
+    ModelRequestGatePort, ModelRequestObservation, Origin, ProjectId, Provider,
+    ProviderFailureKind, RedirectAuthDecision, RequestGateIntent, RequestGateOutcome, RequestId,
+    RequestOutcome, RequestPurpose, RunControl, RunId, RunSubject, SessionId, TokenCount,
+    TokenUsage, redirect_auth_decision,
 };
 use pi_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Context, Model,
@@ -29,6 +32,7 @@ use pi_ai::{
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, LOCATION};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{
     engine_invalid_response, engine_unavailable, provider_failure, provider_status_failure,
@@ -324,86 +328,491 @@ pub(crate) fn model_for(
     })
 }
 
+/// Injected pre-send gate shared by every stream invocation in this engine.
+pub(crate) type SharedRequestGate = Arc<Mutex<Box<dyn ModelRequestGatePort + Send>>>;
+
+/// Purpose label recorded for a normal supervised agent run request.
+const AGENT_RUN_PURPOSE: &str = "agent_run";
+
 /// Per-run provider bridge. The connection settings are frozen at run start;
 /// only the credential is resolved again for every request.
 pub(crate) struct StreamBridge {
+    project_id: ProjectId,
+    agent_id: AgentId,
+    session_id: SessionId,
+    run_id: RunId,
     connection: ConnectionId,
     chatgpt: bool,
     credentials: Arc<dyn CredentialPort + Send + Sync>,
+    control: RunControl,
+    gate: SharedRequestGate,
 }
 
 impl StreamBridge {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        project_id: ProjectId,
+        agent_id: AgentId,
+        session_id: SessionId,
+        run_id: RunId,
         connection: ConnectionId,
         settings: &ConnectionSettings,
         credentials: Arc<dyn CredentialPort + Send + Sync>,
+        control: RunControl,
+        gate: SharedRequestGate,
     ) -> Self {
         Self {
+            project_id,
+            agent_id,
+            session_id,
+            run_id,
             connection,
             chatgpt: settings.auth_method() == AuthMethod::ChatGptLogin,
             credentials,
+            control,
+            gate,
         }
     }
 
     pub(crate) fn stream_fn(self: Arc<Self>) -> HostStreamFn {
         Arc::new(
             move |model: &Model, context: &Context, options: StreamOptions| {
+                let request_id = RequestId::new(self.project_id);
+                let attempt_id = AttemptId::new(self.project_id);
+                let control = self.control.snapshot();
+                let subject = match RunSubject::new(
+                    self.project_id,
+                    self.agent_id,
+                    self.session_id,
+                    self.run_id,
+                ) {
+                    Ok(subject) => EventSubject::Run(subject),
+                    Err(_) => return failure_stream(model, "model request subject is unavailable"),
+                };
+                let purpose = match RequestPurpose::new(AGENT_RUN_PURPOSE) {
+                    Ok(purpose) => purpose,
+                    Err(_) => return failure_stream(model, "model request purpose is unavailable"),
+                };
+                let intent = match RequestGateIntent::new(
+                    request_id,
+                    attempt_id,
+                    self.connection,
+                    purpose,
+                    subject,
+                    control,
+                ) {
+                    Ok(intent) => intent,
+                    Err(_) => return failure_stream(model, "model request intent is invalid"),
+                };
+                if !control.permits_send() {
+                    return failure_stream(model, "model request stopped before send");
+                }
+                match admit_request(&self.gate, &intent) {
+                    Err(_) => {
+                        return failure_stream(
+                            model,
+                            "model request was not admitted by the host gate",
+                        );
+                    }
+                    Ok(RequestGateOutcome::Refuse { .. }) => {
+                        record_preflight_failure(
+                            &self.gate,
+                            request_id,
+                            attempt_id,
+                            ProviderFailureKind::Refused,
+                        );
+                        return failure_stream(model, "model request was refused by the host gate");
+                    }
+                    Ok(RequestGateOutcome::Admit) => {}
+                }
+
                 let secret = match self.credentials.resolve(&self.connection) {
                     Ok(credential) => credential.expose_secret().to_owned(),
-                    Err(error) => return credential_error_stream(model, &error),
+                    Err(error) => {
+                        record_preflight_failure(
+                            &self.gate,
+                            request_id,
+                            attempt_id,
+                            credential_failure_kind(&error),
+                        );
+                        return credential_error_stream(model, &error);
+                    }
                 };
+
+                // The intent is durable. Sending may start only after the
+                // send-started observation is durable too.
+                if !record_observation(
+                    &self.gate,
+                    ModelRequestObservation::new(
+                        request_id,
+                        attempt_id,
+                        RequestOutcome::SendStarted,
+                        None,
+                        None,
+                        TokenUsage::unknown(),
+                    ),
+                ) {
+                    return failure_stream(
+                        model,
+                        "model request observation could not be persisted",
+                    );
+                }
+                // A stop or deadline can arrive while the credential was being
+                // resolved. Re-check the shared control immediately before the
+                // provider call; no HTTP request may start after this point.
+                if !self.control.permits_side_effect() {
+                    let _ = record_observation(
+                        &self.gate,
+                        ModelRequestObservation::new(
+                            request_id,
+                            attempt_id,
+                            RequestOutcome::Cancelled,
+                            None,
+                            None,
+                            TokenUsage::unknown(),
+                        ),
+                    );
+                    return failure_stream(model, "model request stopped before send");
+                }
+
                 let mut options = options.clone();
                 options.api_key = Some(secret);
                 // A hidden provider retry could duplicate a request that the host
                 // already recorded. Retries are a host decision, not an SDK one.
                 options.max_retries = Some(0);
                 options.timeout_ms = Some(120_000);
-                let inner = pi_ai::stream(model, context, options);
-                if !self.chatgpt {
-                    return inner;
+
+                let usage = Arc::new(Mutex::new(UsageTracker::default()));
+                let prior_hook = options.on_provider_stream_event.take();
+                {
+                    let usage = Arc::clone(&usage);
+                    options.on_provider_stream_event =
+                        Some(Arc::new(move |event: &Value, model: &Model| {
+                            usage
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .observe(event);
+                            if let Some(hook) = &prior_hook {
+                                hook(event, model);
+                            }
+                        }));
                 }
+                let cancel = options.cancel.clone();
+                let inner = pi_ai::stream(model, context, options);
                 let (sender, output) = event_channel();
                 let model = model.clone();
+                let chatgpt = self.chatgpt;
+                let gate = Arc::clone(&self.gate);
+                let control = self.control.clone();
                 tokio::spawn(async move {
-                    let mut inner = inner;
-                    let mut terminal = false;
-                    while let Some(event) = inner.next().await {
-                        match event {
-                            AssistantMessageEvent::Done {
-                                reason: StopReason::Length,
-                                message,
-                            } => {
-                                let mut error = message;
-                                error.stop_reason = StopReason::Error;
-                                error.error_message =
-                                    Some("ChatGPT response was incomplete".to_owned());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error,
-                                });
-                                return;
-                            }
-                            AssistantMessageEvent::Done { .. }
-                            | AssistantMessageEvent::Error { .. } => {
-                                terminal = true;
-                                sender.push(event);
-                            }
-                            other => sender.push(other),
-                        }
-                    }
-                    if !terminal {
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Error,
-                            error: failed_message(
-                                &model,
-                                "provider stream ended without a completion event",
-                            ),
-                        });
-                    }
+                    drive_stream(
+                        inner, sender, model, chatgpt, gate, control, cancel, request_id,
+                        attempt_id, usage,
+                    )
+                    .await;
                 });
                 output
             },
         )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_stream(
+    mut inner: AssistantMessageEventStream,
+    sender: pi_ai::EventSender,
+    model: Model,
+    chatgpt: bool,
+    gate: SharedRequestGate,
+    control: RunControl,
+    cancel: CancellationToken,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    usage: Arc<Mutex<UsageTracker>>,
+) {
+    while let Some(event) = inner.next().await {
+        let event = if chatgpt {
+            match event {
+                AssistantMessageEvent::Done {
+                    reason: StopReason::Length,
+                    message,
+                } => {
+                    let mut error = message;
+                    error.stop_reason = StopReason::Error;
+                    error.error_message = Some("ChatGPT response was incomplete".to_owned());
+                    AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error,
+                    }
+                }
+                other => other,
+            }
+        } else {
+            event
+        };
+        match event {
+            AssistantMessageEvent::Done { reason, message } => {
+                let snapshot = control.snapshot();
+                let cancelled = cancel.is_cancelled()
+                    || !snapshot.permits_send()
+                    || matches!(message.stop_reason, StopReason::Aborted);
+                let failed = matches!(message.stop_reason, StopReason::Error);
+                let (outcome, failure) = if cancelled {
+                    (RequestOutcome::Cancelled, None)
+                } else if failed {
+                    (
+                        RequestOutcome::SendResultUnknown,
+                        Some(ProviderFailureKind::Unknown),
+                    )
+                } else {
+                    (RequestOutcome::Completed, None)
+                };
+                let observed_usage = if outcome == RequestOutcome::Completed {
+                    usage
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .usage(&message)
+                } else {
+                    TokenUsage::unknown()
+                };
+                let observation = ModelRequestObservation::new(
+                    request_id,
+                    attempt_id,
+                    outcome,
+                    failure,
+                    model_id(&message),
+                    observed_usage,
+                );
+                if !record_observation(&gate, observation) {
+                    sender.push(AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: failed_message(
+                            &model,
+                            "model request observation could not be persisted",
+                        ),
+                    });
+                    return;
+                }
+                sender.push(AssistantMessageEvent::Done { reason, message });
+                return;
+            }
+            AssistantMessageEvent::Error { reason, error } => {
+                let snapshot = control.snapshot();
+                let cancelled = matches!(error.stop_reason, StopReason::Aborted)
+                    || cancel.is_cancelled()
+                    || !snapshot.permits_send();
+                let (outcome, failure) = if cancelled {
+                    (RequestOutcome::Cancelled, None)
+                } else {
+                    (
+                        RequestOutcome::SendResultUnknown,
+                        Some(ProviderFailureKind::Unknown),
+                    )
+                };
+                let observation = ModelRequestObservation::new(
+                    request_id,
+                    attempt_id,
+                    outcome,
+                    failure,
+                    reported_model_id(&error),
+                    TokenUsage::unknown(),
+                );
+                if !record_observation(&gate, observation) {
+                    sender.push(AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: failed_message(
+                            &model,
+                            "model request observation could not be persisted",
+                        ),
+                    });
+                    return;
+                }
+                sender.push(AssistantMessageEvent::Error { reason, error });
+                return;
+            }
+            other => sender.push(other),
+        }
+    }
+    let _ = record_observation(
+        &gate,
+        ModelRequestObservation::new(
+            request_id,
+            attempt_id,
+            RequestOutcome::SendResultUnknown,
+            Some(ProviderFailureKind::Unknown),
+            None,
+            TokenUsage::unknown(),
+        ),
+    );
+    sender.push(AssistantMessageEvent::Error {
+        reason: StopReason::Error,
+        error: failed_message(&model, "provider stream ended without a completion event"),
+    });
+}
+
+fn admit_request(
+    gate: &SharedRequestGate,
+    intent: &RequestGateIntent,
+) -> Result<RequestGateOutcome, CoreError> {
+    gate.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit(intent)
+}
+
+fn record_observation(
+    gate: &SharedRequestGate,
+    observation: Result<ModelRequestObservation, CoreError>,
+) -> bool {
+    let Ok(observation) = observation else {
+        return false;
+    };
+    gate.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .observe(&observation)
+        .is_ok()
+}
+
+fn record_preflight_failure(
+    gate: &SharedRequestGate,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    failure: ProviderFailureKind,
+) {
+    // A refusal may happen before the intent is durable. The observation then
+    // fails explicitly; it must never turn into a fabricated send or usage.
+    let _ = record_observation(
+        gate,
+        ModelRequestObservation::new(
+            request_id,
+            attempt_id,
+            RequestOutcome::PreflightFailed,
+            Some(failure),
+            None,
+            TokenUsage::unknown(),
+        ),
+    );
+}
+
+fn credential_failure_kind(error: &CoreError) -> ProviderFailureKind {
+    match error {
+        CoreError::AuthenticationRequired { .. } | CoreError::CredentialUnavailable { .. } => {
+            ProviderFailureKind::Authentication
+        }
+        _ => ProviderFailureKind::Unknown,
+    }
+}
+
+fn model_id(message: &AssistantMessage) -> Option<ModelId> {
+    message
+        .response_model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!message.model.trim().is_empty()).then_some(message.model.as_str()))
+        .and_then(|value| ModelId::new(value).ok())
+}
+
+fn reported_model_id(message: &AssistantMessage) -> Option<ModelId> {
+    message
+        .response_model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| ModelId::new(value).ok())
+}
+
+/// Usage fields actually reported by the provider stream.
+///
+/// `pi_ai::Usage` uses plain `u64` values, so a missing field is
+/// indistinguishable from a reported zero in the terminal message. This tracker
+/// observes the raw provider events before normalization and remembers which
+/// fields were present.
+#[derive(Debug, Default)]
+struct UsageTracker {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+}
+
+impl UsageTracker {
+    fn observe(&mut self, event: &Value) {
+        self.visit(event);
+    }
+
+    fn visit(&mut self, value: &Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(usage) = map.get("usage").filter(|value| value.is_object()) {
+                    self.apply(usage);
+                }
+                for child in map.values() {
+                    self.visit(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.visit(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply(&mut self, usage: &Value) {
+        if let Some(value) = first_u64(usage, &["/input_tokens", "/prompt_tokens"]) {
+            self.input = Some(value);
+        }
+        if let Some(value) = first_u64(usage, &["/output_tokens", "/completion_tokens"]) {
+            self.output = Some(value);
+        }
+        if let Some(value) = first_u64(
+            usage,
+            &[
+                "/cache_read_input_tokens",
+                "/input_tokens_details/cached_tokens",
+                "/prompt_tokens_details/cached_tokens",
+                "/cached_tokens",
+                "/prompt_cache_hit_tokens",
+            ],
+        ) {
+            self.cache_read = Some(value);
+        }
+        if let Some(value) = first_u64(
+            usage,
+            &[
+                "/cache_creation_input_tokens",
+                "/input_tokens_details/cache_write_tokens",
+                "/prompt_tokens_details/cache_write_tokens",
+                "/cache_write_tokens",
+            ],
+        ) {
+            self.cache_write = Some(value);
+        }
+    }
+
+    fn usage(&self, message: &AssistantMessage) -> TokenUsage {
+        TokenUsage::new(
+            reported_count(self.input, message.usage.input),
+            reported_count(self.output, message.usage.output),
+            reported_count(self.cache_read, message.usage.cache_read),
+            reported_count(self.cache_write, message.usage.cache_write),
+        )
+    }
+}
+
+fn first_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
+}
+
+fn reported_count(tracked: Option<u64>, reported: u64) -> TokenCount {
+    match tracked {
+        Some(_) => TokenCount::Known(reported),
+        // A non-zero value must have come from the provider even if this
+        // tracker did not recognize the event shape. Zero stays unknown because
+        // it may be the SDK's default rather than a reported count.
+        None if reported > 0 => TokenCount::Known(reported),
+        None => TokenCount::Unknown,
     }
 }
 
@@ -413,6 +822,10 @@ fn credential_error_stream(model: &Model, error: &CoreError) -> AssistantMessage
         CoreError::CredentialUnavailable { .. } => "provider credential unavailable",
         _ => "provider credential could not be resolved",
     };
+    pi_ai::error_stream(model, StopReason::Error, message)
+}
+
+fn failure_stream(model: &Model, message: &str) -> AssistantMessageEventStream {
     pi_ai::error_stream(model, StopReason::Error, message)
 }
 

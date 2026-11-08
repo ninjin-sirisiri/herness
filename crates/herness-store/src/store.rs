@@ -627,6 +627,28 @@ impl Store {
         Ok(records)
     }
 
+    /// Loads every recorded request attempt for one project in stable order.
+    ///
+    /// This is a read-only recovery and audit query. It never sends a request
+    /// and returns only host-owned request metadata plus observations.
+    pub fn model_requests_for_project(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<ModelRequestRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM model_requests
+             WHERE project_id = ?1
+             ORDER BY recorded_at ASC, attempt_id ASC"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query([project.to_string()])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(model_request_record_from_row(row)?);
+        }
+        Ok(records)
+    }
+
     /// Persists one request intent before any bytes may be sent.
     ///
     /// Repeating an identical attempt is idempotent and returns the stored
@@ -978,6 +1000,26 @@ impl StorePort for Store {
         events: Vec<EventDraft>,
     ) -> Result<CommitReceipt, CoreError> {
         Store::record_operation_result_with_events(self, operation, result, events)
+            .map_err(Into::into)
+    }
+
+    fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        Store::record_model_request(self, intent, recorded_at)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    fn record_model_request_observation(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        Store::record_model_request_observation(self, observation, observed_at)
+            .map(|_| ())
             .map_err(Into::into)
     }
 }

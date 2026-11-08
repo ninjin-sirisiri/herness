@@ -653,3 +653,69 @@ impl DenialOutcome {
         &self.run
     }
 }
+
+/// Result of one host-owned pump iteration.
+///
+/// The pump drains every project's committed engine events and applies run
+/// deadlines without consulting the UI. A skipped pump means an explicit
+/// shutdown was already in progress; it performed no work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PumpReport {
+    skipped: bool,
+    projects: usize,
+    runs: usize,
+    events: usize,
+    deadline_stops: Vec<RunId>,
+}
+
+impl PumpReport {
+    /// A pump that did no work because shutdown had begun.
+    pub(crate) const fn skipped() -> Self {
+        Self {
+            skipped: true,
+            projects: 0,
+            runs: 0,
+            events: 0,
+            deadline_stops: Vec::new(),
+        }
+    }
+
+    /// Whether the pump skipped work because shutdown had begun.
+    pub const fn is_skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// Number of projects considered.
+    pub const fn projects(&self) -> usize {
+        self.projects
+    }
+
+    /// Number of runs polled.
+    pub const fn runs(&self) -> usize {
+        self.runs
+    }
+
+    /// Number of newly committed events.
+    pub const fn events(&self) -> usize {
+        self.events
+    }
+
+    /// Runs stopped because their deadline was reached.
+    pub fn deadline_stops(&self) -> &[RunId] {
+        &self.deadline_stops
+    }
+
+    pub(crate) fn note_project(&mut self) {
+        self.projects += 1;
+    }
+
+    pub(crate) fn note_run(&mut self, events: usize) {
+        self.runs += 1;
+        self.events += events;
+    }
+
+    pub(crate) fn note_deadline_stop(&mut self, run: RunId) {
+        self.deadline_stops.push(run);
+    }
+}

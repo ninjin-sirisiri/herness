@@ -15,14 +15,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use herness_core::runtime::StoreModelRequestGate;
 use herness_core::{
     AbsolutePath, AuthMethod, BashExecutor, BoundedPermissionEvaluator, ConnectionDirectory,
     ConnectionId, ConversationFailure, CoreError, CredentialPort, EngineEvent, EngineInput,
     EnginePort, EngineStart, EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput,
-    FrozenOperation, NativeFileTools, OperationId, PermissionOutcome, PermissionPolicy,
-    ProcessSupervisor, ProjectRoot, Provider, ProviderFailureKind, RunId, RunPermissionContext,
-    RunState, ShellFailure, StopReason, StopReport, StorePort, SystemLauncher, ToolArguments,
-    ToolExecutor, ToolGateway, ToolName,
+    FrozenOperation, ModelRequestGatePort, NativeFileTools, OperationId, PermissionOutcome,
+    PermissionPolicy, ProcessSupervisor, ProjectRoot, Provider, ProviderFailureKind, RunId,
+    RunPermissionContext, RunState, ShellFailure, StopReason, StopReport, StorePort,
+    SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
 };
 use pi_embedded::SessionStatus;
 use pi_embedded::{
@@ -41,7 +42,9 @@ use crate::session_store::{
     ENGINE_TOOL_AWAITING_EVENT_KIND, ENGINE_TOOL_DENIED_EVENT_KIND, EngineCheckpoint,
     EngineSessionStore, EngineStore, RunAuditMetadata,
 };
-use crate::stream::{ChatGptCatalog, ChatGptModel, ProviderEndpoints, StreamBridge, model_for};
+use crate::stream::{
+    ChatGptCatalog, ChatGptModel, ProviderEndpoints, SharedRequestGate, StreamBridge, model_for,
+};
 
 /// How a run's SDK session is opened.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,6 +110,8 @@ pub struct PiEngine<S: StorePort + Send + 'static> {
     policy: Arc<RwLock<PermissionPolicy>>,
     file_locks: Arc<FileLockRegistry>,
     catalog: Arc<ChatGptCatalog>,
+    /// Injected pre-send gate shared with every run's stream bridge.
+    request_gate: SharedRequestGate,
     runs: HashMap<RunId, Arc<RunContext<S>>>,
     /// Permission contexts installed before a resume rebuilds a run.
     pending_permissions: HashMap<RunId, RunPermissionContext>,
@@ -132,6 +137,9 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             .build()
             .map_err(|_| engine_unavailable())?;
         let policy = Arc::new(RwLock::new(config.policy.clone()));
+        let request_gate: SharedRequestGate = Arc::new(Mutex::new(Box::new(
+            StoreModelRequestGate::new(Arc::clone(&store)),
+        )));
         Ok(Self {
             runtime,
             store,
@@ -141,9 +149,19 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             policy,
             file_locks: Arc::new(FileLockRegistry::new()),
             catalog,
+            request_gate,
             runs: HashMap::new(),
             pending_permissions: HashMap::new(),
         })
+    }
+
+    /// Replaces the default store-backed model-request gate.
+    ///
+    /// The desktop composition uses the default. Tests and later H2 policy
+    /// layers can inject a gate that adds consent or budget checks. Call this
+    /// before starting runs; existing run bridges keep the gate they captured.
+    pub fn set_request_gate(&mut self, gate: Box<dyn ModelRequestGatePort + Send>) {
+        self.request_gate = Arc::new(Mutex::new(gate));
     }
 
     /// Replaces the adapter's legacy policy snapshot.
@@ -263,6 +281,10 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             supervisor.clone(),
         )?;
         let gateway = ToolGateway::new(HostExecutors { files, shell });
+        let control = permission
+            .as_ref()
+            .map(|context| context.control().clone())
+            .unwrap_or_default();
         let tools = Arc::new(ToolRuntime {
             run_id: start.run_id(),
             cwd: start.cwd().clone(),
@@ -275,9 +297,15 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             supervisor,
         });
         let stream = Arc::new(StreamBridge::new(
+            start.project_id(),
+            start.agent_id(),
+            start.session_id(),
+            start.run_id(),
             start.connection(),
             &settings,
             Arc::clone(&self.credentials),
+            control,
+            Arc::clone(&self.request_gate),
         ));
         let session_store = Arc::new(EngineSessionStore::new(store.clone(), queue.clone()));
         let host = EmbeddedHost {
