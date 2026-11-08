@@ -17,10 +17,12 @@ pub mod consent;
 pub mod contract;
 pub mod error;
 pub mod evidence;
+pub mod freshness;
 pub mod ids;
 pub mod ports;
 pub mod profiles;
 pub mod state;
+pub mod verification;
 pub mod version;
 
 pub use approval::{ApprovalActor, ApprovalBasis, ConditionApproval, OwnerApprovalSource};
@@ -54,6 +56,12 @@ pub use evidence::{
     EvidenceRecord, EvidenceScope, RequiredCheckResult, TargetScope, TargetVersion,
     VerificationOperation, fingerprint_bytes,
 };
+pub use freshness::{
+    CompletionFreshness, EvidenceApplicability, EvidenceFreshness, FreshnessReport,
+    FreshnessService, InputOrigin, ManifestCoverage, ManifestDiff, ManifestEntry,
+    StaleCompletionReport, TargetManifest, TargetReadSet, WorkspaceInput, WorkspaceSnapshotPort,
+    capture_manifest,
+};
 pub use ids::{
     CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId, RunGroupId, SupervisionId,
     SupervisionKeyKind, SupervisionRequestId, SupervisionScopedId,
@@ -70,7 +78,12 @@ pub use profiles::{
 };
 pub use state::{
     AppliedDecision, AssessmentApplication, CancelCause, CompletionBlocker, CompletionSnapshot,
-    DecisionInvalidation, HumanAction, InvalidatedDecision, StopCause, SupervisionFailure,
-    SupervisionReason, SupervisionRecord, SupervisionState,
+    DecisionInvalidation, HumanAction, InvalidatedDecision, StaleCompletion, StopCause,
+    SupervisionFailure, SupervisionReason, SupervisionRecord, SupervisionState,
+};
+pub use verification::{
+    GatewayVerification, VerificationBoundary, VerificationBoundaryOutcome,
+    VerificationDisposition, VerificationExecution, VerificationPlan, VerificationService,
+    validate_evidence_record,
 };
 pub use version::{SUPERVISION_CONTRACT_VERSION, current_contract_version, ensure_current_version};

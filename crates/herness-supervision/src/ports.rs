@@ -88,6 +88,26 @@ pub trait SupervisionStorePort {
         &mut self,
         result: &CommandResult,
     ) -> Result<CommandResult, SupervisionError>;
+
+    /// Atomically compares the revision, writes the next record, and binds the
+    /// command result.
+    ///
+    /// The default performs the existing two port calls in order. Durable
+    /// stores should override it with one transaction so a crash cannot keep a
+    /// new state revision without its recorded result.
+    fn commit_command(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &SupervisionRecord,
+        result: &CommandResult,
+    ) -> Result<u64, SupervisionError> {
+        let revision =
+            self.compare_and_swap(project_id, supervision_id, expected_revision, next)?;
+        self.record_command_result(result)?;
+        Ok(revision)
+    }
 }
 
 /// Capability labels that later tasks may need to report as explicitly absent.

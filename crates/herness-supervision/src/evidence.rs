@@ -135,6 +135,8 @@ pub struct TargetScope {
     version: TargetVersion,
     read_set: Vec<String>,
     fingerprints: Vec<ContentFingerprint>,
+    #[serde(default)]
+    head: Option<String>,
 }
 
 impl TargetScope {
@@ -144,6 +146,20 @@ impl TargetScope {
         version: TargetVersion,
         read_set: Vec<String>,
         fingerprints: Vec<ContentFingerprint>,
+    ) -> Result<Self, SupervisionError> {
+        Self::new_with_head(project_id, version, read_set, fingerprints, None)
+    }
+
+    /// Creates a bounded target snapshot that also records the observed HEAD.
+    ///
+    /// HEAD is descriptive; applicability is decided from the content
+    /// fingerprints, never from HEAD or a sequence alone.
+    pub fn new_with_head(
+        project_id: ProjectId,
+        version: TargetVersion,
+        read_set: Vec<String>,
+        fingerprints: Vec<ContentFingerprint>,
+        head: Option<String>,
     ) -> Result<Self, SupervisionError> {
         if read_set.is_empty() {
             return Err(SupervisionError::EvidenceContractViolation {
@@ -171,11 +187,26 @@ impl TargetScope {
                 detail: "at least one content fingerprint is required".to_owned(),
             });
         }
+        let head = match head {
+            Some(head) => {
+                let trimmed = head.trim();
+                if trimmed.is_empty() || trimmed.chars().count() > 256 {
+                    return Err(SupervisionError::EvidenceContractViolation {
+                        field: "target.head".to_owned(),
+                        detail: "a recorded HEAD must be non-empty and at most 256 characters"
+                            .to_owned(),
+                    });
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
+        };
         Ok(Self {
             project_id,
             version,
             read_set,
             fingerprints,
+            head,
         })
     }
 
@@ -197,6 +228,11 @@ impl TargetScope {
     /// Content fingerprints observed for the target.
     pub fn fingerprints(&self) -> &[ContentFingerprint] {
         &self.fingerprints
+    }
+
+    /// HEAD observed at capture time, when the project had one.
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
     }
 
     /// Ensures the target belongs to `project`.
@@ -421,6 +457,8 @@ pub struct EvidenceRecord {
     status: CheckStatus,
     sequence: u64,
     observed_at: Timestamp,
+    #[serde(default)]
+    observer: Option<String>,
 }
 
 impl EvidenceRecord {
@@ -477,7 +515,15 @@ impl EvidenceRecord {
             status,
             sequence,
             observed_at,
+            observer: None,
         })
+    }
+
+    /// Records the human observer for human-observation evidence.
+    #[must_use]
+    pub fn with_observer(mut self, observer: impl AsRef<str>) -> Self {
+        self.observer = Some(observer.as_ref().trim().to_owned());
+        self
     }
 
     /// Contract version written by this build.
@@ -548,6 +594,11 @@ impl EvidenceRecord {
     /// When the observation was made.
     pub const fn observed_at(&self) -> Timestamp {
         self.observed_at
+    }
+
+    /// Named human observer, when the acquirer is a human.
+    pub fn observer(&self) -> Option<&str> {
+        self.observer.as_deref()
     }
 
     /// Whether this evidence was acquired against the current target version.

@@ -97,6 +97,11 @@ pub enum SupervisionError {
         /// Command supplied by the caller.
         supplied: String,
     },
+    /// A different command result is already recorded for the request ID.
+    DuplicateResultConflict {
+        /// Request identifier.
+        request: String,
+    },
     /// The selected assessment profile cannot be used.
     ProfileUnavailable {
         /// Structured reason.
@@ -144,6 +149,11 @@ pub enum SupervisionError {
     Unsupported {
         /// Capability label.
         feature: String,
+    },
+    /// Durable storage could not complete the operation.
+    StorageFailure {
+        /// Sanitized description; never contains stored content.
+        detail: String,
     },
 }
 
@@ -234,6 +244,12 @@ impl fmt::Display for SupervisionError {
                 f,
                 "request {request} was already used for {recorded}, not {supplied}"
             ),
+            Self::DuplicateResultConflict { request } => {
+                write!(
+                    f,
+                    "request {request} already has a different recorded result"
+                )
+            }
             Self::ProfileUnavailable { reason } => {
                 write!(f, "assessment profile unavailable: {reason:?}")
             }
@@ -260,6 +276,9 @@ impl fmt::Display for SupervisionError {
                     f,
                     "supervision feature {feature} is not implemented by this build"
                 )
+            }
+            Self::StorageFailure { detail } => {
+                write!(f, "supervision storage failed: {detail}")
             }
         }
     }

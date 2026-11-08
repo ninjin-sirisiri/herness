@@ -347,6 +347,72 @@ impl CompletionSnapshot {
     }
 }
 
+/// A related input change observed after completion.
+///
+/// The completed state and its recorded snapshot are retained. This value only
+/// marks that the snapshot no longer applies to the current project inputs. It
+/// never starts a new run, resumes supervision, or reverses the completion
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleCompletion {
+    previous_target_version: TargetVersion,
+    current_target_version: TargetVersion,
+    changed_paths: Vec<String>,
+    affected_evidence: Vec<EvidenceId>,
+    observed_at: Timestamp,
+}
+
+impl StaleCompletion {
+    /// Creates a stale-snapshot marker for related input changes.
+    pub fn new(
+        previous_target_version: TargetVersion,
+        current_target_version: TargetVersion,
+        changed_paths: Vec<String>,
+        affected_evidence: Vec<EvidenceId>,
+        observed_at: Timestamp,
+    ) -> Result<Self, SupervisionError> {
+        if changed_paths.is_empty() {
+            return Err(SupervisionError::EvidenceContractViolation {
+                field: "staleCompletion.changedPaths".to_owned(),
+                detail: "a stale snapshot requires at least one changed input".to_owned(),
+            });
+        }
+        Ok(Self {
+            previous_target_version,
+            current_target_version,
+            changed_paths,
+            affected_evidence,
+            observed_at,
+        })
+    }
+
+    /// Target version the completion snapshot covered.
+    pub const fn previous_target_version(&self) -> TargetVersion {
+        self.previous_target_version
+    }
+
+    /// Target version observed now.
+    pub const fn current_target_version(&self) -> TargetVersion {
+        self.current_target_version
+    }
+
+    /// Changed input paths that no longer match the snapshot.
+    pub fn changed_paths(&self) -> &[String] {
+        &self.changed_paths
+    }
+
+    /// Evidence whose applicability was lost.
+    pub fn affected_evidence(&self) -> &[EvidenceId] {
+        &self.affected_evidence
+    }
+
+    /// When the change was observed.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+}
+
 /// A higher-priority condition that blocks completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -512,6 +578,8 @@ pub struct SupervisionRecord {
     applied_decisions: Vec<AppliedDecision>,
     invalidated_decisions: Vec<InvalidatedDecision>,
     completion: Option<CompletionSnapshot>,
+    #[serde(default)]
+    completion_stale: Option<StaleCompletion>,
 }
 
 impl SupervisionRecord {
@@ -542,6 +610,7 @@ impl SupervisionRecord {
             applied_decisions: Vec::new(),
             invalidated_decisions: Vec::new(),
             completion: None,
+            completion_stale: None,
         }
     }
 
@@ -625,6 +694,27 @@ impl SupervisionRecord {
         self.completion.as_ref()
     }
 
+    /// Related input change observed after completion, if any.
+    pub fn completion_stale(&self) -> Option<&StaleCompletion> {
+        self.completion_stale.as_ref()
+    }
+
+    /// Marks the completion snapshot stale without changing the completed state
+    /// or starting/resuming anything.
+    pub fn mark_completion_stale(
+        &mut self,
+        stale: StaleCompletion,
+    ) -> Result<(), SupervisionError> {
+        if self.state != SupervisionState::Completed || self.completion.is_none() {
+            return Err(SupervisionError::InvalidStateReason {
+                state: self.state,
+                reason: "stale_completion".to_owned(),
+            });
+        }
+        self.completion_stale = Some(stale);
+        Ok(())
+    }
+
     /// Sets the state and a reason that describes that state.
     pub fn set_state(
         &mut self,
@@ -641,6 +731,7 @@ impl SupervisionRecord {
         self.reason = reason;
         if state != SupervisionState::Completed {
             self.completion = None;
+            self.completion_stale = None;
         }
         Ok(())
     }
@@ -997,6 +1088,7 @@ impl SupervisionRecord {
             snapshot: snapshot.clone(),
         };
         self.completion = Some(snapshot);
+        self.completion_stale = None;
         Ok(())
     }
 

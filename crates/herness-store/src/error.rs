@@ -134,6 +134,16 @@ pub enum StoreError {
     },
     /// A supervised-state key was empty.
     InvalidStateKey,
+    /// A different evidence value is already stored for the same ID.
+    EvidenceRecordConflict {
+        /// Evidence identifier whose stored value differs.
+        evidence: String,
+    },
+    /// A different command result is already stored for the same request ID.
+    CommandResultConflict {
+        /// Request identifier whose stored result differs.
+        request: String,
+    },
     /// Stored data failed an integrity check.
     CorruptData {
         /// Sanitized description of the failed check.
@@ -241,6 +251,18 @@ impl fmt::Display for StoreError {
                 "supervised state {key:?} revision is stale: expected {expected:?}, found {found:?}"
             ),
             Self::InvalidStateKey => f.write_str("supervised state key must not be empty"),
+            Self::EvidenceRecordConflict { evidence } => {
+                write!(
+                    f,
+                    "evidence {evidence} is already recorded with another value"
+                )
+            }
+            Self::CommandResultConflict { request } => {
+                write!(
+                    f,
+                    "request {request} is already recorded with another result"
+                )
+            }
             Self::CrossProjectReference { expected, found } => write!(
                 f,
                 "history cursor belongs to project {found}, not the expected project {expected}"
@@ -265,6 +287,43 @@ impl std::error::Error for StoreError {}
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::database(error)
+    }
+}
+
+impl From<StoreError> for herness_supervision::SupervisionError {
+    fn from(error: StoreError) -> Self {
+        use herness_supervision::SupervisionError;
+
+        match error {
+            StoreError::CrossProjectReference { expected, found } => {
+                SupervisionError::CrossProjectReference {
+                    id_kind: "project".to_owned(),
+                    expected,
+                    found,
+                }
+            }
+            StoreError::StaleRevision {
+                expected, found, ..
+            } => match (expected, found) {
+                (Some(expected), Some(found)) => {
+                    SupervisionError::RevisionConflict { expected, found }
+                }
+                (_, None) => SupervisionError::UnknownSupervision,
+                (None, Some(found)) => SupervisionError::RevisionConflict { expected: 0, found },
+            },
+            StoreError::EvidenceRecordConflict { evidence } => {
+                SupervisionError::EvidenceContractViolation {
+                    field: "evidence.id".to_owned(),
+                    detail: format!("a different evidence record is already stored for {evidence}"),
+                }
+            }
+            StoreError::CommandResultConflict { request } => {
+                SupervisionError::DuplicateResultConflict { request }
+            }
+            other => SupervisionError::StorageFailure {
+                detail: other.to_string(),
+            },
+        }
     }
 }
 
@@ -299,7 +358,9 @@ impl From<StoreError> for CoreError {
             StoreError::OperationResultConflict { .. }
             | StoreError::RequestIntentConflict { .. }
             | StoreError::RequestObservationConflict { .. }
-            | StoreError::StaleRevision { .. } => CoreError::StoreUnavailable {
+            | StoreError::StaleRevision { .. }
+            | StoreError::EvidenceRecordConflict { .. }
+            | StoreError::CommandResultConflict { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }

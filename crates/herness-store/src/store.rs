@@ -22,6 +22,10 @@ use herness_core::{
     RequestPurpose, RunId, RunSubject, RuntimeStore, StopDeadlineControl, StorePort, Timestamp,
     ToolArguments, ToolName,
 };
+use herness_supervision::{
+    CommandResult, EvidenceId, EvidenceRecord, EvidenceStorePort, SupervisionError, SupervisionId,
+    SupervisionRecord, SupervisionRequestId, SupervisionStorePort,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::config::StoreConfig;
@@ -882,6 +886,204 @@ impl Store {
         ))
     }
 
+    /// Appends one validated evidence record.
+    ///
+    /// The ID is the idempotency key. Re-appending the identical value returns
+    /// the stored record without another write; a different value conflicts.
+    pub fn append_evidence(
+        &mut self,
+        evidence: &EvidenceRecord,
+    ) -> Result<EvidenceRecord, StoreError> {
+        let project = evidence.project_id();
+        if evidence.id().project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: evidence.id().project_id(),
+            });
+        }
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        if let Some(existing) = load_evidence_record(&transaction, project, evidence.id())? {
+            if existing == *evidence {
+                return Ok(existing);
+            }
+            return Err(StoreError::EvidenceRecordConflict {
+                evidence: evidence.id().to_string(),
+            });
+        }
+        let payload = serde_json::to_vec(evidence).map_err(StoreError::codec)?;
+        let changed = transaction.execute(
+            "INSERT INTO evidence_records
+                 (project_id, supervision_id, evidence_id, sequence, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project.to_string(),
+                evidence.supervision_id().to_string(),
+                evidence.id().to_string(),
+                sequence_to_sql(evidence.sequence())?,
+                payload,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::corrupt("evidence insert wrote no row"));
+        }
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(evidence.clone())
+    }
+
+    /// Reads one evidence record.
+    pub fn evidence_record(
+        &self,
+        project: ProjectId,
+        evidence_id: EvidenceId,
+    ) -> Result<Option<EvidenceRecord>, StoreError> {
+        if evidence_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: evidence_id.project_id(),
+            });
+        }
+        load_evidence_record(&self.conn, project, evidence_id)
+    }
+
+    /// Lists evidence for one supervision target in acquisition order.
+    pub fn evidence_for_supervision(
+        &self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Vec<EvidenceRecord>, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT evidence_id, payload FROM evidence_records
+             WHERE project_id = ?1 AND supervision_id = ?2
+             ORDER BY sequence ASC, evidence_id ASC",
+        )?;
+        let mut rows = statement.query(params![project.to_string(), supervision_id.to_string()])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            let evidence_id: String = row.get(0)?;
+            let payload: Vec<u8> = row.get(1)?;
+            let record = decode_evidence(&payload, project)?;
+            if record.id().to_string() != evidence_id || record.supervision_id() != supervision_id {
+                return Err(StoreError::corrupt(
+                    "evidence row does not match its recorded identifiers",
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Loads one supervision record.
+    pub fn load_supervision_record(
+        &self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<SupervisionRecord>, StoreError> {
+        if supervision_id.project_id() != project {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: supervision_id.project_id(),
+            });
+        }
+        load_supervision_record(&self.conn, project, supervision_id)
+    }
+
+    /// Creates or updates one supervision record with revision compare-and-set.
+    pub fn compare_and_swap_supervision(
+        &mut self,
+        project: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &SupervisionRecord,
+    ) -> Result<u64, StoreError> {
+        if next.project_id() != project || next.supervision_id() != supervision_id {
+            return Err(StoreError::CrossProjectReference {
+                expected: project,
+                found: next.project_id(),
+            });
+        }
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        let current = load_supervision_revision(&transaction, project, supervision_id)?;
+        check_revision(supervision_id, expected_revision, current)?;
+        let revision = next.revision();
+        if revision == 0 || current.is_some_and(|found| revision <= found) {
+            return Err(StoreError::corrupt(
+                "supervision revision must increase and stay positive",
+            ));
+        }
+        write_supervision_record(&transaction, next)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(revision)
+    }
+
+    /// Reads one recorded command result.
+    pub fn supervision_command_result(
+        &self,
+        request_id: SupervisionRequestId,
+    ) -> Result<Option<CommandResult>, StoreError> {
+        load_command_result(&self.conn, request_id)
+    }
+
+    /// Records one command result exactly once.
+    pub fn record_supervision_command_result(
+        &mut self,
+        result: &CommandResult,
+    ) -> Result<CommandResult, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        if let Some(existing) = load_command_result(&transaction, result.request_id())? {
+            if existing == *result {
+                return Ok(existing);
+            }
+            return Err(StoreError::CommandResultConflict {
+                request: result.request_id().to_string(),
+            });
+        }
+        write_command_result(&transaction, result)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(result.clone())
+    }
+
     fn history_page(&self, query: HistoryQuery) -> Result<HistoryPage, StoreError> {
         if let Some(cursor) = query.cursor()
             && cursor.project_id() != query.project_id()
@@ -1078,6 +1280,143 @@ impl RuntimeStore for Store {
         Store::record_operation_result_with_state(self, operation, result, events, key, value)
             .map_err(Into::into)
     }
+}
+
+impl EvidenceStorePort for Store {
+    fn append(&mut self, evidence: EvidenceRecord) -> Result<EvidenceRecord, SupervisionError> {
+        Store::append_evidence(self, &evidence).map_err(Into::into)
+    }
+
+    fn get(
+        &self,
+        project_id: ProjectId,
+        evidence_id: EvidenceId,
+    ) -> Result<Option<EvidenceRecord>, SupervisionError> {
+        Store::evidence_record(self, project_id, evidence_id).map_err(Into::into)
+    }
+
+    fn list_for_supervision(
+        &self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Vec<EvidenceRecord>, SupervisionError> {
+        Store::evidence_for_supervision(self, project_id, supervision_id).map_err(Into::into)
+    }
+}
+
+impl SupervisionStorePort for Store {
+    fn load(
+        &self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+    ) -> Result<Option<SupervisionRecord>, SupervisionError> {
+        Store::load_supervision_record(self, project_id, supervision_id).map_err(Into::into)
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &SupervisionRecord,
+    ) -> Result<u64, SupervisionError> {
+        Store::compare_and_swap_supervision(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+        )
+        .map_err(Into::into)
+    }
+
+    fn command_result(
+        &self,
+        request_id: SupervisionRequestId,
+    ) -> Result<Option<CommandResult>, SupervisionError> {
+        Store::supervision_command_result(self, request_id).map_err(Into::into)
+    }
+
+    fn record_command_result(
+        &mut self,
+        result: &CommandResult,
+    ) -> Result<CommandResult, SupervisionError> {
+        Store::record_supervision_command_result(self, result).map_err(Into::into)
+    }
+
+    fn commit_command(
+        &mut self,
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        expected_revision: Option<u64>,
+        next: &SupervisionRecord,
+        result: &CommandResult,
+    ) -> Result<u64, SupervisionError> {
+        commit_command_atomically(
+            self,
+            project_id,
+            supervision_id,
+            expected_revision,
+            next,
+            result,
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn commit_command_atomically(
+    store: &mut Store,
+    project_id: ProjectId,
+    supervision_id: SupervisionId,
+    expected_revision: Option<u64>,
+    next: &SupervisionRecord,
+    result: &CommandResult,
+) -> Result<u64, StoreError> {
+    if next.project_id() != project_id || next.supervision_id() != supervision_id {
+        return Err(StoreError::CrossProjectReference {
+            expected: project_id,
+            found: next.project_id(),
+        });
+    }
+    if result.project_id() != project_id || result.supervision_id() != supervision_id {
+        return Err(StoreError::CrossProjectReference {
+            expected: project_id,
+            found: result.project_id(),
+        });
+    }
+    let transaction = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if store.fault.commit == Some(CommitPoint::BeforeRows) {
+        return Err(StoreError::InjectedFault {
+            point: CommitPoint::BeforeRows.as_str(),
+        });
+    }
+    if let Some(existing) = load_command_result(&transaction, result.request_id())? {
+        if existing == *result {
+            return Ok(existing.revision());
+        }
+        return Err(StoreError::CommandResultConflict {
+            request: result.request_id().to_string(),
+        });
+    }
+    let current = load_supervision_revision(&transaction, project_id, supervision_id)?;
+    check_revision(supervision_id, expected_revision, current)?;
+    let revision = next.revision();
+    if revision == 0 || current.is_some_and(|found| revision <= found) {
+        return Err(StoreError::corrupt(
+            "supervision revision must increase and stay positive",
+        ));
+    }
+    write_supervision_record(&transaction, next)?;
+    write_command_result(&transaction, result)?;
+    if store.fault.commit == Some(CommitPoint::BeforeCommit) {
+        return Err(StoreError::InjectedFault {
+            point: CommitPoint::BeforeCommit.as_str(),
+        });
+    }
+    transaction.commit().map_err(StoreError::database)?;
+    Ok(revision)
 }
 
 fn write_host_state(
@@ -1674,6 +2013,197 @@ fn load_supervised_state(
         ));
     }
     Ok(Some(SupervisedStateRecord { revision, value }))
+}
+
+fn decode_evidence(payload: &[u8], project: ProjectId) -> Result<EvidenceRecord, StoreError> {
+    let record: EvidenceRecord = serde_json::from_slice(payload).map_err(StoreError::codec)?;
+    if record.project_id() != project
+        || record.id().project_id() != project
+        || record.supervision_id().project_id() != project
+        || record.target().project_id() != project
+    {
+        return Err(StoreError::corrupt(
+            "evidence record identifiers do not match its stored project",
+        ));
+    }
+    Ok(record)
+}
+
+fn load_evidence_record(
+    conn: &Connection,
+    project: ProjectId,
+    evidence_id: EvidenceId,
+) -> Result<Option<EvidenceRecord>, StoreError> {
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM evidence_records
+             WHERE project_id = ?1 AND evidence_id = ?2",
+            params![project.to_string(), evidence_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| {
+            let record = decode_evidence(&payload, project)?;
+            if record.id() != evidence_id {
+                return Err(StoreError::corrupt(
+                    "evidence row does not match its stored identifier",
+                ));
+            }
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn decode_supervision(
+    payload: &[u8],
+    project: ProjectId,
+    supervision_id: SupervisionId,
+) -> Result<SupervisionRecord, StoreError> {
+    let record: SupervisionRecord = serde_json::from_slice(payload).map_err(StoreError::codec)?;
+    if record.project_id() != project || record.supervision_id() != supervision_id {
+        return Err(StoreError::corrupt(
+            "supervision record identifiers do not match its stored row",
+        ));
+    }
+    Ok(record)
+}
+
+fn load_supervision_record(
+    conn: &Connection,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+) -> Result<Option<SupervisionRecord>, StoreError> {
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM supervision_records
+             WHERE project_id = ?1 AND supervision_id = ?2",
+            params![project.to_string(), supervision_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| decode_supervision(&payload, project, supervision_id))
+        .transpose()
+}
+
+fn load_supervision_revision(
+    conn: &Connection,
+    project: ProjectId,
+    supervision_id: SupervisionId,
+) -> Result<Option<u64>, StoreError> {
+    let revision: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM supervision_records
+             WHERE project_id = ?1 AND supervision_id = ?2",
+            params![project.to_string(), supervision_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::corrupt("supervision revision must be positive"))
+        })
+        .transpose()
+}
+
+fn check_revision(
+    supervision_id: SupervisionId,
+    expected: Option<u64>,
+    found: Option<u64>,
+) -> Result<(), StoreError> {
+    let matches = match (expected, found) {
+        (None, None) => true,
+        (Some(expected), Some(found)) => expected == found,
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::StaleRevision {
+            key: supervision_id.to_string(),
+            expected,
+            found,
+        })
+    }
+}
+
+fn write_supervision_record(
+    transaction: &Transaction<'_>,
+    record: &SupervisionRecord,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_vec(record).map_err(StoreError::codec)?;
+    let changed = transaction.execute(
+        "INSERT INTO supervision_records
+             (project_id, supervision_id, revision, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(project_id, supervision_id) DO UPDATE SET
+             revision = excluded.revision,
+             payload = excluded.payload",
+        params![
+            record.project_id().to_string(),
+            record.supervision_id().to_string(),
+            sequence_to_sql(record.revision())?,
+            payload,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::corrupt("supervision record write wrote no row"));
+    }
+    Ok(())
+}
+
+fn decode_command_result(
+    payload: &[u8],
+    request_id: SupervisionRequestId,
+) -> Result<CommandResult, StoreError> {
+    let result: CommandResult = serde_json::from_slice(payload).map_err(StoreError::codec)?;
+    if result.request_id() != request_id {
+        return Err(StoreError::corrupt(
+            "command result row does not match its request identifier",
+        ));
+    }
+    Ok(result)
+}
+
+fn load_command_result(
+    conn: &Connection,
+    request_id: SupervisionRequestId,
+) -> Result<Option<CommandResult>, StoreError> {
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM supervision_command_results WHERE request_id = ?1",
+            [request_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| decode_command_result(&payload, request_id))
+        .transpose()
+}
+
+fn write_command_result(
+    transaction: &Transaction<'_>,
+    result: &CommandResult,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_vec(result).map_err(StoreError::codec)?;
+    let changed = transaction.execute(
+        "INSERT INTO supervision_command_results
+             (request_id, project_id, supervision_id, revision, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            result.request_id().to_string(),
+            result.project_id().to_string(),
+            result.supervision_id().to_string(),
+            sequence_to_sql(result.revision())?,
+            payload,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::corrupt("command result write wrote no row"));
+    }
+    Ok(())
 }
 
 fn timestamp_from_sql(value: i64, field: &str) -> Result<Timestamp, StoreError> {

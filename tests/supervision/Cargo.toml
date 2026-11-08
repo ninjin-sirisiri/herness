@@ -16,3 +16,7 @@ herness-supervision = { path = "../../crates/herness-supervision" }
 serde_json.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+tempfile.workspace = true
+

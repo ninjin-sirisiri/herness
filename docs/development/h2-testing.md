@@ -240,6 +240,40 @@ H2実装で追加する共通契約の検証手順を記録する。正本仕様
 
 `tests/runtime/tests/connections.rs` は既存H1回帰に加え、legacy settingsの互換decode、宣言付き設定のround-trip、未知capability formの拒否、directory経由の能力公開とagent実行拒否を確認する。実provider・実Keychain・実Jev/Decisions接続はこのTaskでは未確認とする。
 
+## Task 8で追加した証拠の鮮度と永続化
+
+### target manifestと鮮度
+
+- `TargetManifest` はproject・target version・HEAD（分かる場合）・owner指定のread-set・入力の内容指紋を持つ。入力は `InputOrigin` でtracked/uncommitted/untracked/external/dependency/settingsを区別するが、適用判定はmtimeやHEADでなくSHA-256の内容指紋で行う。依存・設定入力はread-setに宣言されていなくてもmanifestへ含める。
+- `manifestDigest` はHEAD・coverage・read-set・内容指紋を正規化してハッシュする。同じHEADでもfile内容が変わればmanifestとfingerprintが変わる。HEADだけの変更やoriginの変更は内容が同じなら証拠の適用性を失わせない。
+- `FreshnessService` はworkspace readerとclockを注入され、file I/O・時計取得を自身では行わない。`TargetReadSet::Declared` は宣言pathとdependency/settingsを、`TargetReadSet::WholeProject` はproject全体の入力manifestを採取する。範囲不明は `TargetManifest::unknown` または `widen` で全体manifestへ広げ、判定不能をpassへ読み替えない。
+- 証拠の適用性は、その証拠のread-setとfingerprintだけを現在manifestと比較する。関連pathが変わった証拠だけ `Invalidated`、無関係な変更では `Applies`、coverage不足は `UnknownScope` になる。`evaluate` は証拠ごとの結果を返し、storeにある他の証拠を巻き込まない。
+
+### H1権限を通じた検証
+
+- `VerificationService::verify` は検証前にmanifestを採取し、`VerificationBoundary` にH1の評価と実行を委ねる。`GatewayVerification` は実 `PermissionService` を持つ `ToolGateway` を包み、`Allow` のときだけsingle-use authorizationを確認してfake/実executorを呼ぶ。`Deny`・`AwaitingHuman`・boundary failureではexecutorを呼ばず、証拠も保存しない。
+- 検証後にもmanifestを採取する。実行中に関連内容が変わった場合、executorがpassを報告してもstatusを `Inconclusive` へ落とし、passとして保存しない。保存するevidence targetは検証開始時のmanifestである。
+- 正確なcommandはfrozen `Bash` operationのcommandと完全一致しなければならず、shell以外のread等はequivalent operationとして記録する。
+- `validate_evidence_record` は保存前に、acquirer・正確な操作・実結果（exit/signal/timeout/truncation）・target版とfingerprint・scopeを検査する。commandで結果がない証拠、passなのにexit 0以外・signal・timeout・truncationがある証拠、`DONE`/`success`だけの文言、`OperationOutcome::Applied` だけでcheck結果がない証拠を拒否する。human証拠はobserverを必須とする。子agent・CI・人間の再利用も同じ検証を通す。
+- 完了後の関連変更は `CompletionFreshness::Stale` を返し、`StaleCompletionReport::apply` が `SupervisionRecord::completion_stale` を設定する。recordは `completed` のまま、completion snapshotと履歴も保持し、run groupを増やさず、自動再開しない。範囲不明は `Inconclusive` としてstaleとも完了とも主張しない。
+
+### Store schema 7と原子的な保存
+
+- migration `0007_supervision_evidence` を追加し、`supervision_records`（project + supervisionごとのrevision付きpayload）、`evidence_records`（project + evidence ID、supervision内sequenceは一意）、`supervision_command_results`（request IDごとの結果payload）を持つ。0001〜0006は変更しない。
+- `EvidenceStorePort` と `SupervisionStorePort` を `herness-store::Store` が実装する。evidence appendは同じIDの同一値を冪等に返し、異なる値はconflictにする。supervision CASはstale revisionを状態もeventも書かずに拒否する。command resultは同じrequest IDの同一結果を返し、異なる結果は `DuplicateResultConflict` にする。project外のID・recordは読み書き前に拒否する。
+- `SupervisionStorePort::commit_command` を追加した。既定実装は従来のCAS + result記録だが、storeは1つのimmediate transactionでrecordとcommand resultをまとめて書き、fault時は両方rollbackする。`execute_command` はこの境界を使うため、crashで新revisionだけが残る半端なstateにならない。
+- 保存payloadはsupervision/evidence/commandのJSONだけで、credential・provider body・raw request contentを含めない。
+
+### Task 8のテスト
+
+`tests/supervision/tests/evidence.rs`:
+
+- pass/fail/not_run/unavailable/inconclusiveの区別、非zero exit・signal・timeout・truncationがpassにならないこと、command結果なし・`OperationOutcome::Applied` だけ・`DONE`/`success`だけの拒否。
+- 同じHEADで内容が変わるmanifest/fingerprintの変化と関連証拠の失効、uncommitted/untracked/external/dependency/settings入力の包含、無関係変更の保持と影響証拠だけの失効。
+- 検証中・検証後・評価中の変更検出、範囲不明のinconclusive、完了後のstale snapshot（completedのまま・run追加なし・自動再開なし）。
+- 実 `PermissionService` + fake executorでallowがpass証拠を保存し、deny/askがexecutor 0回・証拠0件になること。child/CI/human証拠の再利用とhuman observer必須。
+- 実SQLiteでCAS conflict、duplicate requestの同一結果、異なるcommand resultの拒否、faultによるstate/evidence/command resultのrollback、cross-project拒否、reopen後のevidence/supervision/command result読み取り。
+
 ## テストコマンド
 
 Task 1の受入で実行するコマンド:
@@ -306,11 +340,26 @@ Task 7の追加確認:
 - `adapters.rs` はloopback mockだけを使い、429/5xx/Retry-After、最大2回retry、送信不明timeoutの再送0、取消し、cross-origin redirectのAuthorization不転送、secret canary、image bytes/URL、同一connection retry、billing非関与を確認する。
 - 実Jev/Decisions/OpenAIへの接続成功は主張しない。これらは別途許可された実接続検証まで未確認である。
 
+Task 8の受入で実行するコマンド:
+
+```sh
+cargo test -p herness-supervision-tests --test evidence --locked
+cargo test -p herness-store --locked
+cargo check --workspace --all-targets --locked
+```
+
+Task 8の追加確認:
+
+- `cargo test -p herness-supervision-tests --test evidence --locked` は上記の証拠・鮮度・H1境界・SQLite原子性を確認する。
+- `cargo test -p herness-store --locked` はschema 7のmigration一覧と既存store単体テストの回帰を確認する。
+- `cargo test -p herness-runtime-tests --test store --locked` で既存schema 3→最新migration、v1 history、request/state回帰が維持されることを確認する。
+
 `tests/runtime/tests/store.rs`は次を確認する。
 
 - schema 3のv1 event fixture（contract version 1と2、ID、sequence、operation ID、kind、時刻、payload、件数）をmigration後もSQL値と`Event::from_v1`の両方で保持する。checkpoint、operation、host-state row、`project_sequences`も保持し、migration後の新eventは続きのsequenceを使う。
 - host activity eventをrun eventと同じproject sequenceへ保存し、SQL上でagent/session/run列がNULL、activity kind/IDだけが入ることを確認する。別connectionのreplayと再open後の追記も確認する。
 - schema 4のevents rebuild途中（statement 1と4）とschema 5のfaultで、schema 3・旧columns・旧rows・indexがrollbackされ、その後の正常openで移行できることを確認する。
+- schema 7のmigration途中faultでschema 6のままrollbackされ、正常openでevidence/supervision/command resultの表が作られることを確認する（`tests/supervision/tests/evidence.rs`）。
 - 新しいschemaを古いtargetで開くdowngradeが拒否され、既存rowが残ることを確認する。
 - supervised stateの作成・更新・stale revision拒否・cross-project event拒否と、commit後に別connectionからstate/eventが見えることを確認する。
 - request intentの冪等再記録、同一attemptのconflict、send-started→terminalの遷移、terminal上書き拒否、intentなし観測拒否、unknown usageとknown zeroの区別、実model ID、host activity subjectを確認する。

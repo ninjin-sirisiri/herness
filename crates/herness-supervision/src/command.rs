@@ -233,20 +233,23 @@ pub fn execute_command<S: SupervisionStorePort>(
         });
     }
     next.set_command_revision(current.revision().saturating_add(1));
-    let revision = store.compare_and_swap(
-        project,
-        request.supervision_id(),
-        Some(current.revision()),
-        &next,
-    )?;
     let result = CommandResult {
         request_id: request.request_id(),
         project_id: project,
         supervision_id: request.supervision_id(),
         command: request.command(),
-        revision,
+        revision: next.revision(),
         state: next.state(),
         reason: next.reason().clone(),
     };
-    store.record_command_result(&result)
+    let revision = store.commit_command(
+        project,
+        request.supervision_id(),
+        Some(current.revision()),
+        &next,
+        &result,
+    )?;
+    let mut result = result;
+    result.revision = revision;
+    Ok(result)
 }

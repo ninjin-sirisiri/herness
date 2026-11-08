@@ -11,7 +11,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use crate::error::StoreError;
 use crate::fault::MigrationPoint;
 
-const LATEST_SCHEMA_VERSION: u32 = 6;
+const LATEST_SCHEMA_VERSION: u32 = 7;
 
 struct Migration {
     version: u32,
@@ -49,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "0006_supervised_state",
         sql: include_str!("../migrations/0006_supervised_state.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "0007_supervision_evidence",
+        sql: include_str!("../migrations/0007_supervision_evidence.sql"),
     },
 ];
 
@@ -235,7 +240,7 @@ mod tests {
             latest_schema_version(),
             MIGRATIONS.last().expect("migrations exist").version
         );
-        assert_eq!(latest_schema_version(), 6);
+        assert_eq!(latest_schema_version(), 7);
     }
 
     #[test]
