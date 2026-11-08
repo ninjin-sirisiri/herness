@@ -132,10 +132,7 @@ pub fn open_project(
 ) -> Result<ProjectView, String> {
     verify_source(&window)?;
     let mut host = lock_host(&state)?;
-    let view = host
-        .runtime_mut()
-        .open_project(&path)
-        .map_err(|error| error.to_string())?;
+    let view = host.open_project(&path)?;
     *state
         .selected_project
         .lock()

@@ -7,12 +7,12 @@
 //! continue to execute inside `PiEngine`, and the runtime executor is reached
 //! only for an operation the adapter explicitly reported as awaiting approval.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use herness_core::runtime::{
-    ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor,
-    ToolExecution,
+    ProjectView, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
+    RuntimeToolExecutor, ToolExecution,
 };
 use herness_core::{
     ArgumentViolation, BashExecutor, Checkpoint, CheckpointCommit, ConnectionAdmin,
@@ -33,6 +33,7 @@ pub struct DesktopHost {
     connections: ConnectionAdmin,
     directory: ConnectionDirectory,
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+    app_data_root: PathBuf,
 }
 
 impl DesktopHost {
@@ -75,6 +76,7 @@ impl DesktopHost {
                 connections,
                 directory,
                 credentials,
+                app_data_root: app_data_root.as_ref().to_path_buf(),
             },
             report,
         ))
@@ -108,6 +110,32 @@ impl DesktopHost {
     /// Current non-secret permission policy.
     pub fn policy(&self) -> &PermissionPolicy {
         self.runtime.policy()
+    }
+
+    /// Opens a project, rejecting the private application-data area.
+    ///
+    /// The store and its checkpoints must never live inside the project the
+    /// agent can edit, and the app-data directory (or a child) is never a
+    /// valid project. `Runtime::open_project` still performs the canonical
+    /// readable-directory checks.
+    pub fn open_project(&mut self, path: impl AsRef<Path>) -> Result<ProjectView, String> {
+        let config = StoreConfig::new(&self.app_data_root).map_err(|error| error.to_string())?;
+        config
+            .ensure_outside_project(path.as_ref())
+            .map_err(|error| error.to_string())?;
+        let project = std::fs::canonicalize(path.as_ref())
+            .map_err(|error| format!("project is not readable: {error}"))?;
+        let app_data = std::fs::canonicalize(&self.app_data_root)
+            .unwrap_or_else(|_| self.app_data_root.clone());
+        if project == app_data || project.starts_with(&app_data) {
+            return Err(
+                "the application data directory or its children cannot be opened as a project"
+                    .to_owned(),
+            );
+        }
+        self.runtime
+            .open_project(&project)
+            .map_err(|error| error.to_string())
     }
 
     /// Non-secret connection views for the UI.

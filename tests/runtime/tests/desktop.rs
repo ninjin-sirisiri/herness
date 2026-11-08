@@ -378,6 +378,16 @@ fn wait_for_approval(
 // ---------------------------------------------------------------------------
 
 #[test]
+fn project_open_rejects_the_private_application_data_area() {
+    let mut fixture = Fixture::new(Vec::new());
+    let app_data = fixture.app_data.clone();
+    assert!(fixture.host.open_project(&app_data).is_err());
+    let nested = app_data.join("nested-project");
+    std::fs::create_dir_all(&nested).expect("nested project");
+    assert!(fixture.host.open_project(&nested).is_err());
+}
+
+#[test]
 fn ui_uses_text_only_rendering_and_no_browser_secret_storage() {
     let app_js = include_str!("../../../ui/app.js");
     for forbidden in [
