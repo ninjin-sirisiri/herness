@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herness_core::{
-    AuthMethod, ConnectionCapabilities, ConnectionDirectory, ConnectionId, CredentialKind,
-    CredentialPort, Endpoint, EndpointClass, InputModality, Origin, Provider, RedirectAuthDecision,
-    redirect_auth_decision,
+    AuthMethod, ConnectionCapabilities, ConnectionDirectory, ConnectionError, ConnectionId,
+    CredentialKind, CredentialPort, Endpoint, EndpointClass, InputModality, Origin, Provider,
+    RedirectAuthDecision, redirect_auth_decision,
 };
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RETRY_AFTER,
@@ -271,20 +271,54 @@ fn contains_external_image_reference(value: &Value) -> bool {
                 key.as_str(),
                 "image_url" | "imageurl" | "image_uri" | "imageuri"
             ) {
-                return true;
+                return image_reference_is_external(value);
             }
             if key == "type"
                 && value
                     .as_str()
                     .is_some_and(|kind| kind.eq_ignore_ascii_case("image_url"))
             {
-                return true;
+                // The URL itself is checked where it appears.
+                return false;
             }
             contains_external_image_reference(value)
         }),
         Value::Array(items) => items.iter().any(contains_external_image_reference),
         _ => false,
     }
+}
+
+/// Only an inline `data:image/...;base64,` value represents caller-provided
+/// bytes. Any other image reference would make the provider fetch content the
+/// caller did not supply.
+fn image_reference_is_external(value: &Value) -> bool {
+    let url = match value {
+        Value::String(url) => Some(url.as_str()),
+        Value::Object(object) => object.get("url").and_then(Value::as_str),
+        _ => None,
+    };
+    !url.is_some_and(inline_image_data_url)
+}
+
+fn inline_image_data_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return false;
+    };
+    let Some((metadata, payload)) = rest.split_once(',') else {
+        return false;
+    };
+    let Some(media_type) = metadata
+        .trim()
+        .to_ascii_lowercase()
+        .strip_suffix(";base64")
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    matches!(
+        media_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) && !payload.is_empty()
 }
 
 /// One caller-provided image.
@@ -697,6 +731,26 @@ impl AssessmentTransport {
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
+    }
+
+    /// Reads the registered capabilities for one connection without sending.
+    ///
+    /// Assessment adapters use this to prove that the connection/profile they
+    /// were given is the exact registered connection, not a stale or
+    /// re-pointed value.
+    pub fn capabilities(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<ConnectionCapabilities, AssessmentError> {
+        self.inner
+            .directory
+            .capabilities(connection)
+            .map_err(|error| match error {
+                ConnectionError::UnknownConnection { .. } => {
+                    AssessmentError::new(AssessmentErrorKind::UnknownConnection)
+                }
+                _ => AssessmentError::new(AssessmentErrorKind::CapabilityMismatch),
+            })
     }
 
     /// Sends one assessment request.
@@ -1139,6 +1193,30 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.kind(), AssessmentErrorKind::ExternalImageUrl);
+        for body in [
+            serde_json::json!({
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]
+            }),
+            serde_json::json!({
+                "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]
+            }),
+        ] {
+            assert!(
+                ToolLessPayload::new(body).is_ok(),
+                "inline caller bytes must be accepted"
+            );
+        }
+        for body in [
+            serde_json::json!({"content": [{"image_url": "data:text/plain;base64,AA=="}]}),
+            serde_json::json!({"content": [{"image_url": "https://example.com/a.png"}]}),
+            serde_json::json!({"content": [{"image_url": {"url": "https://example.com/a.png"}}]}),
+            serde_json::json!({"content": [{"image_url": {"file_id": "file-1"}}]}),
+        ] {
+            assert_eq!(
+                ToolLessPayload::new(body).unwrap_err().kind(),
+                AssessmentErrorKind::ExternalImageUrl
+            );
+        }
     }
 
     #[test]

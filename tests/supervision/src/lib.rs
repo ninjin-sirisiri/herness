@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use herness_core::ConnectionSettings;
 use herness_core::contracts::{
     AgentId, AuthMethod, ConnectionCapabilities, ConnectionId, ConnectionStatus, ConnectionUsage,
     EndpointClass, InputCapabilities, ModelId, ProjectId, Provider, SessionId, Timestamp,
@@ -331,6 +332,44 @@ pub fn completion_profile_for(project: ProjectId, connection: ConnectionId) -> A
 /// Normal-LLM completion profile using a fresh synthetic connection.
 pub fn completion_profile(project: ProjectId) -> AssessmentProfile {
     completion_profile_for(project, normal_connection().connection_id())
+}
+
+/// Normal-LLM completion profile with an explicit connection, model, and
+/// required inputs.
+pub fn llm_completion_profile_for(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Completion,
+        ProviderKind::NormalLlm,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-llm-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::normal_llm(),
+    )
+    .expect("completion profile")
+}
+
+/// Profile entry whose profile and connection are the registered settings.
+pub fn llm_profile_entry(
+    settings: &ConnectionSettings,
+    profile: AssessmentProfile,
+    structured_output: bool,
+) -> ProfileEntry {
+    ProfileEntry::new(
+        profile,
+        settings.capabilities().expect("connection capabilities"),
+        ConnectionStatus::Available,
+        structured_output,
+    )
 }
 
 /// Completion profile entry whose profile and connection match.

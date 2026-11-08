@@ -18,6 +18,17 @@ pub enum AssessmentErrorKind {
     ExternalImageUrl,
     /// The connection does not accept a required input modality.
     UnsupportedModality,
+    /// The profile requires provider-native structured output that the
+    /// connection or route cannot provide.
+    StructuredOutputUnavailable,
+    /// A caller-supplied evidence document is missing, duplicated, or outside
+    /// the exact evidence set of the request.
+    InvalidEvidence,
+    /// An evidence document belongs to another project.
+    CrossProjectReference,
+    /// The request, profile, and connection do not describe the same fixed
+    /// assessment profile.
+    ProfileBindingMismatch,
     /// The connection is not registered.
     UnknownConnection,
     /// The connection settings or endpoint class cannot serve assessment.
@@ -165,6 +176,18 @@ impl fmt::Display for AssessmentError {
             }
             AssessmentErrorKind::UnsupportedModality => {
                 "the connection does not accept a required assessment input modality"
+            }
+            AssessmentErrorKind::StructuredOutputUnavailable => {
+                "the connection cannot provide the required structured assessment output"
+            }
+            AssessmentErrorKind::InvalidEvidence => {
+                "the supplied evidence does not match the assessment request"
+            }
+            AssessmentErrorKind::CrossProjectReference => {
+                "the supplied evidence belongs to another project"
+            }
+            AssessmentErrorKind::ProfileBindingMismatch => {
+                "the assessment request, profile, and connection do not match"
             }
             AssessmentErrorKind::UnknownConnection => "the assessment connection is not registered",
             AssessmentErrorKind::CapabilityMismatch => {
