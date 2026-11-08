@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
+<meta name="sdd-source-digest" content="sha256:4b4755b0def169d3713ddb62cbdb26352f051b51b8f02e408f741b348d40b709">
+<title>H2: 継続実行と完了判定</title>
+<link rel="stylesheet" href="../assets/sdd.css">
+</head>
+<body data-document-kind="spec">
+<a class="skip-link" href="#content">本文へ移動</a>
+<header class="document-header" data-document-kind="spec"><p class="document-kind">Design spec / H2</p></header>
+<div class="document-layout">
+<aside class="document-outline" aria-labelledby="outline-label">
+<details>
+<summary id="outline-label">この文書の構成</summary>
+<nav aria-label="文書内の目次"><ol>
+<li><a href="#goals-and-non-goals">Goals and non-goals</a></li>
+<li><a href="#approach-and-architecture">Approach and architecture</a></li>
+<li><a href="#shared-contract">Shared contract</a><ol>
+<li><a href="#completion-contract-and-operations">Completion contract and operations</a></li>
+<li><a href="#evidence-and-freshness">Evidence and freshness</a></li>
+<li><a href="#model-assessment-and-permission-evaluation">Model assessment and permission evaluation</a></li>
+<li><a href="#states-and-continuation">States and continuation</a></li>
+<li><a href="#profiles-providers-and-disclosure">Profiles, providers and disclosure</a></li>
+</ol></li>
+<li><a href="#budgets-and-request-failures">Budgets and request failures</a></li>
+<li><a href="#h1-integration-prerequisites">H1 integration prerequisites</a></li>
+<li><a href="#data-flow-and-ordering">Data flow and ordering</a></li>
+<li><a href="#numeric-defaults">Numeric defaults</a></li>
+<li><a href="#testing-and-acceptance">Testing and acceptance</a></li>
+<li><a href="#consuming-paths-and-references">Consuming paths and references</a></li>
+<li><a href="#open-items-and-approval">Open items and approval</a></li>
+</ol></nav>
+</details>
+</aside>
+<main id="content" tabindex="-1">
+<h1 id="h2-継続実行と完了判定">H2: 継続実行と完了判定</h1>
+<p class="metadata"><strong>Classification:</strong> architectural</p>
+<p class="metadata"><strong>Status:</strong> 設計案。2026-11-08の面談結果を反映し、specレビュー待ち。本specの承認・sdd-plan・本実装・実モデルへの送信は未許可。</p>
+<p class="metadata"><strong>Chosen approach:</strong> 必須検証と安全条件をhostが検査し、モデルによる条件別の評価をhostが統合する。モデルは状態遷移・権限・完了条件を変更しない。</p>
+<p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH2を扱う。<a href="2026-11-07-h1-runtime-design.md">H1</a>を実行・権限・保存の正本、<a href="../../../CONTEXT.md">CONTEXT.md</a>を用語の正本とする。H1は実装済みだが<a href="../../research/2026-11-08-h1-acceptance.md">受入未完了</a>。今回の指示はH2の設計開始だけを許可し、H1の未確認項目を免除しない。</p>
+<section>
+<h2 id="goals-and-non-goals">Goals and non-goals</h2>
+<ul>
+<li>同じ完了条件を通常LLM・Jev・OpenAI Decisionsで評価でき、未達なら同じ子エージェントの作業を有限の範囲で継続する。</li>
+<li>必須検証、証拠の適用範囲、停止・人間待ち・予算をモデルより優先し、完了に至らない理由を永続化する。</li>
+<li>H3の品質評価とH4のTask監督が利用する共通契約を提供し、同じモデル接続基盤からH1の許可評価器を提供する。</li>
+<li>SDD planの解釈・Task台帳・Git境界はH4、HTML固有の条件・検証・公開はH3が所有する。H2は既存SDDの再開回数やHTML policyを変更しない。</li>
+<li>自動push・merge・公開、権限拡大、OS隔離、必須の独立レビュー、Taskの並列化、新規CLI製品は含めない。</li>
+</ul>
+</section>
+<section>
+<h2 id="approach-and-architecture">Approach and architecture</h2>
+<p>比較した案は、採用する「条件別評価をhostで統合」と、「必須検証後に一つの総合質問で判定」の二つ。前者は証拠・未達条件を追跡でき、複数の要因を一問に混ぜないDecisionモデルの利用にも合う。後者は問いをまとめやすいが、情報不足と未達の切分けが弱い。</p>
+<p>Rust hostにアプリ寿命のsupervisorを置く。WebViewのpollや選択中のprojectに依存せず、engineイベント・検証・deadlineを処理する。各監督対象は一つの子agentと一連のrunを束ね、H3 jobやH4 TaskのIDを不透明なowner参照として持つ。これらを同じ識別子にしない。</p>
+<table>
+<caption>共通監督機構の構成要素</caption>
+<thead><tr><th scope="col">Component</th><th scope="col">責務</th></tr></thead>
+<tbody>
+<tr><td>Supervisor</td><td>承認済み条件、状態遷移、追加実行、停止、排他所有</td></tr>
+<tr><td>Evidence service</td><td>検証記録、対象版、証拠の鮮度、必要な範囲の組立て</td></tr>
+<tr><td>Assessment service</td><td>条件別の問い、応答検証、結果の統合。実行toolを持たない</td></tr>
+<tr><td>Provider adapters</td><td>通常LLM・Jev・Decisionsの通信、能力・応答の正規化</td></tr>
+<tr><td>Budget and disclosure service</td><td>稼働時間・回数・要求予約・使用量・送信同意</td></tr>
+<tr><td>Durable supervision store</td><td>H1のSQLiteに監督状態・条件・証拠・判定・予算を保存</td></tr>
+</tbody>
+</table>
+</section>
+<section>
+<h2 id="shared-contract">Shared contract</h2>
+<h3 id="completion-contract-and-operations">Completion contract and operations</h3>
+<p>監督対象はproject、agent/session、owner参照、条件版、実行範囲、必須検証、条件別rubric、証拠の対象範囲、判定profile版、送信同意版、予算、run群を保持する。IDはproject内で安定し、公開契約はversion付きとする。モデルが作った条件案は人間が開始前に確認する。H3の承認済み設定やH4の承認済みplanから条件を渡す場合、その承認を継承して毎回は確認しない。取込みの正当性は各ownerが保証し、H2が散文を推測して補わない。</p>
+<table>
+<caption>監督対象に対する操作</caption>
+<thead><tr><th scope="col">操作</th><th scope="col">成功・制約</th></tr></thead>
+<tbody>
+<tr><td>作成・開始</td><td>条件と承認根拠、能力、許可、送信範囲、有限上限を検査して保存してから実行。初回は子agentを作成できる</td></tr>
+<tr><td>取得・購読</td><td>状態、理由、未達条件、証拠、判定先と版、使用済み・予約済み予算、最終sequenceを返す</td></tr>
+<tr><td>一時停止・取消し</td><td>新規要求を止めH1の停止経路を使う。既存変更を巻き戻さず、取消しは履歴を残す</td></tr>
+<tr><td>再判定・再開</td><td>人間の操作。現在の条件・対象・権限・同意を照合し、必要な証拠を取り直す。消費済み予算は維持する</td></tr>
+<tr><td>条件・profile・上限の変更</td><td>人間または承認済みowner操作だけ。停止・版更新後に再確認する。旧判定を失効し、予算の変更前後を残す</td></tr>
+</tbody>
+</table>
+<p>子agentは条件・権限・上限を変更できない。条件や対象版が変わった実行中の判定結果は履歴だけに残し、状態へ適用しない。同じ入力での判定の引き直しを自動で繰り返さない。重複要求IDは同じ結果を返し、追加run・送信・取消しを重複実行しない。</p>
+<h3 id="evidence-and-freshness">Evidence and freshness</h3>
+<p>各証拠はID、取得者、正確なコマンドまたは同等の操作、実際の結果・出力・終了状態、対象の版、検証範囲と限界を持つ。run・操作ID、取得時sequence、truncation、依存する条件・ファイル・設定・依存関係の指紋も記録する。子agent・CI・人間の証拠も同じ要件で再利用し、親が実行していないことだけを理由に再検証しない。</p>
+<p>必須検証の結果はpass・fail・not_run・unavailable・inconclusiveを区別する。H1の操作成功は検証成功ではない。shellはexit code・signal・timeout・停止確認を調べ、非zero終了をpassにしない。単なる「成功した」という報告やDONE、commit、idleを証拠の代わりにしない。人間の観測証拠は観測者と対象版を明示し、機械検証と混同しない。</p>
+<p>鮮度は経過秒数でなく対象・範囲への適用可能性で決める。HEADやH1 sequenceだけでは、未commit・shell・外部編集を含む作業状態を表せない。ownerが定めたread-set、関連設定・依存関係・条件を内容指紋とmanifestで検証前後・判定前後・完了確定直前に照合する。範囲が不明ならproject全体の入力manifestへ広げるか判定不能とし、根拠なく除外しない。</p>
+<p>関連入力が変われば影響する検証と評価だけを失効し、無関係な証拠は保持する。変更中の検証、結果不明の操作、未停止の管理下process、欠けた・省略された必須情報は完了を禁止する。外部編集との完全な同時実行分離は保証せず、完了は記録したsnapshotに対する結果とする。後の関連変更はその適用状態をstaleにし、ownerへ通知する。H2だけで自動再開・公開はしない。</p>
+<h3 id="model-assessment-and-permission-evaluation">Model assessment and permission evaluation</h3>
+<p>完了評価は条件IDごとにmet・unmet・insufficientを問い、必要な証拠だけを渡す。全必須検証が現対象でpassし、必要な条件がすべてmetの場合だけ完了候補となる。決定的な検証だけで証明できる条件にはモデルを強制せず、品質等の意味評価が必要な条件をモデルへ渡す。複数条件の平均点で一つの未達を隠さない。</p>
+<p>通常LLMはschema付きの条件別結果と根拠の証拠IDを返す。未知ID、欠落、矛盾、不正schema、拒否、uncertainは判定不能とする。自己申告の数値を校正済み確率として扱わない。Jev・Decisionsはmet・unmet・insufficientのchoiceと全選択肢の確率を使い、選択結果と分布の整合・有限値・範囲・和を検証する。選択されたmetまたはunmetの確率が0.95以上の場合に採用し、それ以外やinsufficientは判定不能にする。providerのconfidenceは確率とは別に保存し、異なるprovider間で同じ尺度と仮定しない。</p>
+<p>Decision応答から存在しない文章の理由を作らない。問い・rubric・送信した証拠ID・分布・選択・適用したhost規則を説明可能な記録とする。通常LLMの短い根拠はモデルの説明として区別し、内部思考を要求・保存しない。</p>
+<p>操作許可は別の用途・問い・記録とする。H1のFrozenOperation、依頼作業、許可境界、必要な証拠を使い、allow・deny・askを評価する。Decision方式のallow・denyは選択確率0.99以上、それ以外はask。通常LLMはschema・操作との結付け・根拠参照・不確実性の検査を通した明示的なallow・denyだけを採用し、不確実ならask。確率を持たない方式の結果を数値閾値との同等保証として表示しない。</p>
+<p>H2は詳細判定を保存してH1の既存PermissionEvaluatorPortへallow・deny・askまたはsanitized errorを返す。H1のdeny・ask・grant上限・最終引数照合・single-use承認を変更しない。完了評価の高い確率を操作許可へ流用しない。証拠内の指示や変更理由は権限の正本ではなく、prompt injectionへの耐性を完全な隔離保証とはしない。</p>
+<h3 id="states-and-continuation">States and continuation</h3>
+<table>
+<caption>監督対象の状態と停止理由</caption>
+<thead><tr><th scope="col">状態</th><th scope="col">意味・次の操作</th></tr></thead>
+<tbody>
+<tr><td>ready</td><td>条件等の承認済み。開始待ち</td></tr>
+<tr><td>running</td><td>初回または追加の子runを実行中</td></tr>
+<tr><td>verifying / assessing</td><td>安定した対象で検証中／条件を評価中</td></tr>
+<tr><td>waiting_human</td><td>操作承認、条件判断、送信同意、認証、判定不能等。理由と必要操作を返す</td></tr>
+<tr><td>stopped</td><td>人間停止、停滞、予算、停止未確認、復旧照合待ち。再開には原因解消が必要</td></tr>
+<tr><td>failed / cancelled</td><td>回復不能／明示取消し。完了ではない</td></tr>
+<tr><td>completed</td><td>記録snapshotで全条件成立。後の関連変更によるstaleを別に保持する</td></tr>
+</tbody>
+</table>
+<p>H1のrun状態とは別に保存する。今回submitした入力の完結と対応が取れたidleだけを検証開始に使い、作成直後のidleや、未解決のtool・背景shellがある状態では判定しない。検証で修正可能なfailが出たら、その不足と証拠を同じ子agentへ返し、同じ条件・許可内で追加runを起動する。未達を直せる範囲で「続けますか」は毎回尋ねない。</p>
+<p>追加runでは会話、承認済み条件・制約、未達条件と証拠を維持する。H1の同一runの復旧と区別し、新しいrun IDを持たせる。文脈容量不足を新しい無関係なsessionで黙って補わず、人間待ちにする。BLOCKED・NEEDS_CONTEXT相当の報告は同じ入力で再試行せず、必要な判断や文脈を求める。Task固有の報告契約はH4が解釈する。</p>
+<p>1評価サイクルはrunの安定、検証、必要なモデル評価までとする。3回連続の評価サイクルで、関連成果物・未達条件・有効な検証結果・有用な取得証拠に進展がなければstoppedとする。ログの時刻・応答文言・tool回数だけの変化は進展と数えない。調査で得た新しい関連証拠は進展に含め、file編集の有無だけで決めない。進展を確認できなければ安全側へ停止し、人間が根拠を追加して再開できる。</p>
+<p>停止・人間待ち・上限・回復不能は完了判定より優先する。停止未確認の間は次runや再判定を開始しない。アプリ再起動は状態を復元するだけで実行・送信せず、照合と人間の再開操作を必要とする。進行中だった判定は適用せず、遅延応答も古いattemptとして無視する。取消し・停止はundoではなく、既存成果物や履歴を削除しない。</p>
+<h3 id="profiles-providers-and-disclosure">Profiles, providers and disclosure</h3>
+<p>実行モデルと判定モデルは独立に選ぶ。完了評価・HTML評価・操作許可の用途別profileをprojectに設定し、監督開始時に版を固定する。未設定のprofileを実行モデルで黙って代用しない。利用不可の接続や未対応の画像入力を成功扱いにせず、別モデルへ自動切替しない。</p>
+<p>通常LLMはH1の接続・認証境界を再利用するが、評価専用のtoolなし要求を使い、通常の作業agentをjudgeとして起動しない。JevはAPIキーでPOST /v1/systemone、DecisionsはOpenAI APIキーでPOST /v1/decisionsへ接続する。2026-11-08確認の基準はJevの固定ID jev-1.14.0とDecisionsのgpt-6-luna。ChatGPTログインをDecisionsのAPI認可として流用しない。model alias・返却された実model ID・adapter/rubric版を記録し、モデル更新時は評価をやり直す。</p>
+<p>接続資格情報はH1と同じKeychain境界に置き、判定入力・DB・イベントへ入れない。送信同意はproject・接続先origin・用途・データ種別・対象範囲の版へ結び付け、初回の人間承認後は同じ範囲内で継続する。別provider、scope拡大、画像追加、同意取消しでは未送信要求を止め再確認する。取消しは既に送信した内容を取り消さない。</p>
+<p>入力は必要な原文・コード・差分・ログ・画像に限定し、全会話・全repositoryを既定送信しない。秘密情報の除外を行うが、任意の秘密を完全検出できるとは保証しない。除外や容量制限で必要な情報を欠いた場合はinsufficientとする。画像は承認範囲のbytesを送り、任意の外部URLや資格情報付きURLをproviderに取得させない。対象HTMLの撮影・情報保持のrubricはH3が所有する。</p>
+</section>
+<section>
+<h2 id="budgets-and-request-failures">Budgets and request failures</h2>
+<p>初期上限は監督対象1件につき累積稼働2時間・追加実行30回。初回を含むrun数は最大31であり、追加runの起動意図を保存した時点で回数を消費する。実行・検証・評価・許可判定・同じ接続への再試行待機を合算し、人間待ち・明示一時停止・アプリ停止中は除く。再開で消費量をリセットしない。経過時間はmonotonic clockと永続化した区間で計測し、クラッシュ時の未確定区間は保守的に計上する。</p>
+<p>金額上限は任意。指定時は実行・検証に伴うモデル要求・完了評価・許可評価の費用を同じ予算へ合算し、並行要求は送信前に上限見積りを予約する。価格版・入力上限・最大出力・料金条件が不明なら送信しない。ChatGPTログイン等の金額見積不能な経路は金額上限付きでは利用不可。使用量欠落・timeout後の課金不明は予約を解放せず照合待ちにする。金額はローカル見積りで、外部請求の厳密な上限保証ではない。</p>
+<p>deadlineは長い単発runにも適用し、到達したら新規tool・要求を止めH1へ協調停止する。既に送信済みの要求の課金や既存変更の巻戻しは保証しない。停止猶予はH1の規則に従う。予算到達後に届いた成功をcompletedへ採用しない。共有のproject予算は初期要件にせず、H3・H4が生成する各監督対象にも有限の上限を適用する。</p>
+<p>評価要求の429・一時的な5xx・接続前の一時障害だけ、同じ接続で最大2回追加再試行する。待機は1秒・2秒を基準にjitterを加え、Retry-Afterが残りdeadlineに収まらなければ確認待ちにする。送信済みか不明なtimeout、不正応答、低確度、拒否、認証失敗は自動で引き直さない。実行モデル要求・副作用を伴うtoolにはこの再試行規則を流用しない。SDKの隠れた再試行は無効にする。</p>
+</section>
+<section>
+<h2 id="h1-integration-prerequisites">H1 integration prerequisites</h2>
+<p>現在のmain 225ff5dを調査した結果であり、H1の保証が検証済みという意味ではない。次をH1所有の実行境界で満たす必要がある。H2の実装planは前提の補修と追加契約を明示し、H1の正本を先に整合させる。今回コードは変更しない。</p>
+<table>
+<caption>H1実行境界の接続前提</caption>
+<thead><tr><th scope="col">必要な保証</th><th scope="col">現状と解消条件</th></tr></thead>
+<tbody>
+<tr><td>同じ会話での追加run、submitとidleの対応</td><td>Piはrunごとに新しいruntimeを作り、起動時idleを先に通知する。SDK型を漏らさない継続・入力識別境界と実adapterテストが必要</td></tr>
+<tr><td>復旧と未確定操作の照合</td><td>同一process再開と未完了応答の復元には制約がある。再実行せず照合し、利用不能なら再開不可を返す</td></tr>
+<tr><td>実toolへのgrant・評価器の引継ぎ</td><td>Pi内の許可経路は評価器なし・再構成したgrantで動く。hostの制限と評価器を唯一の実行経路へ適用し、二重実行を防ぐ</td></tr>
+<tr><td>使用量・要求状態・停止deadline</td><td>H1公開eventにusageはない。SDK checkpointをH2が解析せず、要求ID・使用量・終了状態をhost型で取得する追加契約が必要</td></tr>
+<tr><td>UIから独立した監視</td><td>現在のイベント処理はUIのproject pollに依存する。host所有の監視へ接続し、閉じたwindowや非選択projectでも進める</td></tr>
+<tr><td>永続化・イベント</td><td>H2状態と通知をtransaction化する。run作成前の監督イベントに架空のrun IDを与えず、project sequenceを共有するH1のenvelope拡張が必要</td></tr>
+</tbody>
+</table>
+<p>H1のOpenAI・Anthropic APIキー経路は受入未確認のまま保持する。H1全体が受入済みと偽らず、H2も各接続のmock・実接続・未確認を区別する。</p>
+</section>
+<section>
+<h2 id="data-flow-and-ordering">Data flow and ordering</h2>
+<ol>
+<li>ownerまたは人間が条件・証拠範囲・profile・上限を確定し、hostが承認・能力・同意を検査する。</li>
+<li>監督対象と初回要求の意図を保存し、H1を通じて親の会話から独立した子agentを開始する。</li>
+<li>対応する実行の安定を待ち、対象版を採取して必須検証を実行または再利用する。検証コマンドもH1の権限境界を通す。</li>
+<li>修正可能なfailは未達として継続し、機構不足・結果不明・人間判断が必要なら待機または停止する。</li>
+<li>必要なモデル評価の入力を固定し、同意・予算予約を保存してから送信する。全回答が揃うまで成功にしない。</li>
+<li>条件・対象・許可・同意・予算・停止状態を再照合し、証拠と状態を保存してから通知する。完了には完了snapshotを含める。</li>
+<li>未達は不足を子agentへ渡して追加runへ進み、completedはownerへ返す。次Task・HTML反映・公開の許可には変換しない。</li>
+</ol>
+<p>監督対象ごとに一つのcontrollerだけが遷移を確定し、revisionの比較更新で重複イベント・遅延結果を排除する。復旧時は未完了の要求意図を未送信と決め付けず、手動再開前に照合する。</p>
+</section>
+<section>
+<h2 id="numeric-defaults">Numeric defaults</h2>
+<table>
+<caption>上限と判定規則の初期値</caption>
+<thead><tr><th scope="col">項目</th><th scope="col">初期値・意味</th></tr></thead>
+<tbody>
+<tr><td>稼働上限・追加run</td><td>7,200秒・30回。人間待ち等を除き、初回runと検証・判定も時間へ含める</td></tr>
+<tr><td>停滞</td><td>3連続評価サイクルで進展を確認できなければ停止</td></tr>
+<tr><td>金額上限</td><td>既定なし。指定時は有限のUSD額と価格版、全モデル要求の見積りを必要とする</td></tr>
+<tr><td>評価timeout</td><td>1要求60秒または残り稼働時間の短い方。許可評価器も適用し、永久に呼出しを占有させない</td></tr>
+<tr><td>一時障害の追加再試行</td><td>最大2回、待機基準1秒・2秒。各要求は予算内、別モデルfallbackなし</td></tr>
+<tr><td>Decisionの採用確率</td><td>完了条件のmet・unmetは0.95以上、操作allow・denyは0.99以上。insufficient・askは実行／完了の根拠にしない</td></tr>
+<tr><td>分布の許容誤差</td><td>確率は有限で0〜1、選択肢が完全一致し合計の1からの誤差0.001以内。無断で補正しない</td></tr>
+<tr><td>初期profile</td><td>未設定は利用不可。判定providerと送信同意を人間が選ぶ</td></tr>
+</tbody>
+</table>
+<p>閾値は安全性・正答率の保証ではなく、評価前の保守的な設計初期値。provider・model・用途ごとの評価セットで妥当性を確認する。通常LLMには同じ確率閾値を捏造しない。閾値を下げる変更はprofile版更新と人間の再確認を必要とする。</p>
+</section>
+<section>
+<h2 id="testing-and-acceptance">Testing and acceptance</h2>
+<ul>
+<li><strong>契約と遷移:</strong> 同じ条件を三方式へ渡す。必須fail・未実行・証拠不足・停止・人間待ち・上限で、モデルがmetを返しても完了しない。開始直後idle、重複・遅延応答、版変更を検証する。</li>
+<li><strong>証拠:</strong> SDDの取得者・操作・実結果・対象・範囲を保つ再利用、関連変更だけの失効、未commit・外部／shell変更、検証途中の変更、truncation、非zero shellをテストする。</li>
+<li><strong>実adapter統合:</strong> 実Pi＋loopback modelで初回と追加runの会話・制約保持、子grantと自動評価器、明示deny・ask、停止・復旧照合を確認する。service mockだけで実tool経路の成功としない。</li>
+<li><strong>予算とlifecycle:</strong> fake clockとfault injectionで長い単発runのdeadline、30回制限、同時予約、費用不明、再起動時送信0、再開時の消費維持、停止未確認をテストする。実Tauriでwindowなし・非選択projectの継続も確認する。</li>
+<li><strong>provider契約:</strong> 三方式の正常・拒否・不正schema・欠落／重複回答・未知ID・不正分布・低確度・429・5xx・timeout・auth失敗をmockで検証する。Jevの応答をDecisionsのschemaとして扱わない。</li>
+<li><strong>送信と権限:</strong> 同意取消し・origin／用途／画像追加・秘密canary・入力中の偽指示・判断中の最終引数変更・予算切れで実行を許可しない。judgeがtoolを実行できないことを確認する。</li>
+<li><strong>評価セット:</strong> 完了・未達・証拠不足、古い成功、虚偽DONE、範囲外操作、紛らわしい変更理由、指示注入を含める。必須の負例では誤完了・誤allowを一つも許さず、保留率と誤停止も記録する。これは未知の入力で誤りがないという保証ではない。</li>
+<li><strong>実接続:</strong> 利用者が別途許可した合成証拠・有限の要求数と料金で、通常LLM・Jev・Decisionsの各経路を確認する。無許可のlogin・有料要求はしない。許可がない経路は未確認で、mock成功を実接続の受入へ流用しない。</li>
+</ul>
+<p>H2受入には上記の自動検証、H1前提の実adapter検証、許可済み実接続の証跡が必要。未確認経路を免除するには人間と受入範囲を再合意し、それまでは全体の完成を主張しない。H3のHTML品質やH4のplan取込みそのものはH2受入に含めず、owner fixtureで共通契約を確認する。</p>
+</section>
+<section>
+<h2 id="consuming-paths-and-references">Consuming paths and references</h2>
+<ul>
+<li>提案配置はcrates/herness-supervision/に共通監督・証拠・判定、crates/herness-assessment/にtoolなしprovider adapter。H1のcore・engine-pi・storeとsrc-tauriが接続する。tests/supervision/で契約を検証する。これらの新規crateはまだ存在しない。</li>
+<li>H3は条件・原文版・画像等の証拠・公開前の再照合を渡し、H4は承認済み条件・制約・Task対応と順序を所有する。H5はこのspecの状態・理由・証拠・再開操作を使い、UI独自の成功を作らない。</li>
+<li>SDD正本は../sdd/skills/verification-before-completion/SKILL.md、sdd-goal、sdd-executeとそのimplementer-prompt。五項目の証拠契約を再利用する。H3・H4のhost差分が未承認の間は既存packの動作を置き換えない。</li>
+<li>2026-11-08に<a href="https://docs.typesafe.ai/api/system-one.md">Jev API</a>、<a href="https://docs.typesafe.ai/models.md">models</a>、<a href="https://docs.typesafe.ai/confidence.md">confidence</a>、<a href="https://docs.typesafe.ai/model-jaggedness.md">既知の弱点</a>、<a href="https://developers.openai.com/api/docs/guides/decisions">Decisions guide</a>、<a href="https://developers.openai.com/api/reference/resources/decisions/methods/create">API reference</a>を確認した。文書の取得は実モデル検証ではない。</li>
+</ul>
+</section>
+<section>
+<h2 id="open-items-and-approval">Open items and approval</h2>
+<p>H1境界の補修・追加APIとmigrationはH2の実装plan作成前にH1正本へ反映し、共有契約の変更としてレビューする。H1受入の未確認経路は未確認のまま追跡する。モデル別の閾値検証・通常LLMの対応能力・画像上限は接続を有効にする前に検証し、満たさないprofileは利用不可とする。これらを黙ったfallbackや成功扱いで埋めない。</p>
+<p>面談で合意したのは、条件案の事前確認と承認継承、累積稼働2時間・追加30回、金額上限は任意、範囲承認後の継続送信、判定不能後は人間が再開、条件別評価をhostが統合する構成。停滞・timeout・確率等の数値と残る詳細はこの設計案でレビューする。本specの保存・commitは設計の承認ではなく、本実装や実接続を開始しない。</p>
+</section>
+</main>
+</div>
+</body>
+</html>

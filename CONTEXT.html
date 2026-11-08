@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:72e71e9e6324e5634635034d4fc2723a69837e07b4aa97e5e6a4f4ea87249653">
+<meta name="sdd-source-digest" content="sha256:e94074b5dfab36c6a3738c7385d124e6fb5ddcb9f3cecd3acaa765c01a3bb381">
 <title>herness Context</title>
 <link rel="stylesheet" href="docs/sdd/assets/sdd.css">
 </head>
@@ -47,6 +47,20 @@
 <dd>
 <p>hernessがツール操作の実行可否を扱う方式。設定済みの権限ルールを使う「設定権限モード」と、軽量LLMやDecisionモデルで評価する「自動判定モード」を切り替えられる。</p>
 <p class="avoid-terms"><em>Avoid</em>: 完了判定モード、無条件実行モード</p>
+</dd>
+</div>
+<div class="term-entry">
+<dt>完了判定</dt>
+<dd>
+<p>承認済みの完了条件について、検証証拠とモデルの評価を用いてhernessが達成を確定すること。エージェントの応答終了や操作の実行許可とは区別する。</p>
+<p class="avoid-terms"><em>Avoid</em>: 正常終了、操作承認</p>
+</dd>
+</div>
+<div class="term-entry">
+<dt>継続実行</dt>
+<dd>
+<p>未達の完了条件に向けて、同じ子エージェントが承認済みの範囲と上限内で作業を続けること。中断した処理の復旧や、失敗した操作の再実行とは区別する。</p>
+<p class="avoid-terms"><em>Avoid</em>: 無制限実行、操作の自動再試行</p>
 </dd>
 </div>
 </dl>

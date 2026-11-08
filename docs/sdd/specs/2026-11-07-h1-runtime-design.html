@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:54cce2cc494833747ea037fab0ac0a949b6a41c464a73c4743fbdfe967fc69bd">
+<meta name="sdd-source-digest" content="sha256:53579215c4b60dbf1632d658f2138cf748602ddb5402fac10ccef7007a16b00c">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -49,7 +49,7 @@
 <main id="content" tabindex="-1">
 <h1 id="h1-実行基盤と変更理由の記録">H1: 実行基盤と変更理由の記録</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が承認。H1のsdd-planへ進む。本実装はまだ開始しない。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-08に利用者が設計と基盤選定を承認。その後実装をmainへ統合したが、<a href="../../research/2026-11-08-h1-acceptance.md">受入記録</a>ではOpenAI・Anthropic APIキー経路が未確認で、H1受入は未完了。H2の設計開始は別途指示されたが、未確認項目の免除ではない。</p>
 <p class="metadata"><strong>Chosen approach:</strong> TauriのRustホストに<code>pi-embedded</code>と<code>pi-ai</code>を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH1を扱う。用語は<a href="../../../CONTEXT.md">CONTEXT.md</a>、選定の証拠と限界は<a href="../../research/2026-11-07-pi-rust-spike.md">spike結果</a>を参照する。H2〜H5が利用する実行・許可・変更記録の正本は本specとする。</p>
 <section>
@@ -245,7 +245,7 @@
 </section>
 <section>
 <h2 id="consuming-paths">Consuming paths</h2>
-<p>既存のアプリコードはない。次は本specで提案する配置であり、ファイルを作成済みという意味ではない。</p>
+<p>設計時に提案した以下の配置へH1の実装が追加された。配置の存在は受入完了を意味せず、確認範囲は受入記録を参照する。H2が必要とする継続・評価器引継ぎ等の現状と追加契約の解消時点は<a href="2026-11-08-h2-supervision-design.md">H2の設計案</a>に記録している。共有する実行契約の変更は本specへ反映してレビューしてから実装する。</p>
 <ul>
 <li><code>src-tauri/</code>: Tauri起動、信頼されたIPC、lifecycleと接続設定。</li>
 <li><code>crates/herness-core/</code>: project・agent・run、許可、tool gateway、公開契約。</li>

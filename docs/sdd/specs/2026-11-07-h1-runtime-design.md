@@ -2,7 +2,7 @@
 
 **Classification:** architectural
 
-**Status:** 2026-11-08に利用者が承認。H1のsdd-planへ進む。本実装はまだ開始しない。
+**Status:** 2026-11-08に利用者が設計と基盤選定を承認。その後実装をmainへ統合したが、[受入記録](../../research/2026-11-08-h1-acceptance.md)ではOpenAI・Anthropic APIキー経路が未確認で、H1受入は未完了。H2の設計開始は別途指示されたが、未確認項目の免除ではない。
 
 **Chosen approach:** TauriのRustホストに`pi-embedded`と`pi-ai`を接続し、hernessが実行・許可・記録・保存を所有する案を採用する。Node runtimeは初期構成に含めない。2026-11-08のspec承認で基盤選定を確定した。
 
@@ -184,7 +184,7 @@ H1の受入には、上記の自動検証、実Tauriと選定adapterの接続、
 
 ## Consuming paths
 
-既存のアプリコードはない。次は本specで提案する配置であり、ファイルを作成済みという意味ではない。
+設計時に提案した以下の配置へH1の実装が追加された。配置の存在は受入完了を意味せず、確認範囲は受入記録を参照する。H2が必要とする継続・評価器引継ぎ等の現状と追加契約の解消時点は[H2の設計案](2026-11-08-h2-supervision-design.md)に記録している。共有する実行契約の変更は本specへ反映してレビューしてから実装する。
 
 - `src-tauri/`: Tauri起動、信頼されたIPC、lifecycleと接続設定。
 - `crates/herness-core/`: project・agent・run、許可、tool gateway、公開契約。
