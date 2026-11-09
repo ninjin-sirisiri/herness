@@ -1,16 +1,19 @@
 //! Desktop H3 HTML sync adapters.
 //!
-//! Task 14 adds the Common SDD policy bridge. The observer, coordinator,
-//! worker, renderer, publication, and UI commands remain later tasks; nothing
-//! in this module writes a file, creates HTML, calls a model, or sends an
-//! external request.
+//! Task 14 adds the Common SDD policy bridge, Task 17 the non-privileged
+//! WKWebView render evidence, and Task 18 the versioned evidence and Html
+//! condition-assessment adapters. Assessment calls the existing H2 tool-free
+//! transport through its purpose, consent, and budget gates; nothing in this
+//! module writes a formal file, creates HTML, or bypasses those gates.
 
+pub mod assessment;
 pub mod observer;
 pub mod policy;
 pub mod render;
 #[cfg(target_os = "macos")]
 mod render_macos;
 pub mod render_test;
+pub mod verification;
 pub mod store;
 pub mod worker;
 
@@ -32,4 +35,9 @@ pub use render::{
     RouterSelfProbe, render_candidate,
 };
 pub use render_test::RenderTestLaunch;
+pub use verification::{
+    CandidateVerification, CandidateVerificationRequest, FingerprintCapture, PolicyCheckSummary,
+    render_facts, verify_candidate,
+};
+pub use assessment::{HTML_ASSESSMENT_PURPOSE, HtmlAssessmentHost};
 pub use worker::{HtmlSyncWorker, ProjectWorkspaces};

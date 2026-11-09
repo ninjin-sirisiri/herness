@@ -18,11 +18,13 @@ pub mod config;
 pub mod coordinator;
 pub mod document;
 pub mod error;
+pub mod evidence;
 pub mod events;
 pub mod ids;
 pub mod observer;
 pub mod ports;
 pub mod request;
+pub mod rubric;
 pub mod state;
 pub mod version;
 pub mod workspace;
@@ -54,6 +56,23 @@ pub use document::{
     SourceSnapshot,
 };
 pub use error::H3Error;
+pub use evidence::{
+    AppliedEvaluation, AssessmentPlan, AssessmentSlice, CheckSet, ConditionAdoption,
+    ConditionBinding, ConditionEvidenceRef, ConditionEvidenceSummary, CoverageReport,
+    EvaluationBinding, EvaluationDisposition, EvaluationDispositionState, EvaluationSplit,
+    EvidenceBuildInput, EvidenceCheckResult, EvidenceContentKind, EvidenceContentSource,
+    EvidenceContentStore, EvidenceDocumentContent, EvidenceFingerprints, EvidenceImage,
+    EvidenceOrigin, EvidencePack, EvidenceValidationError, H3Condition, HOST_JS_ACCESSIBILITY_SOURCE,
+    H3_EVIDENCE_CONTENT_SCHEMA, H3_EVIDENCE_SCHEMA, H3_RENDER_MANIFEST_VERSION,
+    MAX_DEFAULT_SLICE_BYTES, MAX_DEFAULT_SLICE_UNITS, NATIVE_RENDER_SOURCE, Provenance,
+    RenderCandidateFingerprints, RenderConfigurationEvidence, RenderEvidence, RenderPngEvidence,
+    RenderSignalEvidence, RequiredCheck, RequiredCheckKind, ScannedHtml, SliceAssessment,
+    SourceUnitDefinition, SourceUnits, StrictRequirement, SupportEvidence, SupplementaryEvidence,
+    UnitEvidence, UsabilityEvidence,
+};
+pub use rubric::{
+    ConditionRubric, H3_RUBRIC_SCHEMA, H3_RUBRIC_VERSION, RubricSet, condition_rubric,
+};
 pub use events::{
     H3_DOCUMENT_ACTIVITY_KIND, H3_PROJECT_ACTIVITY_KIND, H3_PUBLICATION_EVENT_KIND,
     H3_SETTINGS_EVENT_KIND, H3_STATE_EVENT_KIND, document_state_event, publication_event,

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use herness_assessment::llm::EvidenceDocument;
+use herness_html_sync::{EvidenceContentKind, EvidenceContentSource};
 use herness_assessment::{
     AssessmentEndpoints, AssessmentTransport, DecisionsAssessmentAdapter, JevAssessmentAdapter,
     LlmAssessmentAdapter,
@@ -225,6 +226,7 @@ pub struct HostAssessmentPort {
     store: StoreHandle,
     config: ConfigStore,
     host: AssessmentHost,
+    content: Option<Arc<dyn EvidenceContentSource>>,
 }
 
 impl HostAssessmentPort {
@@ -234,7 +236,19 @@ impl HostAssessmentPort {
             store,
             config,
             host,
+            content: None,
         }
+    }
+
+    /// Adds an exact content source for full H3 evidence text/images.
+    ///
+    /// This does not bypass the purpose, consent, budget, or profile gates. It
+    /// only replaces the metadata-only evidence projection with the exact
+    /// content the H3 evidence pack already assembled.
+    #[must_use]
+    pub fn with_evidence_content(mut self, content: Arc<dyn EvidenceContentSource>) -> Self {
+        self.content = Some(content);
+        self
     }
 
     fn transport_for(
@@ -440,9 +454,10 @@ impl ConditionAssessmentPort for HostAssessmentPort {
         let configured = self.configured(project, request.profile())?;
         if request.purpose() == ProfilePurpose::Html
             && configured.profile.required_inputs().requires_image()
+            && self.content.is_none()
         {
-            // This port supplies text evidence only. A profile that requires
-            // images must not be sent as a text-only assessment.
+            // A port without a content source supplies text evidence only. A
+            // profile that requires images must not be sent as text-only.
             return Err(SupervisionError::ProfileUnavailable {
                 reason: ProfileUnavailable::MissingInput {
                     modality: herness_core::contracts::InputModality::Image,
@@ -467,12 +482,86 @@ impl ConditionAssessmentPort for HostAssessmentPort {
                 },
             });
         }
-
         let evidence = self
             .store
             .list_for_supervision(project, request.supervision_id())?;
         let mut documents = Vec::new();
+        let mut has_image = false;
         for evidence_id in request.evidence() {
+            if !evidence.iter().any(|record| record.id() == *evidence_id) {
+                return Err(SupervisionError::EvidenceContractViolation {
+                    field: "assessment.evidence".to_owned(),
+                    detail: "requested evidence is no longer present".to_owned(),
+                });
+            }
+            if let Some(source) = &self.content {
+                let Some(content) = source.document(project, *evidence_id)? else {
+                    return Err(SupervisionError::EvidenceContractViolation {
+                        field: "assessment.evidence".to_owned(),
+                        detail: "requested evidence content is no longer present".to_owned(),
+                    });
+                };
+                if content.is_truncated() {
+                    return Err(SupervisionError::EvidenceContractViolation {
+                        field: "assessment.evidence".to_owned(),
+                        detail: "evidence was truncated and cannot be assessed".to_owned(),
+                    });
+                }
+                if content.has_secret_exclusion() {
+                    return Err(SupervisionError::EvidenceContractViolation {
+                        field: "assessment.evidence".to_owned(),
+                        detail: "evidence excluded secret content and cannot be assessed"
+                            .to_owned(),
+                    });
+                }
+                match content.kind() {
+                    EvidenceContentKind::Text => {
+                        let Some(text) = content.text_payload() else {
+                            return Err(SupervisionError::EvidenceContractViolation {
+                                field: "assessment.evidence".to_owned(),
+                                detail: "text evidence content is missing".to_owned(),
+                            });
+                        };
+                        documents.push(
+                            EvidenceDocument::text(*evidence_id, text).map_err(|error| {
+                                SupervisionError::AssessmentContractViolation {
+                                    field: "assessment.evidence".to_owned(),
+                                    detail: error.to_string(),
+                                }
+                            })?,
+                        );
+                    }
+                    EvidenceContentKind::Image => {
+                        let Some(media_type) = content.media_type() else {
+                            return Err(SupervisionError::EvidenceContractViolation {
+                                field: "assessment.evidence".to_owned(),
+                                detail: "image evidence media type is missing".to_owned(),
+                            });
+                        };
+                        let Some(bytes) = content.image_bytes() else {
+                            return Err(SupervisionError::EvidenceContractViolation {
+                                field: "assessment.evidence".to_owned(),
+                                detail: "image evidence bytes are missing".to_owned(),
+                            });
+                        };
+                        has_image = true;
+                        documents.push(
+                            EvidenceDocument::image(
+                                *evidence_id,
+                                media_type,
+                                bytes.to_vec(),
+                            )
+                            .map_err(|error| {
+                                SupervisionError::AssessmentContractViolation {
+                                    field: "assessment.evidence".to_owned(),
+                                    detail: error.to_string(),
+                                }
+                            })?,
+                        );
+                    }
+                }
+                continue;
+            }
             let Some(record) = evidence.iter().find(|record| record.id() == *evidence_id) else {
                 return Err(SupervisionError::EvidenceContractViolation {
                     field: "assessment.evidence".to_owned(),
@@ -498,6 +587,25 @@ impl ConditionAssessmentPort for HostAssessmentPort {
             return Err(SupervisionError::AssessmentContractViolation {
                 field: "assessment.evidence".to_owned(),
                 detail: "an assessment needs at least one evidence document".to_owned(),
+            });
+        }
+        if configured.profile.required_inputs().requires_image() && !has_image {
+            return Err(SupervisionError::ProfileUnavailable {
+                reason: ProfileUnavailable::MissingInput {
+                    modality: herness_core::contracts::InputModality::Image,
+                },
+            });
+        }
+        if has_image
+            && !consent
+                .scope()
+                .data_kinds()
+                .contains(&herness_supervision::DisclosureDataKind::Image)
+        {
+            return Err(SupervisionError::ConsentBlocked {
+                reason: herness_supervision::ConsentBlock::ScopeExpanded {
+                    added: vec![herness_supervision::DisclosureDataKind::Image],
+                },
             });
         }
         let entry = self.host.entry(&configured.profile)?;

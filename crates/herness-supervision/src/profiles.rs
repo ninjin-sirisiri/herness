@@ -159,6 +159,11 @@ pub struct ProfileInputs {
     text: bool,
     image: bool,
     structured_output: bool,
+    /// The connection/input may carry images when supplied, but an individual
+    /// request does not have to contain one. This distinguishes a text-only
+    /// condition from an image-required condition under one purpose profile.
+    #[serde(default)]
+    image_optional: bool,
 }
 
 impl ProfileInputs {
@@ -168,6 +173,18 @@ impl ProfileInputs {
             text,
             image,
             structured_output,
+            image_optional: false,
+        }
+    }
+
+    /// Text with optional image input. Image bytes are sent when the caller
+    /// supplies them; a text-only request remains valid.
+    pub const fn text_with_optional_image() -> Self {
+        Self {
+            text: true,
+            image: false,
+            structured_output: false,
+            image_optional: true,
         }
     }
 
@@ -177,6 +194,7 @@ impl ProfileInputs {
             text: true,
             image: false,
             structured_output: false,
+            image_optional: false,
         }
     }
 
@@ -186,6 +204,7 @@ impl ProfileInputs {
             text: true,
             image: false,
             structured_output: true,
+            image_optional: false,
         }
     }
 
@@ -194,9 +213,19 @@ impl ProfileInputs {
         self.text
     }
 
-    /// Whether image bytes are required.
+    /// Whether image bytes are required for every request.
     pub const fn requires_image(self) -> bool {
         self.image
+    }
+
+    /// Whether image bytes are accepted when the caller supplies them.
+    pub const fn supports_image(self) -> bool {
+        self.image || self.image_optional
+    }
+
+    /// Whether image input is optional rather than required.
+    pub const fn has_optional_image(self) -> bool {
+        self.image_optional
     }
 
     /// Whether structured output is required.

@@ -1399,6 +1399,7 @@ dependencies = [
 name = "herness-html-sync-tests"
 version = "0.1.0"
 dependencies = [
+ "herness-assessment",
  "herness-core",
  "herness-desktop",
  "herness-engine-pi",
