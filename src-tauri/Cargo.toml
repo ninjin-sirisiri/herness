@@ -23,10 +23,12 @@ tauri-build = "2.7.4"
 herness-core = { path = "../crates/herness-core" }
 herness-assessment = { path = "../crates/herness-assessment" }
 herness-engine-pi = { path = "../crates/herness-engine-pi" }
+herness-html-sync = { path = "../crates/herness-html-sync" }
 herness-store = { path = "../crates/herness-store" }
 herness-supervision = { path = "../crates/herness-supervision" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2.workspace = true
 uuid.workspace = true
 tauri = { version = "2.12.5", default-features = true }
 url = "2.5.8"

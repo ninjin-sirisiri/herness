@@ -13,6 +13,10 @@ pub enum HostCapability {
     HtmlWorker,
     /// Driving SDD Task progress across runs.
     SddTaskController,
+    /// Dispatching an approved HTML authoring job to a host-owned worker.
+    AuthoringDispatch,
+    /// Calling the versioned Common SDD host API for static policy work.
+    PolicyBridge,
 }
 
 impl HostCapability {
@@ -22,6 +26,8 @@ impl HostCapability {
             Self::SkillRead => "skill_read",
             Self::HtmlWorker => "html_worker",
             Self::SddTaskController => "sdd_task_controller",
+            Self::AuthoringDispatch => "authoring_dispatch",
+            Self::PolicyBridge => "policy_bridge",
         }
     }
 }
@@ -33,6 +39,9 @@ pub enum CapabilityUnavailableReason {
     /// H1 deliberately does not implement this worker. H3/H4 own it and no
     /// parent-model fallback is performed.
     NotImplementedInH1,
+    /// This build has not implemented the capability yet. It must stay
+    /// explicitly unavailable rather than falling back to the parent model.
+    NotImplementedYet,
 }
 
 /// Availability of one capability.
@@ -61,16 +70,21 @@ impl CapabilityStatus {
 
 /// Capability report for one host configuration.
 ///
-/// H1 can read skills, but never advertises the HTML worker or SDD Task
-/// controller as available. A caller that needs one of those flows must
-/// receive an explicit unavailability result; it must not silently fall back
-/// to the parent model.
+/// The H1 default can read skills but never advertises the HTML worker, SDD
+/// Task controller, authoring dispatch, or policy bridge as available. The H3
+/// policy-bridge constructor advertises only the versioned Common SDD host API;
+/// the HTML worker and authoring dispatch stay explicitly unavailable until
+/// their later tasks connect them. A caller that needs an unavailable flow
+/// receives an explicit result and never silently falls back to the parent
+/// model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostCapabilities {
     skill_read: CapabilityStatus,
     html_worker: CapabilityStatus,
     sdd_task_controller: CapabilityStatus,
+    authoring_dispatch: CapabilityStatus,
+    policy_bridge: CapabilityStatus,
 }
 
 impl HostCapabilities {
@@ -84,7 +98,47 @@ impl HostCapabilities {
             sdd_task_controller: CapabilityStatus::Unavailable {
                 reason: CapabilityUnavailableReason::NotImplementedInH1,
             },
+            authoring_dispatch: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedYet,
+            },
+            policy_bridge: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedYet,
+            },
         }
+    }
+
+    /// The H3 policy-bridge capability set.
+    ///
+    /// Task 14 connects the versioned Common SDD host API. The HTML worker and
+    /// authoring dispatch stay explicitly unavailable until Tasks 16/22; this
+    /// report never claims them early.
+    pub const fn h3_policy_bridge() -> Self {
+        Self {
+            skill_read: CapabilityStatus::Available,
+            html_worker: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedYet,
+            },
+            sdd_task_controller: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedInH1,
+            },
+            authoring_dispatch: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedYet,
+            },
+            policy_bridge: CapabilityStatus::Available,
+        }
+    }
+
+    /// Returns a copy with one capability replaced.
+    pub const fn with_status(self, capability: HostCapability, status: CapabilityStatus) -> Self {
+        let mut next = self;
+        match capability {
+            HostCapability::SkillRead => next.skill_read = status,
+            HostCapability::HtmlWorker => next.html_worker = status,
+            HostCapability::SddTaskController => next.sdd_task_controller = status,
+            HostCapability::AuthoringDispatch => next.authoring_dispatch = status,
+            HostCapability::PolicyBridge => next.policy_bridge = status,
+        }
+        next
     }
 
     /// Returns the status of `capability`.
@@ -93,6 +147,8 @@ impl HostCapabilities {
             HostCapability::SkillRead => self.skill_read,
             HostCapability::HtmlWorker => self.html_worker,
             HostCapability::SddTaskController => self.sdd_task_controller,
+            HostCapability::AuthoringDispatch => self.authoring_dispatch,
+            HostCapability::PolicyBridge => self.policy_bridge,
         }
     }
 }

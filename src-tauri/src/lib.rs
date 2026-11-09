@@ -9,6 +9,7 @@ pub mod commands;
 pub mod credentials;
 pub mod guard;
 pub mod host;
+pub mod html_sync;
 pub mod lifecycle;
 pub mod login;
 pub mod real_check;

@@ -14,6 +14,7 @@
 #![doc = "H3 numeric defaults remain the approved spec values; this crate does not weaken them."]
 
 pub mod candidate;
+pub mod config;
 pub mod document;
 pub mod error;
 pub mod events;
@@ -26,6 +27,17 @@ pub mod version;
 pub use candidate::{
     CandidateArtifactStore, CandidateGenerationRequest, MAX_CANDIDATE_BYTES,
     MAX_SOURCE_MARKDOWN_BYTES, OpenedCandidateGeneration,
+};
+pub use config::{
+    APPROVED_AUTHORING_CONCURRENCY, APPROVED_DOCUMENT_PUBLICATION_CONCURRENCY,
+    H3ApprovalLimits, H3ApprovalState, H3Approver, H3ConfigurationApproval,
+    H3ConfigurationDraft, H3ConnectionApproval, H3OwnerBinding, H3PackBinding, H3ScopeChange,
+    H3ScopeChangeKind, H3VersionBinding, HOST_API_PROTOCOL, HOST_API_VERSION,
+    MAX_APPROVED_ADDITIONAL_RUNS, MAX_APPROVED_CANDIDATE_BYTES, MAX_APPROVED_CONSECUTIVE_STALLS,
+    MAX_APPROVED_CYCLE_ACTIVE_SECONDS, MAX_APPROVED_RECONCILE_INTERVAL_MS,
+    MAX_APPROVED_RENDER_TIMEOUT_MS, MAX_APPROVED_SETTLE_MS, MAX_APPROVED_SOURCE_BYTES,
+    MAX_APPROVED_SVG_ELEMENTS, PACK_INTEGRATION_HOST, PACK_INTEGRATION_SCHEMA,
+    PACK_POLICY_VERSION, StoreBackedOwnerApprovalRegistry,
 };
 pub use document::{
     DocumentKey, FingerprintKind, FingerprintSet, MAX_DOCUMENT_PATH_BYTES, SourceRevision,

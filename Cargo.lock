@@ -1330,12 +1330,14 @@ dependencies = [
  "herness-assessment",
  "herness-core",
  "herness-engine-pi",
+ "herness-html-sync",
  "herness-store",
  "herness-supervision",
  "security-framework",
  "security-framework-sys",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tempfile",
@@ -1383,11 +1385,13 @@ name = "herness-html-sync-tests"
 version = "0.1.0"
 dependencies = [
  "herness-core",
+ "herness-desktop",
  "herness-html-sync",
  "herness-store",
  "herness-supervision",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]

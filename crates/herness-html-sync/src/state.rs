@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use uuid::Uuid;
 
+use crate::config::{H3ConfigurationApproval, mix_approval_fingerprint};
 use crate::document::{DocumentKey, FingerprintKind, FingerprintSet, SourceSnapshot};
 use crate::error::H3Error;
 use crate::ids::{CandidateId, CycleId, GenerationId, JobId, PublicationId};
@@ -1358,7 +1359,8 @@ impl H3Record for SyncCycle {
     }
 }
 
-/// Approved, versioned H3 project settings.
+/// Versioned H3 project settings with an optional human configuration
+/// approval. Settings without an approval are scan-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct H3Settings {
@@ -1371,11 +1373,19 @@ pub struct H3Settings {
     retain_history: bool,
     fingerprint: ContentDigest,
     approved_at: Timestamp,
+    /// Human approval bound to this exact version. Settings without one are
+    /// scan-only; a receipt or contract is never stored here as approval.
+    #[serde(default)]
+    approval: Option<H3ConfigurationApproval>,
 }
 
 impl H3Settings {
-    /// Creates approved settings. Target paths are canonical, unique, and
-    /// sorted; the fingerprint binds the exact approved scope.
+    /// Creates settings without a recorded human configuration approval.
+    ///
+    /// This value is persisted and may be scanned, but the H3 owner registry
+    /// never mints authority from it. Use [`Self::approved`] for the normal
+    /// human-approved path. Target paths are canonical, unique, and sorted; the
+    /// fingerprint binds the exact stored scope.
     pub fn new(
         project_id: ProjectId,
         version: u64,
@@ -1407,7 +1417,79 @@ impl H3Settings {
             retain_history,
             fingerprint,
             approved_at,
+            approval: None,
         })
+    }
+
+    /// Creates settings from one human configuration approval.
+    ///
+    /// The settings version, Target set, retention flag, and approval time all
+    /// come from the approval. The fingerprint binds both the stored scope and
+    /// the approval fingerprint, so removing, adding, or altering a Target
+    /// without a new approval is detected.
+    pub fn approved(
+        approval: H3ConfigurationApproval,
+        enabled: bool,
+    ) -> Result<Self, H3Error> {
+        let project_id = approval.project_id();
+        let version = approval.settings_version();
+        let targets = approval.targets().to_vec();
+        let auto_publish = approval.auto_publish();
+        let retain_history = approval.retain_history();
+        let approved_at = approval.approved_at();
+        Self::new(
+            project_id,
+            version,
+            enabled,
+            targets,
+            auto_publish,
+            retain_history,
+            approved_at,
+        )?
+        .with_approval(approval)
+    }
+
+    /// Attaches one human approval to these settings.
+    ///
+    /// The approval must cover exactly this project, settings version, Target
+    /// set, and retention flag. The fingerprint is recomputed with the
+    /// approval fingerprint mixed in.
+    pub fn with_approval(mut self, approval: H3ConfigurationApproval) -> Result<Self, H3Error> {
+        approval.verify_fingerprint()?;
+        if approval.project_id() != self.project_id {
+            return Err(H3Error::CrossProject {
+                id_kind: "configuration approval".to_owned(),
+                expected: self.project_id,
+                found: approval.project_id(),
+            });
+        }
+        if approval.settings_version() != self.version {
+            return Err(H3Error::invalid(
+                "settingsVersion",
+                "the approval does not cover this settings version",
+            ));
+        }
+        if approval.targets() != self.target_paths {
+            return Err(H3Error::invalid(
+                "targetPaths",
+                "the approval does not cover exactly this Target set",
+            ));
+        }
+        if approval.auto_publish() != self.auto_publish {
+            return Err(H3Error::invalid(
+                "autoPublish",
+                "the approval auto-publish setting differs from the settings",
+            ));
+        }
+        if approval.retain_history() != self.retain_history {
+            return Err(H3Error::invalid(
+                "retainHistory",
+                "the approval retention differs from the settings",
+            ));
+        }
+        self.approval = Some(approval);
+        self.fingerprint = self.compute_fingerprint();
+        Ok(self)
     }
 
     /// Project these settings belong to.
@@ -1450,7 +1532,21 @@ impl H3Settings {
         self.approved_at
     }
 
+    /// Human configuration approval bound to this version, when one exists.
+    pub const fn approval(&self) -> Option<&H3ConfigurationApproval> {
+        self.approval.as_ref()
+    }
+
+    /// Recomputes and verifies the stored scope fingerprint.
+    pub fn verify_fingerprint(&self) -> bool {
+        self.fingerprint == self.compute_fingerprint()
+    }
+
     /// Returns a new enabled version with a fresh fingerprint.
+    ///
+    /// A settings version is part of the human approval. Enabling therefore
+    /// records no approval until a human approves the new version; the previous
+    /// approval never carries over silently.
     pub fn enable(self, at: Timestamp) -> Result<Self, H3Error> {
         let next = self
             .version
@@ -1465,6 +1561,17 @@ impl H3Settings {
             self.retain_history,
             at,
         )
+    }
+
+    fn compute_fingerprint(&self) -> ContentDigest {
+        let base = settings_fingerprint(
+            self.project_id,
+            self.version,
+            &self.target_paths,
+            self.auto_publish,
+            self.retain_history,
+        );
+        mix_approval_fingerprint(&base, self.approval.as_ref())
     }
 }
 

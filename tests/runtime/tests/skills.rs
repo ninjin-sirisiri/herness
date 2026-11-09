@@ -351,6 +351,62 @@ fn run_context_distinguishes_reading_from_unavailable_worker_execution() {
 }
 
 #[test]
+fn h3_policy_bridge_capability_is_available_without_claiming_worker_or_dispatch() {
+    let h1 = HostCapabilities::h1();
+    assert!(h1.status(HostCapability::SkillRead).is_available());
+    assert_eq!(
+        h1.status(HostCapability::PolicyBridge),
+        CapabilityStatus::Unavailable {
+            reason: CapabilityUnavailableReason::NotImplementedYet
+        }
+    );
+    assert_eq!(h1, HostCapabilities::default());
+
+    let h3 = HostCapabilities::h3_policy_bridge();
+    assert!(h3.status(HostCapability::SkillRead).is_available());
+    assert!(h3.status(HostCapability::PolicyBridge).is_available());
+    assert_eq!(
+        h3.status(HostCapability::HtmlWorker),
+        CapabilityStatus::Unavailable {
+            reason: CapabilityUnavailableReason::NotImplementedYet
+        },
+        "Task 14 must not claim the HtmlWorker before Task 16"
+    );
+    assert_eq!(
+        h3.status(HostCapability::AuthoringDispatch),
+        CapabilityStatus::Unavailable {
+            reason: CapabilityUnavailableReason::NotImplementedYet
+        },
+        "Task 14 must not claim authoring dispatch before Task 16"
+    );
+    assert_eq!(
+        h3.status(HostCapability::SddTaskController),
+        CapabilityStatus::Unavailable {
+            reason: CapabilityUnavailableReason::NotImplementedInH1
+        }
+    );
+    assert_eq!(HostCapability::PolicyBridge.as_str(), "policy_bridge");
+    assert_eq!(
+        HostCapability::AuthoringDispatch.as_str(),
+        "authoring_dispatch"
+    );
+
+    let encoded = serde_json::to_value(h3).expect("serialize capabilities");
+    assert_eq!(encoded["policyBridge"], serde_json::json!({"status": "available"}));
+    assert_eq!(encoded["htmlWorker"]["status"], "unavailable");
+    assert_eq!(encoded["authoringDispatch"]["status"], "unavailable");
+    assert_eq!(encoded["authoringDispatch"]["reason"], "not_implemented_yet");
+
+    let flipped = h3.with_status(
+        HostCapability::AuthoringDispatch,
+        CapabilityStatus::Available,
+    );
+    assert!(flipped.status(HostCapability::AuthoringDispatch).is_available());
+    assert!(!flipped.status(HostCapability::HtmlWorker).is_available());
+    assert!(flipped.status(HostCapability::PolicyBridge).is_available());
+}
+
+#[test]
 fn run_context_detects_change_mid_run() {
     let temp = TempDir::new().expect("temp dir");
     let pack_root = temp.path().join("pack");

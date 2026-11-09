@@ -14,9 +14,11 @@ herness-core = { path = "../../crates/herness-core" }
 herness-html-sync = { path = "../../crates/herness-html-sync" }
 herness-supervision = { path = "../../crates/herness-supervision" }
 serde_json.workspace = true
+sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+herness-desktop = { path = "../../src-tauri" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
 rusqlite.workspace = true
 tempfile.workspace = true
