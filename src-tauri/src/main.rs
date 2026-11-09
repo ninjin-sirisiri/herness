@@ -10,10 +10,14 @@ fn main() {
     if let Some(exit_code) = herness_desktop::real_check::main_entry(std::env::args().skip(1)) {
         std::process::exit(exit_code);
     }
-    let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
-    let quit_test = std::env::args().any(|argument| argument == "--quit-test");
-    let close_reopen_test = std::env::args().any(|argument| argument == "--close-reopen-test");
-    if let Err(error) = herness_desktop::app::run(smoke_test, quit_test, close_reopen_test) {
+    let mode = match herness_desktop::app::parse_launch_mode(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("herness-desktop arguments are invalid: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = herness_desktop::app::run(mode) {
         eprintln!("herness-desktop failed to start: {error}");
         std::process::exit(1);
     }

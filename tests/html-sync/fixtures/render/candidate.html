@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="sdd-html-contract" content="semantic-v1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      This fixture deliberately uses a permissive CSP. The render evidence test
+      must prove the native WKContentRuleList, navigation delegates, and scheme
+      handler are the network boundary, not a page-level policy.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src * data: blob:; connect-src *; frame-src *; form-action *; style-src * 'unsafe-inline'; script-src * 'unsafe-inline'"
+    />
+    <title>H3 render evidence fixture</title>
+    <link rel="stylesheet" href="candidate.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <p class="eyebrow">herness / H3 render evidence</p>
+      <h1>非特権WebKitの描画証拠</h1>
+      <p class="lede">
+        この文書は、生成候補HTML・CSS・資源だけをメモリ上のjob限定protocolから配信し、
+        外部network・新規window・外部navigation・download・Tauri IPCを遮断した状態で
+        実際のWKWebViewが何を描画したかを記録するためのフィクスチャである。
+      </p>
+    </header>
+
+    <nav aria-label="Fixture sections">
+      <ul>
+        <li><a href="#diagram">Diagram</a></li>
+        <li><a href="#table">Comparison table</a></li>
+        <li><a href="#probe">Network probe</a></li>
+      </ul>
+    </nav>
+
+    <main>
+      <section id="diagram" aria-labelledby="diagram-heading">
+        <h2 id="diagram-heading">状態遷移の図</h2>
+        <figure>
+          <svg
+            role="img"
+            aria-labelledby="diagram-title diagram-desc"
+            viewBox="0 0 640 220"
+            width="100%"
+            height="220"
+          >
+            <title id="diagram-title">観測から描画証拠までの流れ</title>
+            <desc id="diagram-desc">
+              Markdown source, observer, candidate store, render job and evidence manifest.
+            </desc>
+            <defs>
+              <marker
+                id="arrow"
+                viewBox="0 0 10 10"
+                refX="9"
+                refY="5"
+                markerWidth="7"
+                markerHeight="7"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+              </marker>
+            </defs>
+            <g fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="12" y="70" width="128" height="64" rx="10" />
+              <rect x="180" y="70" width="128" height="64" rx="10" />
+              <rect x="348" y="70" width="128" height="64" rx="10" />
+              <rect x="516" y="70" width="112" height="64" rx="10" />
+              <line x1="140" y1="102" x2="180" y2="102" marker-end="url(#arrow)" />
+              <line x1="308" y1="102" x2="348" y2="102" marker-end="url(#arrow)" />
+              <line x1="476" y1="102" x2="516" y2="102" marker-end="url(#arrow)" />
+            </g>
+            <g fill="currentColor" font-size="14" text-anchor="middle">
+              <text x="76" y="98">Markdown</text>
+              <text x="76" y="118">source</text>
+              <text x="244" y="98">observer</text>
+              <text x="244" y="118">revision</text>
+              <text x="412" y="98">candidate</text>
+              <text x="412" y="118">bytes</text>
+              <text x="572" y="98">render</text>
+              <text x="572" y="118">evidence</text>
+            </g>
+          </svg>
+          <figcaption id="diagram-caption">
+            図1: 原文の安定版から候補bytes、そして描画証拠までの一方向の流れ。
+          </figcaption>
+        </figure>
+        <p>
+          図はインラインSVGで描かれ、同じ内容を外部資源としても読み込む。外部資源が
+          配信されない場合は画像の自然サイズが0になり、失敗画像signalとして記録される。
+        </p>
+        <img
+          src="assets/diagram.svg"
+          alt="外部資源として読み込む状態遷移の図"
+          width="320"
+          height="110"
+        />
+      </section>
+
+      <section id="table" aria-labelledby="table-heading">
+        <h2 id="table-heading">比較表</h2>
+        <table>
+          <caption>描画境界の比較</caption>
+          <thead>
+            <tr>
+              <th scope="col">境界</th>
+              <th scope="col">native layer</th>
+              <th scope="col">証拠</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">subresource</th>
+              <td>WKContentRuleList</td>
+              <td>loopback受信0</td>
+            </tr>
+            <tr>
+              <th scope="row">navigation</th>
+              <td>WKNavigationDelegate</td>
+              <td>拒否URL列</td>
+            </tr>
+            <tr>
+              <th scope="row">new window</th>
+              <td>WKUIDelegate</td>
+              <td>new window数</td>
+            </tr>
+            <tr>
+              <th scope="row">IPC</th>
+              <td>初期化scriptなし</td>
+              <td>typeof probe</td>
+            </tr>
+            <tr>
+              <th scope="row">storage</th>
+              <td>non-persistent store</td>
+              <td>cookie/localStorage分離</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="content" aria-labelledby="content-heading">
+        <h2 id="content-heading">可読性とlayout</h2>
+        <p>
+          本文は日本語とEnglishを混在させ、system fontのfallback、行長、行間、
+          tableの折返しを観測できるようにしている。長いcode行はmobile viewportで
+          横overflowを発生させ、<code>overflow</code> signalの検出対象になる。
+        </p>
+        <pre><code>h3render://0123456789abcdef0123456789abcdef/index.html?this-is-a-deliberately-long-unbroken-path-for-overflow-evidence</code></pre>
+        <p class="fine-print">
+          この注記は意図的に11 CSS pxで書かれ、small text signalの検出対象になる。
+        </p>
+        <div class="cards">
+          <div class="card">
+            <h3>描画の入力</h3>
+            <p>候補HTML、shared CSS、宣言済み資源だけをメモリから配信する。</p>
+          </div>
+          <div class="card card-overlap">
+            <h3>描画の境界</h3>
+            <p>外部network、新規window、download、external navigation、IPCを拒否する。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="probe" aria-labelledby="probe-heading">
+        <h2 id="probe-heading">Network probe</h2>
+        <p>
+          以下の要素はloopback listenerを指す。native遮断がなければ、このfixtureの
+          描画中に1件以上の受信が発生する。
+        </p>
+        <img src="{{LEAK_BASE}}/leak-image.png" alt="loopback leak image" width="64" height="64" />
+        <iframe src="{{LEAK_BASE}}/leak-frame" title="loopback leak frame"></iframe>
+        <form id="leak-form" action="{{LEAK_BASE}}/leak-form" method="post">
+          <button type="submit">send leak form</button>
+        </form>
+        <a id="leak-link" href="{{LEAK_BASE}}/leak-nav">external navigation</a>
+      </section>
+    </main>
+
+    <footer>
+      <p>Exact candidate bytes are fingerprinted into the render manifest.</p>
+    </footer>
+
+    <script>
+      (() => {
+        const base = "{{LEAK_BASE}}";
+        const results = {
+          scheme: "http",
+          websocket: "not-attempted",
+          beacon: "not-attempted",
+          popup: "not-attempted",
+          form: "not-attempted",
+          link: "not-attempted",
+        };
+        window.addEventListener("load", () => {
+          setTimeout(() => {
+            fetch(base + "/leak-js-fetch", { cache: "no-store" })
+              .then(() => {
+                results.fetch = "allowed";
+                window.__H3_CANDIDATE_PROBE__ = { ...results };
+              })
+              .catch((error) => {
+                results.fetch = "blocked:" + ((error && error.name) || "error");
+                window.__H3_CANDIDATE_PROBE__ = { ...results };
+              });
+            const image = new Image();
+            image.onload = () => {
+              results.image = "allowed";
+              window.__H3_CANDIDATE_PROBE__ = { ...results };
+            };
+            image.onerror = () => {
+              results.image = "blocked";
+              window.__H3_CANDIDATE_PROBE__ = { ...results };
+            };
+            image.src = base + "/leak-js-image";
+            try {
+              const socket = new WebSocket(base.replace("http", "ws") + "/leak-ws");
+              socket.onerror = () => {};
+              results.websocket = "attempted";
+            } catch (error) {
+              results.websocket = "blocked";
+            }
+            try {
+              results.beacon = navigator.sendBeacon(base + "/leak-beacon", "probe")
+                ? "queued"
+                : "blocked";
+            } catch (error) {
+              results.beacon = "blocked";
+            }
+            try {
+              results.popup = String(window.open(base + "/leak-popup", "_blank"));
+            } catch (error) {
+              results.popup = "blocked";
+            }
+            try {
+              document.getElementById("leak-form").submit();
+              results.form = "submitted";
+            } catch (error) {
+              results.form = "blocked";
+            }
+            // The link stays in the document for the accessibility projection.
+            // It is not clicked here because WebKit may open a speculative TCP
+            // connection for a user-initiated top-level navigation before the
+            // navigation delegate cancels it; the form submit above already
+            // exercises external navigation with no connection at all.
+            results.link = "not-clicked";
+            window.__H3_CANDIDATE_PROBE__ = { ...results };
+          }, 0);
+        });
+      })();
+    </script>
+  </body>
+</html>

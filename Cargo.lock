@@ -1336,6 +1336,7 @@ dependencies = [
 name = "herness-desktop"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "herness-assessment",
  "herness-core",
  "herness-engine-pi",
@@ -1343,6 +1344,10 @@ dependencies = [
  "herness-store",
  "herness-supervision",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-web-kit",
  "security-framework",
  "security-framework-sys",
  "serde",

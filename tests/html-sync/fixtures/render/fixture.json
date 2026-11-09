@@ -1,0 +1,10 @@
+{
+  "html": "candidate.html",
+  "css": "candidate.css",
+  "resources": [
+    {
+      "path": "assets/diagram.svg",
+      "contentType": "image/svg+xml"
+    }
+  ]
+}

@@ -7,6 +7,10 @@
 
 pub mod observer;
 pub mod policy;
+pub mod render;
+#[cfg(target_os = "macos")]
+mod render_macos;
+pub mod render_test;
 pub mod store;
 pub mod worker;
 
@@ -19,4 +23,13 @@ pub use policy::{
     CandidateCheck, CandidateDecision, CandidateStage, ConnectedPolicyBridge, HtmlPolicyBridge,
     PackProbe, PolicyBootstrap, PolicyBridgeError, PolicyFinding,
 };
+pub use render::{
+    BrowserEvidence, CancellationToken, CandidateEvidence, ConfigurationEvidence, CssViewport,
+    HiddenWindowEvidence, IsolationEvidence, PngEvidence, ProtocolEvidence, ProtocolRequestRecord,
+    RENDER_CONFIGURATIONS, RENDER_HARD_TIMEOUT, RENDER_MANIFEST_VERSION, RenderAppearance,
+    RenderBudget, RenderConfiguration, RenderError, RenderEvidence, RenderFailure, RenderJob,
+    RenderManifest, RenderPng, RenderResource, RenderSignals, RenderStatus, RenderViewport,
+    RouterSelfProbe, render_candidate,
+};
+pub use render_test::RenderTestLaunch;
 pub use worker::{HtmlSyncWorker, ProjectWorkspaces};
