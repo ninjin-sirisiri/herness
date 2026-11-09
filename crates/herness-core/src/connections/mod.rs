@@ -33,4 +33,6 @@ pub use redact::{
     redact_known_secrets, redact_url,
 };
 pub use redirect::{Origin, RedirectAuthDecision, RedirectDropReason, redirect_auth_decision};
-pub use registry::{ConnectionAdmin, ConnectionDirectory, ConnectionSettings, InsecureRemoteHttp};
+pub use registry::{
+    AssessmentGateway, ConnectionAdmin, ConnectionDirectory, ConnectionSettings, InsecureRemoteHttp,
+};

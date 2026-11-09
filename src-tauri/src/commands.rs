@@ -16,8 +16,9 @@ use herness_core::runtime::{
     RunView, RuntimeSnapshot, StopOutcome,
 };
 use herness_core::{
-    ArgumentViolation, AuthMethod, ConnectionId, ConnectionInfo, ConnectionSettings, CoreError,
-    Endpoint, Event, HistoryLimit, InsecureRemoteHttp, OperationId, PermissionMode, ProjectId,
+    ArgumentViolation, AssessmentGateway, AuthMethod, ConnectionCapabilityDeclaration,
+    ConnectionId, ConnectionInfo, ConnectionSettings, CoreError, Endpoint, EndpointClass, Event,
+    HistoryLimit, InputCapabilities, InsecureRemoteHttp, OperationId, PermissionMode, ProjectId,
     Provider, RunId, SecretString, StopReason,
 };
 use herness_supervision::operations::{HumanOperation, SupervisionOperationRequest};
@@ -280,6 +281,7 @@ pub fn project_view(
 
 /// Registers a human-configured provider connection.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn add_connection(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
@@ -288,6 +290,7 @@ pub fn add_connection(
     auth_method: AuthMethod,
     endpoint: Option<String>,
     insecure_http_acknowledged: Option<bool>,
+    assessment_gateway: Option<String>,
 ) -> Result<ConnectionInfo, String> {
     verify_source(&window)?;
     let endpoint = match endpoint {
@@ -299,15 +302,49 @@ pub fn add_connection(
     let acknowledgment = insecure_http_acknowledged
         .filter(|acknowledged| *acknowledged)
         .map(|_| InsecureRemoteHttp::Acknowledged);
-    let settings = ConnectionSettings::new(
-        ConnectionId::new(),
-        provider,
-        model,
-        auth_method,
-        endpoint,
-        acknowledgment,
-    )
-    .map_err(|error| error.to_string())?;
+    let connection = ConnectionId::new();
+    let gateway = assessment_gateway
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let settings = if provider == Provider::TypeSafe {
+        let declaration = ConnectionCapabilityDeclaration::new(
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+        );
+        let settings = ConnectionSettings::new_with_capabilities(
+            connection,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            acknowledgment,
+            declaration,
+        )
+        .map_err(|error| error.to_string())?;
+        match gateway {
+            Some("commandcode") => settings
+                .with_assessment_gateway(AssessmentGateway::CommandCode)
+                .map_err(|error| error.to_string())?,
+            Some(other) => {
+                return Err(format!("unknown assessment gateway {other:?}"));
+            }
+            None => settings,
+        }
+    } else {
+        if gateway.is_some() {
+            return Err("an assessment gateway is only valid for TypeSafe Jev".to_owned());
+        }
+        ConnectionSettings::new(
+            connection,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            acknowledgment,
+        )
+        .map_err(|error| error.to_string())?
+    };
     let connection = settings.connection_id();
     let mut host = lock_host(&state)?;
     host.register_connection(settings)?;
@@ -818,6 +855,26 @@ pub fn supervision_profile(
         Some(confirmation),
     )
     .map_err(CommandFailure::supervision)
+}
+
+/// Marks a configured assessment profile verified or unverified.
+///
+/// The profile is never verified by a model/tool or by a preview/remote
+/// document. This command is reachable only after the trusted-main guard.
+#[tauri::command(async)]
+pub fn supervision_verify_profile(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    purpose: String,
+    verified: bool,
+) -> Result<PurposeStatusView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let purpose = parse_purpose(&purpose)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let _confirmation = host.confirm_supervision(ConfirmationKind::Profile);
+    host.supervision_mark_profile_verified(project, purpose, verified)
+        .map_err(CommandFailure::supervision)
 }
 
 /// Grants or revokes per-purpose disclosure consent.

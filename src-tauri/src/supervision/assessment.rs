@@ -13,10 +13,10 @@ use herness_assessment::{
     LlmAssessmentAdapter,
 };
 use herness_core::{
-    AttemptId, ConnectionDirectory, ConnectionStatus, CredentialAvailability, CredentialPort,
-    EventKind, EventSubject, HostActivityId, HostActivitySubject, ModelRequestGatePort,
-    ModelRequestObservation, RequestGateIntent, RequestGateOutcome, RequestId, RequestOutcome,
-    RequestPurpose, StopDeadlineControl, TokenUsage,
+    AssessmentGateway, AttemptId, ConnectionDirectory, ConnectionStatus, CredentialAvailability,
+    CredentialPort, EventKind, EventSubject, HostActivityId, HostActivitySubject,
+    ModelRequestGatePort, ModelRequestObservation, RequestGateIntent, RequestGateOutcome,
+    RequestId, RequestOutcome, RequestPurpose, StopDeadlineControl, TokenUsage,
 };
 use herness_supervision::budget::gate::BudgetRequestGate;
 use herness_supervision::budget::ledger::BudgetLedger;
@@ -71,6 +71,36 @@ impl AssessmentHost {
         ))
     }
 
+    /// Whether this connection uses the fixed Command Code assessment gateway.
+    pub fn is_commandcode(&self, connection: herness_core::ConnectionId) -> bool {
+        self.directory
+            .get(connection)
+            .ok()
+            .and_then(|settings| settings.assessment_gateway())
+            == Some(AssessmentGateway::CommandCode)
+    }
+
+    /// Assessment provider bases for one connection.
+    ///
+    /// Direct providers use the host's official/loopback endpoints; a Command
+    /// Code gateway uses its fixed origin only.
+    pub fn endpoints_for(&self, connection: herness_core::ConnectionId) -> AssessmentEndpoints {
+        if self.is_commandcode(connection) {
+            AssessmentEndpoints::for_commandcode()
+        } else {
+            self.endpoints.clone()
+        }
+    }
+
+    /// Fixed Jev wire model for one connection.
+    pub fn jev_wire_model(&self, connection: herness_core::ConnectionId) -> &'static str {
+        if self.is_commandcode(connection) {
+            herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL
+        } else {
+            herness_assessment::JEV_REQUEST_MODEL
+        }
+    }
+
     /// Exact provider origin used by one registered connection.
     pub fn origin_for(
         &self,
@@ -82,6 +112,9 @@ impl AssessmentHost {
                 .map_err(|error| SupervisionError::Unsupported {
                     feature: format!("connection origin is unavailable: {error}"),
                 })?;
+        if settings.assessment_gateway() == Some(AssessmentGateway::CommandCode) {
+            return ProviderOrigin::parse("https://api.commandcode.ai");
+        }
         if let Some(endpoint) = settings.endpoint() {
             // The consent origin is scheme + host + port; a compatible
             // endpoint may carry a path such as `/v1`.
@@ -153,6 +186,13 @@ pub fn build_profile(
     model: &str,
 ) -> Result<ConfiguredProfile, SupervisionError> {
     let provider = host.provider_kind(connection)?;
+    if host.is_commandcode(connection) && model != herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL
+    {
+        return Err(SupervisionError::InvalidValue {
+            field: "profile.model".to_owned(),
+            detail: "the Command Code Jev gateway requires typesafe/jev-1.14.0".to_owned(),
+        });
+    }
     let profile = AssessmentProfile::new(
         herness_supervision::ProfileId::new(project),
         herness_supervision::ProfileVersion::new(1)?,
@@ -197,11 +237,14 @@ impl HostAssessmentPort {
         }
     }
 
-    fn transport(&self) -> Result<AssessmentTransport, SupervisionError> {
+    fn transport_for(
+        &self,
+        connection: herness_core::ConnectionId,
+    ) -> Result<AssessmentTransport, SupervisionError> {
         AssessmentTransport::new(
             Arc::clone(&self.host.credentials),
             self.host.directory.clone(),
-            self.host.endpoints.clone(),
+            self.host.endpoints_for(connection),
         )
         .map_err(|error| SupervisionError::Unsupported {
             feature: format!("assessment transport is unavailable: {error}"),
@@ -423,7 +466,7 @@ impl ConditionAssessmentPort for HostAssessmentPort {
             }
         }
         let remaining = gate.ledger_mut().remaining_active_seconds().unwrap_or(0);
-        let transport = self.transport()?;
+        let transport = self.transport_for(configured.profile.connection())?;
         let control = herness_assessment::TransportControl::default()
             .with_remaining(std::time::Duration::from_secs(remaining));
         let clock: Arc<dyn herness_supervision::ClockPort + Send + Sync> = Arc::new(HostClock);
@@ -434,10 +477,22 @@ impl ConditionAssessmentPort for HostAssessmentPort {
                     .map_err(assessment_error)
                     .map(|assessment| assessment.into_result())
             }
-            herness_supervision::ProviderKind::Jev => JevAssessmentAdapter::new(transport, clock)
-                .assess(request, &entry, &documents, control)
-                .map_err(assessment_error)
-                .map(|assessment| assessment.into_result()),
+            herness_supervision::ProviderKind::Jev => {
+                let adapter = if self.host.is_commandcode(configured.profile.connection()) {
+                    JevAssessmentAdapter::with_wire_model(
+                        transport,
+                        clock,
+                        herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL,
+                    )
+                    .map_err(assessment_error)?
+                } else {
+                    JevAssessmentAdapter::new(transport, clock)
+                };
+                adapter
+                    .assess(request, &entry, &documents, control)
+                    .map_err(assessment_error)
+                    .map(|assessment| assessment.into_result())
+            }
             herness_supervision::ProviderKind::Decisions => {
                 DecisionsAssessmentAdapter::new(transport, clock)
                     .assess(request, &entry, &documents, control)

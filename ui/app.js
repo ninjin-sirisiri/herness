@@ -781,6 +781,9 @@ function bind() {
         authMethod,
         endpoint: endpointValue.length > 0 ? endpointValue : null,
         insecureHttpAcknowledged: byId("insecure-http").checked,
+        assessmentGateway: byId("assessment-gateway").checked
+          ? "commandcode"
+          : null,
       });
       ui.connection = connection.connectionId;
       ui.connectionAuth = connection.authMethod;
@@ -792,6 +795,21 @@ function bind() {
       if (submit) {
         submit.disabled = false;
       }
+    }
+  });
+
+  byId("provider").addEventListener("change", () => {
+    const typesafe = byId("provider").value === "typesafe";
+    byId("assessment-gateway").disabled = !typesafe;
+    if (!typesafe) {
+      byId("assessment-gateway").checked = false;
+    }
+    byId("endpoint").disabled = typesafe;
+    if (typesafe) {
+      byId("endpoint").value = "";
+      byId("model").placeholder = "typesafe/jev-1.14.0";
+    } else {
+      byId("model").placeholder = "model name";
     }
   });
 
@@ -911,6 +929,26 @@ function bind() {
   byId("refresh").addEventListener("click", async () => {
     try {
       await refreshAll();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-verify-profile").addEventListener("click", async () => {
+    try {
+      if (!ui.project) {
+        throw new Error("open a project first");
+      }
+      const status = await call("supervision_verify_profile", {
+        project: ui.project,
+        purpose: byId("sup-purpose").value,
+        verified: true,
+      });
+      setText(
+        "supervision-status",
+        `Profile ${status.purpose}: ${status.profileId} is ${status.verified ? "verified" : "unverified"} (${status.provider}). This is a human confirmation, not a model decision.`
+      );
+      await loadSupervision();
     } catch (error) {
       showError(errorText(error));
     }

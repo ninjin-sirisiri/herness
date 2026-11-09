@@ -483,6 +483,18 @@ impl DesktopHost {
             .configure_profile(actor, project, purpose, connection, model, confirmation)
     }
 
+    /// Marks a configured assessment profile verified or unverified after a
+    /// trusted human confirmation. This is not exposed to the model.
+    pub fn supervision_mark_profile_verified(
+        &self,
+        project: herness_core::ProjectId,
+        purpose: herness_supervision::ProfilePurpose,
+        verified: bool,
+    ) -> Result<PurposeStatusView, SupervisionError> {
+        self.supervision
+            .mark_profile_verified(project, purpose, verified)
+    }
+
     /// Grants per-purpose disclosure consent.
     #[allow(clippy::too_many_arguments)]
     pub fn supervision_grant_consent(

@@ -40,6 +40,18 @@ pub enum InsecureRemoteHttp {
     Acknowledged,
 }
 
+/// Fixed third-party gateway used by an assessment-only connection.
+///
+/// The gateway keeps the provider's wire shape (for example TypeSafe System
+/// One) but changes the fixed origin, API key, and model label. It is never
+/// auto-selected or inferred from a model name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentGateway {
+    /// Command Code Provider API's `typesafe/jev` System One route.
+    CommandCode,
+}
+
 /// Non-secret configuration of one provider connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +73,10 @@ pub struct ConnectionSettings {
     /// settings, which keep the H1 provider defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<ConnectionCapabilityDeclaration>,
+    /// Fixed assessment gateway for an assessment-only connection. Absent for
+    /// direct provider connections and legacy settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assessment_gateway: Option<AssessmentGateway>,
 }
 
 impl ConnectionSettings {
@@ -181,6 +197,7 @@ impl ConnectionSettings {
             vault_account: None,
             insecure_http_acknowledged,
             capabilities,
+            assessment_gateway: None,
         };
         // Validate the effective capability set before it can be registered.
         // This rejects provider/authentication/endpoint-class mismatches,
@@ -203,6 +220,35 @@ impl ConnectionSettings {
         self.capabilities = Some(declaration);
         self.capabilities()?;
         Ok(self)
+    }
+
+    /// Attaches a fixed assessment gateway to a TypeSafe System One
+    /// assessment-only connection.
+    ///
+    /// The gateway is rejected for agent-executable connections, non-TypeSafe
+    /// providers, non-API-key auth, and non-System-One declarations. It never
+    /// changes provider fallback or credential scope.
+    pub fn with_assessment_gateway(
+        mut self,
+        gateway: AssessmentGateway,
+    ) -> Result<Self, ConnectionError> {
+        let capabilities = self.capabilities()?;
+        if self.provider != Provider::TypeSafe
+            || self.auth_method != AuthMethod::ApiKey
+            || capabilities.endpoint_class() != EndpointClass::TypeSafeSystemOne
+            || capabilities.usage() != ConnectionUsage::AssessmentOnly
+        {
+            return Err(ConnectionError::CapabilityDeclarationRejected {
+                detail: "an assessment gateway requires assessment-only TypeSafe System One with an API key".to_owned(),
+            });
+        }
+        self.assessment_gateway = Some(gateway);
+        Ok(self)
+    }
+
+    /// Fixed assessment gateway, when configured.
+    pub const fn assessment_gateway(&self) -> Option<AssessmentGateway> {
+        self.assessment_gateway
     }
 
     /// Effective non-secret capabilities of this connection.
@@ -351,6 +397,8 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
             insecure_http_acknowledged: Option<InsecureRemoteHttp>,
             #[serde(default)]
             capabilities: Option<ConnectionCapabilityDeclaration>,
+            #[serde(default)]
+            assessment_gateway: Option<AssessmentGateway>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -375,7 +423,12 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
                 .map_err(de::Error::custom)?,
             None => settings,
         };
-        Ok(settings)
+        match wire.assessment_gateway {
+            Some(gateway) => settings
+                .with_assessment_gateway(gateway)
+                .map_err(de::Error::custom),
+            None => Ok(settings),
+        }
     }
 }
 

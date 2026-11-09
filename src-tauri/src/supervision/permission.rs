@@ -188,10 +188,11 @@ impl HostPermissionEvaluator {
         supervision: Option<SupervisionId>,
         config: &PermissionConfig,
     ) -> Result<PermissionEvaluator, CoreError> {
+        let connection = config.profile.profile().connection();
         let transport = AssessmentTransport::new(
             Arc::clone(&self.assessment.credentials),
             self.assessment.directory.clone(),
-            self.assessment.endpoints.clone(),
+            self.assessment.endpoints_for(connection),
         )
         .map_err(|_| CoreError::PermissionEvaluationFailed {
             failure: EvaluationFailureKind::Unavailable,
@@ -237,6 +238,7 @@ impl HostPermissionEvaluator {
             config.target_version,
             transport,
         )
+        .with_jev_wire_model(self.assessment.jev_wire_model(connection))
         .with_budget_gate(gate)
         .with_budget_scope(match supervision {
             Some(_) => PermissionBudgetScope::Supervised,

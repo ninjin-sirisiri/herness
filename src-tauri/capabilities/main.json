@@ -36,6 +36,7 @@
     "allow-supervision-reassess",
     "allow-supervision-change",
     "allow-supervision-profile",
+    "allow-supervision-verify-profile",
     "allow-supervision-consent",
     "allow-supervision-evidence",
     "allow-supervision-budget",

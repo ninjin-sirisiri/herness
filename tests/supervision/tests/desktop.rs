@@ -2107,3 +2107,69 @@ mod permission_composition {
         assert_eq!(harness.server.count(), 0);
     }
 }
+
+#[test]
+fn command_code_assessment_connection_is_registered_and_profile_is_verified_by_human() {
+    use herness_core::{
+        AssessmentGateway, ConnectionCapabilityDeclaration, EndpointClass, InputCapabilities,
+    };
+
+    let admin = ConnectionAdmin::new();
+    let connection = ConnectionId::new();
+    let settings = ConnectionSettings::new_with_capabilities(
+        connection,
+        Provider::TypeSafe,
+        herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL,
+        AuthMethod::ApiKey,
+        None,
+        None,
+        ConnectionCapabilityDeclaration::new(
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+        ),
+    )
+    .expect("TypeSafe settings")
+    .with_assessment_gateway(AssessmentGateway::CommandCode)
+    .expect("Command Code gateway");
+    admin.add(settings).expect("register connection");
+
+    let host = AssessmentHost {
+        directory: admin.directory(),
+        credentials: Arc::new(NoCredentials),
+        endpoints: loopback_assessment_endpoints(),
+    };
+    assert!(host.is_commandcode(connection));
+    assert_eq!(
+        host.origin_for(connection).expect("origin").host(),
+        "api.commandcode.ai"
+    );
+    assert_eq!(
+        host.provider_kind(connection).expect("provider kind"),
+        ProviderKind::Jev
+    );
+    let project = ProjectId::new();
+    let profile = herness_desktop::supervision::assessment::build_profile(
+        &host,
+        project,
+        ProfilePurpose::Completion,
+        connection,
+        herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL,
+    )
+    .expect("Command Code profile");
+    assert_eq!(profile.profile.provider(), ProviderKind::Jev);
+    assert_eq!(
+        profile.profile.model().as_str(),
+        herness_assessment::COMMANDCODE_JEV_REQUEST_MODEL
+    );
+    assert!(
+        herness_desktop::supervision::assessment::build_profile(
+            &host,
+            project,
+            ProfilePurpose::Completion,
+            connection,
+            herness_assessment::JEV_REQUEST_MODEL,
+        )
+        .is_err(),
+        "a Command Code connection must not silently use the direct model label"
+    );
+}

@@ -38,6 +38,7 @@ fn main() {
         "supervision_reassess",
         "supervision_change",
         "supervision_profile",
+        "supervision_verify_profile",
         "supervision_consent",
         "supervision_evidence",
         "supervision_budget",

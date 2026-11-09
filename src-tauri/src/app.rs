@@ -129,6 +129,7 @@ pub fn run(
             commands::supervision_reassess,
             commands::supervision_change,
             commands::supervision_profile,
+            commands::supervision_verify_profile,
             commands::supervision_consent,
             commands::supervision_evidence,
             commands::supervision_budget,

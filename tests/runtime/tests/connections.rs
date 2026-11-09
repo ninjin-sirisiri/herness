@@ -1322,3 +1322,53 @@ fn collect_files(root: &Path, files: &mut Vec<PathBuf>) {
         }
     }
 }
+
+#[test]
+fn command_code_assessment_gateway_is_fixed_and_assessment_only() {
+    let settings = ConnectionSettings::new_with_capabilities(
+        ConnectionId::new(),
+        Provider::TypeSafe,
+        "typesafe/jev-1.14.0",
+        AuthMethod::ApiKey,
+        None,
+        None,
+        ConnectionCapabilityDeclaration::new(
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+        ),
+    )
+    .expect("TypeSafe settings")
+    .with_assessment_gateway(AssessmentGateway::CommandCode)
+    .expect("Command Code gateway");
+    let capabilities = settings.capabilities().expect("capabilities");
+    assert_eq!(
+        capabilities.endpoint_class(),
+        EndpointClass::TypeSafeSystemOne
+    );
+    assert!(!capabilities.allows_agent_execution());
+    assert!(capabilities.allows_assessment());
+    assert_eq!(
+        settings.assessment_gateway(),
+        Some(AssessmentGateway::CommandCode)
+    );
+
+    let json = serde_json::to_value(&settings).expect("serialize");
+    assert_eq!(json["assessmentGateway"], "command_code");
+    let decoded: ConnectionSettings = serde_json::from_value(json).expect("decode");
+    assert_eq!(decoded, settings);
+
+    let agent = ConnectionSettings::new(
+        ConnectionId::new(),
+        Provider::OpenAi,
+        "gpt-test",
+        AuthMethod::ApiKey,
+        None,
+        None,
+    )
+    .expect("agent settings");
+    assert!(
+        agent
+            .with_assessment_gateway(AssessmentGateway::CommandCode)
+            .is_err()
+    );
+}

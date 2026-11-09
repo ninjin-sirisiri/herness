@@ -33,6 +33,7 @@
               <option value="openai">OpenAI</option>
               <option value="anthropic">Anthropic</option>
               <option value="openai_compatible">OpenAI-compatible</option>
+              <option value="typesafe">TypeSafe Jev (assessment)</option>
             </select>
             <label for="model">Model</label>
             <input id="model" type="text" autocomplete="off" placeholder="model name" />
@@ -50,6 +51,10 @@
             <label class="checkbox">
               <input id="insecure-http" type="checkbox" />
               Acknowledge remote plain-HTTP credential risk
+            </label>
+            <label class="checkbox">
+              <input id="assessment-gateway" type="checkbox" />
+              Use Command Code gateway (TypeSafe Jev only)
             </label>
             <button type="submit">Add connection</button>
           </div>
@@ -125,6 +130,7 @@
           <label for="sup-model">Model</label>
           <input id="sup-model" type="text" autocomplete="off" placeholder="judge model" />
           <button id="sup-config-profile" type="button">Configure profile</button>
+          <button id="sup-verify-profile" type="button">Mark profile verified</button>
         </div>
         <div class="row">
           <label for="sup-origin">Consent origin</label>
