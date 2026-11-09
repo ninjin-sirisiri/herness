@@ -23,13 +23,14 @@ use herness_core::{
     OperationIntent, OperationOutcome, OperationResult, PermissionMode, PolicyVersion, Rationale,
     ToolArguments, ToolName, WriteArgs,
 };
+use herness_store::test_support::CommitFault;
 use herness_store::{Store, StoreConfig};
-use herness_supervision::approval::ApprovalActor;
+use herness_supervision::approval::{ApprovalActor, OwnerApprovalSource};
 use herness_supervision::budget::ledger::{
     BudgetClockPort, BudgetLedger, ClockReading, MoneySettlement,
 };
 use herness_supervision::budget::{
-    BudgetPolicy, Money, MoneyCap, PriceVersion, RequestBudgetEstimate,
+    BudgetLimit, BudgetPolicy, Money, MoneyCap, PriceVersion, RequestBudgetEstimate,
 };
 use herness_supervision::conditions::ConditionVersion;
 use herness_supervision::consent::DisclosureConsent;
@@ -39,10 +40,14 @@ use herness_supervision::contract::{
 use herness_supervision::evidence::TargetVersion;
 use herness_supervision::ids::{BudgetRequestId, SupervisionId, SupervisionRequestId};
 use herness_supervision::operations::{
-    HumanOperation, OperationPorts, OperationRuntimePort, SupervisionChange,
-    SupervisionOperationRequest, execute_operation,
+    HumanOperation, OperationPorts, OperationResult as OwnerOperationResult, OperationRuntimePort,
+    OwnerSupersessionRequest, SupervisionChange, SupervisionOperationRequest, execute_operation,
+    execute_owner_supersession,
 };
-use herness_supervision::ports::ClockPort;
+use herness_supervision::owner_launch::{
+    HostOwnerAuthority, OwnerLaunchBinding, authorize_owner_launch,
+};
+use herness_supervision::ports::{ClockPort, SupervisionStorePort};
 use herness_supervision::profiles::{
     AdapterVersion, AssessmentProfile, ProfileInputs, ProfilePurpose, ProfileThresholds,
     ProfileVersion, ProviderKind, RubricVersion,
@@ -53,16 +58,17 @@ use herness_supervision::recovery::{
     UnresolvedRequestKind, mark_active_supervision_for_quit,
 };
 use herness_supervision::state::{
-    ChangeKind, DecisionInvalidation, HumanAction, StaleCompletion, StopCause, SupervisionRecord,
-    SupervisionState,
+    CancelCause, ChangeKind, DecisionInvalidation, HumanAction, StaleCompletion, StopCause,
+    SupervisionFailure, SupervisionReason, SupervisionRecord, SupervisionState,
 };
 use herness_supervision::supervisor::{
     OwnerNotificationPort, StopDisposition, SupervisorNotification,
 };
+use herness_supervision::OwnerSupersessionRejection;
 use herness_supervision_tests::{
-    approved_condition_set_at, assessment_request, assessment_result, completion_profile,
-    completion_snapshot, consent_for_origin, contract, ids, now, other_origin, project,
-    target_scope,
+    ScriptedOwnerApprovalRegistry, approved_condition_set_at, assessment_request, assessment_result,
+    completion_profile, completion_snapshot, consent_for_origin, contract, ids, now, other_origin,
+    owner_contract_at, owner_contract_succeeding, project, target_scope,
 };
 use tempfile::TempDir;
 
@@ -1714,4 +1720,443 @@ fn explicit_condition_and_limit_change_records_before_after_without_resetting_bu
     assert_eq!(stored.record().policy_version(), 2);
     assert_eq!(stored.record().usage().runs_started(), 1);
     runtime.assert_zero_external_work();
+}
+
+// ---------------------------------------------------------------------------
+// Approved-owner generation replacement and its latches
+// ---------------------------------------------------------------------------
+
+struct OwnerHarness {
+    _web: Harness,
+    project_id: ProjectId,
+    supervision: SupervisionId,
+    current: SupervisionContract,
+    store: Store,
+    budget: BudgetLedger<Store, FixedClock>,
+    clock: FixedClock,
+}
+
+impl OwnerHarness {
+    fn new(prepare: impl FnOnce(&mut SupervisionRecord)) -> Self {
+        let web = Harness::new();
+        let project_id = project();
+        let owner =
+            OwnerRef::new(OwnerKind::H3HtmlJob, "generation-job").expect("owner reference");
+        let current = owner_contract_at(
+            project_id,
+            owner,
+            OwnerApprovalSource::H3ApprovedSettings,
+            1,
+            1,
+        );
+        let mut record = SupervisionRecord::new(&current);
+        prepare(&mut record);
+        let supervision = record.supervision_id();
+        let mut store = web.open();
+        save_new(&mut store, &record);
+        save_budget(&mut store, &default_budget_record(project_id));
+        let clock = FixedClock::fixture();
+        let budget = BudgetLedger::open(
+            web.open(),
+            project_id,
+            supervision,
+            current.budget().clone(),
+            1,
+            clock,
+        )
+        .expect("owner budget ledger");
+        Self {
+            _web: web,
+            project_id,
+            supervision,
+            current,
+            store,
+            budget,
+            clock,
+        }
+    }
+
+    fn record(&self) -> SupervisionRecord {
+        self.store
+            .load_supervision_record(self.project_id, self.supervision)
+            .expect("load record")
+            .expect("record")
+    }
+
+    fn replacement(&self, target_version: u64) -> SupervisionContract {
+        owner_contract_succeeding(
+            &self.current,
+            target_version,
+            1,
+            self.current.budget().clone(),
+        )
+    }
+
+    fn authority(&self, contract: &SupervisionContract) -> HostOwnerAuthority {
+        let binding =
+            OwnerLaunchBinding::from_contract(contract, 1, 1, "generation-job").expect("binding");
+        let mut registry = ScriptedOwnerApprovalRegistry::new();
+        registry.insert(binding.approval().clone());
+        authorize_owner_launch(&registry, &binding, self.clock.now()).expect("authority")
+    }
+
+    fn request(
+        &self,
+        contract: &SupervisionContract,
+        expected_revision: u64,
+    ) -> OwnerSupersessionRequest {
+        OwnerSupersessionRequest::new(
+            SupervisionRequestId::new(self.project_id),
+            self.supervision,
+            expected_revision,
+            contract.clone(),
+        )
+        .expect("supersession request")
+    }
+
+    fn execute(
+        &mut self,
+        runtime: &mut FakeRuntime,
+        current: &SupervisionContract,
+        contract: &SupervisionContract,
+        expected_revision: u64,
+    ) -> Result<OwnerOperationResult, herness_supervision::SupervisionError> {
+        let request = self.request(contract, expected_revision);
+        let authority = self.authority(contract);
+        execute_owner_supersession(
+            OperationPorts {
+                store: &mut self.store,
+                runtime,
+                budget: &mut self.budget,
+                clock: &self.clock,
+            },
+            current,
+            1,
+            request,
+            authority,
+        )
+    }
+}
+
+#[test]
+fn owner_supersession_refuses_every_human_stop_wait_stagnation_limit_recovery_cancel_and_failure_latch()
+{
+    let cases: Vec<(
+        &str,
+        Box<dyn FnOnce(&mut SupervisionRecord)>,
+        OwnerSupersessionRejection,
+    )> = vec![
+        (
+            "human stop",
+            Box::new(|record| record.stop(StopCause::UserRequest).expect("stop")),
+            OwnerSupersessionRejection::HumanStopped,
+        ),
+        (
+            "waiting human",
+            Box::new(|record| {
+                record
+                    .wait_for_human(HumanAction::ReconcileRecovery)
+                    .expect("wait")
+            }),
+            OwnerSupersessionRejection::HumanWaiting {
+                action: HumanAction::ReconcileRecovery,
+            },
+        ),
+        (
+            "stagnation",
+            Box::new(|record| record.stop(StopCause::Stagnation).expect("stop")),
+            OwnerSupersessionRejection::Stagnated,
+        ),
+        (
+            "run limit",
+            Box::new(|record| {
+                record
+                    .stop(StopCause::Budget(BudgetLimit::RunCount))
+                    .expect("stop")
+            }),
+            OwnerSupersessionRejection::BudgetExhausted {
+                limit: BudgetLimit::RunCount,
+            },
+        ),
+        (
+            "active-time limit",
+            Box::new(|record| {
+                record
+                    .stop(StopCause::Budget(BudgetLimit::ActiveSeconds))
+                    .expect("stop")
+            }),
+            OwnerSupersessionRejection::BudgetExhausted {
+                limit: BudgetLimit::ActiveSeconds,
+            },
+        ),
+        (
+            "recovery pending",
+            Box::new(|record| {
+                record
+                    .stop(StopCause::RecoveryReconciliation)
+                    .expect("stop")
+            }),
+            OwnerSupersessionRejection::RecoveryPending,
+        ),
+        (
+            "cancelled",
+            Box::new(|record| record.cancel(CancelCause::UserRequest).expect("cancel")),
+            OwnerSupersessionRejection::Cancelled,
+        ),
+        (
+            "failed",
+            Box::new(|record| {
+                record
+                    .fail(SupervisionFailure::VerificationUnavailable)
+                    .expect("fail")
+            }),
+            OwnerSupersessionRejection::Failed,
+        ),
+        (
+            "completed",
+            Box::new(|record| {
+                record
+                    .set_state(
+                        SupervisionState::Completed,
+                        SupervisionReason::Completed {
+                            snapshot: completion_snapshot(&contract(project())),
+                        },
+                    )
+                    .expect("complete")
+            }),
+            OwnerSupersessionRejection::Completed,
+        ),
+    ];
+
+    for (name, prepare, expected) in cases {
+        let mut harness = OwnerHarness::new(prepare);
+        let current = harness.current.clone();
+        let replacement = harness.replacement(2);
+        let before = harness.record();
+        let before_usage = harness.budget.record().usage();
+        let mut runtime = FakeRuntime::new();
+        let result = harness.execute(&mut runtime, &current, &replacement, before.revision());
+        assert_eq!(
+            result.expect_err(name),
+            herness_supervision::SupervisionError::OwnerSupersessionRejected {
+                reason: expected
+            },
+            "{name}"
+        );
+        let after = harness.record();
+        assert_eq!(after.revision(), before.revision(), "{name}");
+        assert_eq!(after.state(), before.state(), "{name}");
+        assert_eq!(after.target_version(), before.target_version(), "{name}");
+        assert_eq!(after.change_log().len(), 0, "{name}");
+        assert_eq!(harness.budget.record().usage(), before_usage, "{name}");
+        assert_eq!(runtime.stop_calls, 0, "{name}: no stop may be attempted");
+    }
+}
+
+#[test]
+fn owner_supersession_refuses_a_running_record_with_unresolved_recovery_facts() {
+    let project_id = project();
+    let run = RunId::new(project_id);
+    let mut harness = OwnerHarness::new(|record| {
+        record.begin_run(run).expect("begin run");
+    });
+    let intent = request_intent(project_id, run, "completion-assessment");
+    record_request(&mut harness.store, &intent, None);
+    let current = harness.current.clone();
+    let replacement = harness.replacement(2);
+    let before = harness.record();
+    let before_usage = harness.budget.record().usage();
+    let mut runtime = FakeRuntime::new();
+    runtime.set_run(run, RunState::Idle, RecoveryMode::SameProcess);
+
+    let result = harness.execute(&mut runtime, &current, &replacement, before.revision());
+    assert_eq!(
+        result.expect_err("unresolved request"),
+        herness_supervision::SupervisionError::OwnerSupersessionRejected {
+            reason: OwnerSupersessionRejection::RecoveryPending
+        }
+    );
+    let after = harness.record();
+    assert_eq!(after.revision(), before.revision());
+    assert_eq!(after.target_version(), before.target_version());
+    assert_eq!(after.change_log().len(), 0);
+    assert_eq!(harness.budget.record().usage(), before_usage);
+    assert_eq!(runtime.stop_calls, 0);
+}
+
+#[test]
+fn owner_supersession_refuses_an_unconfirmed_stop_before_any_state_change() {
+    let project_id = project();
+    let run = RunId::new(project_id);
+    let mut harness = OwnerHarness::new(|record| {
+        record.begin_run(run).expect("begin run");
+    });
+    let current = harness.current.clone();
+    let replacement = harness.replacement(2);
+    let before = harness.record();
+    let before_usage = harness.budget.record().usage();
+    let mut runtime = FakeRuntime::new();
+    runtime.stop_result = StopDisposition::Unconfirmed;
+
+    let result = harness.execute(&mut runtime, &current, &replacement, before.revision());
+    assert_eq!(
+        result.expect_err("unconfirmed stop"),
+        herness_supervision::SupervisionError::OwnerSupersessionRejected {
+            reason: OwnerSupersessionRejection::StopUnconfirmed
+        }
+    );
+    assert_eq!(runtime.stop_calls, 1);
+    let after = harness.record();
+    assert_eq!(after.revision(), before.revision());
+    assert_eq!(after.state(), before.state());
+    assert_eq!(after.target_version(), before.target_version());
+    assert_eq!(after.change_log().len(), 0);
+    assert_eq!(harness.budget.record().usage(), before_usage);
+}
+
+#[test]
+fn duplicate_and_crashed_owner_supersession_do_not_double_supersede() {
+    let project_id = project();
+    let run = RunId::new(project_id);
+    let mut harness = OwnerHarness::new(|record| {
+        record.begin_run(run).expect("begin run");
+    });
+    let current = harness.current.clone();
+    let replacement = harness.replacement(2);
+    let before = harness.record();
+    let before_usage = harness.budget.record().usage();
+    let mut runtime = FakeRuntime::new();
+
+    let request_id = SupervisionRequestId::new(project_id);
+    let authority = harness.authority(&replacement);
+    let first = execute_owner_supersession(
+        OperationPorts {
+            store: &mut harness.store,
+            runtime: &mut runtime,
+            budget: &mut harness.budget,
+            clock: &harness.clock,
+        },
+        &current,
+        1,
+        OwnerSupersessionRequest::new(
+            request_id,
+            harness.supervision,
+            before.revision(),
+            replacement.clone(),
+        )
+        .expect("first request"),
+        authority,
+    )
+    .expect("first supersession");
+    assert!(!first.duplicate());
+    assert_eq!(runtime.stop_calls, 1);
+    assert_eq!(harness.budget.record().usage(), before_usage);
+
+    let after_first = harness.record();
+    assert_eq!(after_first.target_version().get(), 2);
+    assert_eq!(after_first.change_log().len(), 1);
+    assert_eq!(
+        after_first.revision(),
+        before.revision().saturating_add(1)
+    );
+
+    // A duplicate id returns the recorded result and performs no load, stop,
+    // budget mutation, or second state change.
+    let duplicate_authority = harness.authority(&replacement);
+    let duplicate = execute_owner_supersession(
+        OperationPorts {
+            store: &mut harness.store,
+            runtime: &mut runtime,
+            budget: &mut harness.budget,
+            clock: &harness.clock,
+        },
+        &replacement,
+        1,
+        OwnerSupersessionRequest::new(
+            request_id,
+            harness.supervision,
+            after_first.revision(),
+            replacement.clone(),
+        )
+        .expect("duplicate request"),
+        duplicate_authority,
+    )
+    .expect("duplicate request");
+    assert!(duplicate.duplicate());
+    let after_duplicate = harness.record();
+    assert_eq!(after_duplicate.revision(), after_first.revision());
+    assert_eq!(after_duplicate.change_log().len(), 1);
+    assert_eq!(runtime.stop_calls, 1);
+
+    // A new request whose atomic commit fails leaves no result. Retrying the
+    // same id succeeds exactly once.
+    let replacement_three = owner_contract_succeeding(
+        &replacement,
+        3,
+        1,
+        replacement.budget().clone(),
+    );
+    let request_three_id = SupervisionRequestId::new(project_id);
+    let request_three = OwnerSupersessionRequest::new(
+        request_three_id,
+        harness.supervision,
+        after_first.revision(),
+        replacement_three.clone(),
+    )
+    .expect("third request");
+    let authority_three = harness.authority(&replacement_three);
+    harness
+        .store
+        .set_commit_fault(Some(CommitFault::BeforeCommit));
+    let failed = execute_owner_supersession(
+        OperationPorts {
+            store: &mut harness.store,
+            runtime: &mut runtime,
+            budget: &mut harness.budget,
+            clock: &harness.clock,
+        },
+        &replacement,
+        1,
+        request_three,
+        authority_three,
+    );
+    assert!(failed.is_err(), "the injected commit fault must surface");
+    harness.store.set_commit_fault(None);
+    assert!(harness
+        .store
+        .command_result(request_three_id)
+        .expect("command lookup")
+        .is_none());
+    let after_crash = harness.record();
+    assert_eq!(after_crash.revision(), after_first.revision());
+    assert_eq!(after_crash.target_version().get(), 2);
+    assert_eq!(after_crash.change_log().len(), 1);
+    assert_eq!(runtime.stop_calls, 1);
+
+    let retry_authority = harness.authority(&replacement_three);
+    let retried = execute_owner_supersession(
+        OperationPorts {
+            store: &mut harness.store,
+            runtime: &mut runtime,
+            budget: &mut harness.budget,
+            clock: &harness.clock,
+        },
+        &replacement,
+        1,
+        OwnerSupersessionRequest::new(
+            request_three_id,
+            harness.supervision,
+            after_first.revision(),
+            replacement_three,
+        )
+        .expect("retry request"),
+        retry_authority,
+    )
+    .expect("retry");
+    assert!(!retried.duplicate());
+    let after_retry = harness.record();
+    assert_eq!(after_retry.revision(), after_first.revision().saturating_add(1));
+    assert_eq!(after_retry.target_version().get(), 3);
+    assert_eq!(after_retry.change_log().len(), 2);
+    assert_eq!(runtime.stop_calls, 1);
 }

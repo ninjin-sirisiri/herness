@@ -40,7 +40,8 @@ use herness_supervision::supervisor::{
     capture_target_snapshot,
 };
 use herness_supervision_tests::{
-    assessment_result, completion_profile, contract, ids, now, project, record, target_scope,
+    assessment_result, completion_profile, contract, contract_succeeding, ids, now, project,
+    record, target_scope,
 };
 use uuid::Uuid;
 
@@ -1384,6 +1385,52 @@ fn a_change_during_assessment_is_history_only_and_never_completes() {
         assert_eq!(h.assessment.calls.len(), 1);
         assert_eq!(h.notifier.count(), 0);
     }
+}
+
+#[test]
+fn a_late_met_result_from_the_old_generation_is_history_only_after_supersession() {
+    let mut h = Harness::new();
+    start_and_complete_first_input(&mut h);
+    tick_to_assessing(&mut h);
+    h.tick().expect("prepare pending assessment");
+    assert!(h.record().supervisor().pending_assessment().is_some());
+
+    let store = h.store.clone();
+    let current_contract = h.contract.clone();
+    h.assessment.on_assess(move || {
+        let replacement = contract_succeeding(&current_contract, 2, 1);
+        store
+            .revise(|record| {
+                record
+                    .apply_generation(&replacement)
+                    .expect("owner supersession")
+            })
+            .expect("out-of-band owner supersession");
+    });
+
+    let report = h.tick().expect("send assessment after supersession");
+    assert_eq!(report.outcome(), TickOutcome::StaleAssessment);
+    let record = h.record();
+    assert_eq!(record.target_version().get(), 2);
+    assert_eq!(record.state(), SupervisionState::Ready);
+    assert!(record.completion().is_none());
+    assert!(record.applied_decisions().is_empty());
+    assert_eq!(record.invalidated_decisions().len(), 1);
+    assert_eq!(record.unmet_conditions().len(), 2);
+    assert_eq!(h.assessment.calls.len(), 1);
+    assert_eq!(h.notifier.count(), 0);
+
+    // The new generation can start its own run and still never applies the
+    // delayed old-generation result.
+    h.contract = contract_succeeding(&h.contract, 2, 1);
+    let next = h.tick().expect("new generation tick");
+    assert_eq!(next.outcome(), TickOutcome::Advanced);
+    assert_eq!(h.state(), SupervisionState::Running);
+    assert!(h.record().applied_decisions().is_empty());
+    assert_eq!(h.record().invalidated_decisions().len(), 1);
+    assert_eq!(h.record().target_version().get(), 2);
+    assert_eq!(h.runtime.starts.len(), 1);
+    assert_eq!(h.runtime.continuations.len(), 0);
 }
 
 #[test]

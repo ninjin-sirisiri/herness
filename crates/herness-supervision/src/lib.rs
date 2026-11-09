@@ -62,7 +62,8 @@ pub use contract::{
     approval_matches_conditions, disclosure_purpose, same_approval_kind,
 };
 pub use error::{
-    ApprovalRejection, OwnerLaunchRejection, SupervisionError, WorkPacketRejection,
+    ApprovalRejection, OwnerLaunchRejection, OwnerSupersessionRejection, SupervisionError,
+    WorkPacketRejection,
 };
 pub use evidence::{
     CheckStatus, ContentDigest, ContentFingerprint, EvidenceAcquirer, EvidenceOutcome,
@@ -81,7 +82,8 @@ pub use ids::{
 };
 pub use operations::{
     HumanOperation, OperationBudgetPort, OperationPorts, OperationResult, OperationRuntimePort,
-    SupervisionChange, SupervisionOperationRequest, execute_operation,
+    OwnerSupersessionRequest, SupervisionChange, SupervisionOperationRequest,
+    ensure_owner_supersedable, execute_operation, execute_owner_supersession,
 };
 pub use owner_launch::{
     HostOwnerAuthority, OwnerApproval, OwnerApprovalRegistryPort, OwnerLaunchBinding,

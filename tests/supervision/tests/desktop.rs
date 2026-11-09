@@ -26,14 +26,16 @@ use herness_desktop::supervision::plan::ConfigStore;
 use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};use herness_desktop::supervision::store::StoreHandle;
 use herness_desktop::supervision::{
     CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
-    SupervisionHost,
+    SupersedeSupervisionRequest, SupervisionHost,
 };
+use herness_store::test_support::CommitFault;
 use herness_store::{Store, StoreConfig};
 use herness_supervision::operations::SupervisionOperationRequest;
 use herness_supervision::operations::{HumanOperation, OperationRuntimePort};
 use herness_supervision::owner_launch::{
     HostOwnerAuthority, OwnerLaunchBinding, authorize_owner_launch,
 };
+use herness_supervision::ports::SupervisionStorePort;
 use herness_supervision::recovery::{
     ManagedProcessState, RecoveryCheckpoint, RecoveryRuntimePort, RecoveryStopState,
 };
@@ -44,11 +46,11 @@ use herness_supervision::supervisor::{
 };
 use herness_supervision::{
     AdapterVersion, AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
-    CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
-    EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind, OwnerLaunchRejection, OwnerRef,
-    ProfilePurpose, ProfileThresholds, ProviderKind, ProviderOrigin, RubricVersion,
-    SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId, TargetReadSet,
-    TargetVersion, WorkPacketRejection,
+    ChangeKind, CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
+    EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind, OwnerLaunchRejection,
+    OwnerRef, OwnerSupersessionRejection, ProfilePurpose, ProfileThresholds, ProviderKind,
+    ProviderOrigin, RubricVersion, SupervisionError, SupervisionId, SupervisionRecord,
+    SupervisionRequestId, TargetReadSet, TargetVersion, WorkPacketRejection,
 };
 use herness_supervision_tests::ScriptedOwnerApprovalRegistry;
 use tempfile::TempDir;
@@ -412,26 +414,55 @@ impl ConditionAssessmentPort for MetAssessment {
         &mut self,
         request: &AssessmentRequest,
     ) -> Result<AssessmentResult, SupervisionError> {
-        let provenance = AssessmentProvenance::new(
-            herness_core::Provider::OpenAi,
-            ProviderKind::NormalLlm,
-            herness_core::ModelId::new("judge-model").expect("static model"),
-            request.adapter_version().clone(),
-            request.rubric_version().clone(),
-        )?;
-        AssessmentResult::new(
-            request,
-            request.evidence().to_vec(),
-            "scripted met verdict",
-            None,
-            AssessmentOutcome::NormalLlm {
-                verdict: ConditionVerdict::Met,
-                confidence: None,
-            },
-            provenance,
-            Timestamp::now(),
-        )
+        assessment_result_with(request, ConditionVerdict::Met)
     }
+}
+
+struct UnmetAssessment;
+
+impl ConditionAssessmentPort for UnmetAssessment {
+    fn profile(
+        &self,
+        _binding: herness_supervision::ProfileBinding,
+    ) -> Result<AssessmentProfileFacts, SupervisionError> {
+        Ok(AssessmentProfileFacts::new(
+            AdapterVersion::new("herness-llm-condition-v1")?,
+            RubricVersion::new("herness-conditions-v1")?,
+            ProfileThresholds::normal_llm(),
+        ))
+    }
+
+    fn assess(
+        &mut self,
+        request: &AssessmentRequest,
+    ) -> Result<AssessmentResult, SupervisionError> {
+        assessment_result_with(request, ConditionVerdict::Unmet)
+    }
+}
+
+fn assessment_result_with(
+    request: &AssessmentRequest,
+    verdict: ConditionVerdict,
+) -> Result<AssessmentResult, SupervisionError> {
+    let provenance = AssessmentProvenance::new(
+        herness_core::Provider::OpenAi,
+        ProviderKind::NormalLlm,
+        herness_core::ModelId::new("judge-model").expect("static model"),
+        request.adapter_version().clone(),
+        request.rubric_version().clone(),
+    )?;
+    AssessmentResult::new(
+        request,
+        request.evidence().to_vec(),
+        "scripted verdict",
+        None,
+        AssessmentOutcome::NormalLlm {
+            verdict,
+            confidence: None,
+        },
+        provenance,
+        Timestamp::now(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +478,27 @@ struct Harness {
     admin: ConnectionAdmin,
     host: SupervisionHost,
     runtime: FakeRuntime,
+}
+
+fn supersede_request(
+    project: ProjectId,
+    supervision: SupervisionId,
+    expected_revision: u64,
+    target_version: u64,
+) -> SupersedeSupervisionRequest {
+    SupersedeSupervisionRequest {
+        request_id: SupervisionRequestId::new(project),
+        supervision_id: supervision,
+        expected_revision,
+        target_version: TargetVersion::new(target_version).expect("target version"),
+        conditions: None,
+        condition_version: None,
+        profile_purpose: None,
+        consent_purpose: Some(ProfilePurpose::Completion),
+        budget: None,
+        settings_version: 1,
+        job_id: "h3-job-1".to_owned(),
+    }
 }
 
 fn request(project: ProjectId, connection: ConnectionId) -> CreateSupervisionRequest {
@@ -477,18 +529,28 @@ fn request(project: ProjectId, connection: ConnectionId) -> CreateSupervisionReq
 }
 
 fn harness() -> Harness {
-    harness_with_check(false, false)
+    harness_with_check(false, AssessmentMode::Unverified)
 }
 
 fn harness_with_pass_check() -> Harness {
-    harness_with_check(true, false)
+    harness_with_check(true, AssessmentMode::Unverified)
 }
 
 fn harness_with_completion() -> Harness {
-    harness_with_check(true, true)
+    harness_with_check(true, AssessmentMode::Met)
 }
 
-fn harness_with_check(pass: bool, met_assessment: bool) -> Harness {
+fn harness_with_pass_check_unmet() -> Harness {
+    harness_with_check(true, AssessmentMode::Unmet)
+}
+
+enum AssessmentMode {
+    Unverified,
+    Met,
+    Unmet,
+}
+
+fn harness_with_check(pass: bool, mode: AssessmentMode) -> Harness {
     let temp = tempfile::tempdir().expect("temp");
     let project_root = temp.path().join("project");
     std::fs::create_dir_all(project_root.join("src")).expect("project dirs");
@@ -526,10 +588,10 @@ fn harness_with_check(pass: bool, met_assessment: bool) -> Harness {
     } else {
         Box::new(UnavailableCheck)
     };
-    let assessment: Box<dyn ConditionAssessmentPort + Send> = if met_assessment {
-        Box::new(MetAssessment)
-    } else {
-        Box::new(UnverifiedAssessment)
+    let assessment: Box<dyn ConditionAssessmentPort + Send> = match mode {
+        AssessmentMode::Unverified => Box::new(UnverifiedAssessment),
+        AssessmentMode::Met => Box::new(MetAssessment),
+        AssessmentMode::Unmet => Box::new(UnmetAssessment),
     };
     let host = SupervisionHost::with_config_for_test(
         store.clone(),
@@ -1302,6 +1364,370 @@ fn approved_h3_owner_starts_once_and_duplicate_request_does_not_run_again() {
             .len(),
         1
     );
+}
+
+#[test]
+fn owner_supersession_after_confirmed_stop_updates_generation_and_starts_one_run() {
+    let mut harness = harness_with_pass_check_unmet();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let first_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    harness
+        .host
+        .start_approved_owner(
+            &mut harness.runtime,
+            first_authority,
+            SupervisionRequestId::new(harness.project),
+            created.revision,
+        )
+        .expect("approved owner start");
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+
+    // Drive the first generation through one met check and one unmet
+    // assessment so the record has a real applied decision to invalidate.
+    harness.runtime.complete_all_inputs();
+    harness.runtime.set_all_idle();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        harness
+            .host
+            .pump(&mut harness.runtime, &[harness.project])
+            .expect("pump assessment");
+        let view = harness
+            .host
+            .get(harness.project, created.supervision_id)
+            .expect("view");
+        if view.applied_decisions >= 1 {
+            break view;
+        }
+        assert!(Instant::now() < deadline, "assessment did not apply");
+        std::thread::sleep(supervision_interval());
+    };
+    assert!(matches!(
+        before.state.as_str(),
+        "running" | "verifying" | "assessing"
+    ));
+    assert_eq!(before.invalidated_decisions, 0);
+    let before_usage = before.budget.as_ref().expect("budget").usage;
+    let before_runs = before.run_group.len();
+    let before_plan = herness_desktop::supervision::plan::load_plan(
+        &harness.store,
+        harness.project,
+        created.supervision_id,
+    )
+    .expect("load plan")
+    .expect("plan");
+    let before_packet_version = before_plan.packet.packet_version();
+    let before_fingerprint = before_plan.packet.fingerprint().clone();
+
+    // The human settings UI approved the new target scope version.
+    harness.grant_completion(2);
+    let supersede = supersede_request(
+        harness.project,
+        created.supervision_id,
+        before.revision,
+        2,
+    );
+    let binding = harness
+        .host
+        .owner_supersession_binding(&mut harness.runtime, &supersede)
+        .expect("supersession binding");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(binding.approval().clone());
+    let old_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let starts_before = harness.runtime.starts;
+    let continuations_before = harness.runtime.continuations;
+
+    let superseded = harness
+        .host
+        .supersede_approved_owner(
+            &mut harness.runtime,
+            &registry,
+            old_authority,
+            supersede.clone(),
+        )
+        .expect("owner supersession");
+    assert_eq!(superseded.supervision_id, created.supervision_id);
+    assert_eq!(superseded.target_version, 2);
+    assert_eq!(superseded.state, "running");
+    assert_eq!(superseded.applied_decisions, 0);
+    assert_eq!(superseded.invalidated_decisions, 1);
+    assert_eq!(superseded.run_group.len(), before_runs + 1);
+    assert_eq!(superseded.condition_version, before.condition_version);
+    let superseded_usage = superseded.budget.as_ref().expect("budget").usage;
+    assert_eq!(
+        superseded_usage.runs_started(),
+        before_usage.runs_started(),
+        "the supersession itself must not consume a run"
+    );
+    assert_eq!(
+        superseded_usage.money_consumed(),
+        before_usage.money_consumed()
+    );
+    assert_eq!(
+        superseded_usage.money_reserved(),
+        before_usage.money_reserved()
+    );
+    assert!(superseded_usage.active_seconds_consumed() >= before_usage.active_seconds_consumed());
+
+    let after_plan = herness_desktop::supervision::plan::load_plan(
+        &harness.store,
+        harness.project,
+        created.supervision_id,
+    )
+    .expect("load plan")
+    .expect("plan");
+    assert_eq!(after_plan.evidence_target.version().get(), 2);
+    assert_eq!(
+        after_plan.packet.packet_version(),
+        before_packet_version.saturating_add(1)
+    );
+    assert_ne!(after_plan.packet.fingerprint(), &before_fingerprint);
+    assert_eq!(after_plan.contract.work_packet(), &after_plan.packet);
+    let record = harness
+        .store
+        .lock()
+        .load_supervision_record(harness.project, created.supervision_id)
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.change_log().len(), 1);
+    assert_eq!(record.change_log()[0].kind(), ChangeKind::Supersede);
+    assert_eq!(
+        record.change_log()[0].budget_before().runs_started(),
+        before_usage.runs_started()
+    );
+    assert_eq!(
+        record.change_log()[0].budget_after().runs_started(),
+        before_usage.runs_started()
+    );
+    assert!(record.change_log()[0]
+        .budget_after()
+        .active_seconds_consumed()
+        >= record.change_log()[0]
+            .budget_before()
+            .active_seconds_consumed());
+
+    // Exactly one new run starts in the same target and conversation.
+    std::thread::sleep(supervision_interval());
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump superseded generation");
+    assert_eq!(harness.runtime.starts, starts_before + 1);
+    assert_eq!(harness.runtime.continuations, continuations_before);
+    let started = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    let started_usage = started.budget.as_ref().expect("budget").usage;
+    assert_eq!(
+        started_usage.runs_started(),
+        before_usage.runs_started().saturating_add(1)
+    );
+    assert!(started_usage.active_seconds_consumed() >= before_usage.active_seconds_consumed());
+
+    // A duplicate request returns the current view without another supersede
+    // or run.
+    let duplicate_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let duplicate = harness
+        .host
+        .supersede_approved_owner(
+            &mut harness.runtime,
+            &registry,
+            duplicate_authority,
+            SupersedeSupervisionRequest {
+                request_id: supersede.request_id,
+                expected_revision: started.revision,
+                ..supersede
+            },
+        )
+        .expect("duplicate supersession");
+    assert_eq!(duplicate.revision, started.revision);
+    assert_eq!(duplicate.run_group.len(), started.run_group.len());
+    assert_eq!(harness.runtime.starts, starts_before + 1);
+    assert_eq!(
+        duplicate.budget.as_ref().expect("budget").usage.runs_started(),
+        started_usage.runs_started()
+    );
+}
+
+#[test]
+fn stale_owner_registry_entry_is_refused_before_stop_or_generation_change() {
+    let mut harness = harness_with_pass_check_unmet();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let first_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    harness
+        .host
+        .start_approved_owner(
+            &mut harness.runtime,
+            first_authority,
+            SupervisionRequestId::new(harness.project),
+            created.revision,
+        )
+        .expect("approved owner start");
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+
+    harness.grant_completion(2);
+    let view = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    let mut supersede = supersede_request(
+        harness.project,
+        created.supervision_id,
+        view.revision,
+        2,
+    );
+    supersede.conditions = Some(vec![ConditionInput {
+        title: "Changed generation condition".to_owned(),
+        rubric: "The changed target must be reassessed.".to_owned(),
+        checks: vec![],
+    }]);
+    supersede.condition_version = Some(2);
+    // The preview is well formed, but the current registry still carries the
+    // old condition version.
+    harness
+        .host
+        .owner_supersession_binding(&mut harness.runtime, &supersede)
+        .expect("prospective binding");
+    let registry = harness.matching_owner_registry(created.supervision_id, 1, "h3-job-1");
+    let old_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let stops_before = harness.runtime.stops;
+    let result = harness.host.supersede_approved_owner(
+        &mut harness.runtime,
+        &registry,
+        old_authority,
+        supersede,
+    );
+    assert!(matches!(
+        result,
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::StaleConditions {
+                requested: 2,
+                registered: 1
+            }
+        })
+    ));
+    assert_eq!(harness.runtime.stops, stops_before);
+    assert_eq!(harness.runtime.starts, 1);
+    let after = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(after.target_version, 1);
+    assert_eq!(after.condition_version, 1);
+    assert_eq!(after.revision, view.revision);
+}
+
+#[test]
+fn crashed_owner_supersession_is_not_recorded_and_restart_neither_supersedes_nor_starts() {
+    let mut harness = harness_with_pass_check_unmet();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let first_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    harness
+        .host
+        .start_approved_owner(
+            &mut harness.runtime,
+            first_authority,
+            SupervisionRequestId::new(harness.project),
+            created.revision,
+        )
+        .expect("approved owner start");
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+
+    harness.grant_completion(2);
+    let view = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    let supersede = supersede_request(
+        harness.project,
+        created.supervision_id,
+        view.revision,
+        2,
+    );
+    let binding = harness
+        .host
+        .owner_supersession_binding(&mut harness.runtime, &supersede)
+        .expect("supersession binding");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(binding.approval().clone());
+    let old_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    harness
+        .store
+        .lock()
+        .set_commit_fault(Some(CommitFault::BeforeCommit));
+    let failed = harness.host.supersede_approved_owner(
+        &mut harness.runtime,
+        &registry,
+        old_authority,
+        supersede.clone(),
+    );
+    assert!(failed.is_err(), "the injected commit fault must surface");
+    harness.store.lock().set_commit_fault(None);
+
+    let after_crash = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(after_crash.target_version, 1);
+    assert_eq!(after_crash.revision, view.revision);
+    assert_eq!(harness.runtime.starts, 1);
+    assert!(harness
+        .store
+        .lock()
+        .command_result(supersede.request_id)
+        .expect("command lookup")
+        .is_none());
+    let plan_after_crash = herness_desktop::supervision::plan::load_plan(
+        &harness.store,
+        harness.project,
+        created.supervision_id,
+    )
+    .expect("load plan")
+    .expect("plan");
+    assert_eq!(plan_after_crash.evidence_target.version().get(), 1);
+
+    // Restart marks the target as restored. The same request neither
+    // supersedes nor starts another run; a human/new cycle is needed.
+    harness.host.restore(&[harness.project]);
+    let retry_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let retry = harness.host.supersede_approved_owner(
+        &mut harness.runtime,
+        &registry,
+        retry_authority,
+        supersede,
+    );
+    assert!(matches!(
+        retry,
+        Err(SupervisionError::OwnerSupersessionRejected {
+            reason: OwnerSupersessionRejection::RestoredTarget
+        })
+    ));
+    assert_eq!(harness.runtime.starts, 1);
+    let final_view = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(final_view.target_version, 1);
+    assert_eq!(final_view.revision, view.revision);
 }
 
 #[test]

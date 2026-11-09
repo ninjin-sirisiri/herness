@@ -22,10 +22,13 @@ use std::time::{Duration, Instant};
 use herness_core::{ProjectId, Timestamp};
 use herness_supervision::budget::ledger::{BudgetClockPort, BudgetLedger};
 use herness_supervision::operations::{
-    HumanOperation, OperationPorts, SupervisionChange, SupervisionOperationRequest,
-    execute_operation,
+    HumanOperation, OperationPorts, OwnerSupersessionRequest, SupervisionChange,
+    SupervisionOperationRequest, ensure_owner_supersedable, execute_operation,
+    execute_owner_supersession,
 };
-use herness_supervision::owner_launch::{HostOwnerAuthority, OwnerLaunchBinding};
+use herness_supervision::owner_launch::{
+    HostOwnerAuthority, OwnerApprovalRegistryPort, OwnerLaunchBinding, authorize_owner_launch,
+};
 use herness_supervision::ports::{
     BudgetStorePort, ClockPort, EvidenceStorePort, SupervisionStorePort,
 };
@@ -35,10 +38,10 @@ use herness_supervision::supervisor::{
     SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest,
 };
 use herness_supervision::{
-    BudgetUsage, ConditionVersion, ConsentBinding, ConsentState, DisclosureDataKind, HumanAction,
-    ProfileBinding, ProfilePurpose, ProviderOrigin, SupervisionCommand, SupervisionError,
-    SupervisionId, SupervisionRecord, SupervisionRequestId, SupervisionState, TargetVersion,
-    WorkPacket,
+    ApprovalActor, ApprovalBasis, BudgetUsage, ConditionApproval, ConditionVersion,
+    ConsentBinding, ConsentState, DisclosureDataKind, HumanAction, ProfileBinding, ProfilePurpose,
+    ProviderOrigin, SupervisionCommand, SupervisionError, SupervisionId, SupervisionRecord,
+    SupervisionRequestId, SupervisionState, TargetReadSet, TargetVersion, WorkPacket,
 };
 use serde::Serialize;
 
@@ -51,8 +54,8 @@ use assessment::{AssessmentHost, build_profile};
 use checks::HostCheckPort;
 use permission::PermissionRuntime;
 use plan::{
-    BudgetSnapshot, ConfigStore, PLAN_FORMAT_VERSION, build_conditions, load_plan, plan_child,
-    save_plan,
+    BudgetSnapshot, ConfigStore, PLAN_FORMAT_VERSION, PendingPlan, build_conditions, load_pending_plan,
+    load_plan, plan_child, save_pending_plan, save_plan,
 };
 use runtime::DesktopSupervisionRuntime;
 use store::{HostBudgetClock, HostClock, StoreHandle};
@@ -326,6 +329,37 @@ pub struct ChangeSupervisionRequest {
     pub budget: Option<BudgetInput>,
 }
 
+/// Host-only approved-owner generation replacement request.
+///
+/// This is not an IPC payload: the entry point also requires a
+/// [`HostOwnerAuthority`] minted from the current owner registry, so a model or
+/// a serializable owner kind alone cannot invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeSupervisionRequest {
+    /// Host-owned idempotent request ID.
+    pub request_id: SupervisionRequestId,
+    /// Target whose generation is replaced.
+    pub supervision_id: SupervisionId,
+    /// Revision the owner last observed.
+    pub expected_revision: u64,
+    /// Strictly newer approved target version.
+    pub target_version: TargetVersion,
+    /// Replacement condition inputs when the approved conditions changed.
+    pub conditions: Option<Vec<ConditionInput>>,
+    /// Replacement condition version, required with `conditions`.
+    pub condition_version: Option<u64>,
+    /// Purpose whose configured profile should be adopted.
+    pub profile_purpose: Option<ProfilePurpose>,
+    /// Purpose whose configured consent should be adopted.
+    pub consent_purpose: Option<ProfilePurpose>,
+    /// Replacement finite budget policy when it legitimately changed.
+    pub budget: Option<BudgetInput>,
+    /// Current H3/H4-owned settings or approval version.
+    pub settings_version: u64,
+    /// Current H3/H4 job identity.
+    pub job_id: String,
+}
+
 /// One host-owned supervision composition.
 pub struct SupervisionHost {
     store: StoreHandle,
@@ -345,6 +379,13 @@ pub struct SupervisionHost {
 pub(crate) enum CheckMode {
     Real,
     Injected(Box<dyn RequiredCheckPort + Send>),
+}
+
+/// One replacement plan, its exact contract, and the registry binding it needs.
+struct BuiltSupersession {
+    plan: StoredPlan,
+    contract: herness_supervision::SupervisionContract,
+    binding: OwnerLaunchBinding,
 }
 
 impl SupervisionHost {
@@ -522,6 +563,12 @@ impl SupervisionHost {
                 // start (or a fresh owner launch after a new creation) may
                 // proceed.
                 self.set_restored(*project, record.supervision_id(), true);
+                if let Err(error) = self.promote_pending_plan(*project, record.supervision_id()) {
+                    eprintln!(
+                        "SUPERVISION_PENDING_PLAN_ERROR: {project} {}: {error}",
+                        record.supervision_id()
+                    );
+                }
                 match load_plan(&self.store, *project, record.supervision_id()) {
                     Ok(Some(plan)) => {
                         self.plans
@@ -951,6 +998,304 @@ impl SupervisionHost {
         }
         self.set_restored(project, supervision, false);
         self.view(project, supervision)
+    }
+
+    /// Builds the exact replacement binding an H3/H4 owner must currently have
+    /// approved before replacing a stale generation.
+    ///
+    /// This is the request side only. It does not mutate the target, and the
+    /// returned value is not an authority.
+    pub fn owner_supersession_binding(
+        &self,
+        runtime: &mut dyn DesktopSupervisionRuntime,
+        request: &SupersedeSupervisionRequest,
+    ) -> Result<OwnerLaunchBinding, SupervisionError> {
+        let project = request.request_id.project_id();
+        request.request_id.validate_in(project)?;
+        let record = self.load(project, request.supervision_id)?;
+        let plan = self.plan(project, request.supervision_id)?;
+        Ok(self
+            .build_supersession_plan(runtime, &record, &plan, request)?
+            .binding)
+    }
+
+    /// Replaces a stale generation in the same target using a host-minted
+    /// approved-owner authority.
+    ///
+    /// The current run is stopped and confirmed before the target version,
+    /// work packet, approval basis, and invalidation history change. The
+    /// record, command result, and budget ledger are preserved; the method
+    /// starts at most one new run in the same target. Every human stop, human
+    /// wait, stagnation, budget, recovery, unconfirmed-stop, cancel, and
+    /// completed latch is refused without a mutation. A target loaded by
+    /// `restore` is refused so a restart cannot auto-resume authoring.
+    pub fn supersede_approved_owner(
+        &mut self,
+        runtime: &mut dyn DesktopSupervisionRuntime,
+        registry: &dyn OwnerApprovalRegistryPort,
+        authority: HostOwnerAuthority,
+        request: SupersedeSupervisionRequest,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let project = request.request_id.project_id();
+        let supervision = request.supervision_id;
+        request.request_id.validate_in(project)?;
+        if authority.project_id() != project || authority.supervision_id() != supervision {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: herness_supervision::OwnerSupersessionRejection::TargetMismatch,
+            });
+        }
+        // A crash after the atomic record/command commit but before the plan
+        // promotion is repaired before any duplicate is answered.
+        self.promote_pending_plan(project, supervision)?;
+        // A duplicate request returns its recorded result before any load,
+        // stop, budget change, snapshot capture, or second run.
+        if let Some(recorded) = self.store.command_result(request.request_id)? {
+            if recorded.project_id() != project
+                || recorded.supervision_id() != supervision
+                || recorded.command() != SupervisionCommand::Supersede
+            {
+                return Err(SupervisionError::DuplicateRequestConflict {
+                    request: request.request_id.to_string(),
+                    recorded: recorded.command().as_str().to_owned(),
+                    supplied: SupervisionCommand::Supersede.as_str().to_owned(),
+                });
+            }
+            return self.view(project, supervision);
+        }
+        if self.is_restored(project, supervision) {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: herness_supervision::OwnerSupersessionRejection::RestoredTarget,
+            });
+        }
+        let record = self.load(project, supervision)?;
+        if record.revision() != request.expected_revision {
+            return Err(SupervisionError::RevisionConflict {
+                expected: request.expected_revision,
+                found: record.revision(),
+            });
+        }
+        let plan = self.plan(project, supervision)?;
+        let now = self.clock.now();
+        let current_contract = plan.contract(&record, now)?;
+        // The host-only token proves the caller is still looking at the
+        // approved current generation. The replacement is then checked again
+        // against the current registry below.
+        authority.ensure_contract_binding(&current_contract, plan.budget_version)?;
+        ensure_owner_supersedable(&record)?;
+
+        let built = self.build_supersession_plan(runtime, &record, &plan, &request)?;
+        let new_authority = authorize_owner_launch(registry, &built.binding, now)?;
+        new_authority.ensure_contract_binding(&built.contract, built.plan.budget_version)?;
+
+        save_pending_plan(
+            &self.store,
+            project,
+            supervision,
+            &PendingPlan {
+                record_revision: record.revision().saturating_add(1),
+                request_id: request.request_id,
+                plan: built.plan.clone(),
+            },
+        )?;
+
+        let operation = OwnerSupersessionRequest::new(
+            request.request_id,
+            supervision,
+            request.expected_revision,
+            built.contract.clone(),
+        )?;
+        let mut ledger = self.ledger(project, supervision, &plan)?;
+        let mut facts = self.store.clone();
+        let result = execute_owner_supersession(
+            OperationPorts {
+                store: &mut facts,
+                runtime,
+                budget: &mut ledger,
+                clock: &self.clock,
+            },
+            &current_contract,
+            plan.budget_version,
+            operation,
+            new_authority,
+        )?;
+        if result.duplicate() {
+            self.promote_pending_plan(project, supervision)?;
+            return self.view(project, supervision);
+        }
+        self.promote_pending_plan(project, supervision)?;
+
+        self.set_active(project, supervision, true);
+        let request_id = SupervisionRequestId::new(project);
+        if let Err(error) = self.tick_one(runtime, project, supervision, request_id) {
+            self.set_active(project, supervision, false);
+            return Err(error);
+        }
+        self.view(project, supervision)
+    }
+
+    /// Builds the replacement plan and the exact registry binding it needs.
+    fn build_supersession_plan(
+        &self,
+        runtime: &mut dyn DesktopSupervisionRuntime,
+        record: &SupervisionRecord,
+        current_plan: &StoredPlan,
+        request: &SupersedeSupervisionRequest,
+    ) -> Result<BuiltSupersession, SupervisionError> {
+        let project = record.project_id();
+        let (owner, source) = match &current_plan.actor {
+            plan::RequestActor::ApprovedOwner { owner, source } => (owner.clone(), *source),
+            _ => {
+                return Err(SupervisionError::OwnerLaunchRejected {
+                    reason: herness_supervision::OwnerLaunchRejection::OwnerNotApproved,
+                });
+            }
+        };
+        let now = self.clock.now();
+        let conditions = match request.conditions.as_ref() {
+            Some(inputs) => {
+                let version = ConditionVersion::new(
+                    request
+                        .condition_version
+                        .unwrap_or_else(|| record.condition_version().get().saturating_add(1)),
+                )?;
+                build_conditions(project, version, &current_plan.actor, inputs, now)?
+            }
+            None => {
+                if request.condition_version.is_some() {
+                    return Err(SupervisionError::InvalidValue {
+                        field: "conditionVersion".to_owned(),
+                        detail: "a condition version requires replacement condition inputs"
+                            .to_owned(),
+                    });
+                }
+                let mut set = current_plan.conditions.clone();
+                let approval = ConditionApproval::new(
+                    project,
+                    ApprovalBasis::InheritedOwner {
+                        owner: owner.clone(),
+                        source,
+                        approved_at: now,
+                        expires_at: None,
+                    },
+                    set.condition_version(),
+                    set.digest().clone(),
+                )?;
+                set.approve(
+                    ApprovalActor::ApprovedOwner {
+                        owner: owner.clone(),
+                        source,
+                    },
+                    approval,
+                    now,
+                )?;
+                set
+            }
+        };
+        let config = self.config.get(project);
+        let profile = match request.profile_purpose {
+            Some(purpose) => config
+                .profile(purpose)
+                .map(|profile| profile.profile.clone())
+                .ok_or(SupervisionError::ProfileUnavailable {
+                    reason: herness_supervision::ProfileUnavailable::Unset { purpose },
+                })?,
+            None => current_plan.profile.clone(),
+        };
+        let consent = match request.consent_purpose {
+            Some(purpose) => {
+                let consent =
+                    config
+                        .consent(purpose)
+                        .cloned()
+                        .ok_or(SupervisionError::ConsentBlocked {
+                            reason: herness_supervision::ConsentBlock::Revoked,
+                        })?;
+                consent.require_granted()?;
+                consent
+            }
+            None => current_plan.consent.clone(),
+        };
+        let budget = match request.budget.as_ref() {
+            Some(input) => input.policy()?,
+            None => current_plan.budget.policy()?,
+        };
+        let budget_version = if request.budget.is_some() {
+            current_plan.budget_version.saturating_add(1)
+        } else {
+            current_plan.budget_version
+        };
+        let workspace = workspace::ProjectWorkspace::new(runtime.project_path(project)?);
+        let manifest = herness_supervision::freshness::capture_manifest(
+            &workspace,
+            project,
+            request.target_version,
+            TargetReadSet::Declared(current_plan.evidence_target.read_set().to_vec()),
+        )?;
+        let evidence_target = manifest.target_scope()?;
+
+        let mut next = current_plan.clone();
+        next.conditions = conditions;
+        next.profile = profile;
+        next.consent = consent;
+        next.evidence_target = evidence_target;
+        next.budget = BudgetSnapshot::from_policy(&budget);
+        next.budget_version = budget_version;
+        next.rebuild_contract(record, now)?;
+        let binding = OwnerLaunchBinding::from_contract(
+            &next.contract,
+            next.budget_version,
+            request.settings_version,
+            &request.job_id,
+        )?;
+        Ok(BuiltSupersession {
+            contract: next.contract.clone(),
+            plan: next,
+            binding,
+        })
+    }
+
+    /// Promotes a staged replacement plan only when the exact `Supersede`
+    /// command committed at the staged revision.
+    ///
+    /// A crash before that commit, or any other command at the same revision,
+    /// leaves the canonical plan untouched. Promotion is idempotent.
+    fn promote_pending_plan(
+        &self,
+        project: ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<bool, SupervisionError> {
+        let pending = match load_pending_plan(&self.store, project, supervision) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                eprintln!(
+                    "SUPERVISION_PENDING_PLAN_ERROR: {project} {supervision}: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let Some(record) = self.store.load(project, supervision)? else {
+            return Ok(false);
+        };
+        if record.revision() != pending.record_revision {
+            return Ok(false);
+        }
+        let Some(recorded) = self.store.command_result(pending.request_id)? else {
+            return Ok(false);
+        };
+        if recorded.project_id() != project
+            || recorded.supervision_id() != supervision
+            || recorded.command() != SupervisionCommand::Supersede
+            || recorded.revision() != pending.record_revision
+        {
+            return Ok(false);
+        }
+        save_plan(&self.store, project, supervision, &pending.plan)?;
+        self.plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((project, supervision), pending.plan);
+        Ok(true)
     }
 
     /// Stops or cancels one target through the H1 cooperative stop path.
@@ -1486,6 +1831,9 @@ impl SupervisionHost {
         project: ProjectId,
         supervision: SupervisionId,
     ) -> Result<Option<StoredPlan>, SupervisionError> {
+        // Repair a crash between the atomic supersession commit and the plan
+        // save before reading the canonical plan.
+        self.promote_pending_plan(project, supervision)?;
         let cached = self
             .plans
             .lock()

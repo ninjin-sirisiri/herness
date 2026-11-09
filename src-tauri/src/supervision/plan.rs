@@ -15,8 +15,8 @@ use herness_supervision::{
     ConditionVersion, ConsentId, ConsentState, DisclosureConsent, DisclosureDataKind,
     DisclosureScope, ExecutionScope, Money, MoneyCap, OwnerApprovalSource, OwnerRef, PriceVersion,
     ProfilePurpose, ProviderOrigin, RequiredCheck, RunGroup, SupervisionContract, SupervisionError,
-    SupervisionId, SupervisionRecord, SupervisionSubject, TargetScope, TargetVersion,
-    VerificationOperation, WorkPacket, WorkPacketRejection,
+    SupervisionId, SupervisionRecord, SupervisionRequestId, SupervisionSubject, TargetScope,
+    TargetVersion, VerificationOperation, WorkPacket, WorkPacketRejection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -458,6 +458,24 @@ impl StoredPlan {
     }
 }
 
+/// One durable replacement plan staged before an atomic supersession commit.
+///
+/// The record commit and the command result are one transaction. The pending
+/// entry lets a later open promote the matching replacement plan only when the
+/// recorded `Supersede` result exists at exactly the staged revision. A crash
+/// before that commit, or any other command at the same revision, never
+/// promotes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PendingPlan {
+    /// Record revision the staged plan belongs to.
+    pub record_revision: u64,
+    /// Idempotent supersession request that must have committed.
+    pub request_id: SupervisionRequestId,
+    /// Exact replacement plan.
+    pub plan: StoredPlan,
+}
+
 /// One configured profile and its verification state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -570,6 +588,61 @@ fn config_key(project: ProjectId) -> String {
 
 fn plan_key(project: ProjectId, supervision: SupervisionId) -> String {
     format!("h2.supervision.plan:{project}:{supervision}")
+}
+
+fn pending_plan_key(project: ProjectId, supervision: SupervisionId) -> String {
+    format!("h2.supervision.plan.pending:{project}:{supervision}")
+}
+
+/// Stages one replacement plan for a supersession commit.
+pub(crate) fn save_pending_plan(
+    store: &StoreHandle,
+    project: ProjectId,
+    supervision: SupervisionId,
+    pending: &PendingPlan,
+) -> Result<(), SupervisionError> {
+    pending.plan.verify()?;
+    if pending.record_revision == 0 {
+        return Err(SupervisionError::InvalidValue {
+            field: "pendingPlan.recordRevision".to_owned(),
+            detail: "a staged plan needs the target record revision".to_owned(),
+        });
+    }
+    let bytes =
+        serde_json::to_vec(pending).map_err(|error| SupervisionError::StorageFailure {
+            detail: format!("could not encode the pending supervision plan: {error}"),
+        })?;
+    store
+        .lock()
+        .save_host_state(&pending_plan_key(project, supervision), &bytes)
+        .map_err(|error| SupervisionError::StorageFailure {
+            detail: error.to_string(),
+        })
+}
+
+/// Reads one staged replacement plan.
+pub(crate) fn load_pending_plan(
+    store: &StoreHandle,
+    project: ProjectId,
+    supervision: SupervisionId,
+) -> Result<Option<PendingPlan>, SupervisionError> {
+    let bytes = store
+        .lock()
+        .load_host_state(&pending_plan_key(project, supervision))
+        .map_err(|error| SupervisionError::StorageFailure {
+            detail: error.to_string(),
+        })?;
+    bytes
+        .as_deref()
+        .map(|bytes| {
+            let pending: PendingPlan =
+                serde_json::from_slice(bytes).map_err(|error| SupervisionError::StorageFailure {
+                    detail: format!("could not decode the pending supervision plan: {error}"),
+                })?;
+            pending.plan.verify()?;
+            Ok(pending)
+        })
+        .transpose()
 }
 
 /// Decodes one durable plan with an explicit format switch.

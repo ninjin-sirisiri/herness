@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{BudgetClockState, BudgetLimit, BudgetPriceReason};
 use crate::consent::ConsentBlock;
 use crate::profiles::ProfileUnavailable;
-use crate::state::{CompletionBlocker, SupervisionState};
+use crate::state::{CompletionBlocker, HumanAction, SupervisionState};
 /// Structured supervision contract error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -195,6 +195,13 @@ pub enum SupervisionError {
         /// Structured reason.
         reason: OwnerLaunchRejection,
     },
+    /// An approved-owner generation replacement was refused.
+    ///
+    /// No target version, packet, decision, run, or budget value changed.
+    OwnerSupersessionRejected {
+        /// Structured reason.
+        reason: OwnerSupersessionRejection,
+    },
 }
 
 /// Why an immutable work packet cannot be used.
@@ -289,6 +296,57 @@ pub enum OwnerLaunchRejection {
     /// The target already has at least one started run.
     AlreadyStarted,
     /// The target was loaded by restore in this process and needs a human start.
+    RestoredTarget,
+}
+
+/// Why an approved-owner generation replacement was rejected.
+///
+/// A rejection never changes the stored target version, work packet, decisions,
+/// run group, or budget ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum OwnerSupersessionRejection {
+    /// The authority or contract covers another project or target.
+    TargetMismatch,
+    /// The replacement names the same owner kind but another owner identity.
+    SubjectMismatch,
+    /// The target is still in the same generation.
+    TargetUnchanged,
+    /// The replacement condition content is not a valid newer set.
+    ConditionsMismatch,
+    /// The budget policy changed without a newer version, or the version
+    /// changed without a policy change.
+    BudgetMismatch,
+    /// The target was explicitly cancelled and is not auto-resumed.
+    Cancelled,
+    /// The target failed unrecoverably.
+    Failed,
+    /// The target already completed; a new cycle needs a new target.
+    Completed,
+    /// A human action is still pending.
+    HumanWaiting {
+        /// Human action that must be resolved first.
+        action: HumanAction,
+    },
+    /// A human stopped the target.
+    HumanStopped,
+    /// Three consecutive cycles made no progress.
+    Stagnated,
+    /// The finite budget is already exhausted.
+    BudgetExhausted {
+        /// Reached limit.
+        limit: BudgetLimit,
+    },
+    /// Recovery reconciliation is pending.
+    RecoveryPending,
+    /// H1 did not confirm stopping the current run.
+    StopUnconfirmed,
+    /// The target was loaded by restore in this process and needs a human or a
+    /// new cycle before an owner may start another run.
     RestoredTarget,
 }
 
@@ -441,6 +499,9 @@ impl fmt::Display for SupervisionError {
             }
             Self::OwnerLaunchRejected { reason } => {
                 write!(f, "approved-owner launch rejected: {reason:?}")
+            }
+            Self::OwnerSupersessionRejected { reason } => {
+                write!(f, "approved-owner supersession rejected: {reason:?}")
             }
         }
     }

@@ -21,9 +21,10 @@ use crate::command::{CommandResult, SupervisionCommand};
 use crate::conditions::ConditionSet;
 use crate::consent::ConsentBinding;
 use crate::contract::SupervisionContract;
-use crate::error::SupervisionError;
+use crate::error::{OwnerSupersessionRejection, SupervisionError};
 use crate::evidence::TargetVersion;
 use crate::ids::{SupervisionId, SupervisionRequestId, verify_scoped};
+use crate::owner_launch::HostOwnerAuthority;
 use crate::ports::{BudgetStorePort, ClockPort, StoredBudgetRecord};
 use crate::profiles::ProfileBinding;
 use crate::recovery::{
@@ -31,8 +32,8 @@ use crate::recovery::{
     RecoveryRuntimePort, RecoveryService, RecoveryStopState,
 };
 use crate::state::{
-    CancelCause, ChangeKind, HumanAction, StopCause, SupervisionChangeRecord, SupervisionRecord,
-    SupervisionState,
+    CancelCause, ChangeKind, HumanAction, StopCause, SupervisionChangeRecord, SupervisionReason,
+    SupervisionRecord, SupervisionState,
 };
 use crate::supervisor::{StopDisposition, SupervisorPhase};
 
@@ -163,6 +164,76 @@ impl OperationResult {
     /// Recovery gate evidence for resume/reassessment.
     pub const fn recovery(&self) -> Option<&RecoveryReport> {
         self.recovery.as_ref()
+    }
+}
+
+/// One host-owned approved-owner generation replacement.
+///
+/// The request carries the exact replacement contract. It cannot be built from
+/// an owner kind or a serializable approval alone: the host also has to supply
+/// a [`HostOwnerAuthority`] minted for the replacement contract by the current
+/// owner registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnerSupersessionRequest {
+    request_id: SupervisionRequestId,
+    supervision_id: SupervisionId,
+    expected_revision: u64,
+    new_contract: SupervisionContract,
+}
+
+impl OwnerSupersessionRequest {
+    /// Binds one idempotent request ID to the replacement contract.
+    pub fn new(
+        request_id: SupervisionRequestId,
+        supervision_id: SupervisionId,
+        expected_revision: u64,
+        new_contract: SupervisionContract,
+    ) -> Result<Self, SupervisionError> {
+        let project = request_id.project_id();
+        verify_scoped(&request_id, project)?;
+        verify_scoped(&supervision_id, project)?;
+        if supervision_id != new_contract.subject().supervision_id() {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: OwnerSupersessionRejection::TargetMismatch,
+            });
+        }
+        if expected_revision == 0 {
+            return Err(SupervisionError::InvalidValue {
+                field: "expectedRevision".to_owned(),
+                detail: "revisions start at 1".to_owned(),
+            });
+        }
+        Ok(Self {
+            request_id,
+            supervision_id,
+            expected_revision,
+            new_contract,
+        })
+    }
+
+    /// Host-owned idempotent request ID.
+    pub const fn request_id(&self) -> SupervisionRequestId {
+        self.request_id
+    }
+
+    /// Supervision target.
+    pub const fn supervision_id(&self) -> SupervisionId {
+        self.supervision_id
+    }
+
+    /// Revision the owner last observed.
+    pub const fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+
+    /// Exact replacement contract built by the host composition.
+    pub const fn new_contract(&self) -> &SupervisionContract {
+        &self.new_contract
+    }
+
+    /// Project that owns the request.
+    pub const fn project_id(&self) -> ProjectId {
+        self.request_id.project_id()
     }
 }
 
@@ -409,6 +480,407 @@ pub fn execute_operation(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Rejects owner supersession when a durable stop or human latch is set.
+///
+/// This is the shared latch check used by the host composition and the
+/// operation itself. It never clears the latch and never resumes anything.
+pub fn ensure_owner_supersedable(
+    record: &SupervisionRecord,
+) -> Result<(), SupervisionError> {
+    match record.state() {
+        SupervisionState::Ready
+        | SupervisionState::Running
+        | SupervisionState::Verifying
+        | SupervisionState::Assessing => Ok(()),
+        SupervisionState::WaitingHuman => {
+            let action = match record.reason() {
+                SupervisionReason::WaitingHuman { action } => *action,
+                SupervisionReason::ConditionsChanged { .. } => HumanAction::ConfirmConditions,
+                SupervisionReason::TargetChanged { .. } => HumanAction::ConfirmTarget,
+                _ => HumanAction::ReconcileRecovery,
+            };
+            Err(rejected_supersession(
+                OwnerSupersessionRejection::HumanWaiting { action },
+            ))
+        }
+        SupervisionState::Stopped => {
+            let reason = match record.reason() {
+                SupervisionReason::Stopped { cause } => match cause {
+                    StopCause::UserRequest => OwnerSupersessionRejection::HumanStopped,
+                    StopCause::Stagnation => OwnerSupersessionRejection::Stagnated,
+                    StopCause::Budget(limit) => {
+                        OwnerSupersessionRejection::BudgetExhausted { limit: *limit }
+                    }
+                    StopCause::StopUnconfirmed => OwnerSupersessionRejection::StopUnconfirmed,
+                    StopCause::RecoveryReconciliation => {
+                        OwnerSupersessionRejection::RecoveryPending
+                    }
+                },
+                _ => OwnerSupersessionRejection::RecoveryPending,
+            };
+            Err(rejected_supersession(reason))
+        }
+        SupervisionState::Failed => Err(rejected_supersession(OwnerSupersessionRejection::Failed)),
+        SupervisionState::Cancelled => {
+            Err(rejected_supersession(OwnerSupersessionRejection::Cancelled))
+        }
+        SupervisionState::Completed => {
+            Err(rejected_supersession(OwnerSupersessionRejection::Completed))
+        }
+    }
+}
+
+/// Executes one approved-owner generation replacement in the same target.
+///
+/// The operation keeps the stored run group, decision history, and durable
+/// budget ledger. It stops and confirms the current run before changing the
+/// target version, invalidates every applied decision, and returns the record
+/// to `ready` so the host can start exactly one run in the same conversation.
+///
+/// A duplicate request ID returns the recorded result before any load, stop,
+/// budget change, or commit. Every latch (human stop/wait, stagnation, budget,
+/// recovery, unconfirmed stop, cancellation) is checked before the stop and
+/// before the replacement contract is applied.
+pub fn execute_owner_supersession(
+    ports: OperationPorts<'_>,
+    current_contract: &SupervisionContract,
+    expected_policy_version: u64,
+    request: OwnerSupersessionRequest,
+    authority: HostOwnerAuthority,
+) -> Result<OperationResult, SupervisionError> {
+    let OperationPorts {
+        store,
+        runtime,
+        budget,
+        clock,
+    } = ports;
+
+    if let Some(recorded) = store.command_result(request.request_id())? {
+        if recorded.project_id() != request.project_id()
+            || recorded.supervision_id() != request.supervision_id()
+            || recorded.command() != SupervisionCommand::Supersede
+        {
+            return Err(SupervisionError::DuplicateRequestConflict {
+                request: request.request_id().to_string(),
+                recorded: recorded.command().as_str().to_owned(),
+                supplied: SupervisionCommand::Supersede.as_str().to_owned(),
+            });
+        }
+        return Ok(OperationResult {
+            command: recorded,
+            duplicate: true,
+            recovery: None,
+        });
+    }
+
+    let project = request.project_id();
+    let supervision = request.supervision_id();
+    let current = store
+        .load(project, supervision)?
+        .ok_or(SupervisionError::UnknownSupervision)?;
+    if current.revision() != request.expected_revision() {
+        return Err(SupervisionError::RevisionConflict {
+            expected: request.expected_revision(),
+            found: current.revision(),
+        });
+    }
+
+    ensure_current_generation(&current, current_contract, expected_policy_version)?;
+    if authority.project_id() != project || authority.supervision_id() != supervision {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::TargetMismatch,
+        ));
+    }
+
+    let new_contract = request.new_contract();
+    let new_policy_version = new_contract.work_packet().budget_policy_version();
+    authority.ensure_contract_binding(new_contract, new_policy_version)?;
+
+    let now = clock.now();
+    ensure_replacement_generation(
+        &current,
+        current_contract,
+        new_contract,
+        expected_policy_version,
+        now,
+    )?;
+    ensure_owner_supersedable(&current)?;
+
+    // Recovery is a latch, not a side effect: unresolved requests/operations/
+    // processes, stale permission context, or an exhausted budget block the
+    // owner replacement exactly as they block a human resume.
+    let recovery = {
+        let mut service = RecoveryService::new(&mut *store, &mut *runtime, &mut *budget, clock);
+        service.recover(current_contract, expected_policy_version)?
+    };
+    if let Some(reason) = supersession_recovery_rejection(&recovery) {
+        return Err(rejected_supersession(reason));
+    }
+
+    // The current run must be stopped and confirmed before the target version
+    // or packet can change.
+    let run = current
+        .supervisor()
+        .current_run()
+        .or_else(|| current.run_group().runs().last().copied());
+    if let Some(run) = run {
+        let confirmed = match runtime.stop_state(run)? {
+            RecoveryStopState::Confirmed => true,
+            RecoveryStopState::Unconfirmed => false,
+            RecoveryStopState::NotRequested => {
+                !matches!(runtime.request_stop(run)?, StopDisposition::Unconfirmed)
+            }
+        };
+        if !confirmed {
+            return Err(rejected_supersession(
+                OwnerSupersessionRejection::StopUnconfirmed,
+            ));
+        }
+    }
+
+    let budget_before = budget.budget_usage()?;
+    let policy_changed = new_contract.budget() != current_contract.budget();
+    if policy_changed {
+        if new_policy_version <= expected_policy_version {
+            return Err(rejected_supersession(
+                OwnerSupersessionRejection::BudgetMismatch,
+            ));
+        }
+        budget.change_policy(new_contract.budget().clone(), new_policy_version)?;
+    } else if new_policy_version != expected_policy_version {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::BudgetMismatch,
+        ));
+    }
+
+    let actor = replacement_actor(new_contract)?;
+    let mut next = current.clone();
+    next.apply_generation(new_contract)?;
+    budget.app_stop()?;
+    let budget_after = budget.budget_usage()?;
+    next.push_change(SupervisionChangeRecord::new(
+        ChangeKind::Supersede,
+        actor,
+        generation_label(&current),
+        generation_label_for_contract(new_contract),
+        budget_before,
+        budget_after,
+        now,
+    ));
+    next.set_command_revision(current.revision().saturating_add(1));
+    let result = CommandResult::new(
+        request.request_id(),
+        project,
+        supervision,
+        SupervisionCommand::Supersede,
+        next.revision(),
+        next.state(),
+        next.reason().clone(),
+    )?;
+    match store.commit_command(
+        project,
+        supervision,
+        Some(current.revision()),
+        &next,
+        &result,
+    ) {
+        Ok(revision) => Ok(OperationResult {
+            command: CommandResult::new(
+                result.request_id(),
+                result.project_id(),
+                result.supervision_id(),
+                result.command(),
+                revision,
+                result.state(),
+                result.reason().clone(),
+            )?,
+            duplicate: false,
+            recovery: None,
+        }),
+        Err(SupervisionError::RevisionConflict { .. }) => {
+            let found = store
+                .load(project, supervision)?
+                .map_or(current.revision(), |record| record.revision());
+            Err(SupervisionError::RevisionConflict {
+                expected: current.revision(),
+                found,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_current_generation(
+    record: &SupervisionRecord,
+    contract: &SupervisionContract,
+    expected_policy_version: u64,
+) -> Result<(), SupervisionError> {
+    if contract.project_id() != record.project_id()
+        || contract.subject().supervision_id() != record.supervision_id()
+        || contract.conditions().condition_version() != record.condition_version()
+        || contract.conditions().condition_ids() != record.condition_ids().to_vec()
+        || contract
+            .conditions()
+            .checks()
+            .iter()
+            .map(|check| check.id())
+            .collect::<Vec<_>>()
+            != record.required_checks().to_vec()
+        || contract.evidence_target().version() != record.target_version()
+        || contract.profile() != record.profile()
+        || contract.consent() != record.consent()
+        || contract.work_packet().budget_policy_version() != expected_policy_version
+    {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::TargetMismatch,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_replacement_generation(
+    record: &SupervisionRecord,
+    current: &SupervisionContract,
+    replacement: &SupervisionContract,
+    expected_policy_version: u64,
+    now: Timestamp,
+) -> Result<(), SupervisionError> {
+    replacement_actor(replacement)?;
+    if replacement.project_id() != record.project_id()
+        || replacement.subject().supervision_id() != record.supervision_id()
+        || replacement.subject().owner() != current.subject().owner()
+        || replacement.subject().agent_id() != current.subject().agent_id()
+        || replacement.subject().session_id() != current.subject().session_id()
+    {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::SubjectMismatch,
+        ));
+    }
+    replacement.validate_for_start(now)?;
+    if replacement.evidence_target().version() <= record.target_version() {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::TargetUnchanged,
+        ));
+    }
+    let replacement_version = replacement.conditions().condition_version();
+    if replacement_version < record.condition_version()
+        || (replacement_version == record.condition_version()
+            && (replacement.conditions().condition_ids() != record.condition_ids().to_vec()
+                || replacement
+                    .conditions()
+                    .checks()
+                    .iter()
+                    .map(|check| check.id())
+                    .collect::<Vec<_>>()
+                    != record.required_checks().to_vec()))
+    {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::ConditionsMismatch,
+        ));
+    }
+    if replacement.work_packet().packet_version()
+        <= current.work_packet().packet_version()
+    {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::ConditionsMismatch,
+        ));
+    }
+    let replacement_policy_version = replacement.work_packet().budget_policy_version();
+    if replacement.budget() == current.budget() {
+        if replacement_policy_version != expected_policy_version {
+            return Err(rejected_supersession(
+                OwnerSupersessionRejection::BudgetMismatch,
+            ));
+        }
+    } else if replacement_policy_version <= expected_policy_version {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::BudgetMismatch,
+        ));
+    }
+    Ok(())
+}
+
+fn replacement_actor(
+    contract: &SupervisionContract,
+) -> Result<crate::approval::ApprovalActor, SupervisionError> {
+    use crate::approval::{ApprovalActor, ApprovalBasis, OwnerApprovalSource};
+
+    let approval = contract
+        .conditions()
+        .approval()
+        .ok_or_else(|| rejected_supersession(OwnerSupersessionRejection::ConditionsMismatch))?;
+    let (owner, source) = match approval.basis() {
+        ApprovalBasis::InheritedOwner { owner, source, .. } => (owner.clone(), *source),
+        ApprovalBasis::ExplicitHuman { .. } => {
+            return Err(rejected_supersession(
+                OwnerSupersessionRejection::SubjectMismatch,
+            ));
+        }
+    };
+    if &owner != contract.subject().owner() || !owner.is_approved_owner() {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::SubjectMismatch,
+        ));
+    }
+    if !matches!(
+        (owner.kind(), source),
+        (
+            crate::contract::OwnerKind::H3HtmlJob,
+            OwnerApprovalSource::H3ApprovedSettings
+        ) | (
+            crate::contract::OwnerKind::H4SddTask,
+            OwnerApprovalSource::H4ApprovedPlan
+        )
+    ) {
+        return Err(rejected_supersession(
+            OwnerSupersessionRejection::SubjectMismatch,
+        ));
+    }
+    Ok(ApprovalActor::ApprovedOwner { owner, source })
+}
+
+fn supersession_recovery_rejection(
+    report: &RecoveryReport,
+) -> Option<OwnerSupersessionRejection> {
+    for reason in report.block_reasons() {
+        match reason {
+            RecoveryBlockReason::BudgetExhausted { limit } => {
+                return Some(OwnerSupersessionRejection::BudgetExhausted { limit: *limit });
+            }
+            RecoveryBlockReason::StopUnconfirmed { .. } => {
+                return Some(OwnerSupersessionRejection::StopUnconfirmed);
+            }
+            _ => return Some(OwnerSupersessionRejection::RecoveryPending),
+        }
+    }
+    None
+}
+
+fn generation_label(record: &SupervisionRecord) -> String {
+    format!(
+        "generation:target:{}:conditions:{}:profile:{}:consent:{}",
+        record.target_version().get(),
+        record.condition_version().get(),
+        record.profile().profile_id(),
+        record.consent().consent_id()
+    )
+}
+
+fn generation_label_for_contract(contract: &SupervisionContract) -> String {
+    format!(
+        "generation:target:{}:conditions:{}:profile:{}:consent:{}:packet:{}",
+        contract.evidence_target().version().get(),
+        contract.conditions().condition_version().get(),
+        contract.profile().profile_id(),
+        contract.consent().consent_id(),
+        contract.work_packet().packet_version()
+    )
+}
+
+fn rejected_supersession(reason: OwnerSupersessionRejection) -> SupervisionError {
+    SupervisionError::OwnerSupersessionRejected { reason }
 }
 
 fn stop_or_cancel(

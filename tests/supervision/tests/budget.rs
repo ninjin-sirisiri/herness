@@ -15,16 +15,32 @@ use herness_core::contracts::{
     TokenCount, TokenUsage,
 };
 use herness_core::ports::request_gate::ModelRequestGatePort;
+use herness_core::runtime::RecoveryMode;
+use herness_core::RunState;
 use herness_store::test_support::CommitFault;
 use herness_store::{Store, StoreConfig};
+use herness_supervision::operations::{
+    OperationPorts, OperationRuntimePort, OwnerSupersessionRequest, execute_owner_supersession,
+};
+use herness_supervision::owner_launch::{OwnerLaunchBinding, authorize_owner_launch};
+use herness_supervision::recovery::{
+    ManagedProcessState, RecoveryCheckpoint, RecoveryRuntimePort, RecoveryStopState,
+};
+use herness_supervision::supervisor::StopDisposition;
 use herness_supervision::{
     BudgetClockPort, BudgetLedger, BudgetLedgerRecord, BudgetLimit, BudgetPolicy,
-    BudgetRequestGate, BudgetRequestId, BudgetStorePort, ClockReading, Money, MoneyCap,
-    MoneyReservation, MoneyReservationState, MoneySettlement, PriceVersion, RequestBudgetEstimate,
-    RequestBudgetEstimator, StoredBudgetRecord, SupervisionError, SupervisionId,
+    BudgetRequestGate, BudgetRequestId, BudgetStorePort, ChangeKind, ClockPort, ClockReading, Money,
+    MoneyCap, MoneyReservation, MoneyReservationState, MoneySettlement, OwnerApprovalSource,
+    OwnerKind, OwnerRef, OwnerSupersessionRejection, PriceVersion, RequestBudgetEstimate,
+    RequestBudgetEstimator, StoredBudgetRecord, SupervisionError, SupervisionId, SupervisionRecord,
+    SupervisionRequestId, SupervisionState,
 };
-use herness_supervision_tests::{ids, now, project};
+use herness_supervision_tests::{
+    ScriptedOwnerApprovalRegistry, ids, now, owner_contract_at_with_budget,
+    owner_contract_succeeding, project,
+};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Fake clocks and synthetic store
@@ -73,6 +89,12 @@ impl BudgetClockPort for FakeClock {
             Timestamp::from_unix_millis(state.wall_millis),
             state.monotonic_millis,
         )
+    }
+}
+
+impl ClockPort for FakeClock {
+    fn now(&self) -> Timestamp {
+        self.read().wall()
     }
 }
 
@@ -1249,6 +1271,237 @@ fn failed_schema_eight_migration_rolls_back_to_schema_seven() {
     ));
     drop(open_at_schema_version(harness.config.clone(), 7).expect("rolled back"));
     drop(harness.open());
+}
+
+#[test]
+fn owner_generation_change_preserves_consumed_and_reserved_budget_across_7199_and_7200() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = temp.path().join("app-data");
+    std::fs::create_dir_all(&root).expect("app data directory");
+    let config = StoreConfig::new(&root).expect("store config");
+    let project_id = project();
+    let supervision = ids(project_id).supervision;
+    let owner = OwnerRef::new(OwnerKind::H3HtmlJob, "generation-job").expect("owner");
+    let policy = BudgetPolicy::new(
+        7_200,
+        30,
+        Some(MoneyCap::new(money(1.0), price_version()).expect("cap")),
+    )
+    .expect("finite policy");
+    let current = owner_contract_at_with_budget(
+        project_id,
+        owner.clone(),
+        OwnerApprovalSource::H3ApprovedSettings,
+        1,
+        1,
+        policy.clone(),
+    );
+    let run = RunId::new(project_id);
+    let mut record = SupervisionRecord::new(&current);
+    record.begin_run(run).expect("first run");
+    let mut store = Store::open(config.clone()).expect("store");
+    store
+        .compare_and_swap_supervision(project_id, supervision, None, &record)
+        .expect("save record");
+
+    let clock = FakeClock::new();
+    let mut ledger = BudgetLedger::open(
+        Store::open(config.clone()).expect("budget store"),
+        project_id,
+        supervision,
+        policy.clone(),
+        1,
+        clock.clone(),
+    )
+    .expect("ledger");
+    for index in 0..30u128 {
+        ledger
+            .start_run(BudgetRequestId::from_parts(
+                project_id,
+                Uuid::from_u128(0x1100_0000_0000_4000_8000_0000_0000_0000 + index),
+            ))
+            .expect("additional run");
+    }
+    clock.advance_seconds(7_199);
+    ledger.settle_active().expect("settle");
+    let reserved_money = money(0.10);
+    ledger
+        .reserve_money(
+            RequestId::new(project_id),
+            AttemptId::new(project_id),
+            reserved_money,
+            &price_version(),
+        )
+        .expect("money reservation");
+    let before = ledger.record().usage();
+    assert_eq!(before.runs_started(), 30);
+    assert_eq!(before.active_seconds_consumed(), 7_199);
+    assert_eq!(before.money_reserved(), reserved_money);
+
+    let replacement = owner_contract_succeeding(&current, 2, 1, policy.clone());
+    let binding =
+        OwnerLaunchBinding::from_contract(&replacement, 1, 1, "generation-job").expect("binding");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(binding.approval().clone());
+    let authority = authorize_owner_launch(&registry, &binding, now()).expect("authority");
+    let mut runtime = GenerationRuntime::new(run);
+
+    let request = OwnerSupersessionRequest::new(
+        SupervisionRequestId::new(project_id),
+        supervision,
+        record.revision(),
+        replacement.clone(),
+    )
+    .expect("supersession request");
+    let result = execute_owner_supersession(
+        OperationPorts {
+            store: &mut store,
+            runtime: &mut runtime,
+            budget: &mut ledger,
+            clock: &clock,
+        },
+        &current,
+        1,
+        request,
+        authority,
+    )
+    .expect("owner supersession");
+    assert!(!result.duplicate());
+    assert_eq!(result.command().state(), SupervisionState::Ready);
+    assert_eq!(runtime.stop_calls, 1);
+
+    let changed = store
+        .load_supervision_record(project_id, supervision)
+        .expect("load")
+        .expect("record");
+    assert_eq!(changed.target_version().get(), 2);
+    assert_eq!(changed.run_group().runs(), &[run]);
+    assert_eq!(changed.applied_decisions().len(), 0);
+    assert_eq!(changed.change_log().len(), 1);
+    assert_eq!(changed.change_log()[0].kind(), ChangeKind::Supersede);
+    assert_eq!(changed.change_log()[0].budget_before(), before);
+    assert_eq!(changed.change_log()[0].budget_after(), before);
+    assert_eq!(ledger.record().usage(), before);
+
+    // The boundary run is the thirty-first and is still allowed.
+    ledger
+        .start_run(BudgetRequestId::new(project_id))
+        .expect("thirty-first run");
+    assert_eq!(ledger.record().usage().runs_started(), 31);
+    clock.advance_seconds(1);
+    ledger.settle_active().expect("settle at boundary");
+    assert_eq!(ledger.record().usage().active_seconds_consumed(), 7_200);
+    assert_eq!(ledger.remaining_active_seconds().expect("remaining"), 0);
+    assert_eq!(ledger.record().usage().money_reserved(), reserved_money);
+
+    // A further generation change is refused by the exhausted budget latch and
+    // cannot reset the ledger or consume a thirty-second run.
+    let replacement_three = owner_contract_succeeding(&replacement, 3, 1, policy.clone());
+    let binding_three = OwnerLaunchBinding::from_contract(&replacement_three, 1, 1, "generation-job")
+        .expect("binding three");
+    registry.insert(binding_three.approval().clone());
+    let authority_three =
+        authorize_owner_launch(&registry, &binding_three, now()).expect("authority three");
+    let request_three = OwnerSupersessionRequest::new(
+        SupervisionRequestId::new(project_id),
+        supervision,
+        changed.revision(),
+        replacement_three,
+    )
+    .expect("third request");
+    let rejected = execute_owner_supersession(
+        OperationPorts {
+            store: &mut store,
+            runtime: &mut runtime,
+            budget: &mut ledger,
+            clock: &clock,
+        },
+        &replacement,
+        1,
+        request_three,
+        authority_three,
+    );
+    assert!(matches!(
+        rejected,
+        Err(SupervisionError::OwnerSupersessionRejected {
+            reason: OwnerSupersessionRejection::BudgetExhausted {
+                limit: BudgetLimit::RunCount
+            }
+        })
+    ));
+    assert_eq!(ledger.record().usage().runs_started(), 31);
+    assert_eq!(ledger.record().usage().active_seconds_consumed(), 7_200);
+    assert_eq!(ledger.record().usage().money_reserved(), reserved_money);
+    assert_eq!(
+        ledger.start_run(BudgetRequestId::new(project_id)),
+        Err(SupervisionError::BudgetLimitReached {
+            limit: BudgetLimit::RunCount
+        })
+    );
+    let unchanged = store
+        .load_supervision_record(project_id, supervision)
+        .expect("load")
+        .expect("record");
+    assert_eq!(unchanged.target_version().get(), 2);
+    assert_eq!(unchanged.change_log().len(), 1);
+    assert_eq!(runtime.stop_calls, 1);
+}
+
+struct GenerationRuntime {
+    run: RunId,
+    stop_state: RecoveryStopState,
+    stop_calls: u32,
+}
+
+impl GenerationRuntime {
+    fn new(run: RunId) -> Self {
+        Self {
+            run,
+            stop_state: RecoveryStopState::NotRequested,
+            stop_calls: 0,
+        }
+    }
+}
+
+impl RecoveryRuntimePort for GenerationRuntime {
+    fn run_state(&mut self, _run: RunId) -> Result<RunState, SupervisionError> {
+        Ok(RunState::Idle)
+    }
+
+    fn recovery_mode(&mut self, _run: RunId) -> Result<RecoveryMode, SupervisionError> {
+        Ok(RecoveryMode::SameProcess)
+    }
+
+    fn managed_processes(
+        &mut self,
+        _run: RunId,
+    ) -> Result<Vec<ManagedProcessState>, SupervisionError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self, _run: RunId) -> Result<RecoveryCheckpoint, SupervisionError> {
+        Ok(RecoveryCheckpoint::Present)
+    }
+
+    fn stop_state(&mut self, _run: RunId) -> Result<RecoveryStopState, SupervisionError> {
+        let _ = self.run;
+        Ok(self.stop_state)
+    }
+
+    fn permissions_current(
+        &mut self,
+        _record: &SupervisionRecord,
+    ) -> Result<bool, SupervisionError> {
+        Ok(true)
+    }
+}
+
+impl OperationRuntimePort for GenerationRuntime {
+    fn request_stop(&mut self, _run: RunId) -> Result<StopDisposition, SupervisionError> {
+        self.stop_calls = self.stop_calls.saturating_add(1);
+        self.stop_state = RecoveryStopState::Confirmed;
+        Ok(StopDisposition::Confirmed)
+    }
 }
 
 #[test]

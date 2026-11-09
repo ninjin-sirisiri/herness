@@ -29,6 +29,9 @@ pub enum SupervisionCommand {
     Resume,
     /// Change approved conditions, profile, consent, or budget.
     Change,
+    /// Replace a stale generation in the same target under a host-minted
+    /// approved-owner authority.
+    Supersede,
 }
 
 impl SupervisionCommand {
@@ -40,6 +43,7 @@ impl SupervisionCommand {
             Self::Reassess => "reassess",
             Self::Resume => "resume",
             Self::Change => "change",
+            Self::Supersede => "supersede",
         }
     }
 

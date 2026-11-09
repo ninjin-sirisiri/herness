@@ -526,6 +526,11 @@ pub enum DecisionInvalidation {
     ConsentChanged,
     /// The finite budget policy or its version changed.
     LimitsChanged,
+    /// An approved owner replaced the generation for a newer target snapshot.
+    GenerationSuperseded {
+        /// New target version.
+        to: TargetVersion,
+    },
 }
 
 /// A decision preserved only as history after a version change.
@@ -564,6 +569,8 @@ pub enum ChangeKind {
     Budget,
     /// Execution scope / permission description.
     Permissions,
+    /// Approved-owner generation replacement within the same target.
+    Supersede,
 }
 
 impl ChangeKind {
@@ -576,6 +583,7 @@ impl ChangeKind {
             Self::Consent => "consent",
             Self::Budget => "budget",
             Self::Permissions => "permissions",
+            Self::Supersede => "supersede",
         }
     }
 }
@@ -1266,6 +1274,92 @@ impl SupervisionRecord {
                 action: HumanAction::GrantDisclosureConsent,
             },
         )
+    }
+
+    /// Applies an approved-owner generation replacement in the same target.
+    ///
+    /// The contract must name the same project and target, carry a strictly
+    /// newer target version, and keep the same condition content when the
+    /// condition version does not advance. Every applied decision moves to
+    /// history, the completion snapshot is cleared, and the controller returns
+    /// to `ready` without clearing the run group, evaluation history, or
+    /// budget. Consumed budget is owned by the durable ledger and is never
+    /// touched here.
+    pub fn apply_generation(
+        &mut self,
+        contract: &SupervisionContract,
+    ) -> Result<(), SupervisionError> {
+        if contract.project_id() != self.project_id
+            || contract.subject().supervision_id() != self.supervision_id
+        {
+            return Err(SupervisionError::CrossProjectReference {
+                id_kind: "supersession contract".to_owned(),
+                expected: self.project_id,
+                found: contract.project_id(),
+            });
+        }
+        let target_version = contract.evidence_target().version();
+        if target_version <= self.target_version {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: crate::error::OwnerSupersessionRejection::TargetUnchanged,
+            });
+        }
+        let condition_version = contract.conditions().condition_version();
+        let condition_ids = contract.conditions().condition_ids();
+        let required_checks = contract
+            .conditions()
+            .checks()
+            .iter()
+            .map(|check| check.id())
+            .collect::<Vec<_>>();
+        if condition_version < self.condition_version {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: crate::error::OwnerSupersessionRejection::ConditionsMismatch,
+            });
+        }
+        if condition_version == self.condition_version
+            && (condition_ids != self.condition_ids
+                || required_checks != self.required_checks)
+        {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: crate::error::OwnerSupersessionRejection::ConditionsMismatch,
+            });
+        }
+        if contract.conditions().approval().is_none() {
+            return Err(SupervisionError::OwnerSupersessionRejected {
+                reason: crate::error::OwnerSupersessionRejection::ConditionsMismatch,
+            });
+        }
+
+        self.invalidate_all(DecisionInvalidation::GenerationSuperseded {
+            to: target_version,
+        });
+        self.condition_version = condition_version;
+        self.condition_ids = condition_ids.clone();
+        self.required_checks = required_checks;
+        self.target_version = target_version;
+        self.profile = contract.profile();
+        self.consent = contract.consent();
+        self.unmet_conditions = condition_ids;
+        self.completion = None;
+        self.completion_stale = None;
+        self.revision = self.revision.saturating_add(1);
+        self.set_state(SupervisionState::Ready, SupervisionReason::AwaitingStart)?;
+        let state = self.supervisor_mut();
+        state.phase = crate::supervisor::SupervisorPhase::Idle;
+        state.current_run = None;
+        state.current_input = None;
+        state.current_budget_request = None;
+        state.continuation_of = None;
+        state.pending_deficiency = None;
+        state.stagnation_cycles = 0;
+        state.cycle_baseline = None;
+        state.last_progress = None;
+        state.last_target_digest = None;
+        state.cycle_checks_done.clear();
+        state.cycle_assessed.clear();
+        state.pending_assessment = None;
+        Ok(())
     }
 
     /// Higher-priority blockers currently visible without a proposed snapshot.

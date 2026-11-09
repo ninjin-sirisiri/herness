@@ -947,6 +947,244 @@ pub fn owner_contract(
     .expect("owner contract")
 }
 
+/// A complete approved owner contract at an explicit target/condition version.
+///
+/// The consent covers the same target version and the work packet matches the
+/// exact approved constraints, so the value is accepted by the same H2 rules as
+/// an owner generation replacement.
+pub fn owner_contract_at(
+    project: ProjectId,
+    owner: OwnerRef,
+    source: OwnerApprovalSource,
+    target_version: u64,
+    condition_version: u64,
+) -> SupervisionContract {
+    owner_contract_at_with_budget(
+        project,
+        owner,
+        source,
+        target_version,
+        condition_version,
+        BudgetPolicy::h2_default(),
+    )
+}
+
+/// A complete approved owner contract with an explicit finite budget policy.
+#[allow(clippy::too_many_arguments)]
+pub fn owner_contract_at_with_budget(
+    project: ProjectId,
+    owner: OwnerRef,
+    source: OwnerApprovalSource,
+    target_version: u64,
+    condition_version: u64,
+    budget: BudgetPolicy,
+) -> SupervisionContract {
+    let ids = ids(project);
+    let mut conditions = condition_set_at(project, condition_version);
+    let approval = ConditionApproval::new(
+        project,
+        ApprovalBasis::InheritedOwner {
+            owner: owner.clone(),
+            source,
+            approved_at: now(),
+            expires_at: None,
+        },
+        conditions.condition_version(),
+        conditions.digest().clone(),
+    )
+    .expect("owner condition approval");
+    conditions
+        .approve(
+            ApprovalActor::ApprovedOwner {
+                owner: owner.clone(),
+                source,
+            },
+            approval,
+            now(),
+        )
+        .expect("inherited approval");
+    let subject = SupervisionSubject::new(
+        project,
+        ids.supervision,
+        AgentId::new(project),
+        SessionId::new(project),
+        owner.clone(),
+    )
+    .expect("subject");
+    let execution = ExecutionScope::new(
+        project,
+        vec!["src".to_owned(), "Cargo.toml".to_owned()],
+        vec!["src".to_owned()],
+        true,
+    )
+    .expect("scope");
+    let profile = completion_profile(project);
+    let consent = consent(project, ProfilePurpose::Completion, target_version);
+    let target = target_scope(project, target_version);
+    let packet = work_packet(
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "owner fixture instruction",
+    );
+    SupervisionContract::new(
+        ApprovalActor::ApprovedOwner {
+            owner: owner.clone(),
+            source,
+        },
+        subject,
+        execution,
+        RunGroup::new(ids.run_group),
+        conditions,
+        target,
+        &profile,
+        &consent,
+        budget,
+        packet,
+        now(),
+    )
+    .expect("owner contract at version")
+}
+
+/// A replacement owner contract that keeps the current subject and execution
+/// scope while advancing the target and condition versions.
+pub fn owner_contract_succeeding(
+    current: &SupervisionContract,
+    target_version: u64,
+    condition_version: u64,
+    budget: BudgetPolicy,
+) -> SupervisionContract {
+    let project = current.project_id();
+    let owner = current.subject().owner().clone();
+    let source = match current.conditions().approval().map(|approval| approval.basis()) {
+        Some(ApprovalBasis::InheritedOwner { source, .. }) => *source,
+        _ => panic!("the current contract must carry an inherited owner approval"),
+    };
+    let mut conditions = condition_set_at(project, condition_version);
+    let approval = ConditionApproval::new(
+        project,
+        ApprovalBasis::InheritedOwner {
+            owner: owner.clone(),
+            source,
+            approved_at: now(),
+            expires_at: None,
+        },
+        conditions.condition_version(),
+        conditions.digest().clone(),
+    )
+    .expect("owner condition approval");
+    conditions
+        .approve(
+            ApprovalActor::ApprovedOwner {
+                owner: owner.clone(),
+                source,
+            },
+            approval,
+            now(),
+        )
+        .expect("inherited approval");
+    let subject = SupervisionSubject::new(
+        project,
+        current.subject().supervision_id(),
+        current.subject().agent_id(),
+        current.subject().session_id(),
+        owner.clone(),
+    )
+    .expect("subject");
+    let execution = current.execution_scope().clone();
+    let profile = completion_profile(project);
+    assert_eq!(
+        profile.binding(),
+        current.profile(),
+        "the fixture replacement must keep the current profile binding"
+    );
+    let consent = consent(project, profile.purpose(), target_version);
+    let target = target_scope(project, target_version);
+    let packet = work_packet_at(
+        current.work_packet().packet_version().saturating_add(1),
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "owner fixture instruction",
+    );
+    SupervisionContract::new(
+        ApprovalActor::ApprovedOwner { owner, source },
+        subject,
+        execution,
+        RunGroup::new(ids(project).run_group),
+        conditions,
+        target,
+        &profile,
+        &consent,
+        budget,
+        packet,
+        now(),
+    )
+    .expect("succeeding owner contract")
+}
+
+/// A replacement human contract that keeps the current subject and execution
+/// scope while advancing the target and condition versions.
+pub fn contract_succeeding(
+    current: &SupervisionContract,
+    target_version: u64,
+    condition_version: u64,
+) -> SupervisionContract {
+    let project = current.project_id();
+    let conditions = approved_condition_set_at(project, condition_version);
+    let subject = SupervisionSubject::new(
+        project,
+        current.subject().supervision_id(),
+        current.subject().agent_id(),
+        current.subject().session_id(),
+        current.subject().owner().clone(),
+    )
+    .expect("subject");
+    let execution = current.execution_scope().clone();
+    let profile = completion_profile(project);
+    assert_eq!(
+        profile.binding(),
+        current.profile(),
+        "the fixture replacement must keep the current profile binding"
+    );
+    let consent = consent(project, profile.purpose(), target_version);
+    let target = target_scope(project, target_version);
+    let budget = current.budget().clone();
+    let packet = work_packet_at(
+        current.work_packet().packet_version().saturating_add(1),
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "fixture owner instruction",
+    );
+    SupervisionContract::new(
+        ApprovalActor::Human,
+        subject,
+        execution,
+        RunGroup::new(ids(project).run_group),
+        conditions,
+        target,
+        &profile,
+        &consent,
+        budget,
+        packet,
+        now(),
+    )
+    .expect("succeeding human contract")
+}
+
 /// A fixture work packet matching the supplied approved values.
 #[allow(clippy::too_many_arguments)]
 pub fn work_packet(
@@ -959,8 +1197,34 @@ pub fn work_packet(
     budget: &BudgetPolicy,
     instruction: &str,
 ) -> WorkPacket {
-    WorkPacket::new(
+    work_packet_at(
         1,
+        project,
+        target,
+        execution,
+        condition_version,
+        profile,
+        consent,
+        budget,
+        instruction,
+    )
+}
+
+/// A fixture work packet at an explicit packet version.
+#[allow(clippy::too_many_arguments)]
+pub fn work_packet_at(
+    packet_version: u64,
+    project: ProjectId,
+    target: &TargetScope,
+    execution: &ExecutionScope,
+    condition_version: ConditionVersion,
+    profile: &AssessmentProfile,
+    consent: &DisclosureConsent,
+    budget: &BudgetPolicy,
+    instruction: &str,
+) -> WorkPacket {
+    WorkPacket::new(
+        packet_version,
         instruction,
         project,
         target,
