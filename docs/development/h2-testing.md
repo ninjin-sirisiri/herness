@@ -898,6 +898,14 @@ Phase Bは限定許可（Jev completion / Command Code GOAT）だけを実行し
 
 許可がない場合は検証要求を拒否し、実provider・実Keychain・loginへ触れない。許可済みでも失敗profileは利用不可にし、成功扱いにしない。実接続の要求数・usage・返却model ID・閾値結果・未確認範囲はsecretなしで[H2受入証跡](../research/2026-11-08-h2-acceptance.md)へ記録する。許可された全経路の証拠が揃うまでTask 18もH2全体も完了にしない。
 
+### OpenAI Decisions APIの状態
+
+**UNVERIFIED / 未完了。** `POST /v1/decisions`、`gpt-6-luna`、OpenAI APIキー、choice/probabilities/refusal/usageの実応答、実model ID、rate limit、課金は確認していない。確認済みなのはloopback mock上のadapter契約（Task 12/17）だけであり、実接続受入へ流用しない。Decisionsの条件評価・許可評価とも未確認で、H2受入は未完了である。
+
+### Command Code gatewayの扱い
+
+Command Code Provider APIはJevのopt-in固定gatewayとしてhost compositionにだけ追加した。共有契約はTypeSafe System One shapeと固定`jev-1.14.0`のままで、wire modelだけが`typesafe/jev-1.14.0`になる。自動fallback・直接endpointとの切替はしない。H3/H4向けの新しい共有状態は追加していない。
+
 ### 未確認のまま残るもの
 
 - 通常LLMとOpenAI Decisionsの実endpointによる条件評価・許可評価。

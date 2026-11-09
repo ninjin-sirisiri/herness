@@ -121,6 +121,18 @@
 - 確認していないこと: Jevの許可評価、直接TypeSafe endpoint、画像入力、実Tauri UIからのCommand Code接続設定、通常LLM/Decisions。
 - この結果は**Jev completionの1経路だけ**の証拠である。H2全体の実接続受入へ流用しない。
 
+### Command Code gateway decision
+
+Command Code Provider APIは、Jevの**opt-in固定gateway**としてhost compositionにだけ追加した。共有契約はTypeSafe System One shapeと固定`jev-1.14.0`のままで、wire modelだけがgateway label `typesafe/jev-1.14.0`になる。直接TypeSafe endpointとの自動切替・provider fallbackはなく、利用者がCommand Codeを選んだ場合だけ使う。`AssessmentEndpoints::for_commandcode()`と`JevAssessmentAdapter::with_wire_model`はhost側の構成APIであり、H3/H4が依存する新しい共有状態・ID・遷移は追加していない。この判断は2026-11-09の利用者指示（GOAT枠を使う）に基づく。
+
+### OpenAI Decisions APIの状態（2026-11-09）
+
+**UNVERIFIED / 未完了。** OpenAI Decisionsの実接続確認は行っていない。
+
+- 未確認: `POST /v1/decisions`、model `gpt-6-luna`、OpenAI APIキー、choice/probabilities/refusal/usageの実応答、実返却model ID、rate limit、課金。
+- 確認済みなのはloopback mock上のadapter契約だけ（Task 12/17）。mock成功を実接続受入へ流用しない。
+- Decisionsの条件評価・許可評価とも未確認であり、H2受入は未完了である。
+
 ### 実接続後の未確認一覧の更新
 
 - 確認済み: Jev System Oneの**条件評価**（Command Code GOAT経由、合成証拠、3 requests）。
