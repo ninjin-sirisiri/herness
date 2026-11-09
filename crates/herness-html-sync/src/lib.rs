@@ -19,6 +19,7 @@ pub mod document;
 pub mod error;
 pub mod events;
 pub mod ids;
+pub mod observer;
 pub mod ports;
 pub mod request;
 pub mod state;
@@ -51,6 +52,15 @@ pub use events::{
 };
 pub use ids::{
     CandidateId, CycleId, GenerationId, H3KeyKind, H3RequestId, H3ScopedId, JobId, PublicationId,
+};
+pub use observer::{
+    ChangeSignal, ChangeSource, CompanionChange, CompanionFileKind, CompanionObservation,
+    DependencyInvalidation, DependencyKind, DependencyPath, ExpectedPublicationWrite, FileRead,
+    FilesystemSourceReader, HTML_EVIDENCE_DIR, IneligibleReason, ObservationClock,
+    ObservationEligibility, ObservationTargets, ObservationTrigger, ObservationUncertainty,
+    ObserverHealth, ObserverTick, ProjectObserver, RecoveryReconciliation, SourceChange,
+    SourceObservation, SourceReadError, SourceReadPort, SystemObservationClock, WatcherStatus,
+    dependency_fingerprint, html_evidence_path,
 };
 pub use ports::{
     DocumentCommit, H3DocumentRecord, H3SettingsRecord, H3StorePort, HtmlSyncCommit,

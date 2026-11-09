@@ -5,7 +5,13 @@
 //! in this module writes a file, creates HTML, calls a model, or sends an
 //! external request.
 
+pub mod observer;
 pub mod policy;
+
+pub use observer::{
+    ProjectFilesystemWatcher, WatchAdapterError, WatchNotice, external_editor_change,
+    native_saved_change, shell_change, signal_from_absolute,
+};
 
 pub use policy::{
     CandidateCheck, CandidateDecision, CandidateStage, ConnectedPolicyBridge, HtmlPolicyBridge,

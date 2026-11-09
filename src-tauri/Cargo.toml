@@ -26,6 +26,7 @@ herness-engine-pi = { path = "../crates/herness-engine-pi" }
 herness-html-sync = { path = "../crates/herness-html-sync" }
 herness-store = { path = "../crates/herness-store" }
 herness-supervision = { path = "../crates/herness-supervision" }
+notify = "=8.2.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2.workspace = true
