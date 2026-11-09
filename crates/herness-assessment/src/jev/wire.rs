@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
-use super::{JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevRejection, JevUsage};
+use super::{JEV_CONFIDENCE_SCALE, JevRejection, JevUsage};
 
 const MAX_MODEL_CHARS: usize = 256;
 
@@ -39,7 +39,11 @@ pub(crate) struct ParsedChoice {
 }
 
 /// Parses one System One response body.
-pub(crate) fn parse_response(body: &[u8], question_id: &str) -> ParsedResponse {
+pub(crate) fn parse_response(
+    body: &[u8],
+    question_id: &str,
+    expected_model: &str,
+) -> ParsedResponse {
     let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => return rejected(JevRejection::InvalidJson, None, None, None),
@@ -63,10 +67,10 @@ pub(crate) fn parse_response(body: &[u8], question_id: &str) -> ParsedResponse {
     };
 
     let model = match wire.model.as_ref().and_then(Value::as_str) {
-        Some(model) if model == JEV_REQUEST_MODEL => model,
+        Some(model) if model == expected_model => model,
         _ => return rejected(JevRejection::ModelMismatch, None, usage, reported_model),
     };
-    debug_assert_eq!(model, JEV_REQUEST_MODEL);
+    debug_assert_eq!(model, expected_model);
 
     if wire.answers.is_empty() {
         return rejected(JevRejection::MissingAnswer, None, usage, reported_model);
@@ -321,6 +325,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jev::JEV_REQUEST_MODEL;
     use serde_json::json;
 
     const QUESTION: &str = "condition:project:question";
@@ -347,7 +352,7 @@ mod tests {
 
     #[test]
     fn valid_choice_distribution_is_parsed() {
-        let parsed = parse_response(&valid_body(), QUESTION);
+        let parsed = parse_response(&valid_body(), QUESTION, JEV_REQUEST_MODEL);
         assert!(parsed.choice.is_ok());
         assert_eq!(
             parsed.confidence.as_ref().map(NativeConfidence::value),
@@ -363,7 +368,7 @@ mod tests {
             r#"{{"model":"{JEV_REQUEST_MODEL}","answers":{{"{QUESTION}":{{"type":"choice","choice":"met","confidence":0.9,"probabilities":{{"met":0.96,"unmet":0.03,"insufficient":0.01}}}},"{QUESTION}":{{"type":"choice","choice":"met","confidence":0.9,"probabilities":{{"met":0.96,"unmet":0.03,"insufficient":0.01}}}}}}}}"#
         );
         assert_eq!(
-            parse_response(duplicate_question.as_bytes(), QUESTION)
+            parse_response(duplicate_question.as_bytes(), QUESTION, JEV_REQUEST_MODEL)
                 .choice
                 .unwrap_err(),
             JevRejection::DuplicateAnswer
@@ -373,9 +378,13 @@ mod tests {
             r#"{{"model":"{JEV_REQUEST_MODEL}","answers":{{"{QUESTION}":{{"type":"choice","choice":"met","confidence":0.9,"probabilities":{{"met":0.96,"met":0.96,"unmet":0.03,"insufficient":0.01}}}}}}}}"#
         );
         assert_eq!(
-            parse_response(duplicate_probability.as_bytes(), QUESTION)
-                .choice
-                .unwrap_err(),
+            parse_response(
+                duplicate_probability.as_bytes(),
+                QUESTION,
+                JEV_REQUEST_MODEL
+            )
+            .choice
+            .unwrap_err(),
             JevRejection::DuplicateProbability
         );
     }
@@ -395,7 +404,9 @@ mod tests {
         }))
         .expect("body");
         assert_eq!(
-            parse_response(&body, QUESTION).choice.unwrap_err(),
+            parse_response(&body, QUESTION, JEV_REQUEST_MODEL)
+                .choice
+                .unwrap_err(),
             JevRejection::SelectionNotMaximum
         );
     }
@@ -414,7 +425,10 @@ mod tests {
             }
         }))
         .expect("body");
-        assert_eq!(parse_response(&missing, QUESTION).usage, None);
+        assert_eq!(
+            parse_response(&missing, QUESTION, JEV_REQUEST_MODEL).usage,
+            None
+        );
 
         let malformed = serde_json::to_vec(&json!({
             "model": JEV_REQUEST_MODEL,
@@ -429,6 +443,9 @@ mod tests {
             "usage": {"input_tokens": "120", "output_tokens": 12}
         }))
         .expect("body");
-        assert_eq!(parse_response(&malformed, QUESTION).usage, None);
+        assert_eq!(
+            parse_response(&malformed, QUESTION, JEV_REQUEST_MODEL).usage,
+            None
+        );
     }
 }

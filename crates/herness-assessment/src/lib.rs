@@ -41,8 +41,8 @@ pub use decisions::{
 };
 pub use error::{AssessmentError, AssessmentErrorKind};
 pub use jev::{
-    JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment, JevAssessmentAdapter, JevRejection,
-    JevUsage, jev_question_id,
+    COMMANDCODE_JEV_REQUEST_MODEL, JEV_CONFIDENCE_SCALE, JEV_REQUEST_MODEL, JevAssessment,
+    JevAssessmentAdapter, JevRejection, JevUsage, jev_question_id,
 };
 pub use llm::{
     EvidenceContent, EvidenceDocument, InconclusiveReason, LlmAssessment, LlmAssessmentAdapter,

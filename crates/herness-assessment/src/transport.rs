@@ -584,6 +584,24 @@ impl AssessmentEndpoints {
         }
     }
 
+    /// Command Code Provider API bases.
+    ///
+    /// This routes the TypeSafe System One class through Command Code's fixed
+    /// `typesafe/jev` Provider API endpoint. It is an opt-in host composition
+    /// choice for a validated Command Code gateway connection; no caller can
+    /// supply an arbitrary origin through this constructor. OpenAI and
+    /// Anthropic bases remain the official public endpoints.
+    pub fn for_commandcode() -> Self {
+        Self {
+            typesafe_base: Endpoint::parse("https://api.commandcode.ai/provider")
+                .expect("static Command Code endpoint is valid"),
+            openai_base: Endpoint::parse("https://api.openai.com/v1")
+                .expect("static OpenAI endpoint is valid"),
+            anthropic_base: Endpoint::parse("https://api.anthropic.com")
+                .expect("static Anthropic endpoint is valid"),
+        }
+    }
+
     /// Loopback bases for transport tests. Every value must resolve to a
     /// loopback host.
     pub fn for_loopback(

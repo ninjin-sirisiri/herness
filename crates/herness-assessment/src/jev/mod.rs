@@ -41,6 +41,13 @@ use crate::transport::{
 /// evaluation.
 pub const JEV_REQUEST_MODEL: &str = "jev-1.14.0";
 
+/// Fixed versioned Jev model exposed by the Command Code Provider API.
+///
+/// Command Code forwards the pinned TypeSafe model under the
+/// `typesafe/jev-1.14.0` name on its System One endpoint. The wire shape is the
+/// same as TypeSafe's; only the model name and origin differ.
+pub const COMMANDCODE_JEV_REQUEST_MODEL: &str = "typesafe/jev-1.14.0";
+
 /// Provider-specific scale label for the Jev `confidence` field.
 ///
 /// This value is a derived statistic, not the probability of correctness, and
@@ -278,13 +285,41 @@ impl JevAssessment {
 pub struct JevAssessmentAdapter {
     transport: AssessmentTransport,
     clock: Arc<dyn ClockPort + Send + Sync>,
+    wire_model: String,
 }
 
 impl JevAssessmentAdapter {
     /// Creates an adapter that uses the exact connection selected by the
     /// profile and the injected host clock.
     pub fn new(transport: AssessmentTransport, clock: Arc<dyn ClockPort + Send + Sync>) -> Self {
-        Self { transport, clock }
+        Self {
+            transport,
+            clock,
+            wire_model: JEV_REQUEST_MODEL.to_owned(),
+        }
+    }
+
+    /// Creates a Jev adapter for a trusted fixed gateway model.
+    ///
+    /// The only accepted wire models are the direct TypeSafe fixed ID and the
+    /// Command Code Provider API fixed ID. Aliases are rejected; this method
+    /// never widens the model set from request input.
+    pub fn with_wire_model(
+        transport: AssessmentTransport,
+        clock: Arc<dyn ClockPort + Send + Sync>,
+        wire_model: impl Into<String>,
+    ) -> Result<Self, AssessmentError> {
+        let wire_model = wire_model.into();
+        if wire_model != JEV_REQUEST_MODEL && wire_model != COMMANDCODE_JEV_REQUEST_MODEL {
+            return Err(AssessmentError::new(
+                AssessmentErrorKind::InvalidConfiguration,
+            ));
+        }
+        Ok(Self {
+            transport,
+            clock,
+            wire_model,
+        })
     }
 
     /// Assesses exactly one completion condition using exactly the supplied
@@ -308,7 +343,18 @@ impl JevAssessmentAdapter {
             ));
         }
         let preflight = Preflight::new(request, entry, evidence)?;
-        let body = request::build(request, evidence, &preflight)?;
+        // The direct TypeSafe route may carry a configured alias label while
+        // the wire body uses the fixed versioned ID. The Command Code gateway
+        // requires its exact namespaced wire model on both the connection and
+        // the body, so only that mode is strict here.
+        if self.wire_model == COMMANDCODE_JEV_REQUEST_MODEL
+            && self.wire_model != entry.profile().model().as_str()
+        {
+            return Err(AssessmentError::new(
+                AssessmentErrorKind::ProfileBindingMismatch,
+            ));
+        }
+        let body = request::build(request, evidence, &preflight, &self.wire_model)?;
         let mut transport_request = TransportRequest::new(
             entry.profile().connection(),
             entry.profile().model().as_str(),
@@ -318,7 +364,8 @@ impl JevAssessmentAdapter {
             transport_request = transport_request.with_image(image.clone());
         }
         let response = self.transport.send(transport_request, control)?;
-        let parsed = wire::parse_response(response.body(), &preflight.question_id);
+        let parsed =
+            wire::parse_response(response.body(), &preflight.question_id, &self.wire_model);
 
         let mut provenance = AssessmentProvenance::new(
             Provider::TypeSafe,

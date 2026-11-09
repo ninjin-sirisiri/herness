@@ -12,13 +12,14 @@ use serde_json::{Map, Value, json};
 use crate::error::{AssessmentError, AssessmentErrorKind};
 use crate::llm::{EvidenceContent, EvidenceDocument};
 
-use super::{JEV_REQUEST_MODEL, MAX_REQUEST_BYTES, Preflight};
+use super::{MAX_REQUEST_BYTES, Preflight};
 
 /// Builds the System One body and enforces the request-size limit.
 pub(super) fn build(
     request: &AssessmentRequest,
     evidence: &[EvidenceDocument],
     preflight: &Preflight,
+    wire_model: &str,
 ) -> Result<Value, AssessmentError> {
     let mut entries = Vec::with_capacity(evidence.len());
     let mut assets = Map::new();
@@ -66,7 +67,7 @@ pub(super) fn build(
         }),
     );
     let mut body = json!({
-        "model": JEV_REQUEST_MODEL,
+        "model": wire_model,
         "state": {"evidence": entries},
         "questions": Value::Object(questions),
     });
