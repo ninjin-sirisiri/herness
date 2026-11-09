@@ -1,12 +1,12 @@
 # H2監督の受入証跡（Phase A実行、2026-11-09）
 
-**Status:** Phase A（自動検証・loopback・実Tauri lifecycle）は実行して合格した。Phase B（実接続）は**NOT AUTHORIZED / UNVERIFIED**で、実行していない。したがってTask 18もH2全体も**未完了**である。H1受入は未完了のままであり、[H1受入証跡](2026-11-08-h1-acceptance.md)のOpenAI/Anthropic APIキー経路の**UNVERIFIED**を本記録で上書きしない。
+**Status:** Phase A（自動検証・loopback・実Tauri lifecycle）は実行して合格した。2026-11-09にPhase Bの限定許可を受け、**Jev System Oneの条件評価だけ**をCommand Code GOAT経由で実接続確認した。通常LLM・OpenAI Decisions・Jevの許可評価は未確認で、Task 18もH2全体も**未完了**である。H1受入は未完了のままであり、[H1受入証跡](2026-11-08-h1-acceptance.md)のOpenAI/Anthropic APIキー経路の**UNVERIFIED**を本記録で上書きしない。
 
 - **対象revision:** `547ac0094612ae077feb4c4d3d9a0ff984a07ff3`（Phase A実行時のHEAD。Task 17とTask 16 follow-upのproduction permission evaluatorを含む）。
 - **環境:** macOS 27.2（build 26B123）、Mac17,3（Apple M5）、arm64、16 GiB。`rustc 1.97.1 (8bab26f4f 2026-07-14)`、`cargo 1.97.1 (c980f4866 2026-06-30)`。debug build。
 - **正本spec:** [H2 supervision design](../sdd/specs/2026-11-08-h2-supervision-design.md)のTesting and acceptance・Open items and approval、[H1 runtime design](../sdd/specs/2026-11-07-h1-runtime-design.md)のTesting and acceptance・H2 integration additions。
 - **手順:** [h2-testing.md](../development/h2-testing.md)のTask 18節。
-- **Phase B:** 人間の許可がないため未実行。実provider、実Keychain項目、login、有料要求には一切触れていない。Phase Bの結果は作成していない。
+- **Phase B:** 2026-11-09にJev System Oneの条件評価だけをCommand Code GOAT経由で限定実行した。通常LLM・OpenAI Decisions・Jevの許可評価は未実行。実Keychain項目の探索・login・実TypeSafe APIキーの使用はしていない。使用したのは既存の`COMMANDCODE_API_KEY`（GOAT枠）だけである。
 
 ## 証拠の分類
 
@@ -84,18 +84,47 @@
 - **実Tauri（desktop）:** `--smoke-test`、`--close-reopen-test`、`--quit-test`だけを実processで確認した。監督UIの手動操作、human confirmationのGUI操作、実provider送信は確認していない。
 - **mock:** 通常LLM・Jev System One・OpenAI Decisionsのadapter/permission evaluatorはloopback mockで検証済み。mock成功を実接続の受入へ流用しない。
 - **scripted-contract fixture:** Task 17の16 fixture（完了10・許可6、3方式で48結果）はすべて`scripted_contract`。誤完了0・誤allow0・誤停止0・保留42を確認した。これは契約の判別力の証拠であり、実モデルの精度・閾値の妥当性の証拠ではない。
-- **real:** H2の実接続証拠は**存在しない**。H1 Phase Bで確認済みのOpenAI互換/ChatGPTの結果はH1の証拠であり、H2の通常LLM/Jev/Decisions評価の受入へ流用しない。
+- **real:** 2026-11-09の限定Phase Bで、**Jev System Oneの条件評価だけ**をCommand Code GOAT経由で確認した（3 requests、上記）。通常LLM・OpenAI Decisions・Jev許可評価の実接続証拠は存在しない。H1 Phase Bで確認済みのOpenAI互換/ChatGPTの結果はH1の証拠であり、H2の通常LLM/Jev/Decisions評価の受入へ流用しない。
 - **未確認（unverified）:** 以下の一覧のとおり。
 
 ## 未確認の一覧
 
-- 通常LLM（OpenAI Responses / Anthropic Messages / OpenAI-compatible）、TypeSafe Jev System One、OpenAI Decisionsの**実endpoint**による条件評価。
-- 同じ3方式の**実endpoint**による許可評価（allow/deny/ask）。
-- 実credential・実Keychain項目・login・実返却model ID・実usage・rate limit・課金/利用枠。
+- 通常LLM（OpenAI Responses / Anthropic Messages / OpenAI-compatible）とOpenAI Decisionsの**実endpoint**による条件評価。
+- 通常LLM・Jev・OpenAI Decisionsの**実endpoint**による許可評価（allow/deny/ask）。Jevの条件評価はCommand Code GOAT経由で確認済み。
+- Jevの直接TypeSafe endpoint、画像入力、実TypeSafe APIキー、Command Code接続の実Tauri UIからの設定。
+- 実Keychain項目・login・課金/利用枠の厳密な確認（JevのCommand Code経由usageは取得済み）。
 - H1のOpenAI APIキー→openai-responses、Anthropic APIキー→anthropic-messagesは**UNVERIFIED**のまま（[H1受入証跡](2026-11-08-h1-acceptance.md)）。
 - 完了閾値0.95、許可閾値0.99、分布誤差0.001の実モデルでの妥当性検証。閾値は設計初期値であり、安全性・正答率の保証ではない。
 - 実Tauri監督UIからのtarget作成・profile/consent設定・start/stop/resume/reassess、human confirmation、window閉鎖中の監督進行。
 - 残る製品compositionの制約: 既存のH1接続追加UI/commandはJev/Decisionsのassessment-only接続を作らない。未検証profileは`verified=false`のままで送信しない。permission evaluatorは検証済みprofileと現在の同意がある場合だけ利用可能。これらは「未実装のまま未確認」であり、成功として扱わない。
+
+## Phase B limited: Jev completion via Command Code GOAT（2026-11-09）
+
+利用者がJevの実接続確認を許可し、Command Code GOATのサブスク枠を使うよう指示した。直接のTypeSafe APIキーは使用せず、Command Code Provider APIの`typesafe/jev-1.14.0`（System One shape）だけを確認した。送信データは合成証拠だけで、repository・会話・secretを含まない。`COMMANDCODE_API_KEY`は環境変数から読み、表示・保存・commitしていない。
+
+- 対象revision: `547ac0094612ae077feb4c4d3d9a0ff984a07ff3` + 本節のreal-checkコード `ea58d9b0450790fde7e27b4d862b7f0ef241ffce`。
+- endpoint: `POST https://api.commandcode.ai/provider/v1/systemone`
+- model: `typesafe/jev-1.14.0`（固定。aliasへ切り替えない）
+- auth: `Authorization: Bearer <Command Code API key>`。GOAT枠に計上。
+- timeout: 60秒。transport retryは最大2回だが、実測は全要求1 attempt。追加送信なし。
+
+| # | 実行 | 結果 | usage (input/output) | 採用 |
+| ---: | --- | --- | ---: | --- |
+| 1 | 事前の1要求（`curl`、合成state/choice） | HTTP 200、model `typesafe/jev-1.14.0`、choice `met`、p=0.99 | 370 / 42 | 参考（adapter外） |
+| 2 | herness Jev adapter、正例（evidenceに`herness-ok`を含む） | HTTP 200、`met`、met p=0.99、confidence 0.98、attempts=1 | 640 / 107 | **adopted**（0.95以上） |
+| 3 | herness Jev adapter、負例（evidenceは`herness-no`） | HTTP 200、`unmet`、attempts=1 | 638 / 107 | 非met（正例と区別） |
+
+- 実測合計: **3 requests**（事前1 + adapter 2）、retry 0、失敗0。GOAT creditsに計上。USDの厳密な請求額は確認していない。
+- adapterの証拠: `tests/supervision/tests/real_connections.rs`の`commandcode_jev_completion_met_and_unmet_are_real`（既定は`#[ignore]`、`COMMANDCODE_API_KEY`がある場合だけopt-in実行）。
+- 確認できたこと: Command Code Provider APIのSystem One shape、固定model、Bearer認証、herness Jev adapterのstrict parse、met/unmetの区別、usage取得、0.95採用。
+- 確認していないこと: Jevの許可評価、直接TypeSafe endpoint、画像入力、実Tauri UIからのCommand Code接続設定、通常LLM/Decisions。
+- この結果は**Jev completionの1経路だけ**の証拠である。H2全体の実接続受入へ流用しない。
+
+### 実接続後の未確認一覧の更新
+
+- 確認済み: Jev System Oneの**条件評価**（Command Code GOAT経由、合成証拠、3 requests）。
+- 未確認のまま: Jev System Oneの**許可評価**、直接TypeSafe endpoint、Jev画像入力、通常LLMの条件/許可評価、OpenAI Decisionsの条件/許可評価、実Tauri UIからのprofile/consent/connection設定、実TypeSafe APIキー。
+- H2受入は未完了。Jev以外の経路とJev許可評価の証拠が揃うまで完了扱いにしない。
 
 ## Phase B runbook（未承認・未実行のひな形）
 
@@ -111,4 +140,4 @@ Phase Bは、controllerが次の情報を人間へ提示し、対象・データ
 
 ## Phase Bの状態
 
-**NOT AUTHORIZED / UNVERIFIED。** Phase Bは実行していない。実providerへの送信、実Keychain項目の読書き、login、有料要求、実model ID/usage/課金の取得は行っていない。Task 18はPhase Aのみ完了しており、H2受入全体は未完了である。
+**PARTIALLY AUTHORIZED / JEV COMPLETION VERIFIED, H2 INCOMPLETE。** 2026-11-09に利用者がJevの実接続確認を許可し、Command Code GOAT経由の条件評価だけを実行した（3 requests）。実Keychain項目の探索・login・実TypeSafe APIキーの使用はしていない。通常LLM、OpenAI Decisions、Jevの許可評価、実Tauri UIからの設定は未確認である。Task 18はPhase AとJev completionの限定Phase Bのみで、H2受入全体は未完了である。

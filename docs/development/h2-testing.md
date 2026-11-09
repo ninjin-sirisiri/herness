@@ -869,9 +869,25 @@ Task 18の受入sign-off、実provider接続、UI製品レイアウト、H3/H4�
 - 既知のTask 14 loopback timing flake（`tests/supervision/tests/permissions.rs`の`PermissionEvaluationFailed { failure: Unavailable }`）は今回発生しなかった。発生時は同じコマンドを再実行し、両方の結果を記録し、assertを弱めない。
 - 3つの実Tauri実行はlifecycleのみで、外部provider送信・実Keychain探索・login・有料要求を行わない。
 
+### Phase B limited: Jev completion via Command Code GOAT（2026-11-09）
+
+利用者がJevの実接続確認を許可し、Command Code GOATのサブスク枠を使うよう指示した。直接のTypeSafe APIキーは使わず、Command Code Provider APIの`typesafe/jev-1.14.0`だけを確認した。送信は合成証拠のみで、`COMMANDCODE_API_KEY`は環境変数から読み、表示・保存していない。
+
+```sh
+COMMANDCODE_API_KEY=... cargo test -p herness-supervision-tests \
+  --test real_connections --locked -- --ignored --nocapture
+```
+
+- 実測: `POST https://api.commandcode.ai/provider/v1/systemone`、model `typesafe/jev-1.14.0`、Bearer認証。
+- 事前curl 1 + adapter 2 = 3 requests。retry 0、失敗0。timeout 60秒。
+- 正例: `met`、met probability 0.99、confidence 0.98、usage 640/107、attempts 1、0.95以上で採用。
+- 負例: `unmet`、usage 638/107、attempts 1、正例と区別。
+- このテストは既定で`#[ignore]`。`tests/supervision/tests/real_connections.rs`にあり、通常のworkspace testでは実行しない。
+- 確認済みは**Jev completionのCommand Code経由1経路だけ**。Jevの許可評価、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri UIからの設定は未確認のまま。H2受入は未完了。
+
 ### Phase Bゲート
 
-Phase Bは**NOT AUTHORIZED / UNVERIFIED**であり、Task 18のこの実行では行っていない。実接続を検証する前に、controllerは次を人間へ提示して許可を得る。
+Phase Bは限定許可（Jev completion / Command Code GOAT）だけを実行し、残りは**NOT AUTHORIZED / UNVERIFIED**である。実接続を検証する前に、controllerは次を人間へ提示して許可を得る。
 
 - 対象接続（purpose、provider、endpoint class、connection ID、model ID/version、認証方式）と許可された経路だけの一覧。
 - 使用するTask 17 fixture IDと合成データ。実repository・会話・secretを含めない。
@@ -883,7 +899,8 @@ Phase Bは**NOT AUTHORIZED / UNVERIFIED**であり、Task 18のこの実行で�
 
 ### 未確認のまま残るもの
 
-- 通常LLM・Jev System One・OpenAI Decisionsの実endpointによる条件評価と許可評価。
-- 実credential・実Keychain・login・実model ID・usage・rate limit・課金/利用枠。
+- 通常LLMとOpenAI Decisionsの実endpointによる条件評価・許可評価。
+- Jevの実endpointによる**許可評価**、直接TypeSafe endpoint、画像入力、実TypeSafe APIキー。Jevの条件評価はCommand Code GOAT経由で確認済み。
+- 実Keychain・login・実model ID・rate limit・課金/利用枠の厳密な確認。JevのCommand Code経由usageは取得済み。
 - H1のOpenAI/Anthropic APIキー経路（H1受入証跡のUNVERIFIEDを維持）。
-- 完了閾値0.95・許可閾値0.99の実モデルでの妥当性、実Tauri監督UIの手動操作、Jev/Decisions接続の製品UIからの構成。
+- 完了閾値0.95・許可閾値0.99の実モデルでの妥当性（Jev completionの正例は0.99で採用、負例はunmetを確認）、実Tauri監督UIの手動操作、Jev/Decisions接続の製品UIからの構成。
