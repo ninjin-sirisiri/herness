@@ -12,6 +12,7 @@ pub mod error;
 mod host;
 #[cfg(feature = "test-support")]
 pub mod host_state_test_support;
+pub mod publication;
 pub mod reconcile;
 pub mod request_gate;
 pub mod shutdown;
@@ -21,6 +22,7 @@ pub mod views;
 
 pub use error::RuntimeError;
 pub use host::{AgentSpec, Runtime, RuntimeDependencies};
+pub use publication::{PrivateAppArchive, PublicationWriter};
 pub use reconcile::{
     OperationReconciliation, PermissionReconciliation, ProjectReconciliation, ReconciliationReport,
     ReconciliationSource, RunReconciliation, ShutdownSummary,

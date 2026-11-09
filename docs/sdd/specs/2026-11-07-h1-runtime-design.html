@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:c7eb10cd84cf9a7631c70eb99f2d24202e7412a45ea96b9f695db0b96535ab72">
+<meta name="sdd-source-digest" content="sha256:6adca34d5e77ee2392825e3ea2ebb2055f31758d02a08217908fcef6ca56b1dc">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -279,9 +279,9 @@
 <p>2026-11-09の<a href="2026-11-09-h3-html-sync-design.md">H3設計</a>が必要とする追加契約。同日、利用者がH3 specと本追加契約を承認した。契約は未実装であり、承認は本実装の開始許可ではない。既存の許可優先順位、native file toolのroot検証、停止と復旧の意味は変えない。</p>
 <ol>
 <li><strong>候補専用の著作境界:</strong> hostはproject・job・世代に束縛された候補参照を発行し、不変の原文・既存HTML・CSS等を読取り専用で渡す。候補の作成・編集はH1 gatewayのschema・grant・policy・停止・変更理由・意図保存を経由する。正式な原文・companion・CSS・設定への書込みやshellを許可しない。候補保存のためにnative path検証を無効にしたり、一般的なproject外書込みを許可したりしない。実装では候補参照をproject・job・世代・opaque tokenを持つ<code>ArtifactHandle</code>として発行し、toolを<code>candidate_read</code>・<code>candidate_write</code>・<code>candidate_edit</code>に限定する。slotは<code>source_markdown</code>・<code>existing_html</code>・<code>shared_css</code>（読取り専用）と<code>candidate_html</code>・<code>candidate_provenance</code>（作成・編集可）とし、候補runはnative file toolとshellを公開しない。host artifact portが未接続の場合は明示的な未対応能力を返す。</li>
-<li><strong>hostによる反映:</strong> H3が承認・検証を確定した候補だけを、host専用境界から指定のcompanionへ反映する。model/toolから直接この境界を呼べない。hostは反映要求ID、期待する現在版、前後bytesの指紋、旧版保存結果、反映結果を保存し、path・symlink・許可・停止を副作用直前にも照合する。失敗・不明は再実行せず照合する。HTMLと補助receiptの複数ファイル反映を原子的なfilesystem transactionと偽らない。</li>
-<li><strong>監査と通知:</strong> agentの候補編集はrun・操作IDと変更理由へ結び付ける。正式反映・復元はhost activityとしてactor・目的・対象・差分・反映要求IDを記録し、agentの変更理由や架空のrun/操作IDを捏造しない。H3の状態とproject sequence付きイベントは保存後に公開する。通知の重複で書込みを再実行しない。</li>
-<li><strong>照合と保存互換:</strong> 反映途中・保存失敗・再起動後は候補・旧版・正式成果物を内容で照合し、人間の再開前に不確実性を解消する。既存履歴・checkpoint・承認を保持する順序付きmigrationを行い、未知の保存形式は書込み前に拒否する。H3のjob状態・反映journalはH3が所有する。</li>
+<li><strong>hostによる反映:</strong> H3が承認・検証を確定した候補だけを、host専用境界から指定のcompanionへ反映する。model/toolから直接この境界を呼べない。hostは反映要求ID、期待する現在版、前後bytesの指紋、旧版保存結果、反映結果を保存し、path・symlink・許可・停止を副作用直前にも照合する。失敗・不明は再実行せず照合する。HTMLと補助receiptの複数ファイル反映を原子的なfilesystem transactionと偽らない。実装では<code>PublicationWriter</code>をhostが直接構成し、<code>PublicationRequest</code>の反映要求ID・project-relative target・期待版または明示的不存在・承認bytes・host purposeと、<code>PublicationGatePort</code>・<code>PublicationArchivePort</code>・停止controlを受け取る。host-stateに<code>PublicationRecord</code>（要求指紋、前後digest、旧版保存結果、結果）を保存し、旧版はprivate app領域へ置換前に保存する。単一ファイル置換だけを提供し、複数ファイルの途中状態はH3 journalが所有する。</li>
+<li><strong>監査と通知:</strong> agentの候補編集はrun・操作IDと変更理由へ結び付ける。正式反映・復元はhost activityとしてactor・目的・対象・差分・反映要求IDを記録し、agentの変更理由や架空のrun/操作IDを捏造しない。H3の状態とproject sequence付きイベントは保存後に公開する。通知の重複で書込みを再実行しない。実装ではhost activity kindを<code>artifact.publication</code>、eventを<code>artifact.publish.intended</code>と<code>artifact.publish</code>とし、operation IDとrun IDを持たない。重複要求IDは保存済み結果を返し、pending/unverifiableは照合待ちとして再実行しない。</li>
+<li><strong>照合と保存互換:</strong> 反映途中・保存失敗・再起動後は候補・旧版・正式成果物を内容で照合し、人間の再開前に不確実性を解消する。既存履歴・checkpoint・承認を保持する順序付きmigrationを行い、未知の保存形式は書込み前に拒否する。H3のjob状態・反映journalはH3が所有する。実装の<code>PublicationRecord</code>はH1の反映記録であり、H3のjob状態やjournalを置き換えない。</li>
 </ol>
 <p>受入では実Piの候補toolと禁止対象、理由の保存、版競合、反映前後のfault、復元、通知重複、既存DB migrationを検証する。これはOS sandboxや外部processとの完全な排他の追加ではない。</p>
 </section>

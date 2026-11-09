@@ -7,9 +7,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
+use herness_core::runtime::{PrivateAppArchive, PublicationWriter};
 use herness_core::*;
 use herness_runtime_tests::fixtures::ProjectFixture;
 use herness_store::test_support::{CommitFault, ResultFault};
@@ -21,6 +23,7 @@ struct Harness {
     _temp: TempDir,
     project_root: PathBuf,
     outside_root: PathBuf,
+    archive_root: PathBuf,
     config: StoreConfig,
     fixture: ProjectFixture,
     admin: PolicyAdmin,
@@ -34,6 +37,7 @@ impl Harness {
         let project_root = fs::canonicalize(&project).expect("canonical project");
         let outside_root = temp.path().join("outside");
         fs::create_dir_all(&outside_root).expect("outside directory");
+        let archive_root = temp.path().join("private-archive");
         let config = StoreConfig::new(temp.path().join("app-data")).expect("app data root");
         config
             .ensure_outside_project(&project_root)
@@ -42,6 +46,7 @@ impl Harness {
             _temp: temp,
             project_root,
             outside_root,
+            archive_root,
             config,
             fixture: ProjectFixture::new(),
             admin: PolicyAdmin::new(),
@@ -77,6 +82,66 @@ impl Harness {
 
     fn gateway(&self) -> ToolGateway<NativeFileTools<Store>> {
         ToolGateway::new(self.executor())
+    }
+
+    fn publication_request(
+        &self,
+        request_id: &str,
+        target: &str,
+        expected: ExpectedTargetVersion,
+        content: &str,
+    ) -> PublicationRequest {
+        PublicationRequest::new(
+            self.fixture.project_id,
+            PublicationRequestId::new(request_id).expect("publication request id"),
+            NonEmptyText::new(target).expect("publication target"),
+            expected,
+            content,
+            Purpose::new("publish the approved formal companion").expect("publication purpose"),
+        )
+        .expect("publication request")
+    }
+
+    fn writer_with_records<R, A, G>(
+        &self,
+        records: R,
+        archive: A,
+        gate: G,
+        control: RunControl,
+    ) -> PublicationWriter<R, A, G> {
+        PublicationWriter::new(
+            self.fixture.project_id,
+            ProjectRoot::new(&self.project_root).expect("project root"),
+            records,
+            archive,
+            gate,
+            control,
+        )
+        .expect("publication writer")
+    }
+
+    fn publication_writer<A, G>(
+        &self,
+        archive: A,
+        gate: G,
+        control: RunControl,
+    ) -> PublicationWriter<StorePublicationRecords<Store>, A, G> {
+        self.writer_with_records(
+            StorePublicationRecords::new(self.store()),
+            archive,
+            gate,
+            control,
+        )
+    }
+
+    fn default_publication_writer(
+        &self,
+    ) -> PublicationWriter<StorePublicationRecords<Store>, PrivateAppArchive, AllowGate> {
+        self.publication_writer(
+            PrivateAppArchive::new(&self.archive_root).expect("private archive"),
+            AllowGate,
+            RunControl::new(),
+        )
     }
 
     /// Allows every file tool over the whole project.
@@ -216,6 +281,131 @@ impl Harness {
 
     fn path(&self, relative: &str) -> PathBuf {
         self.project_root.join(relative)
+    }
+}
+
+struct AllowGate;
+
+impl PublicationGatePort for AllowGate {
+    fn authorize_publication(
+        &self,
+        _request: &PublicationRequest,
+    ) -> Result<(), PublicationFailure> {
+        Ok(())
+    }
+}
+
+struct SwitchGate {
+    allowed: AtomicBool,
+}
+
+impl SwitchGate {
+    fn new(allowed: bool) -> Self {
+        Self {
+            allowed: AtomicBool::new(allowed),
+        }
+    }
+}
+
+impl PublicationGatePort for SwitchGate {
+    fn authorize_publication(
+        &self,
+        _request: &PublicationRequest,
+    ) -> Result<(), PublicationFailure> {
+        if self.allowed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(PublicationFailure::PermissionDenied {
+                detail: "publication permission was revoked".to_owned(),
+            })
+        }
+    }
+}
+
+struct FailingArchive {
+    calls: usize,
+}
+
+impl PublicationArchivePort for FailingArchive {
+    fn save_old_version(
+        &mut self,
+        _archive: &OldVersionArchive<'_>,
+    ) -> Result<ArchivedVersion, PublicationFailure> {
+        self.calls += 1;
+        Err(PublicationFailure::OldVersionSaveFailed {
+            detail: "injected old-version save rejection".to_owned(),
+        })
+    }
+}
+
+#[cfg(unix)]
+struct SwappingArchive {
+    inner: PrivateAppArchive,
+    target: PathBuf,
+    outside: PathBuf,
+    swapped: bool,
+}
+
+#[cfg(unix)]
+impl PublicationArchivePort for SwappingArchive {
+    fn save_old_version(
+        &mut self,
+        archive: &OldVersionArchive<'_>,
+    ) -> Result<ArchivedVersion, PublicationFailure> {
+        let saved = self.inner.save_old_version(archive)?;
+        fs::remove_file(&self.target).expect("remove real target");
+        std::os::unix::fs::symlink(&self.outside, &self.target).expect("swap in symlink");
+        self.swapped = true;
+        Ok(saved)
+    }
+}
+
+struct FaultyRecords {
+    inner: StorePublicationRecords<Store>,
+    fail_saves: Vec<usize>,
+    saves: usize,
+}
+
+impl FaultyRecords {
+    fn new(store: Store) -> Self {
+        Self {
+            inner: StorePublicationRecords::new(store),
+            fail_saves: Vec::new(),
+            saves: 0,
+        }
+    }
+
+    fn fail_on(mut self, save: usize) -> Self {
+        self.fail_saves.push(save);
+        self
+    }
+
+    fn store(&self) -> &Store {
+        self.inner.store()
+    }
+}
+
+impl PublicationRecordPort for FaultyRecords {
+    fn load_publication(
+        &self,
+        key: &str,
+    ) -> Result<Option<PublicationRecord>, PublicationFailure> {
+        self.inner.load_publication(key)
+    }
+
+    fn save_publication(
+        &mut self,
+        key: &str,
+        record: &PublicationRecord,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, PublicationFailure> {
+        self.saves += 1;
+        if self.fail_saves.contains(&self.saves) {
+            return Err(PublicationFailure::NotExecutable {
+                detail: format!("injected publication save failure {}", self.saves),
+            });
+        }
+        self.inner.save_publication(key, record, events)
     }
 }
 
@@ -1877,5 +2067,541 @@ fn unwired_candidate_capability_is_explicitly_unsupported() {
         !events
             .iter()
             .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND)
+    );
+}
+
+#[test]
+fn publication_version_conflict_does_not_replace_and_duplicate_is_not_retried() {
+    let harness = Harness::new();
+    fs::write(harness.path("page.html"), "old\n").expect("old target");
+    let request = harness.publication_request(
+        "publish-version-conflict",
+        "page.html",
+        ExpectedTargetVersion::present(hash_bytes(b"different\n")),
+        "new\n",
+    );
+    let mut writer = harness.default_publication_writer();
+
+    let failure = writer
+        .publish(request.clone())
+        .expect_err("version conflict");
+    assert!(matches!(
+        failure,
+        PublicationFailure::VersionConflict { ref target, .. } if target == "page.html"
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+    assert!(
+        !writer
+            .archive()
+            .root()
+            .join(harness.fixture.project_id.to_string())
+            .exists(),
+        "a pre-intent conflict must not save an old version"
+    );
+
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::NotPublished);
+    let before_events = events(writer.records().store(), harness.fixture.project_id);
+    assert_eq!(before_events.len(), 1);
+    assert_eq!(
+        before_events[0].kind().as_str(),
+        PUBLICATION_EVENT_KIND
+    );
+
+    let duplicate = writer
+        .publish(request.clone())
+        .expect("stored rejection result");
+    assert!(duplicate.duplicate());
+    assert_eq!(duplicate.status(), PublicationStatus::NotPublished);
+    assert_eq!(duplicate.unit(), PublicationUnit::SingleFile);
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+    assert_eq!(
+        events(writer.records().store(), harness.fixture.project_id).len(),
+        before_events.len(),
+        "a duplicate must not append another audit event"
+    );
+}
+
+#[test]
+fn publication_distinguishes_expected_absence_from_an_existing_target() {
+    let harness = Harness::new();
+    fs::write(harness.path("page.html"), "old\n").expect("existing target");
+    let mut writer = harness.default_publication_writer();
+
+    let absent_request = harness.publication_request(
+        "publish-absent-conflict",
+        "page.html",
+        ExpectedTargetVersion::absent(),
+        "new\n",
+    );
+    let failure = writer
+        .publish(absent_request)
+        .expect_err("expected absence but the target exists");
+    assert!(matches!(
+        failure,
+        PublicationFailure::ExpectedAbsentButPresent { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+
+    let missing_request = harness.publication_request(
+        "publish-present-conflict",
+        "missing.html",
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "new\n",
+    );
+    let failure = writer
+        .publish(missing_request)
+        .expect_err("expected a version but the target is absent");
+    assert!(matches!(
+        failure,
+        PublicationFailure::ExpectedPresentButAbsent { .. }
+    ));
+    assert!(!harness.path("missing.html").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_rejects_a_symlink_swap_before_the_final_rename() {
+    let harness = Harness::new();
+    let target = harness.path("page.html");
+    let outside = harness.outside_root.join("outside.html");
+    fs::write(&target, "old\n").expect("old target");
+    fs::write(&outside, "outside\n").expect("outside target");
+    let request = harness.publication_request(
+        "publish-symlink-swap",
+        "page.html",
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "new\n",
+    );
+    let archive = SwappingArchive {
+        inner: PrivateAppArchive::new(&harness.archive_root).expect("private archive"),
+        target: target.clone(),
+        outside: outside.clone(),
+        swapped: false,
+    };
+    let mut writer = harness.publication_writer(archive, AllowGate, RunControl::new());
+
+    let failure = writer
+        .publish(request.clone())
+        .expect_err("symlink swap must be rejected");
+    assert!(matches!(
+        failure,
+        PublicationFailure::Path {
+            failure: FileFailure::SymlinkNotAllowed { .. }
+        }
+    ));
+    assert!(writer.archive().swapped);
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside target unchanged"),
+        "outside\n"
+    );
+    assert!(
+        fs::symlink_metadata(&target)
+            .expect("target remains")
+            .file_type()
+            .is_symlink()
+    );
+
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::NotPublished);
+    assert!(
+        record.old_version_save().is_saved(),
+        "the old version was saved before the swap was detected"
+    );
+
+    let duplicate = writer
+        .publish(request)
+        .expect("stored rejection must not touch the symlink");
+    assert!(duplicate.duplicate());
+    assert_eq!(duplicate.status(), PublicationStatus::NotPublished);
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside target unchanged"),
+        "outside\n"
+    );
+}
+
+#[test]
+fn publication_old_version_save_rejection_never_replaces() {
+    let harness = Harness::new();
+    fs::write(harness.path("page.html"), "old\n").expect("old target");
+    let request = harness.publication_request(
+        "publish-old-save-rejected",
+        "page.html",
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "new\n",
+    );
+    let mut writer = harness.publication_writer(
+        FailingArchive { calls: 0 },
+        AllowGate,
+        RunControl::new(),
+    );
+
+    let failure = writer
+        .publish(request.clone())
+        .expect_err("old-version save rejection");
+    assert!(matches!(
+        failure,
+        PublicationFailure::OldVersionSaveFailed { .. }
+    ));
+    assert_eq!(writer.archive().calls, 1);
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::NotPublished);
+    assert!(matches!(
+        record.old_version_save(),
+        OldVersionSave::Failed { .. }
+    ));
+    let event_count = events(writer.records().store(), harness.fixture.project_id).len();
+    assert_eq!(event_count, 2, "intent and not-published result");
+
+    let duplicate = writer
+        .publish(request)
+        .expect("stored rejection result");
+    assert!(duplicate.duplicate());
+    assert_eq!(duplicate.status(), PublicationStatus::NotPublished);
+    assert_eq!(writer.archive().calls, 1, "duplicate must not re-archive");
+    assert_eq!(
+        events(writer.records().store(), harness.fixture.project_id).len(),
+        event_count
+    );
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+}
+
+#[test]
+fn publication_permission_and_stop_are_rechecked_before_any_side_effect() {
+    let harness = Harness::new();
+    fs::write(harness.path("page.html"), "old\n").expect("old target");
+    let gate = SwitchGate::new(false);
+    let mut writer = harness.publication_writer(
+        PrivateAppArchive::new(&harness.archive_root).expect("private archive"),
+        gate,
+        RunControl::new(),
+    );
+
+    let permission_request = harness.publication_request(
+        "publish-permission-denied",
+        "page.html",
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "new\n",
+    );
+    let failure = writer
+        .publish(permission_request.clone())
+        .expect_err("permission denied");
+    assert!(matches!(
+        failure,
+        PublicationFailure::PermissionDenied { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+    assert!(
+        !writer
+            .archive()
+            .root()
+            .join(harness.fixture.project_id.to_string())
+            .exists(),
+        "permission denial must happen before the archive side effect"
+    );
+    let permission_record = writer
+        .load_publication(permission_request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(permission_record.status(), PublicationStatus::NotPublished);
+    assert_eq!(
+        permission_record.old_version_save(),
+        &OldVersionSave::NotAttempted
+    );
+
+    writer.gate().allowed.store(true, Ordering::SeqCst);
+    writer.control().request_stop(StopReason::UserRequest);
+    let stop_request = harness.publication_request(
+        "publish-stopped",
+        "page.html",
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "new\n",
+    );
+    let failure = writer.publish(stop_request.clone()).expect_err("stopped");
+    assert!(matches!(failure, PublicationFailure::Stopped { .. }));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("unchanged target"),
+        "old\n"
+    );
+    assert!(
+        !writer
+            .archive()
+            .root()
+            .join(harness.fixture.project_id.to_string())
+            .exists(),
+        "stop must happen before the archive side effect"
+    );
+    let stop_record = writer
+        .load_publication(stop_request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(stop_record.status(), PublicationStatus::NotPublished);
+}
+
+#[test]
+fn publication_intent_persistence_fault_leaves_the_target_untouched() {
+    let harness = Harness::new();
+    let request = harness.publication_request(
+        "publish-intent-fault",
+        "page.html",
+        ExpectedTargetVersion::absent(),
+        "new\n",
+    );
+    let records = FaultyRecords::new(harness.store()).fail_on(1);
+    let mut writer = harness.writer_with_records(
+        records,
+        PrivateAppArchive::new(&harness.archive_root).expect("private archive"),
+        AllowGate,
+        RunControl::new(),
+    );
+
+    let failure = writer
+        .publish(request.clone())
+        .expect_err("intent persistence fault");
+    assert!(matches!(
+        failure,
+        PublicationFailure::NotExecutable { .. }
+    ));
+    assert!(!harness.path("page.html").exists());
+    assert!(events(writer.records().store(), harness.fixture.project_id).is_empty());
+    assert!(
+        writer
+            .load_publication(request.request_id())
+            .expect("load record")
+            .is_none(),
+        "no intent means no durable claim"
+    );
+    drop(writer);
+
+    // Nothing happened and no record exists, so a fresh request may run once.
+    let mut retry = harness.default_publication_writer();
+    let result = retry.publish(request).expect("retry after no side effect");
+    assert_eq!(result.status(), PublicationStatus::Published);
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("created target"),
+        "new\n"
+    );
+}
+
+#[test]
+fn publication_result_persistence_fault_is_unverifiable_and_never_republished() {
+    let harness = Harness::new();
+    let request = harness.publication_request(
+        "publish-result-fault",
+        "page.html",
+        ExpectedTargetVersion::absent(),
+        "new\n",
+    );
+    let records = FaultyRecords::new(harness.store()).fail_on(2);
+    let mut writer = harness.writer_with_records(
+        records,
+        PrivateAppArchive::new(&harness.archive_root).expect("private archive"),
+        AllowGate,
+        RunControl::new(),
+    );
+
+    let failure = writer
+        .publish(request.clone())
+        .expect_err("result persistence fault");
+    assert!(matches!(
+        failure,
+        PublicationFailure::Unverifiable { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("replaced target"),
+        "new\n"
+    );
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::Pending);
+    assert_eq!(
+        events(writer.records().store(), harness.fixture.project_id).len(),
+        1,
+        "only the intent event is durable"
+    );
+
+    fs::write(harness.path("page.html"), "external\n").expect("external edit");
+    let duplicate = writer
+        .publish(request.clone())
+        .expect_err("pending request must be reconciled");
+    assert!(matches!(
+        duplicate,
+        PublicationFailure::ReconciliationRequired { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.path("page.html")).expect("external edit preserved"),
+        "external\n"
+    );
+    assert_eq!(
+        events(writer.records().store(), harness.fixture.project_id).len(),
+        1,
+        "a pending duplicate must not append an event or retry"
+    );
+}
+
+#[test]
+fn publication_duplicate_returns_the_stored_result_with_a_host_activity_audit_subject() {
+    let harness = Harness::new();
+    fs::create_dir_all(harness.path("docs/sdd/specs")).expect("target directory");
+    let target = harness.path("docs/sdd/specs/page.html");
+    fs::write(&target, "old\n").expect("old target");
+    let old_version = hash_bytes(b"old\n");
+    let request = harness.publication_request(
+        "publish-duplicate",
+        "docs/sdd/specs/page.html",
+        ExpectedTargetVersion::present(old_version.clone()),
+        "<html>new</html>\n",
+    );
+    let mut writer = harness.default_publication_writer();
+
+    let result = writer.publish(request.clone()).expect("publish");
+    assert!(!result.duplicate());
+    assert_eq!(result.status(), PublicationStatus::Published);
+    assert_eq!(result.unit(), PublicationUnit::SingleFile);
+    assert_eq!(result.before_version(), Some(&old_version));
+    assert_eq!(
+        result.observed_after_version(),
+        Some(request.approved_version())
+    );
+    assert!(result.old_version_save().is_saved());
+    assert_eq!(result.old_version_save().version(), Some(&old_version));
+    assert!(result.old_version_save().reference().is_some());
+    assert!(result.notification().is_some());
+    assert_eq!(
+        fs::read_to_string(&target).expect("published target"),
+        "<html>new</html>\n"
+    );
+
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::Published);
+    assert_eq!(record.before_version(), Some(&old_version));
+    assert_eq!(record.approved_version(), request.approved_version());
+    assert_eq!(record.activity_id(), result.activity_id());
+
+    let before_events = events(writer.records().store(), harness.fixture.project_id);
+    assert_eq!(before_events.len(), 2);
+    let intended =
+        event_of_kind(&before_events, PUBLICATION_INTENDED_EVENT_KIND).expect("intent event");
+    let published = event_of_kind(&before_events, PUBLICATION_EVENT_KIND).expect("result event");
+    assert!(intended.sequence() < published.sequence());
+    for event in [intended, published] {
+        let activity = event
+            .subject()
+            .host_activity()
+            .expect("publication audit uses a host activity subject");
+        assert_eq!(activity.activity_kind().as_str(), PUBLICATION_ACTIVITY_KIND);
+        assert_eq!(activity.activity_id(), result.activity_id());
+        assert!(event.run_id().is_none());
+        assert!(event.operation_id().is_none());
+        let payload = event.payload().as_value();
+        assert_eq!(payload["actor"], "host");
+        assert_eq!(payload["requestId"], "publish-duplicate");
+        assert_eq!(payload["unit"], "single_file");
+        assert_eq!(
+            payload["purpose"],
+            "publish the approved formal companion"
+        );
+        assert!(payload.get("rationale").is_none());
+        assert!(payload.get("runId").is_none());
+        assert!(payload.get("operationId").is_none());
+    }
+    assert_eq!(
+        published.payload().as_value()["beforeVersion"],
+        old_version.as_str()
+    );
+    assert_eq!(
+        published.payload().as_value()["observedAfterVersion"],
+        request.approved_version().as_str()
+    );
+
+    fs::write(&target, "external\n").expect("external edit");
+    let duplicate = writer
+        .publish(request.clone())
+        .expect("stored published result");
+    assert!(duplicate.duplicate());
+    assert_eq!(duplicate.status(), PublicationStatus::Published);
+    assert_eq!(
+        duplicate.observed_after_version(),
+        Some(request.approved_version())
+    );
+    assert!(duplicate.notification().is_none());
+    assert_eq!(
+        fs::read_to_string(&target).expect("external edit preserved"),
+        "external\n"
+    );
+    assert_eq!(
+        events(writer.records().store(), harness.fixture.project_id).len(),
+        2,
+        "a duplicate must not publish or append events"
+    );
+
+    let conflicting = harness.publication_request(
+        "publish-duplicate",
+        "docs/sdd/specs/page.html",
+        ExpectedTargetVersion::present(old_version),
+        "different\n",
+    );
+    let failure = writer
+        .publish(conflicting)
+        .expect_err("same request id with a different payload");
+    assert!(matches!(
+        failure,
+        PublicationFailure::RequestConflict { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(&target).expect("external edit preserved"),
+        "external\n"
+    );
+}
+
+#[test]
+fn publication_is_not_a_model_tool_argument_or_operation() {
+    let payload = serde_json::json!({
+        "tool": "publish",
+        "arguments": {
+            "target": "page.html",
+            "content": "<html></html>"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ToolArguments>(payload).is_err(),
+        "publication must not be expressible as model tool arguments"
+    );
+    assert!(
+        serde_json::from_value::<ToolName>(serde_json::json!("publish")).is_err(),
+        "publication must not be a tool name"
     );
 }

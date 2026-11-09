@@ -5,6 +5,7 @@ pub mod continuation;
 pub mod credential;
 pub mod engine;
 pub mod evaluator;
+pub mod publish;
 pub mod request_gate;
 pub mod runtime_store;
 pub mod store;
@@ -19,6 +20,9 @@ pub use engine::{
     ToolExecutionAuthority,
 };
 pub use evaluator::{EvaluationRequest, PermissionEvaluatorPort, SharedPermissionEvaluator};
+pub use publish::{
+    PublicationArchivePort, PublicationGatePort, PublicationRecordPort, StorePublicationRecords,
+};
 pub use request_gate::{ModelRequestGatePort, StopDeadlinePort};
 pub use runtime_store::RuntimeStore;
 pub use store::{CheckpointCommit, CommitReceipt, StorePort};

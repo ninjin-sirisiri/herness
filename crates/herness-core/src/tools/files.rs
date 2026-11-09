@@ -143,7 +143,7 @@ impl FileLockRegistry {
         Self::default()
     }
 
-    fn acquire(&self, path: PathBuf) -> FileLockGuard<'_> {
+    pub(crate) fn acquire(&self, path: PathBuf) -> FileLockGuard<'_> {
         let mut locked = self
             .locked
             .lock()
@@ -671,7 +671,11 @@ fn hash_file(path: &Path) -> Result<FileVersion, FileFailure> {
 }
 
 /// Writes bytes to a temporary file in the target directory and renames it.
-fn atomic_write(path: &Path, content: &[u8], preserve_permissions: bool) -> std::io::Result<()> {
+pub(crate) fn atomic_write(
+    path: &Path,
+    content: &[u8],
+    preserve_permissions: bool,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

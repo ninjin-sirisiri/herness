@@ -697,6 +697,126 @@ pub enum ArtifactFailure {
     },
 }
 
+/// Structured, non-secret reason a host-only publication failed.
+///
+/// Publication is not a model tool. These failures describe the host boundary
+/// that replaces one formal companion file after an approved request. They
+/// never carry agent rationales, run identifiers, or H3 approval state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum PublicationFailure {
+    /// The request was structurally invalid before any filesystem access.
+    InvalidRequest {
+        /// Request field name.
+        field: String,
+        /// Validation failure.
+        violation: ArgumentViolation,
+    },
+    /// The request belongs to another project than this writer.
+    CrossProject {
+        /// Project this writer is bound to.
+        expected: ProjectId,
+        /// Project carried by the request.
+        found: ProjectId,
+    },
+    /// Project root, symlink, or path resolution rejected the target.
+    Path {
+        /// Structured native path failure.
+        failure: FileFailure,
+    },
+    /// The target changed since the request observed it.
+    VersionConflict {
+        /// Project-relative target.
+        target: String,
+        /// Version the request expected.
+        expected: FileVersion,
+        /// Version observed now.
+        actual: FileVersion,
+    },
+    /// The request expected absence but a file exists.
+    ExpectedAbsentButPresent {
+        /// Project-relative target.
+        target: String,
+        /// Version observed at the existing target.
+        actual: FileVersion,
+    },
+    /// The request expected an existing file but the target is absent.
+    ExpectedPresentButAbsent {
+        /// Project-relative target.
+        target: String,
+        /// Version the request expected.
+        expected: FileVersion,
+    },
+    /// Existing bytes at the target are not valid UTF-8 text.
+    InvalidUtf8 {
+        /// Project-relative target.
+        target: String,
+    },
+    /// The host permission/grant check refused this publication.
+    PermissionDenied {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The host stop/latch control does not permit publication.
+    Stopped {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// Saving the old version failed, so the target was not replaced.
+    OldVersionSaveFailed {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The private old-version archive is not available.
+    ArchiveUnavailable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The private publication record store is not available.
+    RecordUnavailable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// A stored publication record is corrupt.
+    RecordCorrupt {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// A stored publication record uses a format this build cannot read.
+    UnsupportedRecordFormat {
+        /// Format found in the record.
+        found: u32,
+    },
+    /// The intent could not be recorded, so no side effect was performed.
+    NotExecutable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The side effect may have happened but its durable result could not be
+    /// recorded. Reconciliation is required; the host did not retry or roll
+    /// back.
+    Unverifiable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// A previous attempt left this request without a usable result.
+    ReconciliationRequired {
+        /// Publication request identifier.
+        request_id: String,
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The same request id was reused with a different payload.
+    RequestConflict {
+        /// Publication request identifier.
+        request_id: String,
+    },
+}
+
 impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -1024,5 +1144,78 @@ impl fmt::Display for ArtifactFailure {
         }
     }
 }
+
+impl fmt::Display for PublicationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, violation } => {
+                write!(f, "invalid publication request field {field:?}: {violation}")
+            }
+            Self::CrossProject { expected, found } => write!(
+                f,
+                "publication request belongs to project {found}, not this writer's project {expected}"
+            ),
+            Self::Path { failure } => write!(f, "publication path rejected: {failure}"),
+            Self::VersionConflict {
+                target,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "publication target {target:?} changed: expected version {expected}, observed {actual}"
+            ),
+            Self::ExpectedAbsentButPresent { target, actual } => write!(
+                f,
+                "publication target {target:?} was expected to be absent but has version {actual}"
+            ),
+            Self::ExpectedPresentButAbsent { target, expected } => write!(
+                f,
+                "publication target {target:?} was expected at version {expected} but is absent"
+            ),
+            Self::InvalidUtf8 { target } => {
+                write!(f, "publication target {target:?} is not valid UTF-8")
+            }
+            Self::PermissionDenied { detail } => {
+                write!(f, "publication permission denied: {detail}")
+            }
+            Self::Stopped { detail } => write!(f, "publication stopped: {detail}"),
+            Self::OldVersionSaveFailed { detail } => {
+                write!(f, "the old version was not saved, so no replacement occurred: {detail}")
+            }
+            Self::ArchiveUnavailable { detail } => {
+                write!(f, "the private publication archive is unavailable: {detail}")
+            }
+            Self::RecordUnavailable { detail } => {
+                write!(f, "the publication record store is unavailable: {detail}")
+            }
+            Self::RecordCorrupt { detail } => {
+                write!(f, "the stored publication record is corrupt: {detail}")
+            }
+            Self::UnsupportedRecordFormat { found } => {
+                write!(f, "publication record format {found} is not supported")
+            }
+            Self::NotExecutable { detail } => {
+                write!(f, "publication was not executed: {detail}")
+            }
+            Self::Unverifiable { detail } => write!(
+                f,
+                "publication may be applied but its result is not durable; reconciliation required: {detail}"
+            ),
+            Self::ReconciliationRequired {
+                request_id,
+                detail,
+            } => write!(
+                f,
+                "publication request {request_id} requires reconciliation: {detail}"
+            ),
+            Self::RequestConflict { request_id } => write!(
+                f,
+                "publication request {request_id} was reused with a different payload"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublicationFailure {}
 
 impl std::error::Error for ArtifactFailure {}

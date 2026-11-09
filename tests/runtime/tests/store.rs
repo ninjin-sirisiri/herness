@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herness_core::runtime::host_state_test_support;
+use herness_core::runtime::{PrivateAppArchive, PublicationWriter, host_state_test_support};
 use herness_core::*;
 use herness_runtime_tests::fixtures::{ProjectFixture, second_project};
 use herness_store::test_support::{
@@ -2345,4 +2345,136 @@ fn host_state_formats_one_and_two_migrate_to_format_three_without_losing_records
     let error = host_state_test_support::migrate(br#"{"format":4,"projects":{}}"#)
         .expect_err("unknown newer format is rejected");
     assert!(error.contains("unsupported host-state format"));
+}
+
+struct AllowPublicationGate;
+
+impl PublicationGatePort for AllowPublicationGate {
+    fn authorize_publication(
+        &self,
+        _request: &PublicationRequest,
+    ) -> Result<(), PublicationFailure> {
+        Ok(())
+    }
+}
+
+#[test]
+fn publication_record_and_host_activity_events_are_durable_across_reopen() {
+    let harness = Harness::new();
+    let fixture = ProjectFixture::new();
+    let target = harness.project_root.join("docs/sdd/specs/page.html");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target directory");
+    fs::write(&target, "old\n").expect("old target");
+    let request = PublicationRequest::new(
+        fixture.project_id,
+        PublicationRequestId::new("store-publication-1").expect("request id"),
+        NonEmptyText::new("docs/sdd/specs/page.html").expect("target"),
+        ExpectedTargetVersion::present(hash_bytes(b"old\n")),
+        "<html>new</html>\n",
+        Purpose::new("publish the approved formal companion").expect("purpose"),
+    )
+    .expect("publication request");
+    let archive_root = harness.config.app_data_root().join("publication-archive");
+
+    let mut writer = PublicationWriter::new(
+        fixture.project_id,
+        ProjectRoot::new(&harness.project_root).expect("project root"),
+        StorePublicationRecords::new(harness.open()),
+        PrivateAppArchive::new(&archive_root).expect("private archive"),
+        AllowPublicationGate,
+        RunControl::new(),
+    )
+    .expect("publication writer");
+
+    let result = writer.publish(request.clone()).expect("publish");
+    assert_eq!(result.status(), PublicationStatus::Published);
+    assert_eq!(result.unit(), PublicationUnit::SingleFile);
+    assert_eq!(
+        fs::read_to_string(&target).expect("published target"),
+        "<html>new</html>\n"
+    );
+
+    let record = writer
+        .load_publication(request.request_id())
+        .expect("load record")
+        .expect("record");
+    assert_eq!(record.status(), PublicationStatus::Published);
+    assert_eq!(record.project_id(), fixture.project_id);
+    assert_eq!(record.request_id(), request.request_id());
+    assert_eq!(
+        record.before_version(),
+        Some(&hash_bytes(b"old\n"))
+    );
+    assert_eq!(record.approved_version(), request.approved_version());
+    assert!(record.old_version_save().is_saved());
+
+    let store = writer.records().store();
+    let events = store
+        .history(HistoryQuery::first(fixture.project_id))
+        .expect("history")
+        .events()
+        .to_vec();
+    assert_eq!(events.len(), 2, "intent and result events");
+    for event in &events {
+        let activity = event
+            .subject()
+            .host_activity()
+            .expect("publication uses a host activity subject");
+        assert_eq!(activity.activity_kind().as_str(), PUBLICATION_ACTIVITY_KIND);
+        assert_eq!(activity.activity_id(), result.activity_id());
+        assert!(event.run_id().is_none());
+        assert!(event.operation_id().is_none());
+    }
+    assert_eq!(
+        events[0].payload().as_value()["requestId"],
+        "store-publication-1"
+    );
+    assert_eq!(events[0].payload().as_value()["actor"], "host");
+    assert!(events[0].payload().as_value().get("rationale").is_none());
+    assert!(
+        store
+            .pending_operations(&fixture.project_id)
+            .expect("pending operations")
+            .is_empty(),
+        "publication is not an OperationId-backed tool operation"
+    );
+    drop(writer);
+
+    // The record and the events are readable from a fresh store connection.
+    let mut reopened = PublicationWriter::new(
+        fixture.project_id,
+        ProjectRoot::new(&harness.project_root).expect("project root"),
+        StorePublicationRecords::new(harness.open()),
+        PrivateAppArchive::new(&archive_root).expect("private archive"),
+        AllowPublicationGate,
+        RunControl::new(),
+    )
+    .expect("reopened publication writer");
+    let record = reopened
+        .load_publication(request.request_id())
+        .expect("load record after reopen")
+        .expect("record after reopen");
+    assert_eq!(record.status(), PublicationStatus::Published);
+
+    fs::write(&target, "external\n").expect("external edit");
+    let duplicate = reopened
+        .publish(request.clone())
+        .expect("duplicate returns the stored result");
+    assert!(duplicate.duplicate());
+    assert_eq!(duplicate.status(), PublicationStatus::Published);
+    assert_eq!(
+        fs::read_to_string(&target).expect("external edit preserved"),
+        "external\n"
+    );
+    assert_eq!(
+        reopened
+            .records()
+            .store()
+            .history(HistoryQuery::first(fixture.project_id))
+            .expect("history after duplicate")
+            .events()
+            .len(),
+        2,
+        "a duplicate must not publish or append another event"
+    );
 }
