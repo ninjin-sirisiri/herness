@@ -10,20 +10,27 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herness_core::{ProjectId, Timestamp};
+use herness_core::{ModelId, ProjectId, Provider, Timestamp};
 use herness_desktop::html_sync::policy::{ConnectedPolicyBridge, HtmlPolicyBridge};
 use herness_html_sync::{
-    CheckSet, ConditionBinding, CoverageReport, DocumentKey, EvidenceBuildInput,
-    EvidenceCheckResult, EvidenceFingerprints, EvidenceOrigin, EvidencePack,
-    EvidenceValidationError, GenerationId, RenderCandidateFingerprints,
+    AppliedEvaluation, AssessmentPlan, CheckSet, ConditionBinding, CoverageReport, DocumentKey,
+    EvaluationBinding, EvidenceBuildInput, EvidenceCheckResult, EvidenceFingerprints,
+    EvidenceOrigin, EvidencePack, EvidenceValidationError, GenerationId,
+    MAX_DEFAULT_SLICE_BYTES, MAX_DEFAULT_SLICE_UNITS, RenderCandidateFingerprints,
     RenderConfigurationEvidence, RenderEvidence, RenderPngEvidence, RenderSignalEvidence,
-    RequiredCheck, RequiredCheckKind, RubricSet, SourceRevision, SourceSnapshot, SourceUnits,
-    StrictRequirement, UnitEvidence,
+    RequiredCheck, RequiredCheckKind, RubricSet, SliceAssessment, SourceRevision, SourceSnapshot,
+    SourceUnits, StrictRequirement, UnitEvidence,
+};
+use herness_supervision::assessment::{
+    AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult, ConditionVerdict,
 };
 use herness_supervision::conditions::{ConditionDigest, ConditionVersion};
 use herness_supervision::evidence::{EvidenceScope, TargetVersion};
-use herness_supervision::ids::{ConditionId, EvidenceId, ProfileId};
-use herness_supervision::profiles::{ProfileBinding, ProfilePurpose, ProfileVersion};
+use herness_supervision::ids::{ConditionId, DecisionId, EvidenceId, ProfileId, SupervisionId};
+use herness_supervision::profiles::{
+    AdapterVersion, ProfileBinding, ProfileInputs, ProfilePurpose, ProfileThresholds,
+    ProfileVersion, RubricVersion,
+};
 use herness_supervision::{ContentDigest, ContentFingerprint, TargetScope};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -128,6 +135,14 @@ pub fn document_key() -> DocumentKey {
 /// A document key for an explicit project.
 pub fn document_key_for(project: ProjectId) -> DocumentKey {
     DocumentKey::new(project, TARGET_PATH).expect("document key")
+}
+
+/// Deterministic H2 supervision id.
+pub fn supervision() -> SupervisionId {
+    SupervisionId::from_parts(
+        project(),
+        Uuid::parse_str("70000000-0000-4000-8000-000000000001").expect("supervision uuid"),
+    )
 }
 
 /// Deterministic H3 generation id.
@@ -393,9 +408,23 @@ fn render_matrix(
 /// Synthetic render shaped like a native capture. The tests label it as a
 /// fixture; it is not a real WKWebView run.
 pub fn fixture_native_render(fixture: &AdrFixture) -> RenderEvidence {
+    fixture_native_render_with_dependencies(
+        fixture,
+        ContentDigest::sha256(b"fixture-css"),
+        ContentDigest::sha256(b"fixture-resources"),
+    )
+}
+
+/// Native-shaped fixture bound to caller-computed CSS/resource digests.
+///
+/// This still reports synthetic PNG bytes and is never presented as a real
+/// WKWebView capture.
+pub fn fixture_native_render_with_dependencies(
+    fixture: &AdrFixture,
+    css: ContentDigest,
+    resources: ContentDigest,
+) -> RenderEvidence {
     let html = ContentDigest::sha256(&fixture.html);
-    let css = ContentDigest::sha256(b"fixture-css");
-    let resources = ContentDigest::sha256(b"fixture-resources");
     let (configurations, pngs, candidate) = render_matrix(&html, &css, &resources);
     RenderEvidence::native(
         "h3-render-manifest-v1",
@@ -541,6 +570,34 @@ pub fn build_pack_with(
     profile: ProfileBinding,
     project: ProjectId,
 ) -> Result<EvidencePack, EvidenceValidationError> {
+    let fingerprints = fingerprints_with(fixture, profile, condition_digest.clone());
+    build_pack_with_fingerprints(
+        fixture,
+        source_units,
+        render,
+        structural,
+        render_check,
+        conditions,
+        condition_digest,
+        project,
+        fingerprints,
+    )
+}
+
+/// Builds a pack with caller-computed exact fingerprints. Publication tests use
+/// this to bind the real on-disk CSS/resource digests rather than placeholders.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pack_with_fingerprints(
+    fixture: &AdrFixture,
+    source_units: &SourceUnits,
+    render: RenderEvidence,
+    structural: RequiredCheck,
+    render_check: RequiredCheck,
+    conditions: ConditionBinding,
+    condition_digest: ConditionDigest,
+    project: ProjectId,
+    fingerprints: EvidenceFingerprints,
+) -> Result<EvidencePack, EvidenceValidationError> {
     let checks = CheckSet::new(vec![structural, render_check])?;
     let provenance_digest =
         ContentDigest::sha256(provenance_payload(fixture.candidate_html()).as_bytes());
@@ -550,7 +607,7 @@ pub fn build_pack_with(
         cycle: cycle_for(project),
         conditions,
         condition_version: condition_version(),
-        condition_digest: condition_digest.clone(),
+        condition_digest,
         target_version: target_version(),
         source: source_snapshot(&fixture.source),
         source_bytes: &fixture.source,
@@ -560,9 +617,95 @@ pub fn build_pack_with(
         source_units,
         checks,
         render,
-        fingerprints: fingerprints_with(fixture, profile, condition_digest),
+        fingerprints,
         created_at: now(),
     })
+}
+
+/// Applies an all-met, native-shaped fixture evaluation to one evidence pack.
+///
+/// The request/result pairs are synthetic host values, not provider calls. The
+/// render evidence remains the native-shaped fixture supplied by the caller.
+pub fn positive_evaluation(pack: &EvidencePack) -> AppliedEvaluation {
+    let profile = pack.fingerprints().profile();
+    let plan = AssessmentPlan::build(
+        pack,
+        &RubricSet::approved(),
+        profile,
+        ProfileInputs::text_with_optional_image(),
+        ProfileThresholds::normal_llm(),
+        MAX_DEFAULT_SLICE_UNITS,
+        MAX_DEFAULT_SLICE_BYTES,
+    )
+    .expect("assessment plan");
+    let adapter = AdapterVersion::new("fixture-adapter-v1").expect("adapter version");
+    let rubric = RubricVersion::new(herness_html_sync::H3_RUBRIC_VERSION).expect("rubric version");
+    let mut results = Vec::new();
+    for (index, slice) in plan.slices().iter().enumerate() {
+        if !plan.slice_is_sendable(slice) {
+            continue;
+        }
+        let evidence = vec![evidence_id(200 + index as u64)];
+        let request = AssessmentRequest::new(
+            DecisionId::from_parts(
+                project(),
+                Uuid::from_u128(0x8000_0000_0000_4000_8000_0000_0000_0000 + index as u128),
+            ),
+            supervision(),
+            pack.conditions().id(slice.condition()),
+            pack.condition_version(),
+            pack.target_version(),
+            slice.rubric(),
+            profile,
+            adapter.clone(),
+            rubric.clone(),
+            evidence.clone(),
+        )
+        .expect("assessment request");
+        let provenance = AssessmentProvenance::new(
+            Provider::OpenAi,
+            herness_supervision::ProviderKind::NormalLlm,
+            ModelId::new("fixture-judge").expect("model id"),
+            adapter.clone(),
+            rubric.clone(),
+        )
+        .expect("provenance")
+        .with_purpose(ProfilePurpose::Html);
+        let result = AssessmentResult::new(
+            &request,
+            evidence,
+            "fixture all-met result",
+            None,
+            AssessmentOutcome::NormalLlm {
+                verdict: ConditionVerdict::Met,
+                confidence: None,
+            },
+            provenance,
+            now(),
+        )
+        .expect("assessment result");
+        let scope = EvidenceScope::new(
+            vec![format!("slice:{}", slice.id())],
+            vec!["synthetic fixture; no provider request".to_owned()],
+        )
+        .expect("scope");
+        results.push(
+            SliceAssessment::from_result(
+                slice,
+                &request,
+                &result,
+                ProfileThresholds::normal_llm(),
+                scope,
+            )
+            .expect("slice assessment"),
+        );
+    }
+    let binding = EvaluationBinding::verification(
+        pack.fingerprints().clone(),
+        pack.fingerprints().clone(),
+    )
+    .with_assessment(pack.fingerprints().clone(), pack.fingerprints().clone());
+    AppliedEvaluation::apply(&plan, results, binding, false, now()).expect("applied evaluation")
 }
 
 /// Extracts the exact non-executed provenance payload from the fixture.

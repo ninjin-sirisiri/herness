@@ -23,6 +23,7 @@ pub mod events;
 pub mod ids;
 pub mod observer;
 pub mod ports;
+pub mod publish;
 pub mod request;
 pub mod rubric;
 pub mod state;
@@ -96,6 +97,14 @@ pub use ports::{
     decode_operation_result, decode_publication, decode_settings, decode_stored_request,
     verify_bytes_digest,
 };
+pub use publish::{
+    BuiltReceipt, CandidatePublication, FinalCandidateCheck, FinalCandidateCheckPort,
+    FinalCandidateCheckRequest, HostPublicationPort, PublicationFileInput,
+    PublicationFileReadPort, PublicationOrchestrator, PublicationOutcome,
+    PublicationPolicyIdentity, PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
+    PublicationWriteExpectationPort, RECEIPT_CONTRACT, RECEIPT_DIRECTORY, RECEIPT_SCHEMA,
+    RECEIPT_VERSION, SHARED_STYLESHEET, build_publication_receipt,
+};
 pub use request::{
     ConflictResolution, H3Operation, H3OperationOutcome, H3OperationRequest, H3OperationResult,
     H3RequestFingerprint, RequestCommit, StoredRequestResult, decode_stored_request_result,
@@ -104,8 +113,9 @@ pub use state::{
     Applicability, ApplicabilityReason, ArchivedVersionRef, CandidateRecord, CandidateStorageRef,
     CycleLatch, CycleState, EvidenceKind, EvidenceRef, GenerationRecord, GenerationStatus,
     H2Reference, H3CancelCause, H3DocumentState, H3DocumentStatus, H3FailureCause, H3Reason,
-    H3Settings, H3State, H3StateReasonKind, H3StopCause, HumanWaitCause, PublicationJournal,
-    PublicationStatus, RequiredAction, SyncCycle, project_activity_id,
+    H3Settings, H3State, H3StateReasonKind, H3StopCause, HumanWaitCause, PublicationFileJournal,
+    PublicationFileRole, PublicationFileStatus, PublicationJournal, PublicationStatus,
+    RequiredAction, SyncCycle, project_activity_id,
 };
 pub use version::{H3_FORMAT_VERSION, H3Record, decode_record, encode_record, ensure_format};
 pub use workspace::{

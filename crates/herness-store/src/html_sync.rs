@@ -592,6 +592,50 @@ impl Store {
         Ok(records)
     }
 
+    /// Updates one existing publication journal payload without adding a
+    /// project sequence or event.
+    ///
+    /// This is a narrow metadata fill after the atomic synced commit. It never
+    /// changes the document, generation, candidate, or event stream.
+    pub fn update_html_sync_publication(
+        &mut self,
+        journal: PublicationJournal,
+    ) -> Result<(), StoreError> {
+        let project = journal.project_id();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = load_publication(&transaction, project, journal.publication_id())?
+            .ok_or_else(|| StoreError::corrupt("the publication journal does not exist"))?;
+        if existing.document_key() != journal.document_key() {
+            return Err(StoreError::HtmlSyncRecordConflict {
+                record: "publication",
+                id: journal.publication_id().to_string(),
+            });
+        }
+        if existing.updated_at() > journal.updated_at() {
+            return Err(StoreError::HtmlSyncInvalidCommit {
+                detail: "the publication journal cannot move its update time backwards"
+                    .to_owned(),
+            });
+        }
+        let payload = encode_record(&journal)?;
+        transaction.execute(
+            "UPDATE html_sync_publications
+             SET payload = ?3, updated_at = ?4, h1_request_id = ?5
+             WHERE project_id = ?1 AND publication_id = ?2",
+            params![
+                project.to_string(),
+                journal.publication_id().to_string(),
+                payload,
+                timestamp(journal.updated_at(), "publication updated_at")?,
+                journal.h1_request_id().to_string(),
+            ],
+        )?;
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(())
+    }
+
     /// Returns a stored idempotent request result.
     pub fn html_sync_request_result(
         &self,
@@ -987,5 +1031,12 @@ impl H3StorePort for Store {
         commit: HtmlSyncCommit,
     ) -> Result<HtmlSyncCommitOutcome, H3Error> {
         Store::commit_html_sync(self, commit).map_err(H3Error::from)
+    }
+
+    fn update_html_sync_publication(
+        &mut self,
+        journal: PublicationJournal,
+    ) -> Result<(), H3Error> {
+        Store::update_html_sync_publication(self, journal).map_err(H3Error::from)
     }
 }

@@ -9,6 +9,7 @@
 pub mod assessment;
 pub mod observer;
 pub mod policy;
+pub mod publish;
 pub mod render;
 #[cfg(target_os = "macos")]
 mod render_macos;
@@ -40,4 +41,8 @@ pub use verification::{
     render_facts, verify_candidate,
 };
 pub use assessment::{HTML_ASSESSMENT_PURPOSE, HtmlAssessmentHost};
+pub use publish::{
+    DesktopPublisher, H3PublicationRecords, H3PublicationSafety, ObserverWriteExpectations,
+    PolicyFinalCheck, ProjectPublicationFiles, SharedHistoryArchive,
+};
 pub use worker::{HtmlSyncWorker, ProjectWorkspaces};

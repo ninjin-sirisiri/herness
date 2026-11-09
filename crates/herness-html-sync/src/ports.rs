@@ -553,6 +553,17 @@ pub trait H3StorePort {
         &mut self,
         commit: HtmlSyncCommit,
     ) -> Result<HtmlSyncCommitOutcome, H3Error>;
+
+    /// Updates one existing publication journal payload without adding a
+    /// project sequence or event.
+    ///
+    /// H3 uses this only to fill the assigned synced sequence after the
+    /// atomic state/event commit. It never changes the document, generation,
+    /// candidate, or event stream.
+    fn update_html_sync_publication(
+        &mut self,
+        journal: PublicationJournal,
+    ) -> Result<(), H3Error>;
 }
 
 /// Decodes one stored settings payload.

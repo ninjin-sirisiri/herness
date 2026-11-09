@@ -590,7 +590,7 @@ impl PublicationRecord {
     }
 
     /// Serializes the record for host-state persistence.
-    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, PublicationFailure> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PublicationFailure> {
         let mut current = self.clone();
         current.format = PUBLICATION_RECORD_FORMAT;
         serde_json::to_vec(&current).map_err(|error| PublicationFailure::RecordCorrupt {
@@ -599,7 +599,7 @@ impl PublicationRecord {
     }
 
     /// Parses a host-state record, rejecting unknown formats and fields.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, PublicationFailure> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PublicationFailure> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|error| PublicationFailure::RecordCorrupt {
                 detail: format!("publication record JSON: {error}"),

@@ -1655,6 +1655,172 @@ pub enum PublicationStatus {
     Conflict,
 }
 
+/// Which formal file one publication journal entry describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationFileRole {
+    /// The formal HTML companion.
+    Html,
+    /// The versioned evaluation receipt under `docs/sdd/html-evidence/`.
+    Receipt,
+}
+
+impl PublicationFileRole {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Receipt => "receipt",
+        }
+    }
+}
+
+/// Per-file state inside one publication journal entry.
+///
+/// H3 publishes the HTML and the receipt as two separate single-file H1
+/// requests. This state records each file independently; it is never presented
+/// as one atomic multi-file filesystem transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationFileStatus {
+    /// The journal intends to publish this file but no side effect ran.
+    Pending,
+    /// The exact approved bytes were observed at the formal path.
+    Published,
+    /// The file was not replaced and the failure is known.
+    NotPublished,
+    /// The file may or may not have been replaced; reconciliation is required.
+    Unverifiable,
+}
+
+impl PublicationFileStatus {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Published => "published",
+            Self::NotPublished => "not_published",
+            Self::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// One file in the H3 publication sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationFileJournal {
+    role: PublicationFileRole,
+    path: String,
+    expected: ExpectedTargetVersion,
+    approved_digest: ContentDigest,
+    h1_request_id: Option<PublicationRequestId>,
+    status: PublicationFileStatus,
+    observed_after: Option<ContentDigest>,
+    updated_at: Timestamp,
+}
+
+impl PublicationFileJournal {
+    /// Creates one pending file entry.
+    pub fn pending(
+        role: PublicationFileRole,
+        path: impl Into<String>,
+        expected: ExpectedTargetVersion,
+        approved_digest: ContentDigest,
+        h1_request_id: Option<PublicationRequestId>,
+        at: Timestamp,
+    ) -> Result<Self, H3Error> {
+        let path = path.into();
+        if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+            return Err(H3Error::invalid(
+                "publicationFile.path",
+                "the publication file path must be project-relative",
+            ));
+        }
+        if path.split('/').any(|part| part.is_empty() || part == "..") {
+            return Err(H3Error::invalid(
+                "publicationFile.path",
+                "the publication file path must be canonical",
+            ));
+        }
+        Ok(Self {
+            role,
+            path,
+            expected,
+            approved_digest,
+            h1_request_id,
+            status: PublicationFileStatus::Pending,
+            observed_after: None,
+            updated_at: at,
+        })
+    }
+
+    /// File role.
+    pub const fn role(&self) -> PublicationFileRole {
+        self.role
+    }
+
+    /// Project-relative formal path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Expected current version or explicit absence at the start of the attempt.
+    pub const fn expected(&self) -> &ExpectedTargetVersion {
+        &self.expected
+    }
+
+    /// Exact approved content digest.
+    pub const fn approved_digest(&self) -> &ContentDigest {
+        &self.approved_digest
+    }
+
+    /// H1 single-file publication request used for this file.
+    pub const fn h1_request_id(&self) -> Option<&PublicationRequestId> {
+        self.h1_request_id.as_ref()
+    }
+
+    /// Current per-file state.
+    pub const fn status(&self) -> PublicationFileStatus {
+        self.status
+    }
+
+    /// Exact digest observed after the side effect, when one was read.
+    pub const fn observed_after(&self) -> Option<&ContentDigest> {
+        self.observed_after.as_ref()
+    }
+
+    /// Last time this file entry changed.
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+
+    /// Records the exact post-write observation.
+    pub fn observed(mut self, observed: ContentDigest, at: Timestamp) -> Self {
+        self.status = if observed == self.approved_digest {
+            PublicationFileStatus::Published
+        } else {
+            PublicationFileStatus::Unverifiable
+        };
+        self.observed_after = Some(observed);
+        self.updated_at = at;
+        self
+    }
+
+    /// Records a known failure without replacement.
+    pub fn not_published(mut self, at: Timestamp) -> Self {
+        self.status = PublicationFileStatus::NotPublished;
+        self.updated_at = at;
+        self
+    }
+
+    /// Records an unknown result after a possible side effect.
+    pub fn unverifiable(mut self, at: Timestamp) -> Self {
+        self.status = PublicationFileStatus::Unverifiable;
+        self.updated_at = at;
+        self
+    }
+}
+
 /// One archived version reference supplied by the host archive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1714,6 +1880,31 @@ pub struct PublicationJournal {
     created_at: Timestamp,
     updated_at: Timestamp,
     detail: Option<String>,
+    /// Canonical receipt path written by this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_path: Option<String>,
+    /// Expected receipt version or explicit absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_receipt: Option<ExpectedTargetVersion>,
+    /// Exact receipt digest written by this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_digest: Option<ContentDigest>,
+    /// H1 single-file request used for the receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_request_id: Option<PublicationRequestId>,
+    /// Exact receipt digest observed after the side effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_after_receipt: Option<ContentDigest>,
+    /// Per-file states and sequence. Never presented as one filesystem
+    /// transaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<PublicationFileJournal>,
+    /// Digest binding this attempt's exact request payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_fingerprint: Option<ContentDigest>,
+    /// Final project sequence returned by the synced commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_project_sequence: Option<u64>,
 }
 
 impl PublicationJournal {
@@ -1759,6 +1950,14 @@ impl PublicationJournal {
             created_at,
             updated_at: created_at,
             detail: None,
+            receipt_path: None,
+            expected_receipt: None,
+            receipt_digest: None,
+            receipt_request_id: None,
+            observed_after_receipt: None,
+            files: Vec::new(),
+            request_fingerprint: None,
+            final_project_sequence: None,
         })
     }
 
@@ -1850,6 +2049,151 @@ impl PublicationJournal {
     /// Sanitized detail for a non-successful status.
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    /// Canonical receipt path, when this attempt publishes one.
+    pub fn receipt_path(&self) -> Option<&str> {
+        self.receipt_path.as_deref()
+    }
+
+    /// Expected current receipt version or explicit absence.
+    pub const fn expected_receipt(&self) -> Option<&ExpectedTargetVersion> {
+        self.expected_receipt.as_ref()
+    }
+
+    /// Exact approved receipt digest.
+    pub const fn receipt_digest(&self) -> Option<&ContentDigest> {
+        self.receipt_digest.as_ref()
+    }
+
+    /// H1 request used for the receipt.
+    pub const fn receipt_request_id(&self) -> Option<&PublicationRequestId> {
+        self.receipt_request_id.as_ref()
+    }
+
+    /// Receipt digest observed after the side effect.
+    pub const fn observed_after_receipt(&self) -> Option<&ContentDigest> {
+        self.observed_after_receipt.as_ref()
+    }
+
+    /// Per-file journal entries in publication order.
+    pub fn files(&self) -> &[PublicationFileJournal] {
+        &self.files
+    }
+
+    /// One per-file entry by role.
+    pub fn file(&self, role: PublicationFileRole) -> Option<&PublicationFileJournal> {
+        self.files.iter().find(|file| file.role() == role)
+    }
+
+    /// Digest binding the exact attempt payload.
+    pub const fn request_fingerprint(&self) -> Option<&ContentDigest> {
+        self.request_fingerprint.as_ref()
+    }
+
+    /// Final project sequence of the synced commit.
+    pub const fn final_project_sequence(&self) -> Option<u64> {
+        self.final_project_sequence
+    }
+
+    /// Binds this attempt's exact payload fingerprint.
+    pub fn with_request_fingerprint(mut self, fingerprint: ContentDigest) -> Self {
+        self.request_fingerprint = Some(fingerprint);
+        self
+    }
+
+    /// Records the receipt target and H1 request for this attempt.
+    pub fn with_receipt(
+        mut self,
+        path: impl Into<String>,
+        expected: ExpectedTargetVersion,
+        digest: ContentDigest,
+        request_id: PublicationRequestId,
+        at: Timestamp,
+    ) -> Result<Self, H3Error> {
+        let path = path.into();
+        if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+            return Err(H3Error::invalid(
+                "receiptPath",
+                "the receipt path must be project-relative",
+            ));
+        }
+        if path.split('/').any(|part| part.is_empty() || part == "..") {
+            return Err(H3Error::invalid(
+                "receiptPath",
+                "the receipt path must be canonical",
+            ));
+        }
+        self.receipt_path = Some(path);
+        self.expected_receipt = Some(expected);
+        self.receipt_digest = Some(digest);
+        self.receipt_request_id = Some(request_id);
+        self.updated_at = at;
+        Ok(self)
+    }
+
+    /// Records the ordered per-file journal entries.
+    pub fn with_files(mut self, files: Vec<PublicationFileJournal>) -> Self {
+        self.files = files;
+        self
+    }
+
+    /// Adds or replaces one file entry after an observation.
+    pub fn with_file(mut self, file: PublicationFileJournal) -> Result<Self, H3Error> {
+        if let Some(index) = self.files.iter().position(|entry| entry.role() == file.role()) {
+            self.files[index] = file;
+        } else {
+            self.files.push(file);
+        }
+        Ok(self)
+    }
+
+    /// Marks the attempt published after both exact files were observed.
+    pub fn published_pair(
+        mut self,
+        observed_html: ContentDigest,
+        observed_receipt: ContentDigest,
+        final_project_sequence: Option<u64>,
+        at: Timestamp,
+    ) -> Result<Self, H3Error> {
+        if self.status != PublicationStatus::Replacing {
+            return Err(H3Error::invalid(
+                "publicationStatus",
+                "only a replacing journal can become published",
+            ));
+        }
+        if observed_html != self.approved_html_digest {
+            return Err(H3Error::invalid(
+                "observedAfterHtml",
+                "the observed HTML does not match the approved candidate",
+            ));
+        }
+        if self.receipt_digest.as_ref() != Some(&observed_receipt) {
+            return Err(H3Error::invalid(
+                "observedAfterReceipt",
+                "the observed receipt does not match the approved receipt",
+            ));
+        }
+        self.status = PublicationStatus::Published;
+        self.observed_after_html = Some(observed_html);
+        self.observed_after_receipt = Some(observed_receipt);
+        self.final_project_sequence = final_project_sequence;
+        self.updated_at = at;
+        Ok(self)
+    }
+
+    /// Marks a post-side-effect state that needs reconciliation.
+    pub fn unverifiable(mut self, detail: impl Into<String>, at: Timestamp) -> Self {
+        self.status = PublicationStatus::Unverifiable;
+        self.detail = Some(detail.into());
+        self.updated_at = at;
+        self
+    }
+
+    /// Records the final project sequence assigned by the synced commit.
+    pub fn with_final_project_sequence(mut self, sequence: u64) -> Self {
+        self.final_project_sequence = Some(sequence);
+        self
     }
 
     /// Records the H1 host-state record key.
