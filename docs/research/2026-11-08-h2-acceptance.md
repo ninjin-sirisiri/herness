@@ -117,6 +117,7 @@
 - 実測合計: **3 requests**（事前1 + adapter 2）、retry 0、失敗0。GOAT creditsに計上。USDの厳密な請求額は確認していない。
 - adapterの証拠: `tests/supervision/tests/real_connections.rs`の`commandcode_jev_completion_met_and_unmet_are_real`（既定は`#[ignore]`、`COMMANDCODE_API_KEY`がある場合だけopt-in実行）。
 - 確認できたこと: Command Code Provider APIのSystem One shape、固定model、Bearer認証、herness Jev adapterのstrict parse、met/unmetの区別、usage取得、0.95採用。
+- 追加観察: 最初のより説明的な正例rubricでは`met` p=0.88（<0.95）で採用されなかった。閾値はrubric/evidenceの表現に敏感で、0.95の実モデル妥当性評価は未完了である。最終確認は直接的なtoken条件（p=0.99）で行った。
 - 確認していないこと: Jevの許可評価、直接TypeSafe endpoint、画像入力、実Tauri UIからのCommand Code接続設定、通常LLM/Decisions。
 - この結果は**Jev completionの1経路だけ**の証拠である。H2全体の実接続受入へ流用しない。
 

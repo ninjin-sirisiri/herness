@@ -883,6 +883,7 @@ COMMANDCODE_API_KEY=... cargo test -p herness-supervision-tests \
 - 正例: `met`、met probability 0.99、confidence 0.98、usage 640/107、attempts 1、0.95以上で採用。
 - 負例: `unmet`、usage 638/107、attempts 1、正例と区別。
 - このテストは既定で`#[ignore]`。`tests/supervision/tests/real_connections.rs`にあり、通常のworkspace testでは実行しない。
+- 追加観察: 最初のより説明的な正例rubricでは`met` p=0.88（<0.95）で採用されなかった。閾値はrubric/evidenceの表現に敏感で、0.95の実モデル妥当性評価は未完了。最終確認は直接的なtoken条件（p=0.99）で行った。
 - 確認済みは**Jev completionのCommand Code経由1経路だけ**。Jevの許可評価、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri UIからの設定は未確認のまま。H2受入は未完了。
 
 ### Phase Bゲート
