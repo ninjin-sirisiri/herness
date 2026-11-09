@@ -53,6 +53,17 @@ impl ProfilePurpose {
             Self::Permission => "permission",
         }
     }
+
+    /// Whether this purpose is a condition assessment handled by the three
+    /// condition adapters.
+    ///
+    /// `Html` is a distinct purpose, not a `Completion` fallback: the request,
+    /// consent, origin, and recorded purpose stay Html. `Permission` has its
+    /// own adapter, question, and record shape and is never accepted by the
+    /// condition adapters.
+    pub const fn is_condition_assessment(self) -> bool {
+        matches!(self, Self::Completion | Self::Html)
+    }
 }
 
 /// Provider shape behind an assessment profile.

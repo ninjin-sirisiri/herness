@@ -390,7 +390,7 @@ impl Preflight {
             ));
         }
         let profile = entry.profile();
-        if request.purpose() != ProfilePurpose::Completion
+        if !request.purpose().is_condition_assessment()
             || !request.profile().matches(profile)
             || request.adapter_version() != profile.adapter_version()
             || request.rubric_version() != profile.rubric_version()
@@ -409,6 +409,19 @@ impl Preflight {
             ));
         }
         if required.requires_image() && !entry.connection().input().supports_image() {
+            return Err(AssessmentError::new(
+                AssessmentErrorKind::UnsupportedModality,
+            ));
+        }
+        if request.purpose() == ProfilePurpose::Html
+            && required.requires_image()
+            && !evidence
+                .iter()
+                .any(|document| document.image_input().is_some())
+        {
+            // An Html condition that requires images must not be assessed from
+            // text alone. The caller must supply approved image bytes or the
+            // host must wait for re-confirmation instead.
             return Err(AssessmentError::new(
                 AssessmentErrorKind::UnsupportedModality,
             ));
@@ -484,12 +497,13 @@ fn provenance(
     request: &AssessmentRequest,
     entry: &ProfileEntry,
 ) -> Result<AssessmentProvenance, AssessmentError> {
-    AssessmentProvenance::new(
+    let provenance = AssessmentProvenance::new(
         entry.connection().provider(),
         ProviderKind::NormalLlm,
         entry.profile().model().clone(),
         request.adapter_version().clone(),
         request.rubric_version().clone(),
     )
-    .map_err(|_| AssessmentError::new(AssessmentErrorKind::CapabilityMismatch))
+    .map_err(|_| AssessmentError::new(AssessmentErrorKind::CapabilityMismatch))?;
+    Ok(provenance.with_purpose(request.purpose()))
 }

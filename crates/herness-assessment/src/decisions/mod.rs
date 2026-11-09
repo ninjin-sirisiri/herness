@@ -357,7 +357,8 @@ impl DecisionsAssessmentAdapter {
             request.adapter_version().clone(),
             request.rubric_version().clone(),
         )
-        .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?;
+        .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?
+        .with_purpose(request.purpose());
         if let Some(model) = parsed
             .reported_model
             .as_deref()
@@ -443,7 +444,7 @@ impl Preflight {
         }
 
         let profile = entry.profile();
-        if request.purpose() != ProfilePurpose::Completion
+        if !request.purpose().is_condition_assessment()
             || profile.provider() != ProviderKind::Decisions
             || !request.profile().matches(profile)
             || request.adapter_version() != profile.adapter_version()
@@ -470,6 +471,18 @@ impl Preflight {
             ));
         }
         if profile.required_inputs().requires_image() && !connection.input().supports_image() {
+            return Err(AssessmentError::new(
+                AssessmentErrorKind::UnsupportedModality,
+            ));
+        }
+        if request.purpose() == ProfilePurpose::Html
+            && profile.required_inputs().requires_image()
+            && !evidence
+                .iter()
+                .any(|document| matches!(document.content(), EvidenceContent::Image(_)))
+        {
+            // A Html condition that requires images must not be sent as a
+            // text-only assessment.
             return Err(AssessmentError::new(
                 AssessmentErrorKind::UnsupportedModality,
             ));

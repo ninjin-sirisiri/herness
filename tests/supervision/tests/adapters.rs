@@ -42,9 +42,11 @@ use herness_supervision::profiles::{
 use herness_supervision_tests::{
     FixedClock, Ids, assessment_request, decisions_assessment_request, decisions_choice_answer,
     decisions_completion_profile_for, decisions_completion_profile_with_inputs,
-    decisions_profile_entry, decisions_response, ids, jev_assessment_request, jev_choice_answer,
-    jev_completion_profile_for, jev_completion_profile_with_inputs, jev_profile_entry,
-    jev_system_one_response, llm_completion_profile_for, llm_profile_entry, other_project, project,
+    decisions_html_profile_with_inputs, decisions_profile_entry, decisions_response, ids,
+    jev_assessment_request, jev_choice_answer, jev_completion_profile_for,
+    jev_completion_profile_with_inputs, jev_html_profile_with_inputs, jev_profile_entry,
+    jev_system_one_response, llm_completion_profile_for, llm_html_profile_for, llm_profile_entry,
+    other_project, project,
 };
 use serde_json::json;
 
@@ -1409,6 +1411,46 @@ fn llm_fixture(
     let fixture_ids = ids(project);
     let profile =
         llm_completion_profile_for(project, settings.connection_id(), LLM_MODEL, required);
+    let entry = llm_profile_entry(&settings, profile.clone(), structured_output);
+    let request = assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    (
+        admin,
+        LlmFixture {
+            profile,
+            entry,
+            request,
+        },
+    )
+}
+
+/// Normal-LLM fixture whose fixed purpose is `Html`.
+fn llm_html_fixture(
+    provider: Provider,
+    auth_method: AuthMethod,
+    endpoint: Option<Endpoint>,
+    endpoint_class: EndpointClass,
+    input: InputCapabilities,
+    required: ProfileInputs,
+    structured_output: bool,
+) -> (ConnectionAdmin, LlmFixture) {
+    let admin = ConnectionAdmin::new();
+    let settings = settings(
+        &admin,
+        provider,
+        auth_method,
+        LLM_MODEL,
+        endpoint,
+        endpoint_class,
+        input,
+    );
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = llm_html_profile_for(project, settings.connection_id(), LLM_MODEL, required);
     let entry = llm_profile_entry(&settings, profile.clone(), structured_output);
     let request = assessment_request(
         project,
@@ -2976,6 +3018,41 @@ fn jev_fixture(
     )
 }
 
+/// Jev fixture whose fixed purpose is `Html`.
+fn jev_html_fixture(
+    model: &str,
+    input: InputCapabilities,
+    profile_version: u64,
+    required: ProfileInputs,
+) -> (ConnectionAdmin, JevFixture) {
+    let admin = ConnectionAdmin::new();
+    let settings = jev_named(&admin, model, input);
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = jev_html_profile_with_inputs(
+        project,
+        settings.connection_id(),
+        model,
+        profile_version,
+        required,
+    );
+    let entry = jev_profile_entry(&settings, profile.clone());
+    let request = jev_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    (
+        admin,
+        JevFixture {
+            profile,
+            entry,
+            request,
+        },
+    )
+}
+
 fn jev_adapter(
     credentials: Arc<dyn CredentialPort + Send + Sync>,
     directory: ConnectionDirectory,
@@ -4297,6 +4374,41 @@ fn decisions_fixture(
     let project = project();
     let fixture_ids = ids(project);
     let profile = decisions_completion_profile_with_inputs(
+        project,
+        settings.connection_id(),
+        model,
+        profile_version,
+        required,
+    );
+    let entry = decisions_profile_entry(&settings, profile.clone());
+    let request = decisions_assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    );
+    (
+        admin,
+        DecisionsFixture {
+            profile,
+            entry,
+            request,
+        },
+    )
+}
+
+/// Decisions fixture whose fixed purpose is `Html`.
+fn decisions_html_fixture(
+    model: &str,
+    input: InputCapabilities,
+    profile_version: u64,
+    required: ProfileInputs,
+) -> (ConnectionAdmin, DecisionsFixture) {
+    let admin = ConnectionAdmin::new();
+    let settings = decisions_named(&admin, model, input);
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = decisions_html_profile_with_inputs(
         project,
         settings.connection_id(),
         model,
@@ -6180,4 +6292,648 @@ fn same_completion_condition_normalizes_across_llm_jev_and_decisions() {
     assert_eq!(llm_other.count(), 0);
     assert_eq!(jev_other.count(), 0);
     assert_eq!(decisions_other.count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Html purpose across all three assessment methods (Task 12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn three_adapters_assess_html_text_conditions_without_a_completion_substitute() {
+    let project = project();
+    let fixture_ids = ids(project);
+
+    // Normal LLM: Html is a distinct purpose but keeps the same tool-less
+    // schema request and response validation.
+    let (llm_admin, llm) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+        ProfileInputs::text_only(),
+        true,
+    );
+    let llm_server = MockServer::start();
+    let llm_other = MockServer::start();
+    let llm_adapter = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        llm_admin.directory(),
+        &llm_server,
+        &llm_other,
+    );
+    let llm_answer = condition_answer(vec![condition_entry(
+        fixture_ids.condition_a,
+        "met",
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b],
+        "The supplied Html evidence supports the condition.",
+        None,
+    )]);
+    llm_server.push(MockResponse::json(
+        200,
+        responses_envelope(&llm_answer.to_string()),
+    ));
+    let llm_assessment = llm_adapter
+        .assess(
+            &llm.request,
+            &llm.entry,
+            &llm_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("html llm assessment");
+    assert_eq!(llm_assessment.rejection(), None);
+    assert_eq!(
+        llm_assessment.result().reported_verdict(),
+        ConditionVerdict::Met
+    );
+    assert_eq!(llm_assessment.result().purpose(), ProfilePurpose::Html);
+    assert_eq!(
+        llm_assessment.result().provenance().purpose(),
+        Some(ProfilePurpose::Html)
+    );
+    assert_eq!(
+        llm_assessment
+            .result()
+            .adopted_verdict(llm.profile.thresholds()),
+        Some(ConditionVerdict::Met)
+    );
+    assert_tool_less(&llm_server.requests()[0].json_body());
+    assert_eq!(llm_server.count(), 1);
+    assert_eq!(llm_other.count(), 0);
+
+    // Jev: Html uses the same fixed System One model and 0.95 adoption rule.
+    let (jev_admin, jev_fixture) = jev_html_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let jev_server = MockServer::start();
+    let jev_other = MockServer::start();
+    let jev_adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        jev_admin.directory(),
+        &jev_server,
+        &jev_other,
+    );
+    let jev_question = jev_question_id(&jev_fixture.request);
+    jev_server.push(MockResponse::json(
+        200,
+        jev_response(&jev_question, "met", 0.951, 0.048, 0.001, 0.8),
+    ));
+    let jev_assessment = jev_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("html jev assessment");
+    assert_eq!(jev_assessment.rejection(), None);
+    assert_eq!(
+        jev_assessment.result().reported_verdict(),
+        ConditionVerdict::Met
+    );
+    assert_eq!(jev_assessment.result().purpose(), ProfilePurpose::Html);
+    assert_eq!(
+        jev_assessment.result().provenance().purpose(),
+        Some(ProfilePurpose::Html)
+    );
+    assert_eq!(
+        jev_assessment.adopted_verdict(jev_fixture.profile.thresholds()),
+        Some(ConditionVerdict::Met)
+    );
+    assert_eq!(
+        jev_server.requests()[0].json_body()["model"].as_str(),
+        Some(JEV_REQUEST_MODEL)
+    );
+    assert_eq!(jev_server.count(), 1);
+    assert_eq!(jev_other.count(), 0);
+
+    // A Html Jev distribution below 0.95 must not be adopted.
+    jev_server.push(MockResponse::json(
+        200,
+        jev_response(&jev_question, "met", 0.949, 0.050, 0.001, 0.8),
+    ));
+    let below = jev_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("below-threshold html jev assessment");
+    assert_eq!(
+        below.adopted_verdict(jev_fixture.profile.thresholds()),
+        None
+    );
+
+    // Decisions: Html uses the same fixed model, ordered distribution, and
+    // 0.95 adoption rule.
+    let (decisions_admin, decisions_fixture) = decisions_html_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_only(),
+        1,
+        ProfileInputs::text_only(),
+    );
+    let decisions_server = MockServer::start();
+    let decisions_other = MockServer::start();
+    let decisions_adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        decisions_admin.directory(),
+        &decisions_server,
+        &decisions_other,
+    );
+    let decisions_question = decisions_question_id(&decisions_fixture.request);
+    decisions_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&decisions_question, "unmet", 0.001, 0.951, 0.048, 0.8),
+    ));
+    let decisions_assessment = decisions_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("html decisions assessment");
+    assert_eq!(decisions_assessment.rejection(), None);
+    assert_eq!(
+        decisions_assessment.result().reported_verdict(),
+        ConditionVerdict::Unmet
+    );
+    assert_eq!(
+        decisions_assessment.result().purpose(),
+        ProfilePurpose::Html
+    );
+    assert_eq!(
+        decisions_assessment.result().provenance().purpose(),
+        Some(ProfilePurpose::Html)
+    );
+    assert_eq!(
+        decisions_assessment.adopted_verdict(decisions_fixture.profile.thresholds()),
+        Some(ConditionVerdict::Unmet)
+    );
+    assert_eq!(
+        decisions_server.requests()[0].json_body()["model"].as_str(),
+        Some(DECISIONS_REQUEST_MODEL)
+    );
+    assert_eq!(decisions_server.count(), 1);
+    assert_eq!(decisions_other.count(), 0);
+
+    decisions_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(&decisions_question, "unmet", 0.001, 0.949, 0.050, 0.8),
+    ));
+    let below = decisions_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("below-threshold html decisions assessment");
+    assert_eq!(
+        below.adopted_verdict(decisions_fixture.profile.thresholds()),
+        None
+    );
+}
+
+#[test]
+fn three_adapters_keep_html_image_capability_checks_and_never_send_text_only() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let png = jev_png(280);
+
+    // Each adapter sends approved image bytes on an Html request.
+    let (llm_admin, llm) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_and_image(),
+        ProfileInputs::new(true, true, true),
+        true,
+    );
+    let llm_server = MockServer::start();
+    let llm_other = MockServer::start();
+    let llm_adapter_instance = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        llm_admin.directory(),
+        &llm_server,
+        &llm_other,
+    );
+    let llm_answer = condition_answer(vec![condition_entry(
+        fixture_ids.condition_a,
+        "met",
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b],
+        "The rendered image and note support the Html condition.",
+        None,
+    )]);
+    llm_server.push(MockResponse::json(
+        200,
+        responses_envelope(&llm_answer.to_string()),
+    ));
+    let llm_image_documents = vec![
+        EvidenceDocument::image(fixture_ids.evidence_a, "image/png", png.clone())
+            .expect("image evidence"),
+        EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER).expect("evidence b"),
+    ];
+    let llm_assessment = llm_adapter_instance
+        .assess(
+            &llm.request,
+            &llm.entry,
+            &llm_image_documents,
+            TransportControl::default(),
+        )
+        .expect("html llm image assessment");
+    assert_eq!(
+        llm_assessment.result().reported_verdict(),
+        ConditionVerdict::Met
+    );
+    let llm_body = llm_server.requests()[0].json_body();
+    assert!(llm_body.to_string().contains("data:image/png;base64,"));
+    assert_tool_less(&llm_body);
+
+    let (jev_admin, jev_fixture) = jev_html_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let jev_server = MockServer::start();
+    let jev_other = MockServer::start();
+    let jev_image_adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        jev_admin.directory(),
+        &jev_server,
+        &jev_other,
+    );
+    jev_server.push(MockResponse::json(
+        200,
+        jev_response(
+            &jev_question_id(&jev_fixture.request),
+            "met",
+            0.96,
+            0.03,
+            0.01,
+            0.8,
+        ),
+    ));
+    let jev_assessment = jev_image_adapter
+        .assess(
+            &jev_fixture.request,
+            &jev_fixture.entry,
+            &jev_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .expect("html jev image assessment");
+    assert!(jev_assessment.rejection().is_none());
+    let jev_request = &jev_server.requests()[0];
+    assert_eq!(
+        jev_request.header("typesafe-danger-zone-images"),
+        Some("true")
+    );
+    assert_eq!(
+        jev_request.json_body()["assets"]
+            .as_object()
+            .expect("image assets")
+            .len(),
+        1
+    );
+
+    let (decisions_admin, decisions_fixture) = decisions_html_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let decisions_server = MockServer::start();
+    let decisions_other = MockServer::start();
+    let decisions_image_adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        decisions_admin.directory(),
+        &decisions_server,
+        &decisions_other,
+    );
+    decisions_server.push(MockResponse::json(
+        200,
+        decisions_valid_response(
+            &decisions_question_id(&decisions_fixture.request),
+            "met",
+            0.96,
+            0.03,
+            0.01,
+            0.8,
+        ),
+    ));
+    let decisions_assessment = decisions_image_adapter
+        .assess(
+            &decisions_fixture.request,
+            &decisions_fixture.entry,
+            &decisions_image_documents(fixture_ids, &png),
+            TransportControl::default(),
+        )
+        .expect("html decisions image assessment");
+    assert!(decisions_assessment.rejection().is_none());
+    assert!(
+        decisions_server.requests()[0]
+            .json_body()
+            .to_string()
+            .contains("data:image/png;base64,")
+    );
+
+    // A text-only connection cannot accept an Html image request.
+    let (admin, fixture) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+        ProfileInputs::text_only(),
+        true,
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = llm_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &llm_image_documents,
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+
+    // A profile that requires image input is not satisfied by text evidence,
+    // even when the connection itself can carry images.
+    let (admin, fixture) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_and_image(),
+        ProfileInputs::new(true, true, true),
+        true,
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &[
+                EvidenceDocument::text(fixture_ids.evidence_a, EVIDENCE_A_MARKER)
+                    .expect("evidence a"),
+                EvidenceDocument::text(fixture_ids.evidence_b, EVIDENCE_B_MARKER)
+                    .expect("evidence b"),
+            ],
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    // The normal-LLM adapter validates the connection route first.
+    assert!(
+        matches!(
+            error.kind(),
+            AssessmentErrorKind::UnsupportedModality | AssessmentErrorKind::CapabilityMismatch
+        ),
+        "unexpected error: {error}"
+    );
+    assert_eq!(server.count(), 0);
+
+    let (admin, fixture) = jev_html_fixture(
+        JEV_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = jev_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &jev_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+
+    let (admin, fixture) = decisions_html_fixture(
+        DECISIONS_MODEL,
+        InputCapabilities::text_and_image(),
+        1,
+        ProfileInputs::new(true, true, false),
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = decisions_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &decisions_text_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::UnsupportedModality);
+    assert_eq!(server.count(), 0);
+
+    // Html requests stay out of the Permission adapter path.
+    let (admin, fixture) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+        ProfileInputs::text_only(),
+        true,
+    );
+    let permission_profile = AssessmentProfile::new(
+        fixture_ids.permission_profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Permission,
+        ProviderKind::NormalLlm,
+        fixture.entry.connection().connection_id(),
+        fixture.profile.model().clone(),
+        fixture.profile.adapter_version().clone(),
+        fixture.profile.rubric_version().clone(),
+        ProfileInputs::text_only(),
+        ProfileThresholds::normal_llm(),
+    )
+    .expect("permission profile");
+    let permission_entry = ProfileEntry::new(
+        permission_profile.clone(),
+        fixture.entry.connection().clone(),
+        ConnectionStatus::Available,
+        true,
+    );
+    let permission_request = SupervisionAssessmentRequest::new(
+        fixture_ids.decision,
+        fixture_ids.supervision,
+        fixture_ids.condition_a,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "fixture permission rubric",
+        permission_profile.binding(),
+        permission_profile.adapter_version().clone(),
+        permission_profile.rubric_version().clone(),
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    )
+    .expect("permission request");
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let error = adapter
+        .assess(
+            &permission_request,
+            &permission_entry,
+            &llm_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+    assert_eq!(other.count(), 0);
+    assert_eq!(llm_other.count(), 0);
+    assert_eq!(jev_other.count(), 0);
+    assert_eq!(decisions_other.count(), 0);
+}
+
+#[test]
+fn llm_adapter_rejects_a_permission_request_before_sending() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let (admin, fixture) = llm_html_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+        ProfileInputs::text_only(),
+        true,
+    );
+    let permission_profile = AssessmentProfile::new(
+        fixture_ids.permission_profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Permission,
+        ProviderKind::NormalLlm,
+        fixture.entry.connection().connection_id(),
+        fixture.profile.model().clone(),
+        fixture.profile.adapter_version().clone(),
+        fixture.profile.rubric_version().clone(),
+        ProfileInputs::text_only(),
+        ProfileThresholds::normal_llm(),
+    )
+    .expect("permission profile");
+    let permission_entry = ProfileEntry::new(
+        permission_profile.clone(),
+        fixture.entry.connection().clone(),
+        ConnectionStatus::Available,
+        true,
+    );
+    let permission_request = SupervisionAssessmentRequest::new(
+        fixture_ids.decision,
+        fixture_ids.supervision,
+        fixture_ids.condition_a,
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        "fixture permission rubric",
+        permission_profile.binding(),
+        permission_profile.adapter_version().clone(),
+        permission_profile.rubric_version().clone(),
+        vec![fixture_ids.evidence_a, fixture_ids.evidence_b],
+    )
+    .expect("permission request");
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let credentials = FakeCredential::api_key(CANARY);
+    let adapter = llm_adapter(credentials.clone(), admin.directory(), &server, &other);
+    let error = adapter
+        .assess(
+            &permission_request,
+            &permission_entry,
+            &llm_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AssessmentErrorKind::ProfileBindingMismatch);
+    assert_eq!(server.count(), 0);
+    assert_eq!(other.count(), 0);
+    assert_eq!(credentials.calls(), 0);
+
+    // The same adapter still accepts a Completion request, so the new Html
+    // allowance did not replace the existing condition purposes.
+    let (admin, fixture) = llm_fixture(
+        Provider::OpenAi,
+        AuthMethod::ApiKey,
+        None,
+        EndpointClass::OpenAiResponses,
+        InputCapabilities::text_only(),
+        ProfileInputs::text_only(),
+        true,
+    );
+    let server = MockServer::start();
+    let other = MockServer::start();
+    let adapter = llm_adapter(
+        FakeCredential::api_key(CANARY),
+        admin.directory(),
+        &server,
+        &other,
+    );
+    let answer = condition_answer(vec![condition_entry(
+        fixture_ids.condition_a,
+        "met",
+        &[fixture_ids.evidence_a, fixture_ids.evidence_b],
+        "The Completion evidence supports the condition.",
+        None,
+    )]);
+    server.push(MockResponse::json(
+        200,
+        responses_envelope(&answer.to_string()),
+    ));
+    let assessment = adapter
+        .assess(
+            &fixture.request,
+            &fixture.entry,
+            &llm_documents(fixture_ids),
+            TransportControl::default(),
+        )
+        .expect("completion assessment");
+    assert_eq!(
+        assessment.result().purpose(),
+        ProfilePurpose::Completion
+    );
+    assert_eq!(
+        assessment.result().reported_verdict(),
+        ConditionVerdict::Met
+    );
+    assert_eq!(server.count(), 1);
 }

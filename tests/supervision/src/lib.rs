@@ -410,6 +410,34 @@ pub fn llm_completion_profile_for(
     .expect("completion profile")
 }
 
+/// Normal-LLM Html assessment profile with an explicit connection, model, and
+/// required inputs.
+///
+/// The profile keeps the fixture adapter/rubric versions so the same request
+/// builder can be used for Completion and Html; the purpose in the binding is
+/// what distinguishes them.
+pub fn llm_html_profile_for(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(1).expect("version"),
+        ProfilePurpose::Html,
+        ProviderKind::NormalLlm,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-llm-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::normal_llm(),
+    )
+    .expect("html profile")
+}
+
 /// Profile entry whose profile and connection are the registered settings.
 pub fn llm_profile_entry(
     settings: &ConnectionSettings,
@@ -462,6 +490,30 @@ pub fn jev_completion_profile_with_inputs(
         ProfileThresholds::decisions(),
     )
     .expect("jev completion profile")
+}
+
+/// Jev Html assessment profile with explicit required inputs.
+pub fn jev_html_profile_with_inputs(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(version).expect("version"),
+        ProfilePurpose::Html,
+        ProviderKind::Jev,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-jev-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-jev-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::decisions(),
+    )
+    .expect("jev html profile")
 }
 
 /// Profile entry for a Jev profile and its registered connection.
@@ -573,6 +625,30 @@ pub fn decisions_completion_profile_with_inputs(
         ProfileThresholds::decisions(),
     )
     .expect("decisions completion profile")
+}
+
+/// Decisions Html assessment profile with explicit required inputs.
+pub fn decisions_html_profile_with_inputs(
+    project: ProjectId,
+    connection: ConnectionId,
+    model: &str,
+    version: u64,
+    required_inputs: ProfileInputs,
+) -> AssessmentProfile {
+    let ids = ids(project);
+    AssessmentProfile::new(
+        ids.profile,
+        ProfileVersion::new(version).expect("version"),
+        ProfilePurpose::Html,
+        ProviderKind::Decisions,
+        connection,
+        ModelId::new(model).expect("model"),
+        AdapterVersion::new("fixture-decisions-adapter-1").expect("adapter"),
+        RubricVersion::new("fixture-decisions-rubric-1").expect("rubric"),
+        required_inputs,
+        ProfileThresholds::decisions(),
+    )
+    .expect("decisions html profile")
 }
 
 /// Profile entry for a Decisions profile and its registered connection.

@@ -291,7 +291,20 @@ impl HostAssessmentPort {
                 reason: herness_supervision::ConsentBlock::Revoked,
             });
         };
-        if consent.binding() != record.consent() {
+        // Revocation is reported before a version comparison so a revoked
+        // record does not look like a stale granted record.
+        consent.require_granted()?;
+        if consent.purpose() != purpose {
+            return Err(SupervisionError::ConsentBlocked {
+                reason: herness_supervision::ConsentBlock::DifferentPurpose,
+            });
+        }
+        // The target's contract binds one consent. A request for that purpose
+        // must use exactly the bound record; a separately configured Html
+        // assessment consent is checked by its own purpose, origin, target
+        // version, and data kinds below and is never substituted for the
+        // contract consent.
+        if purpose == record.consent().purpose() && consent.binding() != record.consent() {
             return Err(SupervisionError::ConsentBlocked {
                 reason: herness_supervision::ConsentBlock::VersionMismatch,
             });
@@ -301,7 +314,6 @@ impl HostAssessmentPort {
                 reason: herness_supervision::ConsentBlock::TargetScopeChanged,
             });
         }
-        consent.require_granted()?;
         Ok(consent.clone())
     }
 
@@ -339,6 +351,16 @@ impl HostAssessmentPort {
     ) -> Result<RequestGateIntent, SupervisionError> {
         let project = request.project_id();
         let local = request.id().local_id();
+        let purpose = match request.purpose() {
+            ProfilePurpose::Completion => "completion_assessment",
+            ProfilePurpose::Html => "html_assessment",
+            ProfilePurpose::Permission => {
+                return Err(SupervisionError::Unsupported {
+                    feature: "the permission purpose has its own evaluator, not a condition assessment"
+                        .to_owned(),
+                });
+            }
+        };
         let subject = EventSubject::HostActivity(
             HostActivitySubject::new(
                 project,
@@ -359,7 +381,7 @@ impl HostAssessmentPort {
             RequestId::from_parts(project, local),
             AttemptId::from_parts(project, local),
             connection,
-            RequestPurpose::new("completion_assessment").map_err(|error| {
+            RequestPurpose::new(purpose).map_err(|error| {
                 SupervisionError::AssessmentContractViolation {
                     field: "assessment.purpose".to_owned(),
                     detail: error.to_string(),
@@ -392,12 +414,41 @@ impl ConditionAssessmentPort for HostAssessmentPort {
         &mut self,
         request: &AssessmentRequest,
     ) -> Result<AssessmentResult, SupervisionError> {
+        if !request.purpose().is_condition_assessment() {
+            return Err(SupervisionError::Unsupported {
+                feature: format!(
+                    "the {} purpose is not a condition assessment",
+                    request.purpose().as_str()
+                ),
+            });
+        }
         let project = request.project_id();
         let record = self
             .store
             .load(project, request.supervision_id())?
             .ok_or(SupervisionError::UnknownSupervision)?;
+        if request.condition_version() != record.condition_version()
+            || request.target_version() != record.target_version()
+            || !record.condition_ids().contains(&request.condition_id())
+        {
+            return Err(SupervisionError::AssessmentContractViolation {
+                field: "assessment.target".to_owned(),
+                detail: "the request must name the current condition and target versions"
+                    .to_owned(),
+            });
+        }
         let configured = self.configured(project, request.profile())?;
+        if request.purpose() == ProfilePurpose::Html
+            && configured.profile.required_inputs().requires_image()
+        {
+            // This port supplies text evidence only. A profile that requires
+            // images must not be sent as a text-only assessment.
+            return Err(SupervisionError::ProfileUnavailable {
+                reason: ProfileUnavailable::MissingInput {
+                    modality: herness_core::contracts::InputModality::Image,
+                },
+            });
+        }
         let consent = self.consent(&record, request.profile().purpose())?;
         let origin = self.host.origin_for(configured.profile.connection())?;
         if consent.origin() != &origin {

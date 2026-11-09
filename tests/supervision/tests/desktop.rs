@@ -2332,7 +2332,7 @@ fn no_child_continuation_or_auto_start_happens_for_normal_creation() {
 // ---------------------------------------------------------------------------
 
 mod permission_composition {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -2346,27 +2346,36 @@ mod permission_composition {
         AbsolutePath, ArgumentsDigest, AuthMethod, ConnectionAdmin,
         ConnectionCapabilityDeclaration, ConnectionId, ConnectionSettings, CredentialAvailability,
         CredentialKind, CredentialPort, Endpoint, EndpointClass, EvaluationContext,
-        EvaluatorAvailability, FrozenOperation, InputCapabilities, InputId, NonEmptyText,
+        EvaluatorAvailability, FrozenOperation, InputCapabilities, InputId, ModelId, NonEmptyText,
         OperationId, PermissionEvaluatorPort, PermissionMode, PermissionOutcome, PermissionPolicy,
         PermissionRule, PolicyAdmin, ProjectId, Provider, Rationale, ResolvedCredential,
         RuleTarget, RunId, SecretString, Timestamp, ToolArguments, ToolExecutor, ToolGateway,
         ToolName, WriteArgs,
     };
     use herness_desktop::host::DesktopHost;
+    use herness_desktop::supervision::assessment::{
+        AssessmentHost as PortAssessmentHost, HostAssessmentPort,
+    };
     use herness_desktop::supervision::runtime::DesktopH1;
     use herness_desktop::supervision::store::HostBudgetClock;
     use herness_desktop::supervision::{
-        ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
+        BudgetInput as HostBudgetInput, ConfirmationKind, CreateSupervisionRequest,
+        PlanRequestActor,
     };
     use herness_engine_pi::ProviderEndpoints;
+    use herness_supervision::ports::EvidenceStorePort;
     use herness_supervision::supervisor::{
         AssessmentProfileFacts, CheckExecution, CheckExecutionRequest, ChildRunStart,
         ConditionAssessmentPort, RequiredCheckPort, SupervisionRuntimePort,
     };
     use herness_supervision::{
-        AssessmentRequest, AssessmentResult, BudgetLedger, BudgetPolicy, CheckStatus, Condition,
-        DisclosureDataKind, ProfileBinding, ProfilePurpose, ProviderOrigin, RequiredCheckResult,
-        SupervisionError, SupervisionRequestId, TargetVersion, WorkPacket, WorkPacketRejection,
+        AdapterVersion, AssessmentRequest, AssessmentResult, BudgetLedger, BudgetPolicy,
+        BudgetRequestId, CheckStatus, Condition, ConditionId, ConsentBlock, DecisionId,
+        DisclosureDataKind, DisclosureRequest, EvidenceAcquirer, EvidenceId, EvidenceOutcome,
+        EvidenceRecord, EvidenceScope, ProfileBinding, ProfilePurpose, ProfileThresholds,
+        ProfileUnavailable, ProviderKind, ProviderOrigin, RequiredCheckResult, RubricVersion,
+        SupervisionError, SupervisionId, SupervisionRequestId, TargetScope, TargetVersion,
+        VerificationOperation, WorkPacket, WorkPacketRejection,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -2477,6 +2486,12 @@ mod permission_composition {
     struct RecordedRequest {
         path: String,
         body: Vec<u8>,
+    }
+
+    impl RecordedRequest {
+        fn json_body(&self) -> Value {
+            serde_json::from_slice(&self.body).expect("mock request body is JSON")
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -3430,6 +3445,1034 @@ mod permission_composition {
             ),
             "a valid but different packet must be refused as a mismatch: {result:?}"
         );
+        assert_eq!(harness.server.count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Html assessment purpose and consent separation (Task 12).
+    // -----------------------------------------------------------------------
+
+    struct AllConnectionCredentials {
+        secret: String,
+    }
+
+    impl AllConnectionCredentials {
+        fn new() -> Self {
+            Self {
+                secret: API_KEY.to_owned(),
+            }
+        }
+    }
+
+    impl CredentialPort for AllConnectionCredentials {
+        fn availability(
+            &self,
+            _connection: &ConnectionId,
+        ) -> Result<CredentialAvailability, herness_core::CoreError> {
+            Ok(CredentialAvailability::Available)
+        }
+
+        fn resolve(
+            &self,
+            _connection: &ConnectionId,
+        ) -> Result<ResolvedCredential, herness_core::CoreError> {
+            Ok(ResolvedCredential::new(
+                CredentialKind::ApiKey,
+                SecretString::new(self.secret.clone())?,
+            ))
+        }
+    }
+
+    fn port_host(harness: &PermissionHost) -> PortAssessmentHost {
+        PortAssessmentHost {
+            directory: harness.host.directory().clone(),
+            credentials: Arc::new(AllConnectionCredentials::new()),
+            endpoints: AssessmentEndpoints::for_loopback(
+                harness.server.url(),
+                harness.server.api_base(),
+                harness.server.url(),
+            )
+            .expect("assessment loopback endpoints"),
+        }
+    }
+
+    fn add_loopback_connection(
+        harness: &PermissionHost,
+        base: &str,
+        input: InputCapabilities,
+    ) -> ConnectionId {
+        let connection = ConnectionId::new();
+        harness
+            .host
+            .connections()
+            .add(
+                ConnectionSettings::new_with_capabilities(
+                    connection,
+                    Provider::OpenAiCompatible,
+                    MODEL,
+                    AuthMethod::ApiKey,
+                    Some(Endpoint::parse(base).expect("loopback endpoint")),
+                    None,
+                    ConnectionCapabilityDeclaration::new(EndpointClass::OpenAiCompletions, input),
+                )
+                .expect("loopback connection settings"),
+            )
+            .expect("add loopback connection");
+        connection
+    }
+
+    fn set_html_profile(
+        harness: &PermissionHost,
+        connection: ConnectionId,
+        required_inputs: herness_supervision::ProfileInputs,
+        grant: bool,
+        target_version: u64,
+    ) -> herness_supervision::AssessmentProfile {
+        let host = port_host(harness);
+        let built = herness_desktop::supervision::assessment::build_profile(
+            &host,
+            harness.project,
+            ProfilePurpose::Html,
+            connection,
+            MODEL,
+        )
+        .expect("html profile");
+        let profile = herness_supervision::AssessmentProfile::new(
+            herness_supervision_tests::ids(harness.project).profile,
+            herness_supervision::ProfileVersion::new(1).expect("profile version"),
+            ProfilePurpose::Html,
+            built.profile.provider(),
+            connection,
+            built.profile.model().clone(),
+            built.profile.adapter_version().clone(),
+            built.profile.rubric_version().clone(),
+            required_inputs,
+            herness_supervision::ProfileThresholds::normal_llm(),
+        )
+        .expect("html profile");
+        let mut config = harness.host.supervision().config().get(harness.project);
+        config.set_profile(profile.clone(), true);
+        harness
+            .host
+            .supervision()
+            .config()
+            .set(harness.project, config);
+        if grant {
+            let origin = host.origin_for(connection).expect("html profile origin");
+            harness
+                .host
+                .supervision_grant_consent(
+                    PlanRequestActor::Human,
+                    harness.project,
+                    ProfilePurpose::Html,
+                    origin,
+                    BTreeSet::from([DisclosureDataKind::Text]),
+                    vec!["src/main.rs".to_owned()],
+                    TargetVersion::new(target_version).expect("target version"),
+                    Some(harness.host.confirm_supervision(ConfirmationKind::Consent)),
+                )
+                .expect("html consent");
+        }
+        profile
+    }
+
+    fn create_target(
+        harness: &mut PermissionHost,
+        connection: ConnectionId,
+        budget: Option<HostBudgetInput>,
+    ) -> (
+        herness_desktop::supervision::SupervisionView,
+        SupervisionId,
+    ) {
+        let project = harness.project;
+        let view = harness
+            .host
+            .supervision_create(
+                PlanRequestActor::Human,
+                CreateSupervisionRequest {
+                    project,
+                    connection,
+                    instructions: PACKET_INSTRUCTION.to_owned(),
+                    conditions: vec![super::ConditionInput {
+                        title: "The check passes".to_owned(),
+                        rubric: "The Html assessment fixture uses a stable target.".to_owned(),
+                        checks: vec![super::CheckInput {
+                            command: "true".to_owned(),
+                            description: "fixture check".to_owned(),
+                        }],
+                    }],
+                    read_set: vec!["src/main.rs".to_owned()],
+                    write_paths: vec!["src".to_owned()],
+                    allow_shell: false,
+                    condition_version: Some(1),
+                    target_version: Some(1),
+                    budget,
+                },
+                Some(harness.host.confirm_supervision(ConfirmationKind::Create)),
+            )
+            .expect("create html target");
+        let supervision = view.supervision_id;
+        (view, supervision)
+    }
+
+    fn default_budget() -> Option<HostBudgetInput> {
+        Some(HostBudgetInput {
+            active_seconds: 60,
+            additional_runs: 1,
+            money_limit_micros: None,
+            price_version: None,
+        })
+    }
+
+    fn activate_ledger(
+        harness: &PermissionHost,
+        supervision: SupervisionId,
+        start_run: bool,
+    ) -> BudgetPolicy {
+        let store = harness.host.store_handle();
+        let plan = herness_desktop::supervision::plan::load_plan(
+            &store,
+            harness.project,
+            supervision,
+        )
+        .expect("load plan")
+        .expect("plan");
+        let policy = plan.budget.policy().expect("budget policy");
+        let mut ledger = BudgetLedger::open(
+            store,
+            harness.project,
+            supervision,
+            policy.clone(),
+            plan.budget_version,
+            HostBudgetClock::new(),
+        )
+        .expect("open ledger");
+        ledger.begin_active().expect("activate ledger");
+        if start_run {
+            ledger
+                .start_run(BudgetRequestId::new(harness.project))
+                .expect("start one budget run");
+        }
+        policy
+    }
+
+    fn append_evidence(
+        harness: &PermissionHost,
+        supervision: SupervisionId,
+        condition: ConditionId,
+        target: &TargetScope,
+        sequence: u64,
+        detail: &str,
+    ) -> EvidenceId {
+        let id = EvidenceId::new(harness.project);
+        let record = EvidenceRecord::new(
+            id,
+            supervision,
+            Some(condition),
+            None,
+            EvidenceAcquirer::ChildAgent,
+            VerificationOperation::command("true").expect("operation"),
+            EvidenceOutcome::new(Some(0), None, false, false, detail).expect("outcome"),
+            target.clone(),
+            EvidenceScope::new(
+                vec![format!("html assessment {sequence}")],
+                vec!["fixture scope".to_owned()],
+            )
+            .expect("scope"),
+            CheckStatus::Pass,
+            sequence,
+            Timestamp::now(),
+        )
+        .expect("evidence");
+        harness
+            .host
+            .store_handle()
+            .append(record)
+            .expect("append evidence");
+        id
+    }
+
+    fn html_request(
+        harness: &PermissionHost,
+        supervision: SupervisionId,
+        condition: ConditionId,
+        profile: &herness_supervision::AssessmentProfile,
+        target_version: u64,
+        evidence: Vec<EvidenceId>,
+    ) -> AssessmentRequest {
+        AssessmentRequest::new(
+            DecisionId::new(harness.project),
+            supervision,
+            condition,
+            herness_supervision::ConditionVersion::new(1).expect("condition version"),
+            TargetVersion::new(target_version).expect("target version"),
+            "H3 Html assessment rubric: preserve source information and meaning.",
+            profile.binding(),
+            profile.adapter_version().clone(),
+            profile.rubric_version().clone(),
+            evidence,
+        )
+        .expect("html assessment request")
+    }
+
+    fn completion_request(
+        harness: &PermissionHost,
+        supervision: SupervisionId,
+        condition: ConditionId,
+        profile: &herness_supervision::AssessmentProfile,
+        evidence: Vec<EvidenceId>,
+    ) -> AssessmentRequest {
+        AssessmentRequest::new(
+            DecisionId::new(harness.project),
+            supervision,
+            condition,
+            herness_supervision::ConditionVersion::new(1).expect("condition version"),
+            TargetVersion::new(1).expect("target version"),
+            "The completion condition is met when the recorded check passes.",
+            profile.binding(),
+            profile.adapter_version().clone(),
+            profile.rubric_version().clone(),
+            evidence,
+        )
+        .expect("completion assessment request")
+    }
+
+    fn push_llm_answer(server: &PermissionMock, condition: ConditionId, evidence: &[EvidenceId]) {
+        let content = json!({
+            "conditions": [{
+                "conditionId": condition.to_string(),
+                "verdict": "met",
+                "evidenceIds": evidence.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "rationale": "The supplied Html evidence supports the condition.",
+                "uncertainty": null,
+            }],
+        })
+        .to_string();
+        server.push(json!({
+            "model": MODEL,
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": content},
+            }],
+        }));
+    }
+
+    fn html_condition_and_target(
+        harness: &PermissionHost,
+        view: &herness_desktop::supervision::SupervisionView,
+    ) -> (ConditionId, TargetScope) {
+        let condition = view
+            .conditions
+            .first()
+            .expect("fixture condition")
+            .condition_id
+            .parse::<ConditionId>()
+            .expect("condition id");
+        let plan = herness_desktop::supervision::plan::load_plan(
+            &harness.host.store_handle(),
+            harness.project,
+            view.supervision_id,
+        )
+        .expect("load plan")
+        .expect("plan");
+        (condition, plan.evidence_target)
+    }
+
+    #[test]
+    fn html_assessment_uses_its_own_profile_consent_origin_and_the_same_cycle_ledger() {
+        let mut harness = PermissionHost::new();
+        harness.configure_purpose(ProfilePurpose::Completion);
+        harness
+            .host
+            .supervision_mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+            .expect("verify completion profile");
+
+        // The Html assessment model is a separate connection and origin from
+        // the target's Completion/authoring disclosure.
+        let html_server = PermissionMock::start();
+        let html_connection = add_loopback_connection(
+            &harness,
+            html_server.api_base().as_str(),
+            InputCapabilities::text_only(),
+        );
+        let html_profile = set_html_profile(
+            &harness,
+            html_connection,
+            herness_supervision::ProfileInputs::text_only(),
+            true,
+            1,
+        );
+
+        let connection = harness.connection;
+        let (view, supervision) = create_target(&mut harness, connection, default_budget());
+        let (condition, target) = html_condition_and_target(&harness, &view);
+        activate_ledger(&harness, supervision, true);
+        let evidence = vec![
+            append_evidence(
+                &harness,
+                supervision,
+                condition,
+                &target,
+                1,
+                "source unit and candidate content",
+            ),
+            append_evidence(
+                &harness,
+                supervision,
+                condition,
+                &target,
+                2,
+                "render and provenance evidence",
+            ),
+        ];
+
+        let request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &html_profile,
+            1,
+            evidence.clone(),
+        );
+        push_llm_answer(&html_server, condition, &evidence);
+        let mut port = HostAssessmentPort::new(
+            harness.host.store_handle(),
+            harness.host.supervision().config(),
+            port_host(&harness),
+        );
+        let html_facts = port
+            .profile(html_profile.binding())
+            .expect("html profile facts");
+        assert_eq!(html_facts.adapter_version().as_str(), "herness-llm-condition-v1");
+        let result = port.assess(&request).expect("html assessment");
+        assert_eq!(result.purpose(), ProfilePurpose::Html);
+        assert_eq!(
+            result.provenance().purpose(),
+            Some(ProfilePurpose::Html)
+        );
+        assert_eq!(result.reported_verdict(), herness_supervision::ConditionVerdict::Met);
+        assert_eq!(html_server.count(), 1);
+        assert_eq!(harness.server.count(), 0);
+        let html_body = html_server.requests()[0].json_body();
+        assert!(!html_body.to_string().contains("\"tools\":"));
+        assert!(!html_body.to_string().contains("\"tool_choice\":"));
+        assert!(
+            html_body.to_string().contains(&condition.to_string()),
+            "the Html request must carry the condition id"
+        );
+
+        // The same target completes a Completion assessment using the bound
+        // Completion profile/consent and its own origin. It is the same ledger.
+        let completion_profile = herness_desktop::supervision::plan::load_plan(
+            &harness.host.store_handle(),
+            harness.project,
+            supervision,
+        )
+        .expect("load plan")
+        .expect("plan")
+        .profile;
+        let completion = completion_request(
+            &harness,
+            supervision,
+            condition,
+            &completion_profile,
+            evidence.clone(),
+        );
+        push_llm_answer(&harness.server, condition, &evidence);
+        let completion_result = port.assess(&completion).expect("completion assessment");
+        assert_eq!(completion_result.purpose(), ProfilePurpose::Completion);
+        assert_eq!(harness.server.count(), 1);
+        assert_eq!(html_server.count(), 1);
+
+        let requests = harness
+            .host
+            .store_handle()
+            .lock()
+            .model_requests_for_project(&harness.project)
+            .expect("model requests");
+        let mut purposes = requests
+            .iter()
+            .map(|request| request.intent().purpose().as_str().to_owned())
+            .collect::<Vec<_>>();
+        purposes.sort();
+        assert_eq!(
+            purposes,
+            vec!["completion_assessment".to_owned(), "html_assessment".to_owned()]
+        );
+
+        let budget = harness
+            .host
+            .store_handle()
+            .lock()
+            .load_budget_record(harness.project, supervision)
+            .expect("budget record")
+            .expect("budget exists");
+        assert_eq!(budget.record().usage().runs_started(), 1);
+        assert!(budget.record().usage().active_seconds_consumed() >= 1);
+        assert_eq!(
+            budget.record().usage().money_consumed(),
+            herness_supervision::Money::zero()
+        );
+
+        // A stale Html request cannot be sent against another target version.
+        let stale = html_request(&harness, supervision, condition, &html_profile, 2, evidence);
+        let error = port.assess(&stale).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::AssessmentContractViolation { .. }
+        ));
+        assert_eq!(html_server.count(), 1);
+    }
+
+    #[test]
+    fn html_requires_its_own_consent_and_does_not_borrow_authoring_consent() {
+        let mut harness = PermissionHost::new();
+        harness.configure_purpose(ProfilePurpose::Completion);
+        harness
+            .host
+            .supervision_mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+            .expect("verify completion profile");
+
+        let html_server = PermissionMock::start();
+        let html_connection = add_loopback_connection(
+            &harness,
+            html_server.api_base().as_str(),
+            InputCapabilities::text_only(),
+        );
+        let html_profile = set_html_profile(
+            &harness,
+            html_connection,
+            herness_supervision::ProfileInputs::text_only(),
+            false,
+            1,
+        );
+
+        let connection = harness.connection;
+        let (view, supervision) = create_target(&mut harness, connection, default_budget());
+        let (condition, target) = html_condition_and_target(&harness, &view);
+        activate_ledger(&harness, supervision, false);
+        let evidence = vec![append_evidence(
+            &harness,
+            supervision,
+            condition,
+            &target,
+            1,
+            "html evidence",
+        )];
+        let request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &html_profile,
+            1,
+            evidence.clone(),
+        );
+        let mut port = HostAssessmentPort::new(
+            harness.host.store_handle(),
+            harness.host.supervision().config(),
+            port_host(&harness),
+        );
+
+        // A Completion consent exists for the target, but no Html consent does.
+        // The Html request must not borrow it.
+        let error = port.assess(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::ConsentBlocked {
+                reason: ConsentBlock::Revoked
+            }
+        ));
+        assert_eq!(html_server.count(), 0);
+        assert_eq!(harness.server.count(), 0);
+
+        // The exact Html consent and origin allow the Html request.
+        let html_origin = port_host(&harness)
+            .origin_for(html_connection)
+            .expect("html origin");
+        let original_html_consent = harness
+            .host
+            .supervision()
+            .config()
+            .get(harness.project)
+            .consent(ProfilePurpose::Html)
+            .cloned();
+        harness
+            .host
+            .supervision_grant_consent(
+                PlanRequestActor::Human,
+                harness.project,
+                ProfilePurpose::Html,
+                html_origin.clone(),
+                BTreeSet::from([DisclosureDataKind::Text]),
+                vec!["src/main.rs".to_owned()],
+                TargetVersion::new(1).expect("target version"),
+                Some(harness.host.confirm_supervision(ConfirmationKind::Consent)),
+            )
+            .expect("html consent");
+        assert!(original_html_consent.is_none());
+        push_llm_answer(&html_server, condition, &evidence);
+        port.assess(&request).expect("html assessment with consent");
+        assert_eq!(html_server.count(), 1);
+        assert_eq!(harness.server.count(), 0);
+
+        // Revocation rejects before a provider send.
+        harness
+            .host
+            .supervision_revoke_consent(
+                PlanRequestActor::Human,
+                harness.project,
+                ProfilePurpose::Html,
+                Some(harness.host.confirm_supervision(ConfirmationKind::Consent)),
+            )
+            .expect("revoke html consent");
+        let error = port.assess(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::ConsentBlocked {
+                reason: ConsentBlock::Revoked
+            }
+        ));
+        assert_eq!(html_server.count(), 1);
+        assert_eq!(harness.server.count(), 0);
+
+        // The Html assessment consent is not an authoring/contract consent:
+        // the contract-bound disclosure still requires the Completion consent.
+        let record = harness
+            .host
+            .supervision_record(harness.project, supervision)
+            .expect("record")
+            .expect("stored record");
+        let plan = herness_desktop::supervision::plan::load_plan(
+            &harness.host.store_handle(),
+            harness.project,
+            supervision,
+        )
+        .expect("load plan")
+        .expect("plan");
+        let contract = plan.contract(&record, Timestamp::now()).expect("contract");
+        let granted_html = herness_supervision::DisclosureConsent::grant(
+            herness_supervision::ApprovalActor::Human,
+            herness_supervision::ConsentId::new(harness.project),
+            html_origin.clone(),
+            herness_supervision::DisclosureScope::new(
+                ProfilePurpose::Html,
+                BTreeSet::from([DisclosureDataKind::Text]),
+                vec!["src/main.rs".to_owned()],
+                TargetVersion::new(1).expect("target version"),
+            )
+            .expect("html disclosure scope"),
+            Timestamp::now(),
+        )
+        .expect("html assessment consent");
+        let authoring_origin = ProviderOrigin::parse(harness.server.url()).expect("authoring origin");
+        let authoring_request = DisclosureRequest::new(
+            harness.project,
+            authoring_origin,
+            ProfilePurpose::Completion,
+            BTreeSet::from([DisclosureDataKind::Text]),
+            TargetVersion::new(1).expect("target version"),
+        )
+        .expect("authoring disclosure request");
+        assert_eq!(
+            contract.authorize_disclosure(&granted_html, &authoring_request),
+            Err(ConsentBlock::VersionMismatch)
+        );
+        assert_eq!(
+            granted_html.authorize(&authoring_request),
+            Err(ConsentBlock::DifferentOrigin)
+        );
+        let html_at_authoring_origin = DisclosureRequest::new(
+            harness.project,
+            html_origin,
+            ProfilePurpose::Completion,
+            BTreeSet::from([DisclosureDataKind::Text]),
+            TargetVersion::new(1).expect("target version"),
+        )
+        .expect("html-origin disclosure request");
+        assert_eq!(
+            granted_html.authorize(&html_at_authoring_origin),
+            Err(ConsentBlock::DifferentPurpose)
+        );
+    }
+
+    #[test]
+    fn money_capped_html_and_completion_assessments_refuse_before_send() {
+        let mut harness = PermissionHost::new();
+        harness.configure_purpose(ProfilePurpose::Completion);
+        harness
+            .host
+            .supervision_mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+            .expect("verify completion profile");
+        let html_profile = set_html_profile(
+            &harness,
+            harness.connection,
+            herness_supervision::ProfileInputs::text_only(),
+            true,
+            1,
+        );
+        let connection = harness.connection;
+        let (view, supervision) = create_target(
+            &mut harness,
+            connection,
+            Some(HostBudgetInput {
+                active_seconds: 60,
+                additional_runs: 1,
+                money_limit_micros: Some(100_000),
+                price_version: Some("fixture-price-v1".to_owned()),
+            }),
+        );
+        let (condition, target) = html_condition_and_target(&harness, &view);
+        activate_ledger(&harness, supervision, false);
+        let evidence = vec![append_evidence(
+            &harness,
+            supervision,
+            condition,
+            &target,
+            1,
+            "html evidence",
+        )];
+        let html = html_request(
+            &harness,
+            supervision,
+            condition,
+            &html_profile,
+            1,
+            evidence.clone(),
+        );
+        let completion_profile = herness_desktop::supervision::plan::load_plan(
+            &harness.host.store_handle(),
+            harness.project,
+            supervision,
+        )
+        .expect("load plan")
+        .expect("plan")
+        .profile;
+        let completion = completion_request(
+            &harness,
+            supervision,
+            condition,
+            &completion_profile,
+            evidence,
+        );
+        let mut port = HostAssessmentPort::new(
+            harness.host.store_handle(),
+            harness.host.supervision().config(),
+            port_host(&harness),
+        );
+
+        for request in [&html, &completion] {
+            let error = port.assess(request).unwrap_err();
+            assert!(matches!(
+                error,
+                SupervisionError::Unsupported { ref feature }
+                    if feature.contains("budget admission refused")
+            ));
+        }
+        assert_eq!(harness.server.count(), 0);
+        let requests = harness
+            .host
+            .store_handle()
+            .lock()
+            .model_requests_for_project(&harness.project)
+            .expect("model requests");
+        assert!(requests.is_empty());
+        let budget = harness
+            .host
+            .store_handle()
+            .lock()
+            .load_budget_record(harness.project, supervision)
+            .expect("budget record")
+            .expect("budget exists");
+        assert_eq!(
+            budget.record().usage().money_reserved(),
+            herness_supervision::Money::zero()
+        );
+        assert_eq!(
+            budget.record().usage().money_consumed(),
+            herness_supervision::Money::zero()
+        );
+    }
+
+    #[test]
+    fn html_image_requirements_revoked_consent_and_oversize_evidence_reject_before_send() {
+        let mut harness = PermissionHost::new();
+        harness.configure_purpose(ProfilePurpose::Completion);
+        harness
+            .host
+            .supervision_mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+            .expect("verify completion profile");
+        let text_profile = set_html_profile(
+            &harness,
+            harness.connection,
+            herness_supervision::ProfileInputs::text_only(),
+            true,
+            1,
+        );
+        let connection = harness.connection;
+        let (view, supervision) = create_target(&mut harness, connection, default_budget());
+        let (condition, target) = html_condition_and_target(&harness, &view);
+        activate_ledger(&harness, supervision, false);
+        let evidence = vec![append_evidence(
+            &harness,
+            supervision,
+            condition,
+            &target,
+            1,
+            "html evidence",
+        )];
+        let mut port = HostAssessmentPort::new(
+            harness.host.store_handle(),
+            harness.host.supervision().config(),
+            port_host(&harness),
+        );
+
+        // Revoked consent rejects before any provider request.
+        harness
+            .host
+            .supervision_revoke_consent(
+                PlanRequestActor::Human,
+                harness.project,
+                ProfilePurpose::Html,
+                Some(harness.host.confirm_supervision(ConfirmationKind::Consent)),
+            )
+            .expect("revoke html consent");
+        let request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &text_profile,
+            1,
+            evidence.clone(),
+        );
+        let error = port.assess(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::ConsentBlocked {
+                reason: ConsentBlock::Revoked
+            }
+        ));
+        assert_eq!(harness.server.count(), 0);
+
+        // An image-requiring Html profile on a text-only connection is not a
+        // text-only assessment.
+        harness
+            .host
+            .supervision_grant_consent(
+                PlanRequestActor::Human,
+                harness.project,
+                ProfilePurpose::Html,
+                ProviderOrigin::parse(harness.server.url()).expect("origin"),
+                BTreeSet::from([DisclosureDataKind::Text]),
+                vec!["src/main.rs".to_owned()],
+                TargetVersion::new(1).expect("target version"),
+                Some(harness.host.confirm_supervision(ConfirmationKind::Consent)),
+            )
+            .expect("html consent");
+        let text_only_connection_profile = set_html_profile(
+            &harness,
+            harness.connection,
+            herness_supervision::ProfileInputs::new(true, true, false),
+            false,
+            1,
+        );
+        let image_request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &text_only_connection_profile,
+            1,
+            evidence.clone(),
+        );
+        let error = port.assess(&image_request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::ProfileUnavailable {
+                reason: ProfileUnavailable::MissingInput { .. }
+            }
+        ));
+        assert_eq!(harness.server.count(), 0);
+
+        // Even an image-capable connection is not used for text-only evidence
+        // when the Html profile declares an image requirement.
+        let image_connection = add_loopback_connection(
+            &harness,
+            "http://127.0.0.1:9/v1",
+            InputCapabilities::text_and_image(),
+        );
+        let image_profile = set_html_profile(
+            &harness,
+            image_connection,
+            herness_supervision::ProfileInputs::new(true, true, false),
+            true,
+            1,
+        );
+        let image_request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &image_profile,
+            1,
+            evidence.clone(),
+        );
+        let error = port.assess(&image_request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::ProfileUnavailable {
+                reason: ProfileUnavailable::MissingInput { .. }
+            }
+        ));
+        assert_eq!(harness.server.count(), 0);
+
+        // Restore the text profile and consent for the oversize evidence case.
+        set_html_profile(
+            &harness,
+            harness.connection,
+            herness_supervision::ProfileInputs::text_only(),
+            true,
+            1,
+        );
+        let oversized = append_evidence(
+            &harness,
+            supervision,
+            condition,
+            &target,
+            2,
+            &"x".repeat(110_000),
+        );
+        let oversized_request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &text_profile,
+            1,
+            vec![oversized],
+        );
+        let error = port.assess(&oversized_request).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SupervisionError::AssessmentContractViolation { .. }
+            ),
+            "unexpected oversize error: {error:?}"
+        );
+        assert_eq!(harness.server.count(), 0);
+        let requests = harness
+            .host
+            .store_handle()
+            .lock()
+            .model_requests_for_project(&harness.project)
+            .expect("model requests");
+        assert!(
+            requests.is_empty(),
+            "a rejected Html image/consent/oversize request must not record a send intent"
+        );
+    }
+
+    #[test]
+    fn html_assessment_requires_a_verified_profile_and_rejects_a_permission_request() {
+        let mut harness = PermissionHost::new();
+        harness.configure_purpose(ProfilePurpose::Completion);
+        harness
+            .host
+            .supervision_mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
+            .expect("verify completion profile");
+        let html_profile = set_html_profile(
+            &harness,
+            harness.connection,
+            herness_supervision::ProfileInputs::text_only(),
+            true,
+            1,
+        );
+        let connection = harness.connection;
+        let (view, supervision) = create_target(&mut harness, connection, default_budget());
+        let (condition, target) = html_condition_and_target(&harness, &view);
+        activate_ledger(&harness, supervision, false);
+        let evidence = vec![append_evidence(
+            &harness,
+            supervision,
+            condition,
+            &target,
+            1,
+            "html evidence",
+        )];
+        let mut port = HostAssessmentPort::new(
+            harness.host.store_handle(),
+            harness.host.supervision().config(),
+            port_host(&harness),
+        );
+
+        // Permission requests never enter the condition assessment gate.
+        let permission_profile = herness_supervision::AssessmentProfile::new(
+            herness_supervision::ProfileId::new(harness.project),
+            herness_supervision::ProfileVersion::new(1).expect("version"),
+            ProfilePurpose::Permission,
+            ProviderKind::NormalLlm,
+            harness.connection,
+            ModelId::new(MODEL).expect("model"),
+            AdapterVersion::new("herness-llm-condition-v1").expect("adapter"),
+            RubricVersion::new("herness-conditions-v1").expect("rubric"),
+            herness_supervision::ProfileInputs::text_only(),
+            ProfileThresholds::normal_llm(),
+        )
+        .expect("permission profile");
+        let mut config = harness.host.supervision().config().get(harness.project);
+        config.set_profile(permission_profile.clone(), true);
+        harness
+            .host
+            .supervision()
+            .config()
+            .set(harness.project, config);
+        let permission_request = AssessmentRequest::new(
+            DecisionId::new(harness.project),
+            supervision,
+            condition,
+            herness_supervision::ConditionVersion::new(1).expect("version"),
+            TargetVersion::new(1).expect("version"),
+            "fixture permission rubric",
+            permission_profile.binding(),
+            permission_profile.adapter_version().clone(),
+            permission_profile.rubric_version().clone(),
+            evidence,
+        )
+        .expect("permission request");
+        let error = port.assess(&permission_request).unwrap_err();
+        assert!(matches!(error, SupervisionError::Unsupported { .. }));
+        assert_eq!(harness.server.count(), 0);
+
+        // An unverified Html profile is not usable.
+        let mut config = harness.host.supervision().config().get(harness.project);
+        let unverified = herness_supervision::AssessmentProfile::new(
+            html_profile.id(),
+            herness_supervision::ProfileVersion::new(2).expect("version"),
+            ProfilePurpose::Html,
+            html_profile.provider(),
+            html_profile.connection(),
+            html_profile.model().clone(),
+            html_profile.adapter_version().clone(),
+            html_profile.rubric_version().clone(),
+            html_profile.required_inputs(),
+            html_profile.thresholds(),
+        )
+        .expect("unverified profile");
+        config.set_profile(unverified.clone(), false);
+        harness
+            .host
+            .supervision()
+            .config()
+            .set(harness.project, config);
+        let request = html_request(
+            &harness,
+            supervision,
+            condition,
+            &unverified,
+            1,
+            vec![EvidenceId::new(harness.project)],
+        );
+        let error = port.assess(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisionError::Unsupported { .. } | SupervisionError::ProfileUnavailable { .. }
+        ));
         assert_eq!(harness.server.count(), 0);
     }
 }

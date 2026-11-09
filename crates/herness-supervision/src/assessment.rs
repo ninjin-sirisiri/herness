@@ -355,6 +355,8 @@ impl AssessmentRequest {
 pub struct AssessmentProvenance {
     provider: Provider,
     provider_kind: ProviderKind,
+    #[serde(default)]
+    purpose: Option<ProfilePurpose>,
     model: ModelId,
     #[serde(default)]
     reported_model: Option<ModelId>,
@@ -385,11 +387,31 @@ impl AssessmentProvenance {
         Ok(Self {
             provider,
             provider_kind,
+            purpose: None,
             model,
             reported_model: None,
             adapter_version,
             rubric_version,
         })
+    }
+
+    /// Records the assessment purpose the adapter was asked to serve.
+    ///
+    /// `Completion` and `Html` share the condition request shape but are not
+    /// interchangeable. The recorded purpose lets a consumer distinguish them
+    /// without inferring it from the profile or provider.
+    #[must_use]
+    pub fn with_purpose(mut self, purpose: ProfilePurpose) -> Self {
+        self.purpose = Some(purpose);
+        self
+    }
+
+    /// Assessment purpose, when the writer recorded it.
+    ///
+    /// Older payloads without this field return `None`; they are never
+    /// silently treated as `Completion`.
+    pub const fn purpose(&self) -> Option<ProfilePurpose> {
+        self.purpose
     }
 
     /// Records the model identifier actually reported by the provider.
@@ -503,6 +525,16 @@ impl AssessmentResult {
                 detail: "adapter and rubric versions must match the request".to_owned(),
             });
         }
+        if provenance
+            .purpose()
+            .is_some_and(|purpose| purpose != request.purpose())
+        {
+            return Err(SupervisionError::AssessmentContractViolation {
+                field: "assessmentResult.provenance.purpose".to_owned(),
+                detail: "the provenance purpose must match the requested assessment purpose"
+                    .to_owned(),
+            });
+        }
         let uncertainty = uncertainty
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
@@ -567,6 +599,14 @@ impl AssessmentResult {
     /// Fixed profile.
     pub const fn profile(&self) -> ProfileBinding {
         self.profile
+    }
+
+    /// Assessment purpose recorded by the fixed profile binding.
+    ///
+    /// `Html` results are not Completion results; a consumer must compare this
+    /// purpose and the binding before using a result for completion.
+    pub const fn purpose(&self) -> ProfilePurpose {
+        self.profile.purpose()
     }
 
     /// Evidence cited by the result.

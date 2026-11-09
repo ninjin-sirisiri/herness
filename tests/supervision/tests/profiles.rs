@@ -576,3 +576,147 @@ fn decision_confidence_and_rationale_provenance_are_additive_and_not_adoption_in
         _ => panic!("expected Decision"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Html purpose (Task 12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn html_is_a_distinct_condition_purpose_with_no_completion_fallback() {
+    assert!(ProfilePurpose::Completion.is_condition_assessment());
+    assert!(ProfilePurpose::Html.is_condition_assessment());
+    assert!(!ProfilePurpose::Permission.is_condition_assessment());
+
+    let project = project();
+    let connection = normal_connection();
+    let html = llm_html_profile_for(
+        project,
+        connection.connection_id(),
+        "synthetic-html-judge",
+        ProfileInputs::text_only(),
+    );
+    assert_eq!(html.purpose(), ProfilePurpose::Html);
+    let html_entry = ProfileEntry::new(
+        html.clone(),
+        connection,
+        ConnectionStatus::Available,
+        false,
+    );
+
+    let mut catalog = ProfileCatalog::for_project(project);
+    catalog.insert(html_entry).expect("insert html profile");
+    assert!(catalog.resolve(ProfilePurpose::Html).is_ok());
+    assert_eq!(
+        catalog.resolve(ProfilePurpose::Completion),
+        Err(unavailable(ProfileUnavailable::Unset {
+            purpose: ProfilePurpose::Completion
+        }))
+    );
+
+    let completion_binding = ProfileBinding::new(
+        html.id(),
+        html.version(),
+        ProfilePurpose::Completion,
+    );
+    assert!(!completion_binding.matches(&html));
+    assert!(matches!(
+        catalog.resolve_bound(completion_binding),
+        Err(SupervisionError::ProfileUnavailable {
+            reason: ProfileUnavailable::Unset { .. }
+        })
+    ));
+}
+
+#[test]
+fn html_assessment_results_record_their_purpose_and_never_support_completion() {
+    let project = project();
+    let fixture_ids = ids(project);
+    let profile = llm_html_profile_for(
+        project,
+        normal_connection().connection_id(),
+        "synthetic-html-judge",
+        ProfileInputs::text_only(),
+    );
+    let request = assessment_request(
+        project,
+        fixture_ids.condition_a,
+        &profile,
+        vec![fixture_ids.evidence_a],
+    );
+    let provenance = AssessmentProvenance::new(
+        Provider::OpenAi,
+        ProviderKind::NormalLlm,
+        profile.model().clone(),
+        request.adapter_version().clone(),
+        request.rubric_version().clone(),
+    )
+    .expect("provenance")
+    .with_purpose(ProfilePurpose::Html);
+    let result = AssessmentResult::new(
+        &request,
+        vec![fixture_ids.evidence_a],
+        "The Html evidence supports the recorded verdict.",
+        None,
+        AssessmentOutcome::NormalLlm {
+            verdict: ConditionVerdict::Met,
+            confidence: None,
+        },
+        provenance,
+        now(),
+    )
+    .expect("result");
+
+    assert_eq!(result.purpose(), ProfilePurpose::Html);
+    assert_eq!(result.profile().purpose(), ProfilePurpose::Html);
+    assert_eq!(
+        result.provenance().purpose(),
+        Some(ProfilePurpose::Html)
+    );
+
+    let completion_binding =
+        ProfileBinding::new(profile.id(), profile.version(), ProfilePurpose::Completion);
+    assert!(!result.supports_completion(
+        ConditionVersion::new(1).expect("version"),
+        TargetVersion::new(1).expect("version"),
+        completion_binding,
+        ProfileThresholds::normal_llm(),
+    ));
+
+    // A provenance record that claims Completion for an Html request is
+    // rejected; the purpose is never inferred or silently substituted.
+    let wrong_provenance = AssessmentProvenance::new(
+        Provider::OpenAi,
+        ProviderKind::NormalLlm,
+        profile.model().clone(),
+        request.adapter_version().clone(),
+        request.rubric_version().clone(),
+    )
+    .expect("provenance")
+    .with_purpose(ProfilePurpose::Completion);
+    assert!(matches!(
+        AssessmentResult::new(
+            &request,
+            vec![fixture_ids.evidence_a],
+            "The Html evidence supports the recorded verdict.",
+            None,
+            AssessmentOutcome::NormalLlm {
+                verdict: ConditionVerdict::Met,
+                confidence: None,
+            },
+            wrong_provenance,
+            now(),
+        ),
+        Err(SupervisionError::AssessmentContractViolation { .. })
+    ));
+
+    // Older payloads without a provenance purpose remain readable and are not
+    // relabelled as Completion. The profile binding still records Html.
+    let mut value = serde_json::to_value(&result).expect("result JSON");
+    value["provenance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("purpose");
+    let decoded: AssessmentResult = serde_json::from_value(value).expect("legacy result JSON");
+    assert_eq!(decoded.provenance().purpose(), None);
+    assert_eq!(decoded.purpose(), ProfilePurpose::Html);
+}
