@@ -2,7 +2,7 @@
 
 **Classification:** architectural
 
-**Status:** 2026-11-09、利用者が本specとH1/H2のH3 integration additionsを承認し、H3のsdd-planへ進む。設計承認は本実装・追加の実モデル送信・pushの許可ではない。
+**Status:** 2026-11-09、利用者が本specとH1/H2のH3 integration additionsを承認し、[H3実装plan](../plans/2026-11-09-h3-html-sync.md)を保存済み。設計承認は本実装・追加の実モデル送信・pushの許可ではない。
 
 **Chosen approach:** Rust hostによる変更イベント監視と定期照合、候補領域でのagent著作、SDD共通検証とH2評価、履歴を残すhost反映を組み合わせる。
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:96c4b640286dd66a3d44cd8682d7adb5a3ccc296c7d759e01fdf2fdb5d8b1d16">
+<meta name="sdd-source-digest" content="sha256:dcc140f31d815c137386fdddd25c0bd14beb9d2c6e42295cb219a75f5b44eb52">
 <title>herness Spec roadmap</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -44,7 +44,7 @@
 <main id="content" tabindex="-1">
 <h1 id="herness-spec-roadmap">herness Spec roadmap</h1>
 <p class="metadata"><strong>Classification:</strong> architectural / multi-spec</p>
-<p class="metadata"><strong>Status:</strong> 分割・依存関係、H1〜H3のspec、H1/H2の接続追加契約は承認済み。H1・H2の実装はmainへ統合済みだが受入未完了。H3は承認済み契約に基づくplanを作成する段階であり、未実装。追加の本実装・実接続の許可ではない。</p>
+<p class="metadata"><strong>Status:</strong> 分割・依存関係、H1〜H3のspec、H1/H2の接続追加契約は承認済み。H1・H2の実装はmainへ統合済みだが受入未完了。H3の実装planを保存済み、H3は未実装。追加の本実装・実接続の許可ではない。</p>
 <section>
 <h2 id="全体目標">全体目標</h2>
 <p>Piを出発点に、SDDによる開発を進めるデスクトップ型エージェントハーネス「herness」を作る。最初の対象はmacOSとする。軽さを重視してTauriとRust中心の構成を優先し、PiのRust移植や他のエージェント基盤もH1で比較する。CLIの操作をGUIに置き換えるだけでなく、子エージェントの起動・継続・完了判定をhernessが制御する。</p>
@@ -129,6 +129,7 @@
 <li><strong>観測可能な完了:</strong> hernessのツール編集と外部編集のどちらからも自動起動し、最新の原文に対応するHTMLだけを同期済みと扱う。順序変更や図解を含む代表文書で全文情報の保持と理解のしやすさを確認し、対応する共通policyの必須検証とH2経由の評価が成立する。古い結果、危険なHTML、情報欠落、判定不能を成功として公開せず、既存成果物を壊さない失敗経路を確認できる。</li>
 <li><strong>消費先:</strong> H4・H5。</li>
 <li><strong>Spec:</strong> <a href="2026-11-09-h3-html-sync-design.md">H3: HTML companionの自動更新と視覚的再構成</a>。2026-11-09にH3 specと各正本のH1/H2接続追加契約を承認済み。追加部分は未実装。</li>
+<li><strong>Plan:</strong> <a href="../plans/2026-11-09-h3-html-sync.md">H3 HTML Sync and Reconstruction Implementation Plan</a>。pack側の共通契約とH1/H2前提補修を含む25 Taskを直列に計画済み。実装指示待ち。</li>
 </ul>
 </section>
 <section>
@@ -162,7 +163,7 @@
 <li>H5の依存する操作の詳細設計は、その操作が利用するH1〜H4の契約確定後に行う。見た目の検討や試作まで禁止するものではない。</li>
 </ul>
 <p>承認済みの設計順序はH1 → H2 → H3 → H4 → H5とする。これは個別specを自動で連続設計・実装する指示ではない。UIの実装を最後まで禁止せず、必要最小限の接続確認は各specの受入条件で扱う。</p>
-<p><strong>現在の対象は、承認済みH3のsdd-planである。</strong> H1・H2は実装を統合済みだが受入未完了。H3が必要とする追加・補修はH3 specと各正本の追加契約に記録し、既存コードで利用可能とはみなさない。H3のplan保存と実装指示までは本実装を始めず、実接続には別途許可を必要とする。H4以降へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。</p>
+<p><strong>現在の対象は、plan保存済み・実装指示待ちのH3である。</strong> H1・H2は実装を統合済みだが受入未完了。H3が必要とする追加・補修はH3 specと各正本の追加契約に記録し、既存コードで利用可能とはみなさない。sdd-executeの指示までは本実装を始めず、実接続には別途許可を必要とする。H4以降へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。</p>
 </section>
 <section>
 <h2 id="共通契約の所有者">共通契約の所有者</h2>
