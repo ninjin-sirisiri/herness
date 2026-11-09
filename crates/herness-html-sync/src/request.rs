@@ -124,6 +124,11 @@ pub enum H3Operation {
         /// Generation to restore.
         generation: GenerationId,
     },
+    /// The source Markdown disappeared or moved outside H3.
+    SourceRemoved {
+        /// New Target-relative path for a move, or `None` for a deletion.
+        new_path: Option<String>,
+    },
 }
 
 impl H3Operation {
@@ -142,6 +147,7 @@ impl H3Operation {
             Self::ResolveConflict { .. } => "resolve_conflict",
             Self::GetHistory { .. } => "get_history",
             Self::RestoreHistory { .. } => "restore_history",
+            Self::SourceRemoved { .. } => "source_removed",
         }
     }
 
@@ -158,6 +164,7 @@ impl H3Operation {
                 | Self::ResolveConflict { .. }
                 | Self::GetHistory { .. }
                 | Self::RestoreHistory { .. }
+                | Self::SourceRemoved { .. }
         )
     }
 
@@ -173,6 +180,7 @@ impl H3Operation {
                 | Self::Regenerate
                 | Self::ResolveConflict { .. }
                 | Self::RestoreHistory { .. }
+                | Self::SourceRemoved { .. }
         )
     }
 
@@ -187,6 +195,7 @@ impl H3Operation {
                 | Self::Regenerate
                 | Self::ResolveConflict { .. }
                 | Self::RestoreHistory { .. }
+                | Self::SourceRemoved { .. }
         )
     }
 }
@@ -247,6 +256,18 @@ impl H3OperationRequest {
             && limit == 0
         {
             return Err(H3Error::must_be_positive("historyLimit"));
+        }
+        if let H3Operation::SourceRemoved { new_path: Some(path) } = &operation {
+            let new_document = DocumentKey::new(project_id, path.clone())?;
+            if document
+                .as_ref()
+                .is_some_and(|document| document.target_path() == new_document.target_path())
+            {
+                return Err(H3Error::invalid(
+                    "newPath",
+                    "a moved Target must have a different canonical path",
+                ));
+            }
         }
         Ok(Self {
             format_version: H3_FORMAT_VERSION,
@@ -385,6 +406,38 @@ pub enum H3OperationOutcome {
     History {
         /// History entries in generation order.
         generations: Vec<GenerationRecord>,
+    },
+    /// A historical version was restored. The document stays unsynchronized
+    /// and waits for a human reassessment; this is not a synced result.
+    Restored {
+        /// Restore journal identifier.
+        publication: crate::ids::PublicationId,
+        /// Generation whose exact bytes were restored.
+        generation: GenerationId,
+        /// Exact restored HTML digest.
+        html_digest: ContentDigest,
+        /// Exact restored receipt digest.
+        receipt_digest: ContentDigest,
+        /// Durable document revision after the restore commit.
+        revision: u64,
+    },
+    /// The selected history pair already equals the formal pair.
+    HistoryUnchanged {
+        /// Selected generation.
+        generation: GenerationId,
+    },
+    /// The Markdown source disappeared or moved. Old artifacts were retained.
+    Orphaned {
+        /// Project-relative companion path that was retained.
+        target: String,
+        /// Remaining approved Target paths after the removal.
+        remaining_paths: Vec<String>,
+        /// New Target path for a move, when one was supplied.
+        new_target: Option<String>,
+        /// Whether the new path is already inside the approved Target scope.
+        new_target_approved: bool,
+        /// Durable document revision after the orphan commit.
+        revision: u64,
     },
     /// A subscription cursor acknowledgement.
     Subscription {

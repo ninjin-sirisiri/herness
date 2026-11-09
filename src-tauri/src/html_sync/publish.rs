@@ -15,8 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herness_core::{
-    ArchivedVersion, EventDraft, OldVersionArchive, ProjectId, ProjectRoot, PublicationFailure,
-    PublicationRecord, PublicationRequest, RunControl, Timestamp,
+    ArchivedVersion, EventDraft, ExpectedTargetVersion, OldVersionArchive, ProjectId, ProjectRoot,
+    PublicationFailure, PublicationRecord, PublicationRequest, RunControl, Timestamp,
 };
 use herness_core::ports::publish::{
     PublicationArchivePort, PublicationGatePort, PublicationRecordPort,
@@ -25,9 +25,11 @@ use herness_core::runtime::{PrivateAppArchive, PublicationWriter};
 use herness_html_sync::{
     CandidatePublication, ExpectedPublicationWrite, FilesystemSourceReader,
     FinalCandidateCheck, FinalCandidateCheckPort, FinalCandidateCheckRequest, H3Error,
-    H3StorePort, ObservationClock, ProjectObserver, PublicationFileReadPort,
-    PublicationOrchestrator, PublicationOutcome, PublicationSafety, PublicationSafetyPort,
-    PublicationSafetyRequest, PublicationWriteExpectationPort, SourceReadError, SourceReadPort,
+    H3OperationRequest, H3StorePort, HistoryReadPort, HistoryRestoreOutcome, ObservationClock,
+    ProjectObserver, PublicationFileReadPort, PublicationId, PublicationOrchestrator,
+    PublicationOutcome, PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
+    PublicationWriteExpectationPort, SourceReadError, SourceReadPort, replace_with_regenerated,
+    restore_history,
 };
 use herness_supervision::TargetVersion;
 use herness_supervision::profiles::ProfileBinding;
@@ -559,6 +561,11 @@ impl DesktopPublisher {
         })
     }
 
+    /// The verified Common SDD policy connection used by this publisher.
+    pub const fn bridge(&self) -> &ConnectedPolicyBridge {
+        self.final_check.bridge()
+    }
+
     /// Runs one idempotent publication attempt.
     pub fn publish(
         &mut self,
@@ -579,6 +586,60 @@ impl DesktopPublisher {
             .post_verification()
             .target_version();
         let profile = attempt.applied().binding().post_verification().profile();
+        let document = attempt.document().clone();
+        let generation = attempt.generation().clone();
+        self.with_orchestrator(
+            &document,
+            &generation,
+            target_version,
+            profile,
+            expectations,
+            |orchestrator| orchestrator.publish(attempt, now),
+        )
+    }
+
+    /// Runs one explicit regenerated replacement through the H3 conflict rules.
+    pub fn replace_explicit(
+        &mut self,
+        attempt: CandidatePublication,
+        expectations: &mut dyn PublicationWriteExpectationPort,
+        now: Timestamp,
+    ) -> Result<PublicationOutcome, H3Error> {
+        if attempt.document().project_id() != self.project {
+            return Err(H3Error::CrossProject {
+                id_kind: "publication".to_owned(),
+                expected: self.project,
+                found: attempt.document().project_id(),
+            });
+        }
+        let target_version = attempt
+            .applied()
+            .binding()
+            .post_verification()
+            .target_version();
+        let profile = attempt.applied().binding().post_verification().profile();
+        let document = attempt.document().clone();
+        let generation = attempt.generation().clone();
+        self.with_orchestrator(
+            &document,
+            &generation,
+            target_version,
+            profile,
+            expectations,
+            |orchestrator| replace_with_regenerated(orchestrator, attempt, now),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_orchestrator<R>(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+        generation: &herness_html_sync::GenerationRecord,
+        target_version: TargetVersion,
+        profile: ProfileBinding,
+        expectations: &mut dyn PublicationWriteExpectationPort,
+        run: impl FnOnce(&mut PublicationOrchestrator<'_>) -> Result<R, H3Error>,
+    ) -> Result<R, H3Error> {
         let mut archive = SharedHistoryArchive::new(&self.archive_root).map_err(|error| {
             H3Error::Storage {
                 detail: format!("the private history archive is unavailable: {error}"),
@@ -588,14 +649,16 @@ impl DesktopPublisher {
             store: self.store.clone(),
             safety: &self.safety,
             control: self.control.clone(),
-            document: attempt.document().clone(),
-            generation: attempt.generation().clone(),
+            document: document.clone(),
+            generation: generation.clone(),
             target_version,
             profile,
         };
         let mut writer = PublicationWriter::new(
             self.project,
-            ProjectRoot::new(&self.project_root).map_err(|error| H3Error::invalid("projectRoot", error.to_string()))?,
+            ProjectRoot::new(&self.project_root).map_err(|error| {
+                H3Error::invalid("projectRoot", error.to_string())
+            })?,
             H3PublicationRecords::new(self.store.clone()),
             archive.clone(),
             gate,
@@ -613,6 +676,97 @@ impl DesktopPublisher {
             expectations,
             control: &self.control,
         };
-        orchestrator.publish(attempt, now)
+        run(&mut orchestrator)
+    }
+
+    /// Restores one selected historical pair through the same host writer.
+    ///
+    /// The H3 restore orchestrator saves the current pair to history first and
+    /// never marks the document synced. This method only supplies the real
+    /// project read boundary, private archive, H1 writer, and safety gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        &mut self,
+        request: &H3OperationRequest,
+        publication: PublicationId,
+        expected_html: &ExpectedTargetVersion,
+        expected_receipt: &ExpectedTargetVersion,
+        history: &dyn HistoryReadPort,
+        now: Timestamp,
+    ) -> Result<HistoryRestoreOutcome, H3Error> {
+        let document = request
+            .document()
+            .cloned()
+            .ok_or_else(|| H3Error::empty("document"))?;
+        let herness_html_sync::H3Operation::RestoreHistory { generation } = request.operation()
+        else {
+            return Err(H3Error::invalid(
+                "operation",
+                "restore requires a RestoreHistory operation",
+            ));
+        };
+        let settings = self
+            .store
+            .load_html_sync_settings(self.project)?
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.restore.settings".to_owned(),
+                detail: "the project has no stored H3 settings".to_owned(),
+            })?;
+        let approval = settings
+            .settings()
+            .approval()
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.restore.approval".to_owned(),
+                detail: "the project has no human configuration approval".to_owned(),
+            })?;
+        let target_version = approval.assessment().consent().target_scope_version();
+        let profile = approval.assessment().profile();
+        let selected_generation = self
+            .store
+            .lock()
+            .html_sync_generations(document.project_id(), &document)?
+            .into_iter()
+            .find(|record| record.generation_id() == *generation)
+            .ok_or_else(|| H3Error::NotFound {
+                record: "generation",
+                id: generation.to_string(),
+            })?;
+        let mut archive = SharedHistoryArchive::new(&self.archive_root).map_err(|error| {
+            H3Error::Storage {
+                detail: format!("the private history archive is unavailable: {error}"),
+            }
+        })?;
+        let gate = H3PublicationGate {
+            store: self.store.clone(),
+            safety: &self.safety,
+            control: self.control.clone(),
+            document,
+            generation: selected_generation,
+            target_version,
+            profile,
+        };
+        let mut writer = PublicationWriter::new(
+            self.project,
+            ProjectRoot::new(&self.project_root)
+                .map_err(|error| H3Error::invalid("projectRoot", error.to_string()))?,
+            H3PublicationRecords::new(self.store.clone()),
+            archive.clone(),
+            gate,
+            self.control.clone(),
+        )
+        .map_err(|error| H3Error::invalid("publicationWriter", error.to_string()))?;
+        let mut h3_store = self.store.clone();
+        restore_history(
+            &mut h3_store,
+            &self.files,
+            history,
+            &mut archive,
+            &mut writer,
+            request,
+            publication,
+            expected_html,
+            expected_receipt,
+            now,
+        )
     }
 }

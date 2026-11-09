@@ -22,6 +22,7 @@ pub mod evidence;
 pub mod events;
 pub mod ids;
 pub mod observer;
+pub mod operations;
 pub mod ports;
 pub mod publish;
 pub mod request;
@@ -90,6 +91,13 @@ pub use observer::{
     ObserverHealth, ObserverTick, ProjectObserver, RecoveryReconciliation, SourceChange,
     SourceObservation, SourceReadError, SourceReadPort, SystemObservationClock, WatcherStatus,
     dependency_fingerprint, html_evidence_path,
+};
+pub use operations::{
+    AdoptionOutcome, AdoptionPreparation, CurrentHtmlAdoption, CurrentHtmlValidation,
+    HistoryReadPort, HistoryRestoreOutcome, HistoryVersion, SourceJobControlPort,
+    SourceRemovalOutcome, SourceStop, adopt_current_html, prepare_adoption,
+    record_external_html_conflict, record_source_removal, replace_with_regenerated,
+    restore_history,
 };
 pub use ports::{
     DocumentCommit, H3DocumentRecord, H3SettingsRecord, H3StorePort, HtmlSyncCommit,

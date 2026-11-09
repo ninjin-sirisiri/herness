@@ -148,6 +148,8 @@ pub struct CandidatePublication {
     applied: AppliedEvaluation,
     expected_html: ExpectedTargetVersion,
     expected_receipt: ExpectedTargetVersion,
+    /// Explicit human conflict resolution rather than automatic publication.
+    explicit_resolution: bool,
 }
 
 impl CandidatePublication {
@@ -207,7 +209,25 @@ impl CandidatePublication {
             applied,
             expected_html,
             expected_receipt,
+            explicit_resolution: false,
         })
+    }
+
+    /// Marks this attempt as an explicit human conflict resolution.
+    ///
+    /// Explicit attempts may start from `waiting_human`, are not gated by the
+    /// automatic-publication flag, may replace an invalid previous receipt
+    /// metadata file, and record the prepared generation atomically with the
+    /// publication intent. They still run the same final validation, exact
+    /// version checks, old-version history save, and idempotent journal.
+    pub fn with_explicit_resolution(mut self) -> Self {
+        self.explicit_resolution = true;
+        self
+    }
+
+    /// Whether this is an explicit human conflict resolution.
+    pub const fn is_explicit_resolution(&self) -> bool {
+        self.explicit_resolution
     }
 
     /// Publication journal identifier.
@@ -611,6 +631,7 @@ impl PublicationOrchestrator<'_> {
         let previous_receipt = match current_receipt.as_deref() {
             Some(bytes) => match std::str::from_utf8(bytes) {
                 Ok(text) => Some(text),
+                Err(_) if attempt.explicit_resolution => None,
                 Err(_) => {
                     let refusal = Refusal::conflict(
                         HumanWaitCause::ExternalHtmlConflict,
@@ -625,6 +646,27 @@ impl PublicationOrchestrator<'_> {
 
         let receipt = match build_publication_receipt(&attempt, settings, previous_receipt) {
             Ok(receipt) => receipt,
+            Err(_error) if attempt.explicit_resolution => {
+                // An explicit human resolution may replace invalid metadata. The
+                // old receipt is still archived byte-exactly before replacement.
+                match build_publication_receipt(&attempt, settings, None) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let refusal = Refusal::conflict(
+                            HumanWaitCause::ExternalHtmlConflict,
+                            error.to_string(),
+                            receipt_path,
+                        );
+                        return self.persist_terminal(
+                            &attempt,
+                            &document_record,
+                            journal,
+                            refusal,
+                            now,
+                        );
+                    }
+                }
+            }
             Err(error) => {
                 let refusal = Refusal::conflict(
                     HumanWaitCause::ExternalHtmlConflict,
@@ -713,7 +755,11 @@ impl PublicationOrchestrator<'_> {
             },
             Vec::new(),
         )?;
-        let ready_document = rebuild_document(&document_record.state(), ready_reason, now)?;
+        let ready_document = if attempt.explicit_resolution {
+            rebuild_explicit_ready_document(&attempt, ready_reason, now)?
+        } else {
+            rebuild_document(&document_record.state(), ready_reason, now)?
+        };
         let prepared_event = crate::events::publication_event(&journal, now)?;
         let ready_event = crate::events::document_state_event(
             attempt.document(),
@@ -721,15 +767,23 @@ impl PublicationOrchestrator<'_> {
             &ready_document,
             now,
         )?;
-        let prepared_outcome = match self.store.commit_html_sync(
-            HtmlSyncCommit::new()
-                .with_document(DocumentCommit::new(
-                    Some(document_record.revision()),
-                    ready_document,
-                )?)
-                .with_publication(journal.clone())
-                .with_events(vec![ready_event, prepared_event]),
-        )? {
+        let mut ready_commit = HtmlSyncCommit::new()
+            .with_document(DocumentCommit::new(
+                Some(document_record.revision()),
+                ready_document,
+            )?)
+            .with_publication(journal.clone())
+            .with_events(vec![ready_event, prepared_event]);
+        if attempt.explicit_resolution {
+            // The human-selected replacement/adoption generation and its exact
+            // candidate metadata become durable with the publication intent,
+            // before any file side effect.
+            ready_commit = ready_commit.with_generation(attempt.generation.clone());
+            if let Some(candidate) = attempt.generation.candidate() {
+                ready_commit = ready_commit.with_candidate(candidate.clone());
+            }
+        }
+        let prepared_outcome = match self.store.commit_html_sync(ready_commit)? {
             HtmlSyncCommitOutcome::Applied { document, .. } => document,
             HtmlSyncCommitOutcome::Duplicate { .. } => {
                 return Err(H3Error::Storage {
@@ -1063,13 +1117,31 @@ impl PublicationOrchestrator<'_> {
             now,
         )?;
         let publication_event = crate::events::publication_event(&published, now)?;
-        let commit = HtmlSyncCommit::new()
+        let mut commit = HtmlSyncCommit::new()
             .with_document(DocumentCommit::new(
                 Some(current_document.revision()),
                 synced_document,
             )?)
             .with_publication(published.clone())
             .with_events(vec![synced_event, publication_event]);
+        if matches!(
+            attempt.generation.status(),
+            crate::state::GenerationStatus::Active | crate::state::GenerationStatus::Completed
+        ) {
+            // Link the generation back to the journal that published it. The
+            // explicit replacement/adoption generation is also completed in the
+            // same transaction that first claims the document is synced.
+            let mut generation = attempt
+                .generation
+                .clone()
+                .with_publication(attempt.publication_id());
+            if attempt.explicit_resolution
+                && attempt.generation.status() == crate::state::GenerationStatus::Active
+            {
+                generation = generation.complete(now)?;
+            }
+            commit = commit.with_generation(generation);
+        }
         let outcome = match self.store.commit_html_sync(commit) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1172,24 +1244,31 @@ impl PublicationOrchestrator<'_> {
                 RequiredAction::ApproveSettings,
             )));
         }
-        if !approval.auto_publish() {
+        if !approval.auto_publish() && !attempt.explicit_resolution {
             return Ok(Some(Refusal::waiting(
                 HumanWaitCause::PermissionDenied,
                 "the approved configuration does not allow automatic publication",
                 RequiredAction::ApproveSettings,
             )));
         }
-        if document.state().generation() != Some(attempt.generation.generation_id())
-            || document.state().source() != attempt.generation.source()
+        if document.state().source() != attempt.generation.source() {
+            return Ok(Some(Refusal::plain(
+                "the saved document no longer names this source revision",
+            )));
+        }
+        if !attempt.explicit_resolution
+            && document.state().generation() != Some(attempt.generation.generation_id())
         {
             return Ok(Some(Refusal::plain(
                 "the saved document no longer names this generation and source revision",
             )));
         }
-        if !matches!(
+        let allowed_state = matches!(
             document.state().state(),
             H3State::Assessing | H3State::ReadyToPublish | H3State::Publishing
-        ) {
+        ) || (attempt.explicit_resolution
+            && document.state().state() == H3State::WaitingHuman);
+        if !allowed_state {
             return Ok(Some(Refusal::plain(
                 "the document is not in a state that allows publication",
             )));
@@ -2092,6 +2171,28 @@ fn rebuild_document(
         document.h2().cloned(),
         document.evidence().to_vec(),
         document.applicability().clone(),
+        now,
+    )
+}
+
+fn rebuild_explicit_ready_document(
+    attempt: &CandidatePublication,
+    reason: H3Reason,
+    now: Timestamp,
+) -> Result<H3DocumentState, H3Error> {
+    let generation = &attempt.generation;
+    H3DocumentState::new(
+        attempt.document.clone(),
+        attempt.settings_version,
+        Some(generation.job_id()),
+        Some(generation.cycle_id()),
+        Some(generation.generation_id()),
+        generation.source().clone(),
+        generation.fingerprints().clone(),
+        reason,
+        generation.h2().cloned(),
+        generation.evidence().to_vec(),
+        Applicability::not_applicable(crate::state::ApplicabilityReason::NeverPublished),
         now,
     )
 }
