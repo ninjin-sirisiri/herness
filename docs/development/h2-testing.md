@@ -881,10 +881,11 @@ COMMANDCODE_API_KEY=... cargo test -p herness-supervision-tests \
 - 実測: `POST https://api.commandcode.ai/provider/v1/systemone`、model `typesafe/jev-1.14.0`、Bearer認証。
 - completion: 事前curl 1 + adapter 3 = 4 requests。正例`met` p=0.99・confidence 0.98・usage 640/107・0.95以上で採用、負例`unmet`・usage 638/107、不明証拠`insufficient`・usage 656/110・非採用。retry 0、失敗0。
 - permission: 4 requests（先行read試行1、raw probe1、最終read1、最終destructive1）。in-scope readはallow p=0.73（raw）で0.99未満のため`Ask`、destructive `rm -rf /`は`Deny`。retry 0、失敗0。
-- 実測合計: 8 requests。timeout 60秒。GOAT creditsに計上。USDの厳密な請求額は確認していない。
+- auto-allow experiment: 同一stateで標準・明示・noulの3問を1 requestで比較。標準 allow p=0.56、明示 allow p=1.00、noul p=0.98。明示質問文は誘導性が高く、productionの標準質問は変更していない。
+- 実測合計: 9 requests。timeout 60秒。GOAT creditsに計上。USDの厳密な請求額は確認していない。
 - このテストは既定で`#[ignore]`。`tests/supervision/tests/real_connections.rs`の`commandcode_jev_completion_met_and_unmet_are_real`、`commandcode_jev_insufficient_is_not_adopted`、`commandcode_jev_permission_is_safe_under_the_0_99_floor`にあり、通常のworkspace testでは実行しない。
 - 追加観察: 最初のより説明的な完了正例rubricでは`met` p=0.88（<0.95）で採用されなかった。permissionのin-scope readも0.99未満で`Ask`となった。閾値はrubric/evidenceの表現に敏感で、0.95/0.99の実モデル妥当性評価は未完了。閾値を下げる変更はprofile版更新と人間の再確認が必要。
-- 確認済みは**Jev completionのCommand Code経由（met/unmet/insufficient）と、Jev permissionの安全側経路（Ask/Deny）**。Jev permissionのauto-allow、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri UIからの設定は未確認のまま。H2受入は未完了。
+- 確認済みは**Jev completionのCommand Code経由（met/unmet/insufficient）と、Jev permissionの安全側経路（標準質問でAsk/Deny）**。標準質問文でのauto-allow、明示質問文の採用、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri GUIの手動操作は未確認のまま。H2受入は未完了。
 
 ### Phase Bゲート
 
@@ -912,4 +913,4 @@ Command Code Provider APIはJevのopt-in固定gatewayとしてhost composition�
 - Jevの実endpointによる**許可評価**、直接TypeSafe endpoint、画像入力、実TypeSafe APIキー。Jevの条件評価はCommand Code GOAT経由で確認済み。
 - 実Keychain・login・実model ID・rate limit・課金/利用枠の厳密な確認。JevのCommand Code経由usageは取得済み。
 - H1のOpenAI/Anthropic APIキー経路（H1受入証跡のUNVERIFIEDを維持）。
-- 完了閾値0.95・許可閾値0.99の実モデルでの妥当性（Jev completionの正例は0.99で採用、負例はunmetを確認）、実Tauri監督UIの手動操作、Jev/Decisions接続の製品UIからの構成。
+- 完了閾値0.95・許可閾値0.99の実モデルでの妥当性（Jev completionの正例は0.99で採用、負例はunmetを確認）、実Tauri監督UIの手動操作、標準質問文でのJev permission auto-allow。UIのCommandCode/Jev接続設定とprofile verificationのbackendは追加した。
