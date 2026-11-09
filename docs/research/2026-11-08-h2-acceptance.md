@@ -123,6 +123,7 @@
 - adapterの証拠: `tests/supervision/tests/real_connections.rs`の`commandcode_jev_completion_met_and_unmet_are_real`、`commandcode_jev_insufficient_is_not_adopted`、`commandcode_jev_permission_is_safe_under_the_0_99_floor`（既定は`#[ignore]`、`COMMANDCODE_API_KEY`がある場合だけopt-in実行）。
 - 確認できたこと: Command Code Provider APIのSystem One shape、固定model、Bearer認証、herness Jev adapterのstrict parse、met/unmetの区別、usage取得、0.95採用。permission evaluatorはin-scope readを0.99未満のため`Ask`にし、destructive操作を`Deny`にした。**安全側の動作**を確認した。
 - permissionの重要な観察: in-scope readのallow確率はraw probeで0.73、標準のadapter経由では`Ask`だった。同じstateで質問文だけを明示的にするとallow p=1.00になったが、これは質問の誘導性を上げる安全側の変更であり、productionの標準質問は変えていない。0.99の許可閾値・質問文の変更にはprofile版更新と人間の再確認が必要。標準profileのauto-allowは未確認。
+- 人間判断（2026-11-09）: **明示質問をopt-in profileとして追加しない。標準の安全側質問を維持し、0.99未満は`Ask`/人間待ちにする。**
 - 追加観察: 最初のより説明的な完了正例rubricでは`met` p=0.88（<0.95）で採用されなかった。閾値はrubric/evidenceの表現に敏感で、0.95の実モデル妥当性評価は未完了である。最終確認は直接的なtoken条件（p=0.99）で行った。
 - 確認していないこと: 標準質問文でのJev permission auto-allow（0.99以上）、明示質問文の採否、直接TypeSafe endpoint、画像入力、実Tauri GUIの手動操作、通常LLM/Decisions。
 - この結果は**Jev completionとpermissionの限られた経路**の証拠である。H2全体の実接続受入へ流用しない。
