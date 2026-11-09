@@ -2,7 +2,7 @@
 
 **Classification:** architectural
 
-**Status:** 2026-11-08に利用者が本specとH1共有契約の追加を承認し、sdd-planを指示した。[H2実装plan](../plans/2026-11-08-h2-supervision.md)を保存済み。本実装・実モデルへの送信は未許可。
+**Status:** 2026-11-08に設計とH1追加契約を承認し、[H2実装plan](../plans/2026-11-08-h2-supervision.md)に基づく実装をmainへ統合済み。[受入記録](../../research/2026-11-08-h2-acceptance.md)ではPhase Aと限定的なJev実接続を確認したが、H2全体の受入は未完了。2026-11-09のH3接続追加案はレビュー待ち。本記録は追加の実装・実送信を許可しない。
 
 **Chosen approach:** 必須検証と安全条件をhostが検査し、モデルによる条件別の評価をhostが統合する。モデルは状態遷移・権限・完了条件を変更しない。
 
@@ -169,10 +169,22 @@ H2受入には上記の自動検証、H1前提の実adapter検証、許可済み
 
 ## Consuming paths and references
 
-- 提案配置はcrates/herness-supervision/に共通監督・証拠・判定、crates/herness-assessment/にtoolなしprovider adapter。H1のcore・engine-pi・storeとsrc-tauriが接続する。tests/supervision/で契約を検証する。これらの新規crateはまだ存在しない。
+- crates/herness-supervision/に共通監督・証拠・判定、crates/herness-assessment/にtoolなしprovider adapterを実装した。H1のcore・engine-pi・storeとsrc-tauriが接続し、tests/supervision/で契約を検証する。実装の存在を受入完了と混同せず、確認範囲は受入記録を参照する。
 - H3は条件・原文版・画像等の証拠・公開前の再照合を渡し、H4は承認済み条件・制約・Task対応と順序を所有する。H5はこのspecの状態・理由・証拠・再開操作を使い、UI独自の成功を作らない。
 - SDD正本は../sdd/skills/verification-before-completion/SKILL.md、sdd-goal、sdd-executeとそのimplementer-prompt。五項目の証拠契約を再利用する。H3・H4のhost差分が未承認の間は既存packの動作を置き換えない。
 - 2026-11-08に[Jev API](https://docs.typesafe.ai/api/system-one.md)、[models](https://docs.typesafe.ai/models.md)、[confidence](https://docs.typesafe.ai/confidence.md)、[既知の弱点](https://docs.typesafe.ai/model-jaggedness.md)、[Decisions guide](https://developers.openai.com/api/docs/guides/decisions)、[API reference](https://developers.openai.com/api/reference/resources/decisions/methods/create)を確認した。文書の取得は実モデル検証ではない。
+
+## H3 integration additions
+
+2026-11-09の[H3設計案](2026-11-09-h3-html-sync-design.md)に対する追加案。保存は許可済みだが、追加契約はレビュー待ち・未実装である。既存の閾値・送信同意・人間待ち・予算・許可優先順位は緩めない。
+
+1. **不変の作業packetと実scope:** ownerが渡す初回指示、snapshot参照、制約を保存し、初回・追加run・復元時の入力へ渡す。モデルによる条件改変やgenericな指示への置換を行わない。ExecutionScopeは保存するだけでなくH1の実grantへ適用し、候補以外への書込み・shell禁止を実tool経路で保証する。一般の監督対象にも既存のscopeを実際に適用する。
+2. **承認済みownerの起動:** host内部の信頼されたowner境界は、現在のH3設定承認・job・条件digest・scope・profile・同意・上限を照合して初回起動できる。単にOwnerKindを指定したIPC・model要求・repo内データを信頼せず、H3側の設定承認registryと照合する。人間が直接作る対象の開始確認や、復旧後の人間再開は省略しない。
+3. **HTML評価の用途と証拠:** purpose=Htmlのprofile・consentを三方式のadapterとdesktop compositionまで渡す。Completionへ偽装しない。H3の条件別の原文・候補・対応表・根拠・render証拠を、完全性・入力能力・同意・予算を照合して評価する。必要画像や全文が欠けた場合はinsufficientとする。通常のCompletionとPermissionの経路・問い・記録を維持する。
+4. **承認範囲内の世代交代:** H3 ownerは原文変更で古くなった実行・判定を失効し、停止を確認して新版へ切り替えられる。これはowner都合の置換であり、人間停止・人間待ち・停滞・予算・復旧待ちを自動解除する権限ではない。同じsync cycleでは監督対象の消費済み時間・追加run数・要求予約・費用を保持し、新しい対象を作って上限を回避しない。条件・snapshot変更は版と承認根拠を更新し、旧結果を履歴にだけ残す。
+5. **結果の回復:** ownerは通知queueの配達だけに依存せず、保存状態・revision・判定証拠を再取得できる。H3の反映直前にも証拠の適用と停止・予算を照合し、H2 completedだけを反映許可に変換しない。
+
+受入はH3 owner＋実Pi/loopbackでpacket・scope・自動初回起動・世代交代を確認し、三方式のHTML評価、画像不足、同意不一致、予算維持、人間待ち迂回の負例を検証する。実モデル・画像能力の未確認経路は別途許可と検証を必要とし、現行H2の未確認項目を免除しない。
 
 ## Open items and approval
 
