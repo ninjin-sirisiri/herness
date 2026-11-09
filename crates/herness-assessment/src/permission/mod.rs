@@ -180,6 +180,7 @@ pub struct PermissionEvaluatorConfig {
     budget_gate: Option<SharedModelRequestGate>,
     budget_scope: PermissionBudgetScope,
     control: TransportControl,
+    jev_wire_model: String,
 }
 
 impl PermissionEvaluatorConfig {
@@ -204,6 +205,7 @@ impl PermissionEvaluatorConfig {
             budget_gate: None,
             budget_scope: PermissionBudgetScope::Supervised,
             control: TransportControl::default(),
+            jev_wire_model: crate::jev::JEV_REQUEST_MODEL.to_owned(),
         }
     }
 
@@ -246,6 +248,23 @@ impl PermissionEvaluatorConfig {
     #[must_use]
     pub fn with_transport_control(mut self, control: TransportControl) -> Self {
         self.control = control;
+        self
+    }
+
+    /// Selects the fixed Jev wire model for a trusted gateway.
+    ///
+    /// The direct TypeSafe route uses `jev-1.14.0`; Command Code's Provider API
+    /// uses `typesafe/jev-1.14.0`. Aliases and arbitrary model names are
+    /// rejected. The configured connection model remains the canonical value
+    /// used for the transport binding.
+    #[must_use]
+    pub fn with_jev_wire_model(mut self, wire_model: impl Into<String>) -> Self {
+        let wire_model = wire_model.into();
+        if wire_model == crate::jev::JEV_REQUEST_MODEL
+            || wire_model == crate::jev::COMMANDCODE_JEV_REQUEST_MODEL
+        {
+            self.jev_wire_model = wire_model;
+        }
         self
     }
 }
@@ -406,6 +425,7 @@ impl PermissionEvaluator {
                 &self.config.transport,
                 &self.config.profile,
                 &question,
+                &self.config.jev_wire_model,
                 self.config.control.clone(),
             ),
             ProviderKind::Decisions => decisions::assess(

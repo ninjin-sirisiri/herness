@@ -43,23 +43,25 @@ pub(crate) fn assess(
     transport: &AssessmentTransport,
     entry: &ProfileEntry,
     question: &PermissionQuestion,
+    wire_model: &str,
     control: TransportControl,
 ) -> Result<PermissionReply, AssessmentError> {
     let text = question.text();
     if text.len() > MAX_REQUEST_TEXT_BYTES {
         return Err(AssessmentError::new(AssessmentErrorKind::InputTooLarge));
     }
-    let body = build(question)?;
+    let body = build(question, wire_model)?;
     let request = TransportRequest::new(entry.profile().connection(), JEV_REQUEST_MODEL, body)?;
     let response = transport.send(request, control)?;
     Ok(parse_response(
         response.body(),
         entry,
         &question.question_id(),
+        wire_model,
     ))
 }
 
-fn build(question: &PermissionQuestion) -> Result<Value, AssessmentError> {
+fn build(question: &PermissionQuestion, wire_model: &str) -> Result<Value, AssessmentError> {
     let mut questions = serde_json::Map::new();
     questions.insert(
         question.question_id(),
@@ -79,7 +81,7 @@ fn build(question: &PermissionQuestion) -> Result<Value, AssessmentError> {
         }),
     );
     let body = json!({
-        "model": JEV_REQUEST_MODEL,
+        "model": wire_model,
         "state": {
             "operation": question.payload(),
         },
@@ -93,7 +95,12 @@ fn build(question: &PermissionQuestion) -> Result<Value, AssessmentError> {
     Ok(body)
 }
 
-fn parse_response(body: &[u8], entry: &ProfileEntry, question_id: &str) -> PermissionReply {
+fn parse_response(
+    body: &[u8],
+    entry: &ProfileEntry,
+    question_id: &str,
+    expected_model: &str,
+) -> PermissionReply {
     let unknown = PermissionReply::ask(TokenUsage::unknown(), None);
     let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -106,7 +113,7 @@ fn parse_response(body: &[u8], entry: &ProfileEntry, question_id: &str) -> Permi
         Ok(wire) => wire,
         Err(_) => return unknown,
     };
-    if wire.model.as_ref().and_then(Value::as_str) != Some(JEV_REQUEST_MODEL) {
+    if wire.model.as_ref().and_then(Value::as_str) != Some(expected_model) {
         return unknown;
     }
     if wire.answers.len() != 1 {
