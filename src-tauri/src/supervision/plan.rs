@@ -268,6 +268,13 @@ impl StoredPlan {
                 },
             });
         }
+        if self.packet.project_id() != self.contract.project_id() {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "packet.projectId".to_owned(),
+                },
+            });
+        }
         if self.contract.work_packet() != &self.packet {
             return Err(SupervisionError::WorkPacketRejected {
                 reason: WorkPacketRejection::Mismatch {

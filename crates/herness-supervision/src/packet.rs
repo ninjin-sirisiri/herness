@@ -232,11 +232,21 @@ impl WorkPacket {
         budget: &BudgetPolicy,
     ) -> Result<(), SupervisionError> {
         self.verify()?;
+        if self.project_id != target.project_id() {
+            return Err(SupervisionError::CrossProjectReference {
+                id_kind: "work packet".to_owned(),
+                expected: target.project_id(),
+                found: self.project_id,
+            });
+        }
         let mismatch = |field: &str| SupervisionError::WorkPacketRejected {
             reason: WorkPacketRejection::Mismatch {
                 field: field.to_owned(),
             },
         };
+        if execution_scope.project_id() != target.project_id() {
+            return Err(mismatch("executionScope.projectId"));
+        }
         if &self.execution_scope != execution_scope {
             return Err(mismatch("executionScope"));
         }
