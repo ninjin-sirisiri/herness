@@ -117,6 +117,14 @@ pub enum CoreError {
         /// Validation failure.
         violation: ArgumentViolation,
     },
+    /// A port feature is not implemented by this build.
+    ///
+    /// Callers must treat this as unavailable. It is never a success and the
+    /// work it would authorize must not proceed.
+    UnsupportedPortFeature {
+        /// Port feature that is missing.
+        feature: PortFeature,
+    },
     /// A checkpoint commit referred to events or an operation from another run.
     MismatchedRun {
         /// Run that owns the transaction.
@@ -200,6 +208,54 @@ pub enum CoreError {
         /// State the caller attempted to enter.
         to: RunState,
     },
+    /// A paused or interrupted run cannot be restored without replaying input
+    /// or a tool.
+    NotResumable {
+        /// Run whose saved state is not safely resumable.
+        run: RunId,
+        /// Sanitized reason. No SDK snapshot or provider text is carried.
+        reason: ConversationFailure,
+    },
+    /// A stable previous conversation cannot be continued as a new run.
+    NotContinuable {
+        /// Previous run whose conversation cannot be carried forward.
+        previous_run: RunId,
+        /// Sanitized reason. No SDK snapshot or provider text is carried.
+        reason: ConversationFailure,
+    },
+}
+
+/// Why a conversation cannot be continued or resumed safely.
+///
+/// These labels are stable, non-secret contract data. They never contain SDK
+/// snapshot bodies, model text, credentials, or provider responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationFailure {
+    /// The previous run has no durable checkpoint.
+    MissingCheckpoint,
+    /// The supplied checkpoint is not the durable latest state.
+    CheckpointNotLatest,
+    /// The checkpoint envelope could not be validated for the requested run.
+    CorruptCheckpoint,
+    /// The previous run is not idle/stable.
+    PreviousRunNotStable,
+    /// A stop was not confirmed for the live engine session.
+    StopUnconfirmed,
+    /// An input was accepted but not completed.
+    PendingInput,
+    /// A tool invocation is not completed. Resuming could execute it again.
+    PendingInvocation,
+    /// A human approval is still recorded for the previous run.
+    PendingApproval,
+    /// A managed process still needs reconciliation.
+    ManagedProcess,
+    /// A tool operation intent has no durable result.
+    UnresolvedOperation,
+    /// The supplied continuation scope does not match the previous run.
+    ScopeMismatch,
+    /// The requested input is unknown or was already consumed.
+    InputUnavailable,
 }
 
 /// Validation failure for a free-form argument value.
@@ -238,6 +294,45 @@ pub enum PathViolation {
     NotAbsolute,
     /// The path contained a NUL byte.
     ContainsNul,
+}
+
+/// A host-owned port feature that this build does not implement yet.
+///
+/// Returning this value is the explicit alternative to a fabricated empty
+/// success. Later phases replace individual variants as the capability lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortFeature {
+    /// Starting a new run that continues a previous conversation.
+    Continuation,
+    /// Correlating input acceptance, start, and completion.
+    InputCorrespondence,
+    /// Admitting an external model request before send.
+    RequestGate,
+    /// Recording a terminal model request observation and its usage.
+    RequestObservation,
+    /// Reading current stop and deadline control for a run.
+    StopDeadlineControl,
+    /// Persisting events for host activities that have no run.
+    HostActivityEvents,
+    /// Installing the host-resolved grant, policy, evaluator, and stop control
+    /// for a run's real tool path.
+    RunPermission,
+}
+
+impl PortFeature {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuation => "continuation",
+            Self::InputCorrespondence => "input_correspondence",
+            Self::RequestGate => "request_gate",
+            Self::RequestObservation => "request_observation",
+            Self::StopDeadlineControl => "stop_deadline_control",
+            Self::HostActivityEvents => "host_activity_events",
+            Self::RunPermission => "run_permission",
+        }
+    }
 }
 
 /// Sanitized permission evaluator failure kinds.
@@ -601,6 +696,9 @@ impl fmt::Display for CoreError {
             Self::InvalidEvent { field, violation } => {
                 write!(f, "invalid event field {field:?}: {violation}")
             }
+            Self::UnsupportedPortFeature { feature } => {
+                write!(f, "port feature {} is not supported", feature.as_str())
+            }
             Self::MismatchedRun { expected, found } => {
                 write!(f, "run {found} does not match transaction run {expected}")
             }
@@ -641,6 +739,16 @@ impl fmt::Display for CoreError {
             Self::InvalidRunTransition { from, to } => {
                 write!(f, "run cannot transition from {from} to {to}")
             }
+            Self::NotResumable { run, reason } => {
+                write!(f, "run {run} is not resumable: {reason:?}")
+            }
+            Self::NotContinuable {
+                previous_run,
+                reason,
+            } => write!(
+                f,
+                "the conversation of run {previous_run} cannot be continued: {reason:?}"
+            ),
         }
     }
 }

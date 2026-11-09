@@ -281,6 +281,7 @@ pub const fn endpoint_class(settings: &ConnectionSettings) -> &'static str {
         (Provider::OpenAi, AuthMethod::ApiKey) => "openai_responses",
         (Provider::Anthropic, _) => "anthropic_messages",
         (Provider::OpenAiCompatible, _) => "openai_completions",
+        (Provider::TypeSafe, _) => "typesafe_system_one",
     }
 }
 

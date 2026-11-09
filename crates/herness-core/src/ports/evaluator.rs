@@ -4,6 +4,8 @@
 //! mode is unavailable without an evaluator, and an evaluator failure results
 //! in human confirmation rather than unconditional execution.
 
+use std::sync::{Arc, Mutex};
+
 use crate::contracts::errors::CoreError;
 use crate::contracts::operation::FrozenOperation;
 use crate::permissions::{EvaluatorAvailability, PermissionDecision};
@@ -65,4 +67,56 @@ pub trait PermissionEvaluatorPort {
 
     /// Evaluates one operation. Errors must be treated as "do not run".
     fn evaluate(&mut self, request: &EvaluationRequest) -> Result<PermissionDecision, CoreError>;
+}
+
+/// One evaluator instance shared by the host runtime and every engine run.
+///
+/// The host creates the instance once and passes clones. The runtime and the
+/// adapter therefore reach the same evaluator state instead of creating a
+/// second evaluator or falling back to `None`.
+#[derive(Clone)]
+pub struct SharedPermissionEvaluator {
+    inner: Arc<Mutex<Box<dyn PermissionEvaluatorPort + Send + Sync>>>,
+}
+
+impl SharedPermissionEvaluator {
+    /// Wraps one host-selected evaluator.
+    pub fn new(evaluator: Box<dyn PermissionEvaluatorPort + Send + Sync>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(evaluator)),
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedPermissionEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedPermissionEvaluator")
+    }
+}
+
+impl PermissionEvaluatorPort for SharedPermissionEvaluator {
+    fn availability(&self) -> EvaluatorAvailability {
+        // Never queue behind a long-running evaluation. A busy evaluator is
+        // reported unavailable; automatic mode then waits for a human instead
+        // of blocking a second tool or the host monitor.
+        match self.inner.try_lock() {
+            Ok(evaluator) => evaluator.availability(),
+            Err(_) => EvaluatorAvailability::Unavailable,
+        }
+    }
+
+    fn evaluate(&mut self, request: &EvaluationRequest) -> Result<PermissionDecision, CoreError> {
+        // A bounded watcher may abandon a worker that still holds this lock.
+        // Refuse a concurrent evaluation instead of waiting behind it; queuing
+        // would reintroduce the unbounded wait the bounded wrapper prevents.
+        let mut evaluator = match self.inner.try_lock() {
+            Ok(evaluator) => evaluator,
+            Err(_) => {
+                return Err(CoreError::PermissionEvaluationFailed {
+                    failure: crate::contracts::errors::EvaluationFailureKind::Unavailable,
+                });
+            }
+        };
+        evaluator.evaluate(request)
+    }
 }

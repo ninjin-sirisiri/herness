@@ -15,23 +15,24 @@ pub mod skills;
 pub mod tools;
 
 pub use connections::{
-    CHATGPT_DYNAMIC_AGENT_CLIENT, CHATGPT_PLAN_SCOPE, CREDENTIAL_FORMAT_VERSION, ConnectionAdmin,
-    ConnectionDirectory, ConnectionError, ConnectionSettings, ConnectionState, CredentialAdmin,
-    CredentialBroker, CredentialMaterial, CredentialRef, CredentialRefresher, CredentialService,
-    CredentialVault, CredentialWriter, Endpoint, EndpointViolation, HttpScheme, InsecureRemoteHttp,
-    MAX_REDACTED_URL_CHARS, OAuthTokenSet, OAuthTokenSetDetails, Origin, REDACTED,
-    RedirectAuthDecision, RedirectDropReason, VAULT_SERVICE, VaultAccount, VaultFailure,
+    AssessmentGateway, CHATGPT_DYNAMIC_AGENT_CLIENT, CHATGPT_PLAN_SCOPE, CREDENTIAL_FORMAT_VERSION,
+    ConnectionAdmin, ConnectionDirectory, ConnectionError, ConnectionSettings, ConnectionState,
+    CredentialAdmin, CredentialBroker, CredentialMaterial, CredentialRef, CredentialRefresher,
+    CredentialService, CredentialVault, CredentialWriter, Endpoint, EndpointViolation, HttpScheme,
+    InsecureRemoteHttp, MAX_REDACTED_URL_CHARS, OAuthTokenSet, OAuthTokenSetDetails, Origin,
+    REDACTED, RedirectAuthDecision, RedirectDropReason, VAULT_SERVICE, VaultAccount, VaultFailure,
     redact_error, redact_header, redact_headers, redact_known_secrets, redact_url,
     redirect_auth_decision,
 };
 pub use contracts::*;
 pub use permissions::{
     ApprovalError, ApprovalRequest, ArgumentsDigest, Authorization, AutomaticModeCapability,
-    AutomaticModeUnavailableReason, DecisionBinding, DecisionStatus, DenialReason,
-    EvaluationContext, EvaluatorAvailability, EvaluatorFailure, GrantScope, GrantWidening,
-    HumanWaitReason, InvalidationReason, MatchMethod, PermissionDecision, PermissionMode,
-    PermissionOutcome, PermissionPolicy, PermissionRule, PermissionService, PolicyAdmin,
-    PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget, SimpleCommand,
+    AutomaticModeUnavailableReason, BoundedPermissionEvaluator, DEFAULT_EVALUATION_TIMEOUT,
+    DecisionBinding, DecisionStatus, DenialReason, EvaluationContext, EvaluatorAvailability,
+    EvaluatorFailure, GrantScope, GrantWidening, HumanWaitReason, InvalidationReason, MatchMethod,
+    PermissionDecision, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionRule,
+    PermissionService, PolicyAdmin, PolicyVersion, ProtectedBoundary, RuleEffect, RuleTarget,
+    RunControl, RunPermissionContext, SharedPolicy, SimpleCommand,
 };
 pub use ports::*;
 pub use skills::{

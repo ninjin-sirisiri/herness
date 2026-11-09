@@ -29,6 +29,14 @@ pub enum IdKind {
     Run,
     /// A tool operation identifier.
     Operation,
+    /// A submitted input identifier.
+    Input,
+    /// A model request identifier.
+    Request,
+    /// A model request attempt identifier.
+    Attempt,
+    /// A host activity identifier.
+    Activity,
     /// A connection identifier.
     Connection,
 }
@@ -42,6 +50,10 @@ impl IdKind {
             Self::Session => "session",
             Self::Run => "run",
             Self::Operation => "operation",
+            Self::Input => "input",
+            Self::Request => "request",
+            Self::Attempt => "attempt",
+            Self::Activity => "activity",
             Self::Connection => "connection",
         }
     }
@@ -136,6 +148,22 @@ pub enum RunKind {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OperationKind {}
 
+/// Marker for submitted input identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InputKind {}
+
+/// Marker for model request identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RequestKind {}
+
+/// Marker for model request attempt identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AttemptKind {}
+
+/// Marker for host activity identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ActivityKind {}
+
 impl ScopedIdKind for AgentKind {
     const PREFIX: &'static str = "agent";
     const KIND: IdKind = IdKind::Agent;
@@ -154,6 +182,26 @@ impl ScopedIdKind for RunKind {
 impl ScopedIdKind for OperationKind {
     const PREFIX: &'static str = "operation";
     const KIND: IdKind = IdKind::Operation;
+}
+
+impl ScopedIdKind for InputKind {
+    const PREFIX: &'static str = "input";
+    const KIND: IdKind = IdKind::Input;
+}
+
+impl ScopedIdKind for RequestKind {
+    const PREFIX: &'static str = "request";
+    const KIND: IdKind = IdKind::Request;
+}
+
+impl ScopedIdKind for AttemptKind {
+    const PREFIX: &'static str = "attempt";
+    const KIND: IdKind = IdKind::Attempt;
+}
+
+impl ScopedIdKind for ActivityKind {
+    const PREFIX: &'static str = "activity";
+    const KIND: IdKind = IdKind::Activity;
 }
 
 /// A typed identifier that belongs to exactly one project.
@@ -266,6 +314,14 @@ pub type SessionId = ScopedId<SessionKind>;
 pub type RunId = ScopedId<RunKind>;
 /// Tool operation identifier.
 pub type OperationId = ScopedId<OperationKind>;
+/// Submitted input identifier used to correlate accept/start/complete.
+pub type InputId = ScopedId<InputKind>;
+/// Host-owned external model request identifier.
+pub type RequestId = ScopedId<RequestKind>;
+/// Identifier of one attempt of a model request.
+pub type AttemptId = ScopedId<AttemptKind>;
+/// Stable identifier of a host activity that has no run.
+pub type HostActivityId = ScopedId<ActivityKind>;
 
 /// A verified project ownership scope used to reject cross-project references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

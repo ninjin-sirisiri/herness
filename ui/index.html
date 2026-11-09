@@ -33,6 +33,7 @@
               <option value="openai">OpenAI</option>
               <option value="anthropic">Anthropic</option>
               <option value="openai_compatible">OpenAI-compatible</option>
+              <option value="typesafe">TypeSafe Jev (assessment)</option>
             </select>
             <label for="model">Model</label>
             <input id="model" type="text" autocomplete="off" placeholder="model name" />
@@ -50,6 +51,10 @@
             <label class="checkbox">
               <input id="insecure-http" type="checkbox" />
               Acknowledge remote plain-HTTP credential risk
+            </label>
+            <label class="checkbox">
+              <input id="assessment-gateway" type="checkbox" />
+              Use Command Code gateway (TypeSafe Jev only)
             </label>
             <button type="submit">Add connection</button>
           </div>
@@ -91,9 +96,9 @@
 
       <section>
         <h2>Pending approvals</h2>
-        <p class="warn">
-          Automatic decision unavailable (H2 evaluator is not connected). Every tool operation
-          needs an explicit human decision in this build.
+        <p id="automatic-warning" class="warn">
+          Automatic decision is unavailable without a verified permission-evaluation profile.
+          Every tool operation needs an explicit human decision in this build.
         </p>
         <ul id="approval-list" class="list"></ul>
       </section>
@@ -104,6 +109,79 @@
           Restore only reads saved state. Unknown results stay pending until a human verifies them.
         </p>
         <pre id="reconciliation" class="history"></pre>
+      </section>
+
+      <section>
+        <h2>Supervision (H2)</h2>
+        <p class="muted">
+          A supervision target runs a separate child agent. Conditions, profile, consent, and
+          limits are fixed before start. Profiles are shown as unverified until a separate real
+          acceptance step; unverified assessment never unlocks completion.
+        </p>
+        <div class="row">
+          <label for="sup-purpose">Purpose</label>
+          <select id="sup-purpose">
+            <option value="completion">completion</option>
+            <option value="html">html</option>
+            <option value="permission">permission</option>
+          </select>
+          <label for="sup-connection">Assessment connection</label>
+          <select id="sup-connection"></select>
+          <label for="sup-model">Model</label>
+          <input id="sup-model" type="text" autocomplete="off" placeholder="judge model" />
+          <button id="sup-config-profile" type="button">Configure profile</button>
+          <button id="sup-verify-profile" type="button">Mark profile verified</button>
+        </div>
+        <div class="row">
+          <label for="sup-origin">Consent origin</label>
+          <input id="sup-origin" type="text" autocomplete="off" placeholder="provider origin (scheme and host)" />
+          <label for="sup-consent-version">Target version</label>
+          <input id="sup-consent-version" type="number" min="1" value="1" />
+          <label for="sup-consent-targets">Targets (one per line)</label>
+          <input id="sup-consent-targets" type="text" autocomplete="off" placeholder="src/app.js" />
+        </div>
+        <div class="row">
+          <label class="checkbox"><input id="sup-kind-text" type="checkbox" checked /> text</label>
+          <label class="checkbox"><input id="sup-kind-code" type="checkbox" /> code</label>
+          <label class="checkbox"><input id="sup-kind-diff" type="checkbox" /> diff</label>
+          <label class="checkbox"><input id="sup-kind-log" type="checkbox" /> log</label>
+          <button id="sup-grant-consent" type="button">Grant consent</button>
+          <button id="sup-revoke-consent" type="button">Revoke consent</button>
+        </div>
+        <div class="panel">
+          <div class="row">
+            <label for="sup-condition-title">Condition title</label>
+            <input id="sup-condition-title" type="text" autocomplete="off" placeholder="The exported report is complete" />
+          </div>
+          <label for="sup-condition-rubric">Rubric</label>
+          <textarea id="sup-condition-rubric" rows="2" placeholder="What must be true, judged from the supplied evidence"></textarea>
+          <div class="row">
+            <label for="sup-check-command">Required check command</label>
+            <input id="sup-check-command" type="text" autocomplete="off" placeholder="npm test" />
+            <label for="sup-check-description">Description</label>
+            <input id="sup-check-description" type="text" autocomplete="off" placeholder="test suite" />
+          </div>
+          <label for="sup-instructions">Child instruction</label>
+          <textarea id="sup-instructions" rows="2" placeholder="Describe the work for the supervised child"></textarea>
+          <div class="row">
+            <label for="sup-read-set">Read set (one path per line)</label>
+            <textarea id="sup-read-set" rows="2" placeholder="src&#10;tests"></textarea>
+            <label for="sup-write-paths">Write paths (one per line)</label>
+            <textarea id="sup-write-paths" rows="2" placeholder="src"></textarea>
+          </div>
+          <div class="row">
+            <label class="checkbox"><input id="sup-allow-shell" type="checkbox" /> shell inside scope</label>
+            <label for="sup-active-seconds">Active seconds</label>
+            <input id="sup-active-seconds" type="number" min="1" value="7200" />
+            <label for="sup-additional-runs">Additional runs</label>
+            <input id="sup-additional-runs" type="number" min="0" value="30" />
+            <button id="sup-create" type="button">Create supervision target</button>
+            <button id="sup-refresh" type="button">Refresh list</button>
+          </div>
+        </div>
+        <p id="supervision-status" class="muted"></p>
+        <ul id="supervision-list" class="list"></ul>
+        <pre id="supervision-detail" class="history"></pre>
       </section>
 
       <section>

@@ -10,20 +10,36 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use herness_assessment::AssessmentEndpoints;
 use herness_core::runtime::{
-    ProjectView, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
+    ProjectView, PumpReport, ReconciliationReport, RunToolContext, Runtime, RuntimeDependencies,
     RuntimeToolExecutor, ShutdownReport, ToolExecution,
 };
 use herness_core::{
     ArgumentViolation, BashExecutor, Checkpoint, CheckpointCommit, ConnectionAdmin,
     ConnectionDirectory, ConnectionSettings, CoreError, EventDraft, FileLockRegistry,
-    FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery, NativeFileTools,
-    OperationEvidence, OperationId, OperationIntent, OperationRecord, OperationResult,
-    PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId, ProjectRoot, RunId, StorePort,
+    FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery,
+    ModelRequestObservation, NativeFileTools, OperationEvidence, OperationId, OperationIntent,
+    OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId,
+    ProjectRoot, RequestGateIntent, RunId, SharedPermissionEvaluator, StorePort, Timestamp,
     ToolExecutor, ToolName,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
+
+use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
+use crate::supervision::permission::PermissionRuntime;
+use crate::supervision::plan::ConfigStore;
+use crate::supervision::runtime::DesktopH1;
+use crate::supervision::store::StoreHandle;
+use crate::supervision::{
+    ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, HumanConfirmation,
+    PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
+};
+use herness_supervision::{
+    ProviderOrigin, SupervisionError, SupervisionId, SupervisionOperationRequest,
+    SupervisionRequestId, TargetVersion,
+};
 
 /// The concrete runtime composed by the desktop shell.
 pub type DesktopRuntime = Runtime<Store, PiEngine<Store>, DesktopToolExecutor>;
@@ -31,6 +47,8 @@ pub type DesktopRuntime = Runtime<Store, PiEngine<Store>, DesktopToolExecutor>;
 /// Process-wide desktop host.
 pub struct DesktopHost {
     runtime: DesktopRuntime,
+    store: Arc<Mutex<Store>>,
+    supervision: SupervisionHost,
     connections: ConnectionAdmin,
     directory: ConnectionDirectory,
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
@@ -49,37 +67,162 @@ impl DesktopHost {
         credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
         endpoints: ProviderEndpoints,
     ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            AssessmentEndpoints::official(),
+            None,
+            None,
+        )
+    }
+
+    /// Test composition seam with explicit assessment provider bases.
+    ///
+    /// Production uses [`Self::open`] with official bases. Tests pass loopback
+    /// bases so the same permission-evaluator and completion-assessment
+    /// composition is exercised without a real provider.
+    #[doc(hidden)]
+    pub fn open_with_assessment_endpoints(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        assessment_endpoints: AssessmentEndpoints,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            assessment_endpoints,
+            None,
+            None,
+        )
+    }
+
+    /// Test-only composition seam for cross-phase loopback regression tests.
+    ///
+    /// This is deliberately not an IPC command and is never selected by the
+    /// desktop shell. It lets the Task 17 regression use the real runtime,
+    /// store, tool executor, request gate, and quit path while injecting
+    /// scripted required-check and assessment ports and a loopback permission
+    /// evaluator. Production `open` uses the real dynamic permission evaluator
+    /// described by `supervision::permission`; this seam overrides it only for
+    /// the regression test.
+    #[doc(hidden)]
+    pub fn open_with_test_boundaries(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        evaluator: Option<SharedPermissionEvaluator>,
+        assessment: Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+        checks: Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            AssessmentEndpoints::official(),
+            evaluator,
+            Some((assessment, checks)),
+        )
+    }
+
+    fn open_inner(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        assessment_endpoints: AssessmentEndpoints,
+        evaluator: Option<SharedPermissionEvaluator>,
+        test_ports: Option<(
+            Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+            Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>,
+        )>,
+    ) -> Result<(Self, ReconciliationReport), String> {
         let config = StoreConfig::new(app_data_root.as_ref()).map_err(|error| error.to_string())?;
         let store = Store::open(config).map_err(|error| error.to_string())?;
         let store = Arc::new(Mutex::new(store));
+        let store_handle = StoreHandle::new(Arc::clone(&store));
         let directory = connections.directory();
         let policy = PolicyAdmin::new();
-        let engine = PiEngine::new(
+        let mut engine = PiEngine::new(
             Arc::clone(&store),
             Arc::clone(&credentials),
             directory.clone(),
             PiEngineConfig::new(policy.policy().clone()).with_endpoints(endpoints.clone()),
         )
         .map_err(|error| error.to_string())?;
+        engine.set_request_gate(
+            crate::supervision::gate::SupervisionAwareGate::new(store_handle.clone()).boxed(),
+        );
         let executor = DesktopToolExecutor::new(Arc::clone(&store));
+        let assessment_host = AssessmentHost {
+            directory: directory.clone(),
+            credentials: Arc::clone(&credentials),
+            endpoints: assessment_endpoints,
+        };
+        let permission = PermissionRuntime::new(store_handle.clone(), assessment_host.clone());
+        let evaluator = evaluator.unwrap_or_else(|| permission.evaluator());
         let dependencies = RuntimeDependencies::new(
-            store,
+            Arc::clone(&store),
             engine,
             Arc::clone(&credentials),
             directory.clone(),
             policy,
             executor,
-        );
+        )
+        .with_shared_evaluator(evaluator);
         let (runtime, report) =
             Runtime::restore(dependencies).map_err(|error| error.to_string())?;
+        let supervision_config = ConfigStore::new();
+        let (assessment, check_mode) = match test_ports {
+            Some((assessment, checks)) => {
+                (assessment, crate::supervision::CheckMode::Injected(checks))
+            }
+            None => {
+                let assessment = HostAssessmentPort::new(
+                    store_handle.clone(),
+                    supervision_config.clone(),
+                    assessment_host.clone(),
+                );
+                (
+                    Box::new(assessment)
+                        as Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+                    crate::supervision::CheckMode::Real,
+                )
+            }
+        };
+        let supervision = SupervisionHost::with_permission(
+            store_handle,
+            supervision_config,
+            assessment_host,
+            assessment,
+            check_mode,
+            permission,
+        );
         let mut host = Self {
             runtime,
+            store: Arc::clone(&store),
+            supervision,
             connections,
             directory,
             credentials,
             app_data_root: app_data_root.as_ref().to_path_buf(),
             endpoints,
         };
+        let projects = host
+            .runtime
+            .projects()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|view| view.project_id())
+            .collect::<Vec<_>>();
+        host.supervision.restore(&projects);
         let reconciliation = host.restore_connection_settings(report)?;
         Ok((host, reconciliation))
     }
@@ -187,6 +330,85 @@ impl DesktopHost {
             .map_err(|error| error.to_string())
     }
 
+    /// Drains every project's engine events and applies run deadlines.
+    ///
+    /// The trusted desktop shell runs this from a host-owned worker thread so a
+    /// closed window or a non-selected project still makes progress. It uses the
+    /// single existing runtime, store, engine, and executor. During explicit
+    /// shutdown it performs no work and returns a skipped report.
+    pub fn pump(&mut self) -> Result<PumpReport, String> {
+        let report = self.runtime.pump().map_err(|error| error.to_string())?;
+        if self.runtime.is_shutting_down() {
+            return Ok(report);
+        }
+        let projects = self
+            .runtime
+            .projects()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|view| view.project_id())
+            .collect::<Vec<_>>();
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        if let Err(error) = self.supervision.pump(&mut adapter, &projects) {
+            // Supervision progress is independent from the H1 pump. A single
+            // H2 failure must not stop H1 event delivery; it is retried on the
+            // next bounded interval.
+            eprintln!("SUPERVISION_PUMP_ERROR: {error}");
+        }
+        Ok(report)
+    }
+
+    /// Marks active supervision records for quit using the real H1 stop report.
+    ///
+    /// This is called after H1 coordinated stops and before finish_shutdown. It
+    /// never starts, resumes, or sends anything.
+    pub fn mark_supervision_for_quit(
+        &mut self,
+        report: &herness_core::runtime::ShutdownReport,
+    ) -> Result<(), String> {
+        let projects = self.runtime.projects().map_err(|error| error.to_string())?;
+        let now = herness_core::Timestamp::now();
+        for project in projects {
+            let project_id = project.project_id();
+            let mut facts = std::collections::BTreeMap::new();
+            for run in report.runs() {
+                if run.project_id() != project_id {
+                    continue;
+                }
+                let confirmed = matches!(
+                    run.report(),
+                    Some(herness_core::StopReport::Stopped | herness_core::StopReport::NotRunning)
+                );
+                facts.insert(run.run_id(), confirmed);
+            }
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| "the supervision store is unavailable".to_owned())?;
+            crate::lifecycle::supervision_quit::mark_supervision_for_quit(
+                &mut store, project_id, &facts, now,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reads a saved supervision record through the shared store.
+    pub fn supervision_record(
+        &self,
+        project: herness_core::ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<Option<herness_supervision::SupervisionRecord>, String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "the supervision store is unavailable".to_owned())?;
+        store
+            .load_supervision_record(project, supervision)
+            .map_err(|error| error.to_string())
+    }
+
     /// Whether an explicit shutdown has begun.
     pub const fn is_shutting_down(&self) -> bool {
         self.runtime.is_shutting_down()
@@ -200,6 +422,236 @@ impl DesktopHost {
     /// Mutable runtime used by the trusted command layer.
     pub const fn runtime_mut(&mut self) -> &mut DesktopRuntime {
         &mut self.runtime
+    }
+
+    /// Cloneable handle to the one durable store shared with H2 supervision.
+    pub fn store_handle(&self) -> StoreHandle {
+        StoreHandle::new(Arc::clone(&self.store))
+    }
+
+    /// Read-only supervision composition.
+    pub const fn supervision(&self) -> &SupervisionHost {
+        &self.supervision
+    }
+
+    /// Mints a host-owned human confirmation after the command guard passed.
+    pub fn confirm_supervision(&self, kind: ConfirmationKind) -> HumanConfirmation {
+        self.supervision.confirm(kind)
+    }
+
+    /// Shared permission evaluator installed into H1 at open.
+    pub fn permission_evaluator(&self) -> SharedPermissionEvaluator {
+        self.supervision.permission().evaluator()
+    }
+
+    /// Whether any project has a verified permission profile and consent.
+    pub fn permission_available(&self) -> bool {
+        self.supervision.permission_available()
+    }
+
+    /// Whether one project has a verified permission profile and consent.
+    pub fn permission_available_for(&self, project: herness_core::ProjectId) -> bool {
+        self.supervision.permission_available_for(project)
+    }
+
+    /// Creates a supervision target.
+    pub fn supervision_create(
+        &mut self,
+        actor: PlanRequestActor,
+        request: CreateSupervisionRequest,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision
+            .create(&mut adapter, actor, request, confirmation)
+    }
+
+    /// Configures a per-purpose profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn supervision_configure_profile(
+        &self,
+        actor: PlanRequestActor,
+        project: herness_core::ProjectId,
+        purpose: herness_supervision::ProfilePurpose,
+        connection: herness_core::ConnectionId,
+        model: &str,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<PurposeStatusView, SupervisionError> {
+        self.supervision
+            .configure_profile(actor, project, purpose, connection, model, confirmation)
+    }
+
+    /// Marks a configured assessment profile verified or unverified after a
+    /// trusted human confirmation. This is not exposed to the model.
+    pub fn supervision_mark_profile_verified(
+        &self,
+        project: herness_core::ProjectId,
+        purpose: herness_supervision::ProfilePurpose,
+        verified: bool,
+    ) -> Result<PurposeStatusView, SupervisionError> {
+        self.supervision
+            .mark_profile_verified(project, purpose, verified)
+    }
+
+    /// Grants per-purpose disclosure consent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn supervision_grant_consent(
+        &self,
+        actor: PlanRequestActor,
+        project: herness_core::ProjectId,
+        purpose: herness_supervision::ProfilePurpose,
+        origin: ProviderOrigin,
+        data_kinds: std::collections::BTreeSet<herness_supervision::DisclosureDataKind>,
+        targets: Vec<String>,
+        target_version: TargetVersion,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<PurposeStatusView, SupervisionError> {
+        self.supervision.grant_consent(
+            actor,
+            project,
+            purpose,
+            origin,
+            data_kinds,
+            targets,
+            target_version,
+            confirmation,
+        )
+    }
+
+    /// Revokes per-purpose disclosure consent.
+    pub fn supervision_revoke_consent(
+        &self,
+        actor: PlanRequestActor,
+        project: herness_core::ProjectId,
+        purpose: herness_supervision::ProfilePurpose,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<PurposeStatusView, SupervisionError> {
+        self.supervision
+            .revoke_consent(actor, project, purpose, confirmation)
+    }
+
+    /// Starts the first run of a ready target.
+    pub fn supervision_start(
+        &mut self,
+        project: herness_core::ProjectId,
+        supervision: SupervisionId,
+        request_id: SupervisionRequestId,
+        expected_revision: u64,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision.start(
+            &mut adapter,
+            project,
+            supervision,
+            request_id,
+            expected_revision,
+            confirmation,
+        )
+    }
+
+    /// Stops or cancels one target.
+    pub fn supervision_stop(
+        &mut self,
+        request: SupervisionOperationRequest,
+        cancel: bool,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let policy_version = self.runtime.policy().version().get();
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision
+            .stop(&mut adapter, request, cancel, policy_version, confirmation)
+    }
+
+    /// Resumes a stopped/waiting target.
+    pub fn supervision_resume(
+        &mut self,
+        request: SupervisionOperationRequest,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let policy_version = self.runtime.policy().version().get();
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision
+            .resume(&mut adapter, request, policy_version, confirmation)
+    }
+
+    /// Reassesses from fresh or reused evidence.
+    pub fn supervision_reassess(
+        &mut self,
+        request: SupervisionOperationRequest,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let policy_version = self.runtime.policy().version().get();
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision
+            .reassess(&mut adapter, request, policy_version, confirmation)
+    }
+
+    /// Changes conditions/profile/consent explicitly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn supervision_change(
+        &mut self,
+        project: herness_core::ProjectId,
+        supervision: SupervisionId,
+        request_id: SupervisionRequestId,
+        expected_revision: u64,
+        actor: PlanRequestActor,
+        change: ChangeSupervisionRequest,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision.change(
+            &mut adapter,
+            project,
+            supervision,
+            request_id,
+            expected_revision,
+            actor,
+            change,
+            confirmation,
+        )
+    }
+
+    /// Reads one supervision view without executing anything.
+    pub fn supervision_get(
+        &self,
+        project: herness_core::ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<SupervisionView, SupervisionError> {
+        self.supervision.get(project, supervision)
+    }
+
+    /// Lists saved supervision targets for one project.
+    pub fn supervision_list(
+        &self,
+        project: herness_core::ProjectId,
+    ) -> Result<Vec<SupervisionView>, SupervisionError> {
+        self.supervision.list(project)
+    }
+
+    /// Reads the durable recovery report.
+    pub fn supervision_recovery(
+        &mut self,
+        project: herness_core::ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<RecoveryView, SupervisionError> {
+        let plans = self.supervision.plans();
+        let store = self.store_handle();
+        let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
+        self.supervision
+            .recovery(&mut adapter, project, supervision)
     }
 
     /// Human-only connection registry.
@@ -403,6 +855,26 @@ impl StorePort for SharedStore {
             operation,
             result,
             events,
+        )
+    }
+
+    fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        <Store as StorePort>::record_model_request(&mut self.lock(), intent, recorded_at)
+    }
+
+    fn record_model_request_observation(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        <Store as StorePort>::record_model_request_observation(
+            &mut self.lock(),
+            observation,
+            observed_at,
         )
     }
 }

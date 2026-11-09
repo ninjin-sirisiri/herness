@@ -8,7 +8,7 @@
 use std::fmt;
 
 use herness_core::{
-    ArgumentViolation, CONTRACT_VERSION, CoreError, IdKind, OperationId, ProjectId,
+    ArgumentViolation, AttemptId, CONTRACT_VERSION, CoreError, IdKind, OperationId, ProjectId,
     StoreFailureKind,
 };
 
@@ -78,6 +78,11 @@ pub enum StoreError {
         /// Contract version found in the event row.
         found: u32,
     },
+    /// A host-activity event was offered to a run-only storage path.
+    ///
+    /// A checkpoint or operation result belongs to one run. The event must not
+    /// be dropped or given a fabricated run identifier.
+    UnsupportedHostActivityEvent,
     /// A checkpoint commit repeats an operation id that is already recorded.
     DuplicateOperation {
         /// Operation id already present in the store.
@@ -101,6 +106,48 @@ pub enum StoreError {
     OperationResultConflict {
         /// Operation id whose stored result differs.
         operation: OperationId,
+    },
+    /// A request attempt is already recorded with a different intent.
+    RequestIntentConflict {
+        /// Attempt whose stored intent differs.
+        attempt: AttemptId,
+    },
+    /// A terminal observation is already recorded, or the transition is not
+    /// allowed.
+    RequestObservationConflict {
+        /// Attempt whose stored observation differs.
+        attempt: AttemptId,
+    },
+    /// An observation was supplied for an attempt that was never persisted.
+    UnknownRequestAttempt {
+        /// Attempt with no intent row.
+        attempt: AttemptId,
+    },
+    /// A supervised-state update used an outdated or missing revision.
+    StaleRevision {
+        /// Host-owned state key.
+        key: String,
+        /// Revision the caller expected.
+        expected: Option<u64>,
+        /// Revision currently stored.
+        found: Option<u64>,
+    },
+    /// A supervised-state key was empty.
+    InvalidStateKey,
+    /// A different evidence value is already stored for the same ID.
+    EvidenceRecordConflict {
+        /// Evidence identifier whose stored value differs.
+        evidence: String,
+    },
+    /// A different command result is already stored for the same request ID.
+    CommandResultConflict {
+        /// Request identifier whose stored result differs.
+        request: String,
+    },
+    /// A different budget reservation is already stored for the same attempt.
+    BudgetReservationConflict {
+        /// Reservation attempt identifier whose stored value differs.
+        attempt: String,
     },
     /// Stored data failed an integrity check.
     CorruptData {
@@ -176,11 +223,56 @@ impl fmt::Display for StoreError {
                 f,
                 "stored event contract version {found} is not supported by contract version {CONTRACT_VERSION}"
             ),
+            Self::UnsupportedHostActivityEvent => {
+                f.write_str("host activity events are not allowed on this run-only path")
+            }
             Self::DuplicateOperation { operation } => {
                 write!(f, "operation {operation} is already recorded")
             }
             Self::UnknownOperation { operation } => {
                 write!(f, "operation {operation} has no recorded intent")
+            }
+            Self::RequestIntentConflict { attempt } => {
+                write!(
+                    f,
+                    "request attempt {attempt} is already recorded with another intent"
+                )
+            }
+            Self::RequestObservationConflict { attempt } => {
+                write!(
+                    f,
+                    "request attempt {attempt} already has a conflicting observation"
+                )
+            }
+            Self::UnknownRequestAttempt { attempt } => {
+                write!(f, "request attempt {attempt} has no recorded intent")
+            }
+            Self::StaleRevision {
+                key,
+                expected,
+                found,
+            } => write!(
+                f,
+                "supervised state {key:?} revision is stale: expected {expected:?}, found {found:?}"
+            ),
+            Self::InvalidStateKey => f.write_str("supervised state key must not be empty"),
+            Self::EvidenceRecordConflict { evidence } => {
+                write!(
+                    f,
+                    "evidence {evidence} is already recorded with another value"
+                )
+            }
+            Self::CommandResultConflict { request } => {
+                write!(
+                    f,
+                    "request {request} is already recorded with another result"
+                )
+            }
+            Self::BudgetReservationConflict { attempt } => {
+                write!(
+                    f,
+                    "attempt {attempt} is already recorded with another budget reservation"
+                )
             }
             Self::CrossProjectReference { expected, found } => write!(
                 f,
@@ -209,6 +301,46 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+impl From<StoreError> for herness_supervision::SupervisionError {
+    fn from(error: StoreError) -> Self {
+        use herness_supervision::SupervisionError;
+
+        match error {
+            StoreError::CrossProjectReference { expected, found } => {
+                SupervisionError::CrossProjectReference {
+                    id_kind: "project".to_owned(),
+                    expected,
+                    found,
+                }
+            }
+            StoreError::StaleRevision {
+                expected, found, ..
+            } => match (expected, found) {
+                (Some(expected), Some(found)) => {
+                    SupervisionError::RevisionConflict { expected, found }
+                }
+                (_, None) => SupervisionError::UnknownSupervision,
+                (None, Some(found)) => SupervisionError::RevisionConflict { expected: 0, found },
+            },
+            StoreError::EvidenceRecordConflict { evidence } => {
+                SupervisionError::EvidenceContractViolation {
+                    field: "evidence.id".to_owned(),
+                    detail: format!("a different evidence record is already stored for {evidence}"),
+                }
+            }
+            StoreError::CommandResultConflict { request } => {
+                SupervisionError::DuplicateResultConflict { request }
+            }
+            StoreError::BudgetReservationConflict { attempt } => {
+                SupervisionError::BudgetReservationConflict { attempt }
+            }
+            other => SupervisionError::StorageFailure {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<StoreError> for CoreError {
     fn from(error: StoreError) -> Self {
         match error {
@@ -230,11 +362,20 @@ impl From<StoreError> for CoreError {
                 found,
                 expected: CONTRACT_VERSION,
             },
+            StoreError::UnsupportedHostActivityEvent => CoreError::UnsupportedPortFeature {
+                feature: herness_core::PortFeature::HostActivityEvents,
+            },
             StoreError::UnsupportedSchemaVersion { .. }
             | StoreError::UnsupportedCheckpointFormat { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::UnsupportedVersion,
             },
-            StoreError::OperationResultConflict { .. } => CoreError::StoreUnavailable {
+            StoreError::OperationResultConflict { .. }
+            | StoreError::RequestIntentConflict { .. }
+            | StoreError::RequestObservationConflict { .. }
+            | StoreError::StaleRevision { .. }
+            | StoreError::EvidenceRecordConflict { .. }
+            | StoreError::CommandResultConflict { .. }
+            | StoreError::BudgetReservationConflict { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }
@@ -245,6 +386,8 @@ impl From<StoreError> for CoreError {
             StoreError::InvalidConfig { .. }
             | StoreError::MigrationFailed { .. }
             | StoreError::UnknownOperation { .. }
+            | StoreError::UnknownRequestAttempt { .. }
+            | StoreError::InvalidStateKey
             | StoreError::Database { .. }
             | StoreError::Io { .. }
             | StoreError::InjectedFault { .. } => CoreError::StoreUnavailable {

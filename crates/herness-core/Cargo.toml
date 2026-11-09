@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes test-only helpers for compatibility fixtures. Production hosts must
+# not enable this feature.
+test-support = []
+
 [dependencies]
 libc.workspace = true
 serde.workspace = true

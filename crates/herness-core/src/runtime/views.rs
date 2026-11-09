@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::connection::{ConnectionId, ConnectionInfo};
 use crate::contracts::events::Event;
-use crate::contracts::ids::{AgentId, IdKind, OperationId, ProjectId, RunId, SessionId};
+use crate::contracts::ids::{AgentId, IdKind, InputId, OperationId, ProjectId, RunId, SessionId};
 use crate::contracts::operation::{FrozenOperation, OperationOutcome};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
@@ -535,6 +535,53 @@ impl StopOutcome {
     }
 }
 
+/// Whether a run's engine state belongs to this process or was restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMode {
+    /// The run was started or resumed in this process, so the live engine
+    /// session may be reused after a confirmed stop.
+    SameProcess,
+    /// The run was restored from durable state in this process. Its engine
+    /// session must be rebuilt from the checkpoint.
+    Restored,
+}
+
+impl RecoveryMode {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SameProcess => "same_process",
+            Self::Restored => "restored",
+        }
+    }
+}
+
+/// Result of starting a new run that continues a previous conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuationOutcome {
+    run: RunView,
+    input_id: InputId,
+}
+
+impl ContinuationOutcome {
+    /// Creates a continuation outcome.
+    pub(crate) const fn new(run: RunView, input_id: InputId) -> Self {
+        Self { run, input_id }
+    }
+
+    /// New run that carries the conversation.
+    pub const fn run(&self) -> &RunView {
+        &self.run
+    }
+
+    /// Accepted input submitted to the new run.
+    pub const fn input_id(&self) -> InputId {
+        self.input_id
+    }
+}
+
 /// Result of an approved operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -604,5 +651,71 @@ impl DenialOutcome {
     /// Run after the decision.
     pub const fn run(&self) -> &RunView {
         &self.run
+    }
+}
+
+/// Result of one host-owned pump iteration.
+///
+/// The pump drains every project's committed engine events and applies run
+/// deadlines without consulting the UI. A skipped pump means an explicit
+/// shutdown was already in progress; it performed no work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PumpReport {
+    skipped: bool,
+    projects: usize,
+    runs: usize,
+    events: usize,
+    deadline_stops: Vec<RunId>,
+}
+
+impl PumpReport {
+    /// A pump that did no work because shutdown had begun.
+    pub(crate) const fn skipped() -> Self {
+        Self {
+            skipped: true,
+            projects: 0,
+            runs: 0,
+            events: 0,
+            deadline_stops: Vec::new(),
+        }
+    }
+
+    /// Whether the pump skipped work because shutdown had begun.
+    pub const fn is_skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// Number of projects considered.
+    pub const fn projects(&self) -> usize {
+        self.projects
+    }
+
+    /// Number of runs polled.
+    pub const fn runs(&self) -> usize {
+        self.runs
+    }
+
+    /// Number of newly committed events.
+    pub const fn events(&self) -> usize {
+        self.events
+    }
+
+    /// Runs stopped because their deadline was reached.
+    pub fn deadline_stops(&self) -> &[RunId] {
+        &self.deadline_stops
+    }
+
+    pub(crate) fn note_project(&mut self) {
+        self.projects += 1;
+    }
+
+    pub(crate) fn note_run(&mut self, events: usize) {
+        self.runs += 1;
+        self.events += events;
+    }
+
+    pub(crate) fn note_deadline_stop(&mut self, run: RunId) {
+        self.deadline_stops.push(run);
     }
 }

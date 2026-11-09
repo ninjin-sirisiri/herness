@@ -96,6 +96,8 @@ H1のrun状態とは別に保存する。今回submitした入力の完結と対
 
 通常LLMはH1の接続・認証境界を再利用するが、評価専用のtoolなし要求を使い、通常の作業agentをjudgeとして起動しない。JevはAPIキーでPOST /v1/systemone、DecisionsはOpenAI APIキーでPOST /v1/decisionsへ接続する。2026-11-08確認の基準はJevの固定ID jev-1.14.0とDecisionsのgpt-6-luna。ChatGPTログインをDecisionsのAPI認可として流用しない。model alias・返却された実model ID・adapter/rubric版を記録し、モデル更新時は評価をやり直す。
 
+Jevは直接のTypeSafe接続に加え、利用者が明示選択したCommand Code Provider API gateway（assessment-only、固定`typesafe/jev-1.14.0`）でも利用できる。gatewayは暗黙のfallbackではなく、connection設定・origin・consent・budget・固定modelを別に検証し、agent実行や他providerへの切替には使わない。gatewayの選択・verificationは信頼された人間UIだけが行う。
+
 接続資格情報はH1と同じKeychain境界に置き、判定入力・DB・イベントへ入れない。送信同意はproject・接続先origin・用途・データ種別・対象範囲の版へ結び付け、初回の人間承認後は同じ範囲内で継続する。別provider、scope拡大、画像追加、同意取消しでは未送信要求を止め再確認する。取消しは既に送信した内容を取り消さない。
 
 入力は必要な原文・コード・差分・ログ・画像に限定し、全会話・全repositoryを既定送信しない。秘密情報の除外を行うが、任意の秘密を完全検出できるとは保証しない。除外や容量制限で必要な情報を欠いた場合はinsufficientとする。画像は承認範囲のbytesを送り、任意の外部URLや資格情報付きURLをproviderに取得させない。対象HTMLの撮影・情報保持のrubricはH3が所有する。

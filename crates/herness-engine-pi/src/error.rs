@@ -10,13 +10,6 @@ use herness_core::{CoreError, EngineFailureKind, ProviderFailureKind};
 /// Longest provider-free detail copied into a model-facing tool failure.
 const MAX_DETAIL_CHARS: usize = 512;
 
-/// A checkpoint could not be produced, parsed, or restored.
-pub(crate) fn checkpoint_unavailable() -> CoreError {
-    CoreError::EngineUnavailable {
-        failure: EngineFailureKind::CheckpointUnavailable,
-    }
-}
-
 /// The engine itself is not available or could not interpret SDK output.
 pub(crate) fn engine_unavailable() -> CoreError {
     CoreError::EngineUnavailable {

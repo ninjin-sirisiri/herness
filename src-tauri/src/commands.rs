@@ -16,9 +16,15 @@ use herness_core::runtime::{
     RunView, RuntimeSnapshot, StopOutcome,
 };
 use herness_core::{
-    ArgumentViolation, AuthMethod, ConnectionId, ConnectionInfo, ConnectionSettings, CoreError,
-    Endpoint, Event, HistoryLimit, InsecureRemoteHttp, OperationId, PermissionMode, ProjectId,
+    ArgumentViolation, AssessmentGateway, AuthMethod, ConnectionCapabilityDeclaration,
+    ConnectionId, ConnectionInfo, ConnectionSettings, CoreError, Endpoint, EndpointClass, Event,
+    HistoryLimit, InputCapabilities, InsecureRemoteHttp, OperationId, PermissionMode, ProjectId,
     Provider, RunId, SecretString, StopReason,
+};
+use herness_supervision::operations::{HumanOperation, SupervisionOperationRequest};
+use herness_supervision::{
+    DisclosureDataKind, ProfilePurpose, ProviderOrigin, SupervisionId, SupervisionRequestId,
+    TargetVersion,
 };
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -27,6 +33,77 @@ use crate::app::AppState;
 use crate::guard;
 use crate::host::DesktopHost;
 use crate::lifecycle::quit::{self as quit_flow, QuitChoice, QuitSnapshot};
+use crate::supervision::{
+    BudgetView, ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, EvidenceView,
+    PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionView,
+};
+
+/// Structured, non-secret error returned by the supervision command layer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl CommandFailure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn guard(error: String) -> Self {
+        Self::new("untrusted_source", error)
+    }
+
+    fn supervision(error: herness_supervision::SupervisionError) -> Self {
+        if let herness_supervision::SupervisionError::Unsupported { feature } = &error
+            && feature.contains("human confirmation")
+        {
+            return Self::new("human_confirmation_required", feature.clone());
+        }
+        Self::new("supervision", error.to_string())
+    }
+
+    fn invalid(field: &str, detail: impl Into<String>) -> Self {
+        Self::new(
+            "invalid_request",
+            format!("invalid {field}: {}", detail.into()),
+        )
+    }
+}
+
+fn verify_supervision_source(window: &tauri::WebviewWindow) -> Result<(), CommandFailure> {
+    verify_source(window).map_err(CommandFailure::guard)
+}
+
+fn parse_purpose(value: &str) -> Result<ProfilePurpose, CommandFailure> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "completion" => Ok(ProfilePurpose::Completion),
+        "html" => Ok(ProfilePurpose::Html),
+        "permission" => Ok(ProfilePurpose::Permission),
+        other => Err(CommandFailure::invalid(
+            "purpose",
+            format!("unknown purpose {other:?}"),
+        )),
+    }
+}
+
+fn parse_data_kind(value: &str) -> Result<DisclosureDataKind, CommandFailure> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" => Ok(DisclosureDataKind::Text),
+        "code" => Ok(DisclosureDataKind::Code),
+        "diff" => Ok(DisclosureDataKind::Diff),
+        "log" => Ok(DisclosureDataKind::Log),
+        "image" => Ok(DisclosureDataKind::Image),
+        other => Err(CommandFailure::invalid(
+            "dataKinds",
+            format!("unknown data kind {other:?}"),
+        )),
+    }
+}
 
 /// Non-secret aggregate the UI reloads after every window reopen.
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +183,10 @@ pub fn frontend_state(
         .map_err(|_| "the selected project is unavailable".to_owned())?;
     let selected =
         selected.filter(|project| projects.iter().any(|view| view.project_id() == *project));
+    let automatic_mode_available = selected.map_or_else(
+        || host.permission_available(),
+        |project| host.permission_available_for(project),
+    );
     let reconciliation = state
         .reconciliation
         .lock()
@@ -117,8 +198,12 @@ pub fn frontend_state(
         connections,
         permission_mode: policy.mode(),
         policy_version: policy.version().get(),
-        automatic_mode_available: false,
-        automatic_mode_reason: "H2 evaluator is not connected; automatic decisions are unavailable",
+        automatic_mode_available,
+        automatic_mode_reason: if automatic_mode_available {
+            "a verified permission-evaluation profile and consent are configured"
+        } else {
+            "no verified permission-evaluation profile is configured; automatic decisions are unavailable"
+        },
         reconciliation,
     })
 }
@@ -196,6 +281,7 @@ pub fn project_view(
 
 /// Registers a human-configured provider connection.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn add_connection(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
@@ -204,6 +290,7 @@ pub fn add_connection(
     auth_method: AuthMethod,
     endpoint: Option<String>,
     insecure_http_acknowledged: Option<bool>,
+    assessment_gateway: Option<String>,
 ) -> Result<ConnectionInfo, String> {
     verify_source(&window)?;
     let endpoint = match endpoint {
@@ -215,15 +302,49 @@ pub fn add_connection(
     let acknowledgment = insecure_http_acknowledged
         .filter(|acknowledged| *acknowledged)
         .map(|_| InsecureRemoteHttp::Acknowledged);
-    let settings = ConnectionSettings::new(
-        ConnectionId::new(),
-        provider,
-        model,
-        auth_method,
-        endpoint,
-        acknowledgment,
-    )
-    .map_err(|error| error.to_string())?;
+    let connection = ConnectionId::new();
+    let gateway = assessment_gateway
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let settings = if provider == Provider::TypeSafe {
+        let declaration = ConnectionCapabilityDeclaration::new(
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+        );
+        let settings = ConnectionSettings::new_with_capabilities(
+            connection,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            acknowledgment,
+            declaration,
+        )
+        .map_err(|error| error.to_string())?;
+        match gateway {
+            Some("commandcode") => settings
+                .with_assessment_gateway(AssessmentGateway::CommandCode)
+                .map_err(|error| error.to_string())?,
+            Some(other) => {
+                return Err(format!("unknown assessment gateway {other:?}"));
+            }
+            None => settings,
+        }
+    } else {
+        if gateway.is_some() {
+            return Err("an assessment gateway is only valid for TypeSafe Jev".to_owned());
+        }
+        ConnectionSettings::new(
+            connection,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            acknowledgment,
+        )
+        .map_err(|error| error.to_string())?
+    };
     let connection = settings.connection_id();
     let mut host = lock_host(&state)?;
     host.register_connection(settings)?;
@@ -416,7 +537,12 @@ pub fn resume_run(
         .map_err(|error| error.to_string())
 }
 
-/// Drains engine events and returns a fresh project snapshot.
+/// Returns a fresh project snapshot.
+///
+/// This command is read-only with respect to execution. Engine events are
+/// drained by the host-owned pump, and committed events are read through
+/// `history`. The `events` field remains for the existing UI shape; it is
+/// always empty because the WebView is not the execution driver.
 #[tauri::command(async)]
 pub fn poll_project(
     window: tauri::WebviewWindow,
@@ -424,27 +550,15 @@ pub fn poll_project(
     project: ProjectId,
 ) -> Result<PollResult, String> {
     verify_source(&window)?;
-    let mut host = lock_host(&state)?;
+    let host = lock_host(&state)?;
     let snapshot = host
         .runtime()
         .snapshot(project)
         .map_err(|error| error.to_string())?;
-    let mut events = Vec::new();
-    // Drain every run, including one whose last observed host state is `idle`.
-    // An adapter can publish its idle echo before the first model turn starts;
-    // skipping idle runs would lose later tool/approval events.
-    for run in snapshot.runs() {
-        events.extend(
-            host.runtime_mut()
-                .poll_run(project, run.run_id())
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    let snapshot = host
-        .runtime()
-        .snapshot(project)
-        .map_err(|error| error.to_string())?;
-    Ok(PollResult { events, snapshot })
+    Ok(PollResult {
+        events: Vec::new(),
+        snapshot,
+    })
 }
 
 /// Returns the stable reconnect snapshot for one project.
@@ -504,6 +618,369 @@ pub fn deny(
         .runtime_mut()
         .deny(project, operation)
         .map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// H2 supervision
+// ---------------------------------------------------------------------------
+
+/// Creates one supervision target from human-confirmed conditions.
+#[tauri::command(async)]
+pub fn supervision_create(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: CreateSupervisionRequest,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Create);
+    host.supervision_create(PlanRequestActor::Human, request, Some(confirmation))
+        .map_err(CommandFailure::supervision)
+}
+
+/// Lists saved supervision targets for one project.
+#[tauri::command(async)]
+pub fn supervision_list(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<Vec<SupervisionView>, CommandFailure> {
+    verify_supervision_source(&window)?;
+    lock_host(&state)
+        .map_err(|error| CommandFailure::new("host_unavailable", error))?
+        .supervision_list(project)
+        .map_err(CommandFailure::supervision)
+}
+
+/// Returns one saved supervision view.
+#[tauri::command(async)]
+pub fn supervision_get(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    lock_host(&state)
+        .map_err(|error| CommandFailure::new("host_unavailable", error))?
+        .supervision_get(project, supervision)
+        .map_err(CommandFailure::supervision)
+}
+
+/// Starts the first run of a ready target.
+#[tauri::command(async)]
+pub fn supervision_start(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Start);
+    host.supervision_start(
+        project,
+        supervision,
+        request_id,
+        expected_revision,
+        Some(confirmation),
+    )
+    .map_err(CommandFailure::supervision)
+}
+
+fn stop_or_cancel(
+    host: &mut DesktopHost,
+    request_id: SupervisionRequestId,
+    supervision: SupervisionId,
+    expected_revision: u64,
+    cancel: bool,
+    kind: ConfirmationKind,
+) -> Result<SupervisionView, CommandFailure> {
+    let operation = if cancel {
+        HumanOperation::Cancel
+    } else {
+        HumanOperation::Stop
+    };
+    let request =
+        SupervisionOperationRequest::new(request_id, supervision, operation, expected_revision)
+            .map_err(CommandFailure::supervision)?;
+    let confirmation = host.confirm_supervision(kind);
+    host.supervision_stop(request, cancel, Some(confirmation))
+        .map_err(CommandFailure::supervision)
+}
+
+/// Stops one target through the H1 cooperative stop path.
+#[tauri::command(async)]
+pub fn supervision_stop(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    stop_or_cancel(
+        &mut host,
+        request_id,
+        supervision,
+        expected_revision,
+        false,
+        ConfirmationKind::Stop,
+    )
+}
+
+/// Cancels one target and retains its history and artifacts.
+#[tauri::command(async)]
+pub fn supervision_cancel(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    stop_or_cancel(
+        &mut host,
+        request_id,
+        supervision,
+        expected_revision,
+        true,
+        ConfirmationKind::Stop,
+    )
+}
+
+/// Resumes a stopped/waiting target after the recovery gate.
+#[tauri::command(async)]
+pub fn supervision_resume(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let request = SupervisionOperationRequest::new(
+        request_id,
+        supervision,
+        HumanOperation::Resume,
+        expected_revision,
+    )
+    .map_err(CommandFailure::supervision)?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Resume);
+    host.supervision_resume(request, Some(confirmation))
+        .map_err(CommandFailure::supervision)
+}
+
+/// Reassesses a target without replaying an old input.
+#[tauri::command(async)]
+pub fn supervision_reassess(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let request = SupervisionOperationRequest::new(
+        request_id,
+        supervision,
+        HumanOperation::Reassess,
+        expected_revision,
+    )
+    .map_err(CommandFailure::supervision)?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Reassess);
+    host.supervision_reassess(request, Some(confirmation))
+        .map_err(CommandFailure::supervision)
+}
+
+/// Changes approved conditions, profile, consent, or budget explicitly.
+#[tauri::command(async)]
+pub fn supervision_change(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+    request_id: SupervisionRequestId,
+    expected_revision: u64,
+    change: ChangeSupervisionRequest,
+) -> Result<SupervisionView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Change);
+    host.supervision_change(
+        project,
+        supervision,
+        request_id,
+        expected_revision,
+        PlanRequestActor::Human,
+        change,
+        Some(confirmation),
+    )
+    .map_err(CommandFailure::supervision)
+}
+
+/// Configures a per-purpose assessment profile.
+#[tauri::command(async)]
+pub fn supervision_profile(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    purpose: String,
+    connection: ConnectionId,
+    model: String,
+) -> Result<PurposeStatusView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let purpose = parse_purpose(&purpose)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Profile);
+    host.supervision_configure_profile(
+        PlanRequestActor::Human,
+        project,
+        purpose,
+        connection,
+        &model,
+        Some(confirmation),
+    )
+    .map_err(CommandFailure::supervision)
+}
+
+/// Marks a configured assessment profile verified or unverified.
+///
+/// The profile is never verified by a model/tool or by a preview/remote
+/// document. This command is reachable only after the trusted-main guard.
+#[tauri::command(async)]
+pub fn supervision_verify_profile(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    purpose: String,
+    verified: bool,
+) -> Result<PurposeStatusView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let purpose = parse_purpose(&purpose)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let _confirmation = host.confirm_supervision(ConfirmationKind::Profile);
+    host.supervision_mark_profile_verified(project, purpose, verified)
+        .map_err(CommandFailure::supervision)
+}
+
+/// Grants or revokes per-purpose disclosure consent.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+pub fn supervision_consent(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    purpose: String,
+    action: String,
+    origin: Option<String>,
+    data_kinds: Option<Vec<String>>,
+    targets: Option<Vec<String>>,
+    target_version: Option<u64>,
+) -> Result<PurposeStatusView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let purpose = parse_purpose(&purpose)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    match action.trim().to_ascii_lowercase().as_str() {
+        "grant" => {
+            let origin = origin.ok_or_else(|| CommandFailure::invalid("origin", "required"))?;
+            let origin = ProviderOrigin::parse(origin).map_err(CommandFailure::supervision)?;
+            let data_kinds = data_kinds
+                .unwrap_or_default()
+                .into_iter()
+                .map(|kind| parse_data_kind(&kind))
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+            let targets = targets.unwrap_or_default();
+            let target_version = TargetVersion::new(target_version.unwrap_or(1))
+                .map_err(CommandFailure::supervision)?;
+            let confirmation = host.confirm_supervision(ConfirmationKind::Consent);
+            host.supervision_grant_consent(
+                PlanRequestActor::Human,
+                project,
+                purpose,
+                origin,
+                data_kinds,
+                targets,
+                target_version,
+                Some(confirmation),
+            )
+            .map_err(CommandFailure::supervision)
+        }
+        "revoke" => {
+            let confirmation = host.confirm_supervision(ConfirmationKind::Consent);
+            host.supervision_revoke_consent(
+                PlanRequestActor::Human,
+                project,
+                purpose,
+                Some(confirmation),
+            )
+            .map_err(CommandFailure::supervision)
+        }
+        other => Err(CommandFailure::invalid(
+            "action",
+            format!("unknown consent action {other:?}"),
+        )),
+    }
+}
+
+/// Returns evidence summaries for one target.
+#[tauri::command(async)]
+pub fn supervision_evidence(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+) -> Result<Vec<EvidenceView>, CommandFailure> {
+    verify_supervision_source(&window)?;
+    Ok(lock_host(&state)
+        .map_err(|error| CommandFailure::new("host_unavailable", error))?
+        .supervision_get(project, supervision)
+        .map_err(CommandFailure::supervision)?
+        .evidence)
+}
+
+/// Returns the durable budget view for one target.
+#[tauri::command(async)]
+pub fn supervision_budget(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+) -> Result<Option<BudgetView>, CommandFailure> {
+    verify_supervision_source(&window)?;
+    Ok(lock_host(&state)
+        .map_err(|error| CommandFailure::new("host_unavailable", error))?
+        .supervision_get(project, supervision)
+        .map_err(CommandFailure::supervision)?
+        .budget)
+}
+
+/// Returns the read-only recovery report for one target.
+#[tauri::command(async)]
+pub fn supervision_recovery(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    supervision: SupervisionId,
+) -> Result<RecoveryView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    host.supervision_recovery(project, supervision)
+        .map_err(CommandFailure::supervision)
 }
 
 // ---------------------------------------------------------------------------

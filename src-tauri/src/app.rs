@@ -80,6 +80,10 @@ pub fn run(
                 reconciliation: Mutex::new(reconciliation),
             });
 
+            // Execution is host-owned: the pump drains every project's engine
+            // events and applies run deadlines even with no window and no
+            // non-selected project poll.
+            lifecycle::start_host_pump(app);
             lifecycle::create_main_window(app)?;
             if smoke_test {
                 lifecycle::start_smoke_test(app, started);
@@ -115,6 +119,21 @@ pub fn run(
             commands::history,
             commands::approve,
             commands::deny,
+            commands::supervision_create,
+            commands::supervision_list,
+            commands::supervision_get,
+            commands::supervision_start,
+            commands::supervision_stop,
+            commands::supervision_cancel,
+            commands::supervision_resume,
+            commands::supervision_reassess,
+            commands::supervision_change,
+            commands::supervision_profile,
+            commands::supervision_verify_profile,
+            commands::supervision_consent,
+            commands::supervision_evidence,
+            commands::supervision_budget,
+            commands::supervision_recovery,
             commands::quit_app,
             commands::quit_state,
             commands::quit_choice,

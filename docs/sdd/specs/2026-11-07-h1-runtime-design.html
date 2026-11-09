@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:c4c547309708f781ee026b8f62f3793ebc16726d56c27ae079a48844fd060578">
+<meta name="sdd-source-digest" content="sha256:bdde7937578ca7115e9ce4e3079247a47d91382bc802d355d1084028fa267db9">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -196,7 +196,7 @@
 <li><strong>唯一のtool許可経路:</strong> hostが確定したrunのgrant上限、現在のpolicy参照、評価器への参照、停止・deadline制御をPiの実tool経路まで渡す。adapterが広いgrantを再構成しない。hostとadapterのうち指定された一方だけが実行し、最終引数・policy・grant・停止状態を副作用直前に照合する。評価の待機はhost全体の監視・停止を占有せず、失敗・取消し・timeoutでは実行しない。H2の60秒等の値はH2が所有する。</li>
 <li><strong>モデル要求のgateと観測:</strong> SDKからの自動的な次要求を含む各外部モデル要求に、host所有の要求ID、接続ID、用途、runまたはhost activity参照、attempt IDを付ける。送信前のgateで同意・予算予約・deadlineを検査し、その意図を永続化してから送る。接続前失敗・送信開始・完結・取消し・送信結果不明、利用可能なinput/output/cache token数と実model IDを返す。欠落した使用量は0でなくunknownとし、H2がopaque checkpointを解析して補わない。gateはH1所有のportとして注入でき、H1単独の利用でH2型を必要としない。gate拒否・保存失敗では送信せず、gateを迂回する通信を残さない。</li>
 <li><strong>host所有の監視:</strong> 実行中の全projectのengineイベント、入力の完結、管理下process、停止・deadlineをRust hostで処理する。WebViewのpollはsnapshot・購読の取得だけとし、実行を進める条件にしない。window閉鎖・非選択projectでも同じ保証を持ち、quitは既存の停止・保存規則に従う。</li>
-<li><strong>判定用の接続能力:</strong> 接続のprovider・認証方式とendpoint class・入力能力を区別する。既存接続の経路は維持し、TypeSafeのAPIキー接続とJev System One、OpenAI APIキーのDecisionsを判定専用の能力として追加する。判定専用接続をagent実行へ渡したら送信前に拒否し、ChatGPTログインをDecisionsへ流用しない。秘密の保存・更新・origin制約は既存のH1境界に従い、用途別profile・送信同意・問いはH2が所有する。</li>
+<li><strong>判定用の接続能力:</strong> 接続のprovider・認証方式とendpoint class・入力能力を区別する。既存接続の経路は維持し、TypeSafeのAPIキー接続とJev System One、OpenAI APIキーのDecisionsを判定専用の能力として追加する。判定専用接続をagent実行へ渡したら送信前に拒否し、ChatGPTログインをDecisionsへ流用しない。秘密の保存・更新・origin制約は既存のH1境界に従い、用途別profile・送信同意・問いはH2が所有する。Command Code Provider APIは、TypeSafe/Jev System Oneのassessment-only接続の明示的な固定gatewayとして選択できる。gatewayはConnectionSettingsのoptionalな宣言として保存し、未知のgateway・agent実行・ChatGPT loginの流用を拒否する。gatewayはprovider fallbackではなく、固定origin・API key・System One shape・固定<code>typesafe/jev-1.14.0</code>を使う。</li>
 <li><strong>version 2のevent envelope:</strong> project、sequence、時刻、kind、payloadに加え、subjectをrun参照またはhost activity参照のいずれかとする。run参照には実在するagent/session/run IDを要求し、host activity参照にはprojectに束縛したkindと安定IDを要求する。run作成前のH2イベントはhost activityを使い、架空のrunを作らない。操作IDは対応するrun参照にだけ付ける。H2の監督状態はH2 payloadで表し、H1のrun状態へ追加しない。全subjectで同じproject sequenceと保存後通知を使う。</li>
 <li><strong>互換とmigration:</strong> 新規書込みの公開契約はversion 2、eventの既知の読込み版は1・2とする。version 1は明示的な互換decoderでrun参照として読み、保存済みのID・sequence・payloadを保持する。host-stateは既存format 1・2を読めるformat 3へ進め、DB schema 3からの変更は4以降の順序付きtransactional migrationで行う。H2の状態・要求意図・予算・通知にも比較更新と原子的な保存境界を提供する。既存履歴・接続・承認記録・checkpointを削除せず、過去の承認を有効化し直さない。未知のDB・host-state・event・SDK形式は書込み前に拒否する。migration失敗時は旧DBを保持し、成功後の旧アプリによるdowngradeや自動的なDB再作成は認めない。SDK checkpointの版変換はadapterだけが行い、変換不能なら再開不可を返す。</li>
 </ol>

@@ -5,11 +5,13 @@
 //! not interpret SDK internals.
 
 use crate::contracts::checkpoint::Checkpoint;
-use crate::contracts::errors::CoreError;
+use crate::contracts::errors::{ArgumentViolation, CoreError, PortFeature};
 use crate::contracts::events::{Event, EventDraft};
 use crate::contracts::history::{HistoryPage, HistoryQuery};
 use crate::contracts::ids::{OperationId, ProjectId, RunId};
 use crate::contracts::operation::{OperationIntent, OperationRecord, OperationResult};
+use crate::contracts::request::{ModelRequestObservation, RequestGateIntent};
+use crate::contracts::time::Timestamp;
 
 /// One atomic checkpoint commit.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +37,14 @@ impl CheckpointCommit {
             }
         }
         for event in &events {
-            let found = event.run_id();
+            let Some(found) = event.run_id() else {
+                return Err(CoreError::InvalidEvent {
+                    field: "subject".to_owned(),
+                    violation: ArgumentViolation::Invalid {
+                        detail: "a host activity event cannot join a run checkpoint".to_owned(),
+                    },
+                });
+            };
             if found != expected {
                 return Err(CoreError::MismatchedRun { expected, found });
             }
@@ -131,4 +140,35 @@ pub trait StorePort {
         result: OperationResult,
         events: Vec<EventDraft>,
     ) -> Result<CommitReceipt, CoreError>;
+
+    /// Durably records one model request intent before any bytes may be sent.
+    ///
+    /// An implementation must persist the intent before returning success. A
+    /// missing implementation returns an explicit unsupported error, so a
+    /// model-request gate built on this store cannot admit a request.
+    fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        let _ = (intent, recorded_at);
+        Err(CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestGate,
+        })
+    }
+
+    /// Durably records a send-started or terminal model request observation.
+    ///
+    /// A missing implementation returns an explicit unsupported error. Missing
+    /// usage must be stored as unknown, never converted to zero.
+    fn record_model_request_observation(
+        &mut self,
+        observation: ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        let _ = (observation, observed_at);
+        Err(CoreError::UnsupportedPortFeature {
+            feature: PortFeature::RequestObservation,
+        })
+    }
 }

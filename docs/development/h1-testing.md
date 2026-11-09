@@ -184,6 +184,8 @@ cargo test --workspace --locked
 
 ## Task 1で固定した契約と検証
 
+2026-11-08のH2 Task 1でevent契約を更新した。新規書込みはversion 2、既知の読込み版は1・2である。以下の「1のみ受付」はH1 Task 1時点の記録であり、現行の検証は [h2-testing.md](h2-testing.md) を参照する。
+
 `herness-core` のtestは次を確認する。
 
 - **contract version:** 1のみ受付。0・2は `UnknownContractVersion`、非数値は `InvalidContractVersion`。event JSONの `contractVersion: 2` はdeserialize時に拒否する。

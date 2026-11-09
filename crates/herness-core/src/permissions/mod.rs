@@ -11,11 +11,14 @@
 
 pub mod approval;
 pub mod capability;
+pub mod control;
 pub mod decision;
+pub mod evaluator;
 pub mod grant;
 pub mod policy;
 pub mod protected;
 pub mod rules;
+pub mod run_context;
 pub mod service;
 
 use std::fmt;
@@ -28,11 +31,14 @@ use crate::contracts::errors::CoreError;
 
 pub use approval::{ApprovalError, ApprovalRequest, Authorization};
 pub use capability::{AutomaticModeCapability, AutomaticModeUnavailableReason};
+pub use control::RunControl;
 pub use decision::{ArgumentsDigest, DecisionBinding, DecisionStatus, InvalidationReason};
+pub use evaluator::{BoundedPermissionEvaluator, DEFAULT_EVALUATION_TIMEOUT};
 pub use grant::{GrantScope, GrantWidening};
-pub use policy::{PermissionPolicy, PolicyAdmin};
+pub use policy::{PermissionPolicy, PolicyAdmin, SharedPolicy};
 pub use protected::ProtectedBoundary;
 pub use rules::{MatchMethod, PermissionRule, RuleEffect, RuleTarget, SimpleCommand};
+pub use run_context::RunPermissionContext;
 pub use service::{
     DenialReason, EvaluationContext, EvaluatorFailure, HumanWaitReason, PermissionOutcome,
     PermissionService,

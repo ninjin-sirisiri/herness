@@ -5,9 +5,10 @@ use herness_runtime_tests::fixtures::{ProjectFixture, second_project};
 use serde_json::json;
 
 #[test]
-fn contract_version_is_pinned_at_one() {
-    assert_eq!(CONTRACT_VERSION, 1);
-    assert_eq!(ContractVersion::CURRENT.get(), 1);
+fn contract_version_writes_two_and_reads_one_and_two() {
+    assert_eq!(CONTRACT_VERSION, 2);
+    assert_eq!(ContractVersion::CURRENT.get(), 2);
+    assert_eq!(ContractVersion::try_from(1), Ok(ContractVersion::V1));
 }
 
 #[test]
@@ -19,8 +20,9 @@ fn fixture_event_roundtrips_through_public_json() {
     );
 
     let encoded = serde_json::to_value(&event).unwrap();
-    assert_eq!(encoded["contractVersion"], 1);
+    assert_eq!(encoded["contractVersion"], 2);
     assert_eq!(encoded["projectId"], fixture.project_id.to_string());
+    assert_eq!(encoded["subject"]["runId"], fixture.run_id.to_string());
     assert_eq!(serde_json::from_value::<Event>(encoded).unwrap(), event);
 }
 

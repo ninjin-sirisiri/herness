@@ -3,6 +3,9 @@ members = [
     "crates/herness-core",
     "crates/herness-engine-pi",
     "crates/herness-store",
+    "crates/herness-supervision",
+    "crates/herness-assessment",
+    "tests/supervision",
     "src-tauri",
     "tests/runtime",
 ]

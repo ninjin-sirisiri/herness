@@ -10,6 +10,8 @@
 //! missing rule, or selecting the current mode is a no-op and does not bump the
 //! version.
 
+use std::sync::{Arc, RwLock};
+
 use serde::Serialize;
 
 use crate::contracts::errors::{ArgumentViolation, CoreError};
@@ -17,6 +19,60 @@ use crate::contracts::operation::FrozenOperation;
 use crate::permissions::{
     EvaluatorAvailability, PermissionMode, PermissionRule, PolicyVersion, RuleEffect,
 };
+
+/// Shared, always-current permission policy handle.
+///
+/// The host creates one handle per runtime and publishes every effective
+/// [`PolicyAdmin`] change through it. The engine adapter reads the handle
+/// immediately before a side effect, so a policy change made during an
+/// evaluation is visible without a second copy of the policy.
+///
+/// The handle only exposes reads. Mutation remains on [`PolicyAdmin`], which is
+/// reachable only from trusted host code.
+#[derive(Debug, Clone)]
+pub struct SharedPolicy {
+    inner: Arc<RwLock<PermissionPolicy>>,
+}
+
+impl SharedPolicy {
+    /// Creates a handle from an initial policy value.
+    pub fn new(policy: PermissionPolicy) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(policy)),
+        }
+    }
+
+    /// Copies the current policy.
+    pub fn snapshot(&self) -> PermissionPolicy {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Current monotonically increasing policy version.
+    pub fn version(&self) -> PolicyVersion {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .version()
+    }
+
+    /// Current permission mode.
+    pub fn mode(&self) -> PermissionMode {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mode()
+    }
+
+    fn replace(&self, policy: PermissionPolicy) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+}
 
 /// Current host permission policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,6 +140,7 @@ impl Default for PermissionPolicy {
 #[derive(Debug, Clone)]
 pub struct PolicyAdmin {
     policy: PermissionPolicy,
+    shared: Option<SharedPolicy>,
 }
 
 impl PolicyAdmin {
@@ -91,6 +148,36 @@ impl PolicyAdmin {
     pub fn new() -> Self {
         Self {
             policy: PermissionPolicy::initial(),
+            shared: None,
+        }
+    }
+
+    /// Reads the current shared policy and keeps publishing changes to it.
+    ///
+    /// This is the host-composition constructor used when another trusted
+    /// component already owns or reads the shared handle. The current value is
+    /// not reset.
+    pub fn from_shared(shared: SharedPolicy) -> Self {
+        Self {
+            policy: shared.snapshot(),
+            shared: Some(shared),
+        }
+    }
+
+    /// Attaches this admin's current value to a shared handle.
+    ///
+    /// Used once at runtime restore. The admin stays the only mutation surface;
+    /// every effective change is published to the handle.
+    #[must_use]
+    pub fn with_shared(mut self, shared: SharedPolicy) -> Self {
+        shared.replace(self.policy.clone());
+        self.shared = Some(shared);
+        self
+    }
+
+    fn publish(&self) {
+        if let Some(shared) = &self.shared {
+            shared.replace(self.policy.clone());
         }
     }
 
@@ -116,6 +203,7 @@ impl PolicyAdmin {
         }
         let version = self.bump_version()?;
         self.policy.mode = mode;
+        self.publish();
         Ok(version)
     }
 
@@ -129,6 +217,7 @@ impl PolicyAdmin {
         }
         let version = self.bump_version()?;
         self.policy.rules.push(rule);
+        self.publish();
         Ok(version)
     }
 
@@ -149,6 +238,7 @@ impl PolicyAdmin {
         };
         let version = self.bump_version()?;
         self.policy.rules.remove(position);
+        self.publish();
         Ok(Some(version))
     }
 
@@ -167,6 +257,7 @@ impl PolicyAdmin {
                 },
             })?;
         self.policy.version = next;
+        self.publish();
         Ok(next)
     }
 }
@@ -229,6 +320,19 @@ mod tests {
                 .expect("same mode"),
             PolicyVersion::new(5).expect("v5")
         );
+    }
+
+    #[test]
+    fn shared_policy_publishes_every_effective_admin_change() {
+        let shared = SharedPolicy::new(PermissionPolicy::initial());
+        let mut admin = PolicyAdmin::from_shared(shared.clone());
+        let rule = read_rule();
+        let version = admin.add_rule(rule.clone()).expect("add");
+        assert_eq!(shared.version(), version);
+        assert_eq!(shared.snapshot(), admin.policy().clone());
+        let bumped = admin.bump_version().expect("bump");
+        assert_eq!(shared.version(), bumped);
+        assert_eq!(shared.snapshot(), admin.policy().clone());
     }
 
     #[test]

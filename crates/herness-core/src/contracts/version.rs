@@ -1,8 +1,10 @@
 //! Public contract versioning.
 //!
-//! Version 1 is the only contract this build can interpret. Unknown versions
-//! are rejected with [`CoreError::UnknownContractVersion`] instead of being
-//! read with version-1 rules.
+//! Version 2 is the only version written for new public events. Both version 1
+//! and version 2 are known read versions: version 1 events are decoded by an
+//! explicit compatibility decoder as run-subject events. Unknown versions are
+//! rejected with [`CoreError::UnknownContractVersion`] instead of being read
+//! with version-2 rules.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,20 +15,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::errors::CoreError;
 
-/// The public contract version implemented by this build.
-pub const CONTRACT_VERSION: u32 = 1;
+/// The version written for new public events.
+pub const CONTRACT_VERSION: u32 = 2;
+
+/// Oldest public contract version this build can read.
+pub const OLDEST_READABLE_CONTRACT_VERSION: u32 = 1;
 
 /// Version of the host-owned public contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContractVersion(u32);
 
 impl ContractVersion {
-    /// The contract version implemented by this build.
+    /// Version 1, readable through the explicit compatibility decoder.
+    pub const V1: Self = Self(1);
+
+    /// Version 2, the only version written for new events.
+    pub const V2: Self = Self(2);
+
+    /// The contract version implemented by this build for new writes.
     pub const CURRENT: Self = Self(CONTRACT_VERSION);
+
+    /// Every event contract version this build can read.
+    pub const READABLE: [Self; 2] = [Self::V1, Self::V2];
 
     /// Returns the numeric version.
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    /// Whether this build knows how to read the version.
+    pub const fn is_readable(self) -> bool {
+        matches!(self.0, 1 | 2)
     }
 }
 
@@ -40,13 +59,13 @@ impl TryFrom<u32> for ContractVersion {
     type Error = CoreError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        if value == CONTRACT_VERSION {
-            Ok(Self(value))
-        } else {
-            Err(CoreError::UnknownContractVersion {
+        match value {
+            1 => Ok(Self::V1),
+            CONTRACT_VERSION => Ok(Self::CURRENT),
+            _ => Err(CoreError::UnknownContractVersion {
                 found: value,
                 expected: CONTRACT_VERSION,
-            })
+            }),
         }
     }
 }

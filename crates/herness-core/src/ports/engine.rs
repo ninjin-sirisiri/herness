@@ -9,10 +9,13 @@ use crate::contracts::errors::{CoreError, EngineFailureKind};
 use crate::contracts::ids::{AgentId, ProjectId, ProjectScope, RunId, SessionId};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::run::RunState;
+use crate::permissions::RunPermissionContext;
 use crate::tools::{ToolArguments, ToolName};
 
+pub use crate::contracts::request::StopReason;
+
 /// Request to start one run in an independent engine session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineStart {
     project_id: ProjectId,
     agent_id: AgentId,
@@ -21,6 +24,7 @@ pub struct EngineStart {
     connection: ConnectionId,
     cwd: AbsolutePath,
     instructions: String,
+    permission: Option<RunPermissionContext>,
 }
 
 impl EngineStart {
@@ -47,7 +51,25 @@ impl EngineStart {
             connection,
             cwd,
             instructions: instructions.into(),
+            permission: None,
         })
+    }
+
+    /// Attaches the host-resolved permission context for this run.
+    ///
+    /// The value is built only by trusted host composition. An adapter that
+    /// executes tools internally must use exactly this grant, policy handle,
+    /// evaluator, and stop control; it must not construct a wide grant when the
+    /// value is absent.
+    #[must_use]
+    pub fn with_permission(mut self, permission: RunPermissionContext) -> Self {
+        self.permission = Some(permission);
+        self
+    }
+
+    /// Host-resolved permission context, when one was supplied.
+    pub const fn permission(&self) -> Option<&RunPermissionContext> {
+        self.permission.as_ref()
     }
 
     /// Project that owns the run.
@@ -91,17 +113,6 @@ impl EngineStart {
 pub enum EngineInput {
     /// A user or host text message.
     Text(String),
-}
-
-/// Reason a run stop was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StopReason {
-    /// The user requested the stop.
-    UserRequest,
-    /// The application is shutting down.
-    ApplicationQuit,
-    /// Policy or approval requires the run to stop.
-    Policy,
 }
 
 /// Result of a stop request. Unconfirmed stops are never reported as stopped.
@@ -180,14 +191,75 @@ pub trait EnginePort {
         ToolExecutionAuthority::Host
     }
 
+    /// Installs the host-resolved permission context for a run that is resumed
+    /// or whose live session is reused.
+    ///
+    /// Start and continuation normally carry the context on [`EngineStart`].
+    /// Resume has no `EngineStart` at the host boundary, so the host installs
+    /// the same value here before calling [`Self::resume`]. An adapter that
+    /// executes tools internally must not fall back to a wide grant or to `None`
+    /// when this value is missing; it must refuse the tool authorization.
+    fn set_run_permission(&mut self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        let _ = permission;
+        Err(CoreError::UnsupportedPortFeature {
+            feature: crate::contracts::errors::PortFeature::RunPermission,
+        })
+    }
+
     /// Starts an independent engine run.
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError>;
+
+    /// Starts a new run that continues the conversation in `previous`.
+    ///
+    /// The new run must use `start.run_id()` for every new tool operation,
+    /// event, and checkpoint while keeping the previous conversation and system
+    /// prompt. Implementations must not re-send previous input, reuse a previous
+    /// approval, or fall back to a fresh unrelated session when the conversation
+    /// cannot be preserved. A build without this capability returns the
+    /// explicit unsupported error.
+    fn start_continuation(
+        &mut self,
+        start: EngineStart,
+        previous: Checkpoint,
+    ) -> Result<(), CoreError> {
+        let _ = (start, previous);
+        Err(CoreError::UnsupportedPortFeature {
+            feature: crate::contracts::errors::PortFeature::Continuation,
+        })
+    }
+
+    /// Checks whether `start` can continue `previous` without side effects.
+    ///
+    /// The host calls this before persisting the new run so a conversation that
+    /// cannot be preserved is refused without creating a run or sending input.
+    /// The default accepts the preflight because an adapter without checkpoint
+    /// semantics has nothing to validate; adapters that own SDK snapshots must
+    /// return an explicit `NotContinuable` error instead of guessing.
+    fn check_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &Checkpoint,
+    ) -> Result<(), CoreError> {
+        let _ = (start, previous);
+        Ok(())
+    }
 
     /// Sends input to an existing run.
     fn send_input(&mut self, run: &RunId, input: EngineInput) -> Result<(), CoreError>;
 
     /// Requests a coordinated stop. The caller must handle `Unconfirmed`.
     fn request_stop(&mut self, run: &RunId, reason: StopReason) -> Result<StopReport, CoreError>;
+
+    /// Checks whether `run` can be restored from `checkpoint` without a model
+    /// request or a tool execution.
+    ///
+    /// The host calls this before changing the run to `running`. The default
+    /// accepts the preflight; adapters that own SDK snapshots must return
+    /// `CoreError::NotResumable` when the snapshot could replay input or a tool.
+    fn check_resume(&self, run: &RunId, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        let _ = (run, checkpoint);
+        Ok(())
+    }
 
     /// Resumes a run from an adapter-owned checkpoint.
     fn resume(&mut self, run: &RunId, checkpoint: Checkpoint) -> Result<(), CoreError>;

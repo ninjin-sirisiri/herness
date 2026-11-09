@@ -13,6 +13,8 @@ const ui = {
   connection: null,
   connectionAuth: null,
   run: null,
+  connections: [],
+  supervision: [],
 };
 
 function byId(id) {
@@ -55,14 +57,24 @@ async function call(command, args) {
 
 async function frontendState() {
   const state = await call("frontend_state");
+  ui.connections = state.connections || [];
   renderProjects(state.projects || []);
-  renderConnections(state.connections || []);
+  renderConnections(ui.connections);
   renderReconciliation(state.reconciliation);
   setText(
     "policy-line",
     `Permission mode: ${state.permissionMode} (policy ${state.policyVersion}) · ` +
-      `Automatic decision: unavailable — ${state.automaticModeReason}`
+      `Automatic decision capability: ${state.automaticModeAvailable ? "available" : "unavailable"} — ` +
+      `${state.automaticModeReason}`
   );
+  if (byId("automatic-warning")) {
+    setText(
+      "automatic-warning",
+      state.automaticModeAvailable
+        ? "A verified permission-evaluation profile is configured. The current policy mode still decides whether human approval is required."
+        : "Automatic decision is unavailable without a verified permission-evaluation profile. Every tool operation needs an explicit human decision in this build."
+    );
+  }
   if (state.selectedProject) {
     ui.project = state.selectedProject;
   }
@@ -269,6 +281,346 @@ function renderProjectSummary(project) {
   );
 }
 
+function splitLines(value) {
+  return String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function reasonText(reason) {
+  if (!reason) {
+    return "";
+  }
+  if (typeof reason === "string") {
+    return reason;
+  }
+  if (reason.kind) {
+    return reason.action ? `${reason.kind} (${reason.action})` : reason.kind;
+  }
+  return JSON.stringify(reason);
+}
+
+function renderConnectionChoices() {
+  const select = byId("sup-connection");
+  const current = select.value;
+  clear("sup-connection");
+  for (const connection of ui.connections) {
+    const option = document.createElement("option");
+    option.value = connection.connectionId;
+    option.textContent = `${connection.provider} / ${connection.model} (${connection.authMethod})`;
+    select.append(option);
+  }
+  if (current) {
+    select.value = current;
+  }
+}
+
+function supervisionRequestId() {
+  const project = ui.project || "";
+  const random =
+    window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `command:${project}:${random}`;
+}
+
+async function loadSupervision() {
+  if (!ui.project) {
+    ui.supervision = [];
+    clear("supervision-list");
+    setText("supervision-status", "No project is open.");
+    return;
+  }
+  const list = await call("supervision_list", { project: ui.project });
+  ui.supervision = list || [];
+  renderSupervision();
+}
+
+function renderSupervision() {
+  clear("supervision-list");
+  const list = ui.supervision || [];
+  if (list.length === 0) {
+    setText(
+      "supervision-status",
+      "No supervision target is saved for this project. Configure a completion profile and consent, then create one."
+    );
+    return;
+  }
+  setText("supervision-status", `${list.length} supervision target(s).`);
+  for (const view of list) {
+    const item = element("li", null, "supervision-item");
+    const purpose = (view.purposes || []).find(
+      (entry) => entry.purpose === view.profile.purpose
+    );
+    const verified = purpose && purpose.verified ? "verified" : "unverified";
+    item.append(
+      element(
+        "div",
+        `${view.state} · revision ${view.revision} · reason ${reasonText(view.reason)}`
+      )
+    );
+    item.append(
+      element(
+        "div",
+        `conditions v${view.conditionVersion} · target v${view.targetVersion} · ` +
+          `profile ${view.profile.provider || view.profile.profileId} v${view.profile.version} ` +
+          `(${verified}) · consent ${view.consent.purpose} v${view.consent.version}`
+      )
+    );
+    item.append(
+      element(
+        "div",
+        `unmet: ${(view.unmetConditions || []).length} · runs: ${(view.runGroup || []).length} · ` +
+          `evidence: ${(view.evidence || []).length} · plan: ${view.planAvailable ? "available" : "unavailable"}`
+      )
+    );
+    if (view.budget) {
+      const budget = view.budget;
+      item.append(
+        element(
+          "div",
+          `budget ${budget.usage.activeSecondsConsumed}/${budget.activeSeconds}s · ` +
+            `runs ${budget.usage.runsStarted}/${budget.additionalRuns + 1} · ` +
+            `remaining ${budget.remainingActiveSeconds}s · unresolved charges ${budget.unresolvedCharges}`
+        )
+      );
+    } else {
+      item.append(element("div", "budget: unavailable"));
+    }
+    for (const purpose of view.purposes || []) {
+      item.append(
+        element(
+          "div",
+          `purpose ${purpose.purpose}: profile ${purpose.profileId || "unset"} ` +
+            `(${purpose.verified ? "verified" : "unverified"}) · consent ${purpose.consentState} ` +
+            `${purpose.consentVersion ? "v" + purpose.consentVersion : ""}`
+        )
+      );
+    }
+    for (const evidence of (view.evidence || []).slice(-5)) {
+      item.append(
+        element(
+          "div",
+          `evidence #${evidence.sequence} ${evidence.status} · ${evidence.operation} · ` +
+            `${String(evidence.outcome).slice(0, 200)}`
+        )
+      );
+    }
+    for (const notification of view.notifications || []) {
+      item.append(
+        element(
+          "div",
+          `notification ${notification.state} · ${reasonText(notification.reason)} · revision ${notification.revision}`
+        )
+      );
+    }
+
+    const row = element("div", null, "row");
+    const makeButton = (label, action) => {
+      const button = element("button", label);
+      button.type = "button";
+      button.addEventListener("click", async () => {
+        try {
+          await action();
+          await loadSupervision();
+        } catch (error) {
+          showError(errorText(error));
+        }
+      });
+      row.append(button);
+    };
+    const operation = () => ({
+      supervision: view.supervisionId,
+      requestId: supervisionRequestId(),
+      expectedRevision: view.revision,
+    });
+    makeButton("Start", () =>
+      call("supervision_start", {
+        project: ui.project,
+        supervision: view.supervisionId,
+        requestId: supervisionRequestId(),
+        expectedRevision: view.revision,
+      })
+    );
+    makeButton("Stop", () =>
+      call("supervision_stop", operation())
+    );
+    makeButton("Cancel", () =>
+      call("supervision_cancel", operation())
+    );
+    makeButton("Reassess", () =>
+      call("supervision_reassess", operation())
+    );
+    makeButton("Resume", () =>
+      call("supervision_resume", operation())
+    );
+    makeButton("Adopt configured profile/consent", async () => {
+      await call("supervision_change", {
+        project: ui.project,
+        supervision: view.supervisionId,
+        requestId: supervisionRequestId(),
+        expectedRevision: view.revision,
+        change: {
+          profilePurpose: "completion",
+          consentPurpose: "completion",
+        },
+      });
+    });
+    makeButton("Change budget", async () => {
+      await call("supervision_change", {
+        project: ui.project,
+        supervision: view.supervisionId,
+        requestId: supervisionRequestId(),
+        expectedRevision: view.revision,
+        change: {
+          budget: {
+            activeSeconds: Number(byId("sup-active-seconds").value) || 7200,
+            additionalRuns: Number(byId("sup-additional-runs").value) || 30,
+          },
+        },
+      });
+    });
+    makeButton("Change conditions", async () => {
+      const command = byId("sup-check-command").value;
+      await call("supervision_change", {
+        project: ui.project,
+        supervision: view.supervisionId,
+        requestId: supervisionRequestId(),
+        expectedRevision: view.revision,
+        change: {
+          conditionVersion: Number(view.conditionVersion) + 1,
+          conditions: [
+            {
+              title: byId("sup-condition-title").value,
+              rubric: byId("sup-condition-rubric").value,
+              checks: command
+                ? [
+                    {
+                      command,
+                      description:
+                        byId("sup-check-description").value || command,
+                    },
+                  ]
+                : [],
+            },
+          ],
+        },
+      });
+    });
+    makeButton("Show recovery", async () => {
+      const recovery = await call("supervision_recovery", {
+        project: ui.project,
+        supervision: view.supervisionId,
+      });
+      setText("supervision-detail", JSON.stringify(recovery, null, 2));
+    });
+    item.append(row);
+    byId("supervision-list").append(item);
+  }
+}
+
+async function configureSupervisionProfile() {
+  if (!ui.project) {
+    throw new Error("open a project first");
+  }
+  const connection = byId("sup-connection").value;
+  if (!connection) {
+    throw new Error("select a connection first");
+  }
+  const status = await call("supervision_profile", {
+    project: ui.project,
+    purpose: byId("sup-purpose").value,
+    connection,
+    model: byId("sup-model").value,
+  });
+  setText(
+    "supervision-status",
+    `Profile ${status.purpose}: ${status.profileId} configured as ${status.verified ? "verified" : "unverified"} (${status.provider}). A separate real acceptance step is required before any provider request.`
+  );
+  await loadSupervision();
+}
+
+async function grantSupervisionConsent() {
+  if (!ui.project) {
+    throw new Error("open a project first");
+  }
+  const dataKinds = [];
+  for (const kind of ["text", "code", "diff", "log"]) {
+    if (byId(`sup-kind-${kind}`).checked) {
+      dataKinds.push(kind);
+    }
+  }
+  const targetVersion = Number(byId("sup-consent-version").value) || 1;
+  const status = await call("supervision_consent", {
+    project: ui.project,
+    purpose: byId("sup-purpose").value,
+    action: "grant",
+    origin: byId("sup-origin").value,
+    dataKinds,
+    targets: splitLines(byId("sup-consent-targets").value),
+    targetVersion,
+  });
+  setText(
+    "supervision-status",
+    `Consent ${status.purpose}: ${status.consentState} v${status.consentVersion} (target v${status.targetScopeVersion}).`
+  );
+  await loadSupervision();
+}
+
+async function revokeSupervisionConsent() {
+  if (!ui.project) {
+    throw new Error("open a project first");
+  }
+  const status = await call("supervision_consent", {
+    project: ui.project,
+    purpose: byId("sup-purpose").value,
+    action: "revoke",
+  });
+  setText(
+    "supervision-status",
+    `Consent ${status.purpose}: ${status.consentState} v${status.consentVersion}. Already sent content is not recalled.`
+  );
+  await loadSupervision();
+}
+
+async function createSupervision() {
+  if (!ui.project) {
+    throw new Error("open a project first");
+  }
+  const connection = byId("sup-connection").value;
+  if (!connection) {
+    throw new Error("select a connection first");
+  }
+  const title = byId("sup-condition-title").value;
+  const rubric = byId("sup-condition-rubric").value;
+  const command = byId("sup-check-command").value;
+  const checks = command
+    ? [{ command, description: byId("sup-check-description").value || command }]
+    : [];
+  const request = {
+    project: ui.project,
+    connection,
+    instructions: byId("sup-instructions").value,
+    conditions: [{ title, rubric, checks }],
+    readSet: splitLines(byId("sup-read-set").value),
+    writePaths: splitLines(byId("sup-write-paths").value),
+    allowShell: byId("sup-allow-shell").checked,
+    conditionVersion: 1,
+    targetVersion: Number(byId("sup-consent-version").value) || 1,
+    budget: {
+      activeSeconds: Number(byId("sup-active-seconds").value) || 7200,
+      additionalRuns: Number(byId("sup-additional-runs").value) || 30,
+    },
+  };
+  const view = await call("supervision_create", { request });
+  setText(
+    "supervision-status",
+    `Created ${view.supervisionId} in state ${view.state}. Start is a separate human action.`
+  );
+  await loadSupervision();
+}
+
 async function loadProjectView() {
   if (!ui.project) {
     setText("project-summary", "No project is open.");
@@ -352,10 +704,12 @@ async function pollProject() {
 async function refreshAll() {
   showError("");
   await frontendState();
+  renderConnectionChoices();
   await loadProjectView();
   await loadSnapshot();
   await loadHistory();
   await loadLoginStatus();
+  await loadSupervision();
 }
 
 async function refreshQuit() {
@@ -427,6 +781,9 @@ function bind() {
         authMethod,
         endpoint: endpointValue.length > 0 ? endpointValue : null,
         insecureHttpAcknowledged: byId("insecure-http").checked,
+        assessmentGateway: byId("assessment-gateway").checked
+          ? "commandcode"
+          : null,
       });
       ui.connection = connection.connectionId;
       ui.connectionAuth = connection.authMethod;
@@ -438,6 +795,21 @@ function bind() {
       if (submit) {
         submit.disabled = false;
       }
+    }
+  });
+
+  byId("provider").addEventListener("change", () => {
+    const typesafe = byId("provider").value === "typesafe";
+    byId("assessment-gateway").disabled = !typesafe;
+    if (!typesafe) {
+      byId("assessment-gateway").checked = false;
+    }
+    byId("endpoint").disabled = typesafe;
+    if (typesafe) {
+      byId("endpoint").value = "";
+      byId("model").placeholder = "typesafe/jev-1.14.0";
+    } else {
+      byId("model").placeholder = "model name";
     }
   });
 
@@ -557,6 +929,66 @@ function bind() {
   byId("refresh").addEventListener("click", async () => {
     try {
       await refreshAll();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-verify-profile").addEventListener("click", async () => {
+    try {
+      if (!ui.project) {
+        throw new Error("open a project first");
+      }
+      const status = await call("supervision_verify_profile", {
+        project: ui.project,
+        purpose: byId("sup-purpose").value,
+        verified: true,
+      });
+      setText(
+        "supervision-status",
+        `Profile ${status.purpose}: ${status.profileId} is ${status.verified ? "verified" : "unverified"} (${status.provider}). This is a human confirmation, not a model decision.`
+      );
+      await loadSupervision();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-config-profile").addEventListener("click", async () => {
+    try {
+      await configureSupervisionProfile();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-grant-consent").addEventListener("click", async () => {
+    try {
+      await grantSupervisionConsent();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-revoke-consent").addEventListener("click", async () => {
+    try {
+      await revokeSupervisionConsent();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-create").addEventListener("click", async () => {
+    try {
+      await createSupervision();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sup-refresh").addEventListener("click", async () => {
+    try {
+      await loadSupervision();
     } catch (error) {
       showError(errorText(error));
     }

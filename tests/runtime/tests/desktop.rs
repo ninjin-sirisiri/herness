@@ -42,6 +42,7 @@ struct MockResponse {
     status: u16,
     content_type: &'static str,
     body: String,
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -50,7 +51,13 @@ impl MockResponse {
             status: 200,
             content_type: "text/event-stream",
             body,
+            delay: Duration::ZERO,
         }
+    }
+
+    fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 }
 
@@ -96,6 +103,9 @@ fn handle_connection(mut stream: TcpStream, response: MockResponse) {
     let Some(_request) = read_request(&mut stream) else {
         return;
     };
+    if !response.delay.is_zero() {
+        thread::sleep(response.delay);
+    }
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.status,
@@ -323,6 +333,7 @@ impl Fixture {
                     status: 500,
                     content_type: "application/json",
                     body: json!({"error": {"message": "mock exhausted"}}).to_string(),
+                    delay: Duration::ZERO,
                 })
             }
         });
@@ -518,6 +529,7 @@ fn worker_normal_quit(app_data: &Path, project: &Path, connection: ConnectionId,
                 status: 500,
                 content_type: "application/json",
                 body: json!({"error": {"message": "worker mock exhausted"}}).to_string(),
+                delay: Duration::ZERO,
             })
         }
     });
@@ -1617,9 +1629,9 @@ fn host_state_format_one_is_readable_and_unknown_formats_are_rejected() {
     store
         .save_host_state(
             "herness.runtime.host-state",
-            br#"{"format":3,"projects":{}}"#,
+            br#"{"format":4,"projects":{}}"#,
         )
-        .expect("save format 3");
+        .expect("save unknown format");
     drop(store);
     let admin = ConnectionAdmin::new();
     let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(FakeCredentials::new(
@@ -1664,6 +1676,7 @@ fn normal_quit_process_saves_checkpoint_and_restores_connection_settings() {
         status: 500,
         content_type: "application/json",
         body: json!({"error": {"message": "restore must not send requests"}}).to_string(),
+        delay: Duration::ZERO,
     });
 
     // The restore reports the persisted connection but cannot resume while the
@@ -1775,6 +1788,7 @@ fn unconfirmed_quit_process_restores_interrupted_without_claiming_success() {
         status: 500,
         content_type: "application/json",
         body: String::new(),
+        delay: Duration::ZERO,
     });
     let (host, report) = fixture.open_restored_counting(&server);
     let project = fixture.project_id(&host);
@@ -1822,6 +1836,7 @@ fn forced_quit_process_keeps_operation_pending_for_reconciliation() {
         status: 500,
         content_type: "application/json",
         body: String::new(),
+        delay: Duration::ZERO,
     });
     let (host, report) = fixture.open_restored_counting(&server);
     let project = fixture.project_id(&host);
@@ -1906,6 +1921,7 @@ fn crash_after_file_apply_restores_evidence_without_inventing_a_result() {
         status: 500,
         content_type: "application/json",
         body: String::new(),
+        delay: Duration::ZERO,
     });
     let (host, report) = fixture.open_restored_counting(&server);
     let project = fixture.project_id(&host);
@@ -2094,7 +2110,118 @@ fn explicit_shutdown_stops_a_managed_shell_group() {
 
 #[test]
 fn closed_window_runtime_keeps_processing_and_reopen_reads_latest_sequence() {
-    let mut fixture = Fixture::new(vec![responses_text("continued while hidden")]);
+    let mut fixture = Fixture::new(vec![
+        responses_text("continued while hidden"),
+        responses_text("second project progressed"),
+    ]);
+    let connection = fixture.connection();
+    let project = fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project")
+        .project_id();
+    let second_path = fixture._temp.path().join("second-project");
+    std::fs::create_dir_all(&second_path).expect("second project");
+    let second = fixture
+        .host
+        .runtime_mut()
+        .open_project(&second_path)
+        .expect("open second project")
+        .project_id();
+    let mut runs = Vec::new();
+    for (project, text) in [
+        (project, "continue while hidden"),
+        (second, "non-selected project progresses"),
+    ] {
+        let agent = fixture
+            .host
+            .runtime_mut()
+            .create_agent(project, AgentSpec::new("main", "implementer", connection))
+            .expect("agent");
+        let run = fixture
+            .host
+            .runtime_mut()
+            .start_run(project, agent.agent_id(), text)
+            .expect("run");
+        fixture
+            .host
+            .runtime_mut()
+            .submit_input(project, run.run_id(), text)
+            .expect("submit");
+        runs.push((project, run.run_id()));
+    }
+
+    // No UI command, poll_run, or lifecycle call runs here: only the
+    // host-owned pump advances both projects, including the non-selected one.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        fixture.host.pump().expect("pump while hidden");
+        let all_ready = runs.iter().all(|(project, run)| {
+            let idle = fixture
+                .host
+                .runtime()
+                .snapshot(*project)
+                .expect("snapshot")
+                .runs()
+                .iter()
+                .find(|view| view.run_id() == *run)
+                .is_some_and(|view| view.state() == RunState::Idle);
+            idle && fixture
+                .host
+                .runtime()
+                .subscribe(*project, None, HistoryLimit::new(500).expect("limit"))
+                .expect("history")
+                .events()
+                .iter()
+                .any(|event| event.kind().as_str() == "run.text_completed")
+        });
+        if all_ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hidden projects did not progress solely via the pump"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fixture._server.request_count(),
+        2,
+        "each hidden run must make exactly one model request"
+    );
+
+    // The page-reload path used on reopen reads a fresh snapshot and history
+    // instead of reusing hidden-page state.
+    for (project, run) in &runs {
+        let snapshot = fixture
+            .host
+            .runtime()
+            .snapshot(*project)
+            .expect("reopen snapshot");
+        assert!(snapshot.runs().iter().any(|view| view.run_id() == *run));
+        assert!(snapshot.runs()[0].state() == RunState::Idle);
+        let history = fixture
+            .host
+            .runtime()
+            .subscribe(*project, None, HistoryLimit::new(500).expect("limit"))
+            .expect("reopen history");
+        assert!(history.last_sequence() > 0);
+        assert!(history.events().iter().any(|event| {
+            event.kind().as_str() == "run.text_completed"
+                && !event.payload().as_value()["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+        }));
+    }
+}
+
+#[test]
+fn pump_stops_one_long_running_request_when_its_deadline_passes() {
+    let mut fixture = Fixture::new(vec![
+        responses_text("too late").delayed(Duration::from_secs(5)),
+    ]);
     let connection = fixture.connection();
     let project = fixture
         .host
@@ -2110,55 +2237,83 @@ fn closed_window_runtime_keeps_processing_and_reopen_reads_latest_sequence() {
     let run = fixture
         .host
         .runtime_mut()
-        .start_run(project, agent.agent_id(), "continue while hidden")
+        .start_run(project, agent.agent_id(), "long request")
         .expect("run");
     fixture
         .host
         .runtime_mut()
-        .submit_input(project, run.run_id(), "continue while hidden")
+        .submit_input(project, run.run_id(), "wait for a slow provider")
         .expect("submit");
 
-    // No UI command or lifecycle call runs here: this is the runtime state a
-    // hidden window leaves behind.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut saw_text = false;
-    while !saw_text {
-        fixture
-            .host
-            .runtime_mut()
-            .poll_run(project, run.run_id())
-            .expect("poll while hidden");
-        let history = fixture
-            .host
-            .runtime()
-            .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
-            .expect("history");
-        saw_text = history
-            .events()
-            .iter()
-            .any(|event| event.kind().as_str() == "run.text_completed");
-        assert!(Instant::now() < deadline, "hidden run did not progress");
+    let request_deadline = Instant::now() + Duration::from_secs(10);
+    while fixture._server.request_count() == 0 {
+        fixture.host.pump().expect("pump before request");
+        assert!(
+            Instant::now() < request_deadline,
+            "the provider request did not start"
+        );
         thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(fixture._server.request_count(), 1);
 
-    // The page-reload path used on reopen reads a fresh snapshot and history
-    // instead of reusing hidden-page state.
-    let snapshot = fixture
+    fixture
         .host
-        .runtime()
-        .snapshot(project)
-        .expect("reopen snapshot");
-    assert_eq!(snapshot.runs()[0].run_id(), run.run_id());
+        .runtime_mut()
+        .set_run_deadline(project, run.run_id(), Some(Instant::now()))
+        .expect("deadline");
+    let report = fixture.host.pump().expect("pump at deadline");
+    assert!(
+        report.deadline_stops().contains(&run.run_id()),
+        "the pump must record the deadline stop"
+    );
+    let snapshot = fixture.host.runtime().snapshot(project).expect("snapshot");
+    let state = snapshot
+        .runs()
+        .iter()
+        .find(|view| view.run_id() == run.run_id())
+        .expect("run")
+        .state();
+    assert!(
+        matches!(state, RunState::Paused | RunState::Interrupted),
+        "a deadline stop must use the H1 cooperative stop path: {state:?}"
+    );
     let history = fixture
         .host
         .runtime()
         .subscribe(project, None, HistoryLimit::new(500).expect("limit"))
-        .expect("reopen history");
-    assert!(history.last_sequence() > 0);
-    assert!(history.events().iter().any(|event| {
-        event.kind().as_str() == "run.text_completed"
-            && event.payload().as_value()["text"] == "continued while hidden"
-    }));
+        .expect("history");
+    assert!(
+        history
+            .events()
+            .iter()
+            .any(|event| event.kind().as_str() == "run.stopped")
+    );
+    assert_eq!(
+        fixture._server.request_count(),
+        1,
+        "a stopped request must not be retried"
+    );
+    let second = fixture.host.pump().expect("pump after stop");
+    assert!(
+        second.deadline_stops().is_empty(),
+        "a stopped run must not be stopped twice"
+    );
+}
+
+#[test]
+fn pump_does_no_work_after_shutdown_begins() {
+    let mut fixture = Fixture::new(Vec::new());
+    fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project");
+    fixture.host.begin_shutdown().expect("begin shutdown");
+    let report = fixture.host.pump().expect("pump during shutdown");
+    assert!(
+        report.is_skipped(),
+        "the pump must not delay the existing quit path"
+    );
 }
 
 /// Manual Task 12 running-memory fixture.
@@ -2195,6 +2350,7 @@ fn measure_running_host_rss() {
                 status: 500,
                 content_type: "application/json",
                 body: String::new(),
+                delay: Duration::ZERO,
             })
         }
     });
@@ -2290,4 +2446,108 @@ fn measure_running_host_rss() {
     let _ = host.finish_shutdown();
     println!("MEASURE_DONE: pid={}", std::process::id());
     std::process::exit(0);
+}
+
+#[test]
+fn quit_hook_marks_real_supervision_without_starting_a_run() {
+    use std::collections::BTreeSet;
+
+    use herness_core::runtime::{ShutdownOutcome, ShutdownReport};
+    use herness_desktop::supervision::{
+        CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
+    };
+    use herness_supervision::{DisclosureDataKind, ProfilePurpose, ProviderOrigin, TargetVersion};
+
+    let mut fixture = Fixture::new(Vec::new());
+    std::fs::create_dir_all(fixture.project.join("src")).expect("supervision dirs");
+    std::fs::write(fixture.project.join("src/main.rs"), "fn main() {}\n")
+        .expect("supervision file");
+    let project = fixture
+        .host
+        .runtime_mut()
+        .open_project(&fixture.project)
+        .expect("open project")
+        .project_id();
+    let connection = fixture.connection();
+    fixture
+        .host
+        .supervision_configure_profile(
+            PlanRequestActor::Human,
+            project,
+            ProfilePurpose::Completion,
+            connection,
+            "gpt-test",
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Profile)),
+        )
+        .expect("profile");
+    fixture
+        .host
+        .supervision_grant_consent(
+            PlanRequestActor::Human,
+            project,
+            ProfilePurpose::Completion,
+            ProviderOrigin::parse("https://api.openai.com").expect("origin"),
+            BTreeSet::from([DisclosureDataKind::Text]),
+            vec!["src/main.rs".to_owned()],
+            TargetVersion::new(1).expect("version"),
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Consent)),
+        )
+        .expect("consent");
+    let created = fixture
+        .host
+        .supervision_create(
+            PlanRequestActor::Human,
+            CreateSupervisionRequest {
+                project,
+                connection,
+                instructions: "quit hook fixture".to_owned(),
+                conditions: vec![ConditionInput {
+                    title: "The check passes".to_owned(),
+                    rubric: "fixture".to_owned(),
+                    checks: vec![CheckInput {
+                        command: "true".to_owned(),
+                        description: "fixture check".to_owned(),
+                    }],
+                }],
+                read_set: vec!["src/main.rs".to_owned()],
+                write_paths: vec!["src".to_owned()],
+                allow_shell: false,
+                condition_version: Some(1),
+                target_version: Some(1),
+                budget: None,
+            },
+            Some(fixture.host.confirm_supervision(ConfirmationKind::Create)),
+        )
+        .expect("create supervision");
+    assert_eq!(created.state, "ready");
+
+    let report = ShutdownReport::new(
+        ShutdownOutcome::Completed,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
+    fixture
+        .host
+        .mark_supervision_for_quit(&report)
+        .expect("quit hook");
+    let record = fixture
+        .host
+        .supervision_record(project, created.supervision_id)
+        .expect("stored record")
+        .expect("record");
+    assert_eq!(record.state().as_str(), "stopped");
+    let revision = record.revision();
+    fixture
+        .host
+        .mark_supervision_for_quit(&report)
+        .expect("repeat quit hook");
+    let after = fixture
+        .host
+        .supervision_record(project, created.supervision_id)
+        .expect("stored record")
+        .expect("record");
+    assert_eq!(after.revision(), revision);
 }

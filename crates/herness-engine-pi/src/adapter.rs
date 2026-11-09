@@ -15,12 +15,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use herness_core::runtime::StoreModelRequestGate;
 use herness_core::{
-    AbsolutePath, AuthMethod, BashExecutor, ConnectionDirectory, ConnectionId, CoreError,
-    CredentialPort, EngineEvent, EngineInput, EnginePort, EngineStart, EvaluationContext,
-    FileFailure, FileLockRegistry, FileToolOutput, FrozenOperation, GrantScope, NativeFileTools,
-    OperationId, PermissionOutcome, PermissionPolicy, ProcessSupervisor, ProjectRoot, Provider,
-    ProviderFailureKind, RunId, RunState, ShellFailure, StopReason, StopReport, StorePort,
+    AbsolutePath, AuthMethod, BashExecutor, BoundedPermissionEvaluator, ConnectionDirectory,
+    ConnectionId, ConversationFailure, CoreError, CredentialPort, EngineEvent, EngineInput,
+    EnginePort, EngineStart, EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput,
+    FrozenOperation, ModelRequestGatePort, NativeFileTools, OperationId, PermissionOutcome,
+    PermissionPolicy, ProcessSupervisor, ProjectRoot, Provider, ProviderFailureKind, RunId,
+    RunPermissionContext, RunState, ShellFailure, StopReason, StopReport, StorePort,
     SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
 };
 use pi_embedded::SessionStatus;
@@ -33,15 +35,27 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{
-    checkpoint_unavailable, engine_invalid_response, engine_unavailable, provider_failure,
-    sanitized_detail,
+    engine_invalid_response, engine_unavailable, provider_failure, sanitized_detail,
 };
 use crate::events::{EventQueue, EventTranslator};
 use crate::session_store::{
-    ENGINE_TOOL_AWAITING_EVENT_KIND, ENGINE_TOOL_DENIED_EVENT_KIND, EngineSessionStore,
-    EngineStore, RunAuditMetadata,
+    ENGINE_TOOL_AWAITING_EVENT_KIND, ENGINE_TOOL_DENIED_EVENT_KIND, EngineCheckpoint,
+    EngineSessionStore, EngineStore, RunAuditMetadata,
 };
-use crate::stream::{ChatGptCatalog, ChatGptModel, ProviderEndpoints, StreamBridge, model_for};
+use crate::stream::{
+    ChatGptCatalog, ChatGptModel, ProviderEndpoints, SharedRequestGate, StreamBridge, model_for,
+};
+
+/// How a run's SDK session is opened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreKind {
+    /// A new empty session with the system prompt.
+    Create,
+    /// Reopen this run's durable checkpoint.
+    Resume,
+    /// Copy a stable previous conversation into a new run.
+    Continuation,
+}
 
 /// Adapter configuration owned by the trusted host composition.
 #[derive(Debug, Clone)]
@@ -96,7 +110,11 @@ pub struct PiEngine<S: StorePort + Send + 'static> {
     policy: Arc<RwLock<PermissionPolicy>>,
     file_locks: Arc<FileLockRegistry>,
     catalog: Arc<ChatGptCatalog>,
+    /// Injected pre-send gate shared with every run's stream bridge.
+    request_gate: SharedRequestGate,
     runs: HashMap<RunId, Arc<RunContext<S>>>,
+    /// Permission contexts installed before a resume rebuilds a run.
+    pending_permissions: HashMap<RunId, RunPermissionContext>,
 }
 
 impl<S: StorePort + Send + 'static> PiEngine<S> {
@@ -119,6 +137,9 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             .build()
             .map_err(|_| engine_unavailable())?;
         let policy = Arc::new(RwLock::new(config.policy.clone()));
+        let request_gate: SharedRequestGate = Arc::new(Mutex::new(Box::new(
+            StoreModelRequestGate::new(Arc::clone(&store)),
+        )));
         Ok(Self {
             runtime,
             store,
@@ -128,15 +149,28 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             policy,
             file_locks: Arc::new(FileLockRegistry::new()),
             catalog,
+            request_gate,
             runs: HashMap::new(),
+            pending_permissions: HashMap::new(),
         })
     }
 
-    /// Replaces the permission policy used by subsequent tool re-checks.
+    /// Replaces the default store-backed model-request gate.
     ///
-    /// The host must build the policy through `PolicyAdmin` so its version is
-    /// newer. An authorization issued for an older version is rejected when the
-    /// gateway re-checks it.
+    /// The desktop composition uses the default. Tests and later H2 policy
+    /// layers can inject a gate that adds consent or budget checks. Call this
+    /// before starting runs; existing run bridges keep the gate they captured.
+    pub fn set_request_gate(&mut self, gate: Box<dyn ModelRequestGatePort + Send>) {
+        self.request_gate = Arc::new(Mutex::new(gate));
+    }
+
+    /// Replaces the adapter's legacy policy snapshot.
+    ///
+    /// Tool authorization uses the host-resolved [`RunPermissionContext`] on
+    /// each run, not this value. The method remains for existing composition
+    /// code. New hosts must supply the run context through
+    /// [`EngineStart::with_permission`] or [`EnginePort::set_run_permission`];
+    /// an absent context never authorizes a tool.
     pub fn replace_policy(&self, policy: PermissionPolicy) {
         *self
             .policy
@@ -175,12 +209,22 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
     fn build_run(
         &self,
         start: EngineStart,
-        restore: Option<crate::session_store::EngineCheckpoint>,
+        restore: Option<EngineCheckpoint>,
+        kind: RestoreKind,
+        permission: Option<RunPermissionContext>,
     ) -> Result<Arc<RunContext<S>>, CoreError> {
         let settings = self
             .directory
             .get(start.connection())
             .map_err(|_| engine_unavailable())?;
+        if let Some(permission) = &permission
+            && permission.run_id() != start.run_id()
+        {
+            return Err(CoreError::MismatchedRun {
+                expected: start.run_id(),
+                found: permission.run_id(),
+            });
+        }
         if settings.auth_method() == AuthMethod::ChatGptLogin && restore.is_none() {
             // The catalog is checked when a run starts. Restoring a saved run
             // must not make a network request or re-resolve a model choice.
@@ -207,8 +251,17 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             cwd: start.cwd().clone(),
             instructions: start.instructions().to_owned(),
         };
-        let store = EngineStore::new(Arc::clone(&self.store), audit.clone());
-        if let Some(restore) = &restore {
+        let store = match (&restore, kind) {
+            (Some(restore), RestoreKind::Continuation) => EngineStore::seeded(
+                Arc::clone(&self.store),
+                audit.clone(),
+                restore.snapshot.clone(),
+            ),
+            _ => EngineStore::new(Arc::clone(&self.store), audit.clone()),
+        };
+        if let Some(restore) = &restore
+            && kind != RestoreKind::Continuation
+        {
             store.set_snapshot(restore.snapshot.clone());
         }
         let queue = EventQueue::new();
@@ -228,12 +281,15 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             supervisor.clone(),
         )?;
         let gateway = ToolGateway::new(HostExecutors { files, shell });
+        let control = permission
+            .as_ref()
+            .map(|context| context.control().clone())
+            .unwrap_or_default();
         let tools = Arc::new(ToolRuntime {
             run_id: start.run_id(),
-            project_id: start.project_id(),
             cwd: start.cwd().clone(),
             requested_work: start.instructions().to_owned(),
-            policy: Arc::clone(&self.policy),
+            permission: RwLock::new(permission),
             gateway: Mutex::new(gateway),
             store: store.clone(),
             queue: queue.clone(),
@@ -241,9 +297,15 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             supervisor,
         });
         let stream = Arc::new(StreamBridge::new(
+            start.project_id(),
+            start.agent_id(),
+            start.session_id(),
+            start.run_id(),
             start.connection(),
             &settings,
             Arc::clone(&self.credentials),
+            control,
+            Arc::clone(&self.request_gate),
         ));
         let session_store = Arc::new(EngineSessionStore::new(store.clone(), queue.clone()));
         let host = EmbeddedHost {
@@ -307,9 +369,194 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
     }
 }
 
+impl<S: StorePort + Send + 'static> PiEngine<S> {
+    fn latest_checkpoint(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<herness_core::Checkpoint>, CoreError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.load_checkpoint(run)
+    }
+
+    /// Validates a continuation without starting anything. The returned
+    /// checkpoint is the previous conversation copied into the new run.
+    fn validate_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &herness_core::Checkpoint,
+    ) -> Result<EngineCheckpoint, CoreError> {
+        let previous_run = previous.run_id();
+        if previous_run == start.run_id() {
+            return Err(CoreError::InvalidValue {
+                field: "runId".to_owned(),
+                violation: herness_core::ArgumentViolation::Invalid {
+                    detail: "a continuation run must have a new run identifier".to_owned(),
+                },
+            });
+        }
+        let Some(stored) = self.latest_checkpoint(&previous_run)? else {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::MissingCheckpoint,
+            ));
+        };
+        if stored.format_version() != previous.format_version()
+            || stored.payload().as_bytes() != previous.payload().as_bytes()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::CheckpointNotLatest,
+            ));
+        }
+        let parsed = crate::session_store::parse_checkpoint(previous, previous_run)
+            .map_err(|_| not_continuable(previous_run, ConversationFailure::CorruptCheckpoint))?;
+        if parsed.meta.project_id != start.project_id()
+            || parsed.meta.agent_id != start.agent_id()
+            || parsed.meta.session_id != start.session_id()
+            || parsed.meta.connection != start.connection()
+            || parsed.meta.cwd != *start.cwd()
+            || parsed.meta.instructions != start.instructions()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::ScopeMismatch,
+            ));
+        }
+        if let Some(context) = self.runs.get(&previous_run) {
+            let live = context.session.snapshot();
+            if live.status != SessionStatus::Idle || live.needs_response || live.partial.is_some() {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::PreviousRunNotStable,
+                ));
+            }
+            if !context.tools.supervisor.active_groups().is_empty() {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::ManagedProcess,
+                ));
+            }
+            if live
+                .invocations
+                .iter()
+                .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+            {
+                return Err(not_continuable(
+                    previous_run,
+                    ConversationFailure::PendingInvocation,
+                ));
+            }
+        }
+        let snapshot = &parsed.snapshot;
+        if snapshot.status != SessionStatus::Idle
+            || snapshot.needs_response
+            || snapshot.partial.is_some()
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::PreviousRunNotStable,
+            ));
+        }
+        if snapshot
+            .invocations
+            .iter()
+            .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+        {
+            return Err(not_continuable(
+                previous_run,
+                ConversationFailure::PendingInvocation,
+            ));
+        }
+        Ok(parsed)
+    }
+
+    /// Validates a resume without opening a session or sending anything.
+    fn validate_resume(
+        &self,
+        run: &RunId,
+        checkpoint: &herness_core::Checkpoint,
+    ) -> Result<EngineCheckpoint, CoreError> {
+        if checkpoint.run_id() != *run {
+            return Err(CoreError::MismatchedRun {
+                expected: *run,
+                found: checkpoint.run_id(),
+            });
+        }
+        let parsed = crate::session_store::parse_checkpoint(checkpoint, *run)?;
+        let Some(stored) = self.latest_checkpoint(run)? else {
+            return Err(not_resumable(run, ConversationFailure::MissingCheckpoint));
+        };
+        if stored.format_version() != checkpoint.format_version()
+            || stored.payload().as_bytes() != checkpoint.payload().as_bytes()
+        {
+            return Err(not_resumable(run, ConversationFailure::CheckpointNotLatest));
+        }
+        if let Some(context) = self.runs.get(run) {
+            let snapshot = context.session.snapshot();
+            if matches!(
+                snapshot.status,
+                SessionStatus::Running | SessionStatus::AwaitingApproval
+            ) {
+                return Err(not_resumable(run, ConversationFailure::StopUnconfirmed));
+            }
+            if !context.tools.supervisor.active_groups().is_empty() {
+                return Err(not_resumable(run, ConversationFailure::ManagedProcess));
+            }
+            ensure_resumable_snapshot(*run, &snapshot)?;
+        } else {
+            ensure_resumable_snapshot(*run, &parsed.snapshot)?;
+        }
+        Ok(parsed)
+    }
+}
+
+fn ensure_resumable_snapshot(
+    run: RunId,
+    snapshot: &pi_embedded::SessionSnapshot,
+) -> Result<(), CoreError> {
+    if snapshot.status == SessionStatus::Disposed {
+        return Err(not_resumable(
+            &run,
+            ConversationFailure::PreviousRunNotStable,
+        ));
+    }
+    if snapshot
+        .invocations
+        .iter()
+        .any(|invocation| invocation.phase != pi_embedded::InvocationPhase::Completed)
+    {
+        return Err(not_resumable(&run, ConversationFailure::PendingInvocation));
+    }
+    Ok(())
+}
+
+fn not_continuable(previous_run: RunId, reason: ConversationFailure) -> CoreError {
+    CoreError::NotContinuable {
+        previous_run,
+        reason,
+    }
+}
+
+fn not_resumable(run: &RunId, reason: ConversationFailure) -> CoreError {
+    CoreError::NotResumable { run: *run, reason }
+}
+
 impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
     fn tool_execution_authority(&self) -> herness_core::ToolExecutionAuthority {
         herness_core::ToolExecutionAuthority::Adapter
+    }
+
+    fn set_run_permission(&mut self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        let run = permission.run_id();
+        if let Some(context) = self.runs.get(&run) {
+            context.tools.set_permission(permission)?;
+        } else {
+            self.pending_permissions.insert(run, permission);
+        }
+        Ok(())
     }
 
     fn start(&mut self, start: EngineStart) -> Result<(), CoreError> {
@@ -317,12 +564,37 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         if self.runs.contains_key(&run_id) {
             return Err(engine_invalid_response());
         }
-        let context = self.build_run(start, None)?;
+        let permission = start.permission().cloned();
+        let context = self.build_run(start, None, RestoreKind::Create, permission)?;
         self.runs.insert(run_id, context.clone());
         context
             .queue
             .push(EngineEvent::StateChanged(RunState::Idle));
         Ok(())
+    }
+
+    fn start_continuation(
+        &mut self,
+        start: EngineStart,
+        previous: herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        let parsed = self.validate_continuation(&start, &previous)?;
+        let run_id = start.run_id();
+        if self.runs.contains_key(&run_id) {
+            return Err(engine_invalid_response());
+        }
+        let permission = start.permission().cloned();
+        let context = self.build_run(start, Some(parsed), RestoreKind::Continuation, permission)?;
+        self.runs.insert(run_id, context);
+        Ok(())
+    }
+
+    fn check_continuation(
+        &self,
+        start: &EngineStart,
+        previous: &herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        self.validate_continuation(start, previous).map(|_| ())
     }
 
     fn send_input(&mut self, run: &RunId, input: EngineInput) -> Result<(), CoreError> {
@@ -358,7 +630,7 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         Ok(())
     }
 
-    fn request_stop(&mut self, run: &RunId, _reason: StopReason) -> Result<StopReport, CoreError> {
+    fn request_stop(&mut self, run: &RunId, reason: StopReason) -> Result<StopReport, CoreError> {
         let Some(context) = self.runs.get(run).cloned() else {
             return Ok(StopReport::NotRunning);
         };
@@ -369,6 +641,11 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             return Ok(StopReport::NotRunning);
         }
         context.tools.stopping.store(true, Ordering::SeqCst);
+        if let Some(permission) = context.tools.permission() {
+            // Wake a pending evaluator wait immediately; the SDK cancellation
+            // below may take longer than the bounded evaluation wait.
+            permission.control().request_stop(reason);
+        }
         // Refuse new managed processes and signal existing groups before the
         // SDK cancellation is waited on. `stop_all` owns the bounded grace and
         // SIGKILL escalation so this synchronous stop can actually return even
@@ -394,38 +671,29 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
         Ok(report)
     }
 
+    fn check_resume(
+        &self,
+        run: &RunId,
+        checkpoint: &herness_core::Checkpoint,
+    ) -> Result<(), CoreError> {
+        self.validate_resume(run, checkpoint).map(|_| ())
+    }
+
     fn resume(
         &mut self,
         run: &RunId,
         checkpoint: herness_core::Checkpoint,
     ) -> Result<(), CoreError> {
+        let parsed = self.validate_resume(run, &checkpoint)?;
         if self.runs.contains_key(run) {
-            return Err(engine_unavailable());
+            // The live session was confirmed stopped and has no unfinished
+            // invocation. Reuse it without restoring a second session, sending
+            // input, or executing a tool. Its permission context was installed
+            // by `set_run_permission` before this call.
+            self.pending_permissions.remove(run);
+            return Ok(());
         }
-        if checkpoint.run_id() != *run {
-            return Err(CoreError::MismatchedRun {
-                expected: *run,
-                found: checkpoint.run_id(),
-            });
-        }
-        let parsed = crate::session_store::parse_checkpoint(&checkpoint, *run)?;
-        let stored = {
-            let store = self
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            store.load_checkpoint(run)?
-        };
-        let Some(stored) = stored else {
-            return Err(checkpoint_unavailable());
-        };
-        if stored.format_version() != checkpoint.format_version()
-            || stored.payload().as_bytes() != checkpoint.payload().as_bytes()
-        {
-            // The supplied checkpoint is not the durable latest state. Never
-            // restore an older snapshot or discard the newer one.
-            return Err(checkpoint_unavailable());
-        }
+        let permission = self.pending_permissions.remove(run);
         let meta = parsed.meta.clone();
         let start = EngineStart::new(
             meta.project_id,
@@ -436,7 +704,7 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             meta.cwd.clone(),
             meta.instructions.clone(),
         )?;
-        let context = self.build_run(start, Some(parsed))?;
+        let context = self.build_run(start, Some(parsed), RestoreKind::Resume, permission)?;
         self.runs.insert(*run, context);
         Ok(())
     }
@@ -473,10 +741,13 @@ struct RunContext<S> {
 
 struct ToolRuntime<S> {
     run_id: RunId,
-    project_id: herness_core::ProjectId,
     cwd: AbsolutePath,
     requested_work: String,
-    policy: Arc<RwLock<PermissionPolicy>>,
+    /// Host-resolved grant, policy, evaluator, and stop/deadline control.
+    ///
+    /// `None` means the host did not supply a run permission context. The tool
+    /// path then refuses to authorize; it never constructs a wide grant.
+    permission: RwLock<Option<RunPermissionContext>>,
     gateway: Mutex<ToolGateway<HostExecutors<S>>>,
     store: EngineStore<S>,
     queue: EventQueue,
@@ -485,6 +756,27 @@ struct ToolRuntime<S> {
 }
 
 impl<S: StorePort + Send + 'static> ToolRuntime<S> {
+    fn set_permission(&self, permission: RunPermissionContext) -> Result<(), CoreError> {
+        if permission.run_id() != self.run_id {
+            return Err(CoreError::MismatchedRun {
+                expected: self.run_id,
+                found: permission.run_id(),
+            });
+        }
+        *self
+            .permission
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(permission);
+        Ok(())
+    }
+
+    fn permission(&self) -> Option<RunPermissionContext> {
+        self.permission
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn tools(self: &Arc<Self>) -> Vec<Arc<dyn EmbeddedTool>> {
         vec![
             self.make_tool(ToolName::Read),
@@ -548,15 +840,31 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 "tool cancelled before execution".to_owned(),
             ));
         }
+        let Some(permission) = self.permission() else {
+            // The host did not install a per-run grant/policy/evaluator/control.
+            // Never substitute a wide grant or a default evaluator.
+            return Err(HostToolFailure::Known(
+                "host run permission context is unavailable; the tool was not authorized"
+                    .to_owned(),
+            ));
+        };
+        let control = permission.control().clone();
+        if !control.permits_side_effect() {
+            return Err(HostToolFailure::Known(
+                "tool stopped or run deadline reached before authorization".to_owned(),
+            ));
+        }
         let arguments = parse_arguments(tool, args)?;
-        // Read the current human policy for each invocation. An authorization
-        // from an older policy version is rejected at the final re-check.
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let grant = GrantScope::for_run(self.project_id, &policy);
+
+        // Use the host's current policy and the exact stored grant. A grant
+        // from an older policy version is stale and cannot authorize new work.
+        let policy = permission.policy().snapshot();
+        let grant = permission.grant().clone();
+        if grant.policy_version() != policy.version() || grant.mode() != policy.mode() {
+            return Err(HostToolFailure::Known(
+                "run permission grant no longer matches the current policy".to_owned(),
+            ));
+        }
         let operation = FrozenOperation::new(
             stable_operation_id(self.run_id, invocation_id),
             self.run_id,
@@ -571,18 +879,28 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
             .gateway
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The evaluator call is bounded by the run deadline and aborts when the
+        // host requests a stop. A timeout or cancellation becomes a human wait
+        // and never an allow.
+        let mut evaluator =
+            BoundedPermissionEvaluator::new(permission.evaluator().cloned(), control.clone());
         let outcome = gateway
             .authorize(
                 &policy,
                 &grant,
                 &operation,
                 &EvaluationContext::new(self.requested_work.clone(), Vec::new()),
-                None,
+                Some(&mut evaluator),
             )
             .map_err(|error| HostToolFailure::Known(sanitized_detail(&error)))?;
         let authorization = match outcome {
             PermissionOutcome::Allow { authorization } => authorization,
             PermissionOutcome::Deny { .. } => {
+                if !control.permits_side_effect() || cancel.is_cancelled() {
+                    return Err(HostToolFailure::Known(
+                        "tool cancelled before execution".to_owned(),
+                    ));
+                }
                 self.store
                     .commit_tool_audit(&operation, ENGINE_TOOL_DENIED_EVENT_KIND, "policy_denied")
                     .map_err(|_| {
@@ -593,6 +911,25 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 ));
             }
             PermissionOutcome::AwaitingApproval { .. } => {
+                if !control.permits_side_effect()
+                    || cancel.is_cancelled()
+                    || self.stopping.load(Ordering::SeqCst)
+                {
+                    // The evaluator timed out or was cancelled because the run
+                    // stopped; never surface this as a fresh human approval.
+                    return Err(HostToolFailure::Known(
+                        "tool cancelled before execution".to_owned(),
+                    ));
+                }
+                let current_policy = permission.policy().snapshot();
+                if current_policy.version() != operation.policy_version()
+                    || current_policy.mode() != operation.permission_mode()
+                {
+                    return Err(HostToolFailure::Known(
+                        "permission policy changed before approval; re-evaluate the tool"
+                            .to_owned(),
+                    ));
+                }
                 self.store
                     .commit_tool_audit(
                         &operation,
@@ -618,16 +955,29 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
                 "tool cancelled before execution".to_owned(),
             ));
         }
-        // Re-read the policy immediately before execution. A policy change
-        // between authorization and execution invalidates the old decision.
-        let current_policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if current_policy.version() != operation.policy_version() {
+        // Re-check the current policy, grant, final arguments, and stop/deadline
+        // immediately before the side effect. Any change in the meantime makes
+        // the unused decision stale and the executor is not reached.
+        let current_policy = permission.policy().snapshot();
+        if current_policy.version() != operation.policy_version()
+            || current_policy.mode() != operation.permission_mode()
+        {
             return Err(HostToolFailure::Known(
-                "permission policy changed before execution; re-evaluate the tool".to_owned(),
+                "permission policy changed during evaluation; re-evaluate the tool".to_owned(),
+            ));
+        }
+        let current_grant = permission.grant();
+        if current_grant.policy_version() != current_policy.version()
+            || current_grant.mode() != current_policy.mode()
+            || !current_grant.permits(&operation)
+        {
+            return Err(HostToolFailure::Known(
+                "run permission grant changed during evaluation; re-evaluate the tool".to_owned(),
+            ));
+        }
+        if !control.permits_side_effect() {
+            return Err(HostToolFailure::Known(
+                "tool stopped or run deadline reached before execution".to_owned(),
             ));
         }
         // The executor behind the gateway records the operation intent and

@@ -17,7 +17,9 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::connection::{
-    AuthMethod, ConnectionId, ConnectionInfo, ConnectionStatus, Provider,
+    AuthMethod, ConnectionCapabilities, ConnectionCapabilityDeclaration, ConnectionId,
+    ConnectionInfo, ConnectionStatus, ConnectionUsage, EndpointClass, InputCapabilities,
+    InputModality, Provider,
 };
 use crate::contracts::errors::CoreError;
 
@@ -38,6 +40,18 @@ pub enum InsecureRemoteHttp {
     Acknowledged,
 }
 
+/// Fixed third-party gateway used by an assessment-only connection.
+///
+/// The gateway keeps the provider's wire shape (for example TypeSafe System
+/// One) but changes the fixed origin, API key, and model label. It is never
+/// auto-selected or inferred from a model name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentGateway {
+    /// Command Code Provider API's `typesafe/jev` System One route.
+    CommandCode,
+}
+
 /// Non-secret configuration of one provider connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,14 +69,23 @@ pub struct ConnectionSettings {
     vault_account: Option<VaultAccount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     insecure_http_acknowledged: Option<InsecureRemoteHttp>,
+    /// Explicit endpoint class and input modalities. Absent for legacy
+    /// settings, which keep the H1 provider defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<ConnectionCapabilityDeclaration>,
+    /// Fixed assessment gateway for an assessment-only connection. Absent for
+    /// direct provider connections and legacy settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assessment_gateway: Option<AssessmentGateway>,
 }
 
 impl ConnectionSettings {
     /// Creates validated non-secret connection settings.
     ///
-    /// * OpenAI, Anthropic, and ChatGPT-login connections use their built-in
-    ///   endpoint; a custom endpoint is rejected. A ChatGPT OAuth connection is
-    ///   represented by [`Provider::OpenAi`] with [`AuthMethod::ChatGptLogin`].
+    /// * OpenAI, Anthropic, ChatGPT-login, and TypeSafe System One connections
+    ///   use their built-in endpoint; a custom endpoint is rejected. A ChatGPT
+    ///   OAuth connection is represented by [`Provider::OpenAi`] with
+    ///   [`AuthMethod::ChatGptLogin`].
     /// * OpenAI-compatible connections require an explicit endpoint and an API
     ///   key.
     /// * Remote plain HTTP requires `insecure_remote_http` to be
@@ -75,6 +98,56 @@ impl ConnectionSettings {
         auth_method: AuthMethod,
         endpoint: Option<Endpoint>,
         insecure_remote_http: Option<InsecureRemoteHttp>,
+    ) -> Result<Self, ConnectionError> {
+        Self::new_with_optional_capabilities(
+            connection_id,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            insecure_remote_http,
+            None,
+        )
+    }
+
+    /// Creates validated settings with an explicit capability declaration.
+    ///
+    /// The declaration is non-secret. It selects the endpoint class and input
+    /// modalities; usage is derived from the class. TypeSafe/Jev System One
+    /// and OpenAI Decisions declarations are assessment-only and therefore
+    /// cannot be used for an agent run. A custom endpoint is still allowed only
+    /// for [`Provider::OpenAiCompatible`], and an OpenAI Decisions declaration
+    /// still requires an API key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_capabilities(
+        connection_id: ConnectionId,
+        provider: Provider,
+        model: impl Into<String>,
+        auth_method: AuthMethod,
+        endpoint: Option<Endpoint>,
+        insecure_remote_http: Option<InsecureRemoteHttp>,
+        capabilities: ConnectionCapabilityDeclaration,
+    ) -> Result<Self, ConnectionError> {
+        Self::new_with_optional_capabilities(
+            connection_id,
+            provider,
+            model,
+            auth_method,
+            endpoint,
+            insecure_remote_http,
+            Some(capabilities),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_optional_capabilities(
+        connection_id: ConnectionId,
+        provider: Provider,
+        model: impl Into<String>,
+        auth_method: AuthMethod,
+        endpoint: Option<Endpoint>,
+        insecure_remote_http: Option<InsecureRemoteHttp>,
+        capabilities: Option<ConnectionCapabilityDeclaration>,
     ) -> Result<Self, ConnectionError> {
         let model = model.into();
         let trimmed = model.trim();
@@ -94,7 +167,7 @@ impl ConnectionSettings {
                 let endpoint = endpoint.ok_or(ConnectionError::EndpointRequired)?;
                 Some(endpoint)
             }
-            Provider::OpenAi | Provider::Anthropic => {
+            Provider::OpenAi | Provider::Anthropic | Provider::TypeSafe => {
                 if endpoint.is_some() {
                     return Err(ConnectionError::EndpointNotAllowed { provider });
                 }
@@ -114,7 +187,7 @@ impl ConnectionSettings {
             _ => None,
         };
 
-        Ok(Self {
+        let settings = Self {
             connection_id,
             provider,
             model: trimmed.to_owned(),
@@ -123,7 +196,102 @@ impl ConnectionSettings {
             credential_ref: CredentialRef::for_connection(connection_id, auth_method),
             vault_account: None,
             insecure_http_acknowledged,
+            capabilities,
+            assessment_gateway: None,
+        };
+        // Validate the effective capability set before it can be registered.
+        // This rejects provider/authentication/endpoint-class mismatches,
+        // ChatGPT login on Decisions, and assessment-only classes on an agent
+        // usage before any settings are stored.
+        settings.capabilities()?;
+        Ok(settings)
+    }
+
+    /// Returns a copy of these settings with a different capability
+    /// declaration.
+    ///
+    /// The declaration is validated against the provider and authentication
+    /// method. The same custom-endpoint rules as [`Self::new`] apply; a
+    /// declaration never re-points a connection to another origin.
+    pub fn with_capabilities(
+        mut self,
+        declaration: ConnectionCapabilityDeclaration,
+    ) -> Result<Self, ConnectionError> {
+        self.capabilities = Some(declaration);
+        self.capabilities()?;
+        Ok(self)
+    }
+
+    /// Attaches a fixed assessment gateway to a TypeSafe System One
+    /// assessment-only connection.
+    ///
+    /// The gateway is rejected for agent-executable connections, non-TypeSafe
+    /// providers, non-API-key auth, and non-System-One declarations. It never
+    /// changes provider fallback or credential scope.
+    pub fn with_assessment_gateway(
+        mut self,
+        gateway: AssessmentGateway,
+    ) -> Result<Self, ConnectionError> {
+        let capabilities = self.capabilities()?;
+        if self.provider != Provider::TypeSafe
+            || self.auth_method != AuthMethod::ApiKey
+            || capabilities.endpoint_class() != EndpointClass::TypeSafeSystemOne
+            || capabilities.usage() != ConnectionUsage::AssessmentOnly
+        {
+            return Err(ConnectionError::CapabilityDeclarationRejected {
+                detail: "an assessment gateway requires assessment-only TypeSafe System One with an API key".to_owned(),
+            });
+        }
+        self.assessment_gateway = Some(gateway);
+        Ok(self)
+    }
+
+    /// Fixed assessment gateway, when configured.
+    pub const fn assessment_gateway(&self) -> Option<AssessmentGateway> {
+        self.assessment_gateway
+    }
+
+    /// Effective non-secret capabilities of this connection.
+    ///
+    /// Settings without an explicit declaration keep the H1 provider defaults:
+    /// OpenAI Responses, Anthropic Messages, or OpenAI-compatible completions,
+    /// all usable for agent execution and assessment. TypeSafe always resolves
+    /// to the assessment-only System One endpoint. A declared assessment
+    /// endpoint class resolves to [`ConnectionUsage::AssessmentOnly`].
+    pub fn capabilities(&self) -> Result<ConnectionCapabilities, ConnectionError> {
+        let (endpoint_class, input) = match self.capabilities {
+            Some(declaration) => (declaration.endpoint_class(), declaration.input()),
+            None => (
+                default_endpoint_class(self.provider),
+                InputCapabilities::text_only(),
+            ),
+        };
+        let usage = if endpoint_class.is_assessment_only() {
+            ConnectionUsage::AssessmentOnly
+        } else {
+            ConnectionUsage::AgentExecution
+        };
+        ConnectionCapabilities::new(
+            self.connection_id,
+            self.provider,
+            self.auth_method,
+            endpoint_class,
+            input,
+            usage,
+        )
+        .map_err(|error| ConnectionError::CapabilityDeclarationRejected {
+            detail: error.to_string(),
         })
+    }
+
+    /// Declared input capabilities, before provider defaults are applied.
+    pub const fn declared_capabilities(&self) -> Option<ConnectionCapabilityDeclaration> {
+        self.capabilities
+    }
+
+    /// Whether the connection supports `modality`.
+    pub fn supports_input(&self, modality: InputModality) -> Result<bool, ConnectionError> {
+        Ok(self.capabilities()?.input().supports(modality))
     }
 
     /// Connection identifier.
@@ -227,16 +395,21 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
             #[serde(default)]
             vault_account: Option<VaultAccount>,
             insecure_http_acknowledged: Option<InsecureRemoteHttp>,
+            #[serde(default)]
+            capabilities: Option<ConnectionCapabilityDeclaration>,
+            #[serde(default)]
+            assessment_gateway: Option<AssessmentGateway>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let settings = Self::new(
+        let settings = Self::new_with_optional_capabilities(
             wire.connection_id,
             wire.provider,
             wire.model,
             wire.auth_method,
             wire.endpoint,
             wire.insecure_http_acknowledged,
+            wire.capabilities,
         )
         .map_err(de::Error::custom)?;
         if settings.credential_ref != wire.credential_ref {
@@ -250,7 +423,12 @@ impl<'de> Deserialize<'de> for ConnectionSettings {
                 .map_err(de::Error::custom)?,
             None => settings,
         };
-        Ok(settings)
+        match wire.assessment_gateway {
+            Some(gateway) => settings
+                .with_assessment_gateway(gateway)
+                .map_err(de::Error::custom),
+            None => Ok(settings),
+        }
     }
 }
 
@@ -350,6 +528,15 @@ impl Default for ConnectionAdmin {
     }
 }
 
+const fn default_endpoint_class(provider: Provider) -> EndpointClass {
+    match provider {
+        Provider::OpenAi => EndpointClass::OpenAiResponses,
+        Provider::Anthropic => EndpointClass::AnthropicMessages,
+        Provider::OpenAiCompatible => EndpointClass::OpenAiCompletions,
+        Provider::TypeSafe => EndpointClass::TypeSafeSystemOne,
+    }
+}
+
 /// Read-only view of registered connection settings.
 #[derive(Debug, Clone)]
 pub struct ConnectionDirectory {
@@ -379,6 +566,41 @@ impl ConnectionDirectory {
             .read()
             .map_err(|_| ConnectionError::RegistryUnavailable)?;
         Ok(connections.values().cloned().collect())
+    }
+
+    /// Returns the effective non-secret capabilities of one connection.
+    ///
+    /// This never falls back to another connection or provider.
+    pub fn capabilities(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<ConnectionCapabilities, ConnectionError> {
+        self.get(connection)?.capabilities()
+    }
+
+    /// Lists the effective capabilities of every registered connection.
+    pub fn list_capabilities(&self) -> Result<Vec<ConnectionCapabilities>, ConnectionError> {
+        self.list()?
+            .iter()
+            .map(ConnectionSettings::capabilities)
+            .collect()
+    }
+
+    /// Returns capabilities for a connection that may start an agent run.
+    ///
+    /// Assessment-only connections are rejected with
+    /// [`ConnectionError::AgentExecutionNotAllowed`]. Callers must use this
+    /// (or [`ConnectionCapabilities::allows_agent_execution`]) before an agent
+    /// send; there is no provider or connection fallback.
+    pub fn agent_execution_capabilities(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<ConnectionCapabilities, ConnectionError> {
+        let capabilities = self.capabilities(connection)?;
+        if !capabilities.allows_agent_execution() {
+            return Err(ConnectionError::AgentExecutionNotAllowed { connection });
+        }
+        Ok(capabilities)
     }
 
     /// Number of registered connections.

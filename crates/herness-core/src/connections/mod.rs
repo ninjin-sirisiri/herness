@@ -19,6 +19,7 @@ mod redact;
 mod redirect;
 mod registry;
 
+pub use crate::contracts::connection::ConnectionCapabilityDeclaration;
 pub use credential::{
     CHATGPT_DYNAMIC_AGENT_CLIENT, CHATGPT_PLAN_SCOPE, CREDENTIAL_FORMAT_VERSION, ConnectionState,
     CredentialAdmin, CredentialBroker, CredentialMaterial, CredentialRef, CredentialRefresher,
@@ -32,4 +33,6 @@ pub use redact::{
     redact_known_secrets, redact_url,
 };
 pub use redirect::{Origin, RedirectAuthDecision, RedirectDropReason, redirect_auth_decision};
-pub use registry::{ConnectionAdmin, ConnectionDirectory, ConnectionSettings, InsecureRemoteHttp};
+pub use registry::{
+    AssessmentGateway, ConnectionAdmin, ConnectionDirectory, ConnectionSettings, InsecureRemoteHttp,
+};

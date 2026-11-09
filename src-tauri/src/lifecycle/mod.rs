@@ -10,6 +10,7 @@
 //! and human choice.
 
 pub mod quit;
+pub mod supervision_quit;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -35,6 +36,39 @@ pub fn ui_ready() -> bool {
 /// Number of successful trusted-UI readiness reports.
 pub fn ui_ready_generation() -> usize {
     UI_READY_GENERATION.load(Ordering::SeqCst)
+}
+
+/// Starts the host-owned monitoring pump.
+///
+/// The pump runs for the application lifetime and drives every project's
+/// engine events and deadlines without a WebView command. It stops touching the
+/// host as soon as an explicit shutdown begins, so quit grace and coordinated
+/// stops keep their existing timing. The thread is detached and uses the single
+/// `AppState` host.
+pub fn start_host_pump(app: &tauri::App) {
+    let handle = app.handle().clone();
+    std::thread::spawn(move || {
+        loop {
+            let state = handle.state::<crate::app::AppState>();
+            let Ok(mut host) = state.host.lock() else {
+                // A poisoned host during quit cannot be advanced safely.
+                return;
+            };
+            if host.is_shutting_down() {
+                return;
+            }
+            if host.pump().is_err() {
+                // One failed iteration must not spin without yielding. The
+                // error is retried after the normal interval; it is never
+                // reported as progress.
+                drop(host);
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            drop(host);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    });
 }
 
 /// Creates the single trusted `main` window from `tauri.conf.json`.
