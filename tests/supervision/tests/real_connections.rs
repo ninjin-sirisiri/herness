@@ -434,3 +434,110 @@ fn commandcode_jev_permission_is_safe_under_the_0_99_floor() {
         "the observed Jev permission allow probability is below the 0.99 floor; record a changed threshold result explicitly"
     );
 }
+
+#[test]
+#[ignore = "opt-in real CommandCode GOAT Jev insufficient check; requires COMMANDCODE_API_KEY and human approval"]
+fn commandcode_jev_insufficient_is_not_adopted() {
+    use herness_supervision::assessment::ConditionVerdict;
+
+    let key = commandcode_key();
+    let project = herness_core::ProjectId::new();
+    let connection = ConnectionId::new();
+    let model = COMMANDCODE_JEV_REQUEST_MODEL;
+
+    let settings = herness_core::ConnectionSettings::new_with_capabilities(
+        connection,
+        Provider::TypeSafe,
+        model,
+        AuthMethod::ApiKey,
+        None,
+        None,
+        ConnectionCapabilityDeclaration::new(
+            EndpointClass::TypeSafeSystemOne,
+            InputCapabilities::text_only(),
+        ),
+    )
+    .expect("Command Code Jev connection settings");
+    let admin = ConnectionAdmin::new();
+    admin.add(settings.clone()).expect("register connection");
+    let directory = admin.directory();
+    let profile = AssessmentProfile::new(
+        ProfileId::new(project),
+        ProfileVersion::new(1).expect("profile version"),
+        ProfilePurpose::Completion,
+        ProviderKind::Jev,
+        connection,
+        herness_core::ModelId::new(model).expect("model"),
+        AdapterVersion::new("real-jev-adapter-1").expect("adapter version"),
+        RubricVersion::new("real-jev-rubric-1").expect("rubric version"),
+        ProfileInputs::text_only(),
+        ProfileThresholds::decisions(),
+    )
+    .expect("Jev profile");
+    let entry = herness_supervision::profiles::ProfileEntry::new(
+        profile.clone(),
+        settings.capabilities().expect("capabilities"),
+        ConnectionStatus::Available,
+        false,
+    );
+    let transport = AssessmentTransport::new(
+        Arc::new(EnvCredential {
+            connection,
+            secret: key,
+        }),
+        directory,
+        AssessmentEndpoints::for_commandcode(),
+    )
+    .expect("Command Code assessment transport");
+    let adapter = JevAssessmentAdapter::with_wire_model(transport, Arc::new(FixedClock), model)
+        .expect("Command Code Jev adapter");
+    let evidence_id = EvidenceId::new(project);
+    let evidence = EvidenceDocument::text(
+        evidence_id,
+        "Synthetic evidence: no observation of notes.txt is available; its content is unknown.",
+    )
+    .expect("insufficient evidence");
+    let request = AssessmentRequest::new(
+        DecisionId::new(project),
+        SupervisionId::new(project),
+        ConditionId::new(project),
+        ConditionVersion::new(1).expect("condition version"),
+        TargetVersion::new(1).expect("target version"),
+        "The evidence states that notes.txt contains exactly herness-ok.",
+        profile.binding(),
+        AdapterVersion::new("real-jev-adapter-1").expect("adapter version"),
+        RubricVersion::new("real-jev-rubric-1").expect("rubric version"),
+        vec![evidence_id],
+    )
+    .expect("insufficient request");
+    let result = adapter
+        .assess(
+            &request,
+            &entry,
+            &[evidence],
+            TransportControl::new(CancelToken::new()).with_remaining(Duration::from_secs(60)),
+        )
+        .expect("real Command Code insufficient assessment");
+    assert!(
+        result.rejection().is_none(),
+        "insufficient assessment was rejected: {:?}",
+        result.rejection()
+    );
+    let verdict = result.result().reported_verdict();
+    let adopted = result.adopted_verdict(ProfileThresholds::decisions());
+    let usage = result.usage().expect("reported usage");
+    println!(
+        "REAL_JEV_INSUFFICIENT verdict={} adopted={:?} usage_in={} usage_out={} attempts={}",
+        verdict.as_str(),
+        adopted,
+        usage.input_tokens(),
+        usage.output_tokens(),
+        result.attempts()
+    );
+    assert_eq!(
+        verdict,
+        ConditionVerdict::Insufficient,
+        "unknown evidence was not classified insufficient"
+    );
+    assert_eq!(adopted, None, "insufficient must not be adopted");
+}
