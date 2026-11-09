@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:da117c406134c3250381a42ccfda3dcaf9ec58fb522000ba1a04594a25c65d9f">
+<meta name="sdd-source-digest" content="sha256:c1b9bd264f3f43f4395eca784a73599999afd92221866081c7b8a0146a8d31fe">
 <title>H2: 継続実行と完了判定</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -39,7 +39,7 @@
 <main id="content" tabindex="-1">
 <h1 id="h2-継続実行と完了判定">H2: 継続実行と完了判定</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> 2026-11-08に設計とH1追加契約を承認し、<a href="../plans/2026-11-08-h2-supervision.md">H2実装plan</a>に基づく実装をmainへ統合済み。<a href="../../research/2026-11-08-h2-acceptance.md">受入記録</a>ではPhase Aと限定的なJev実接続を確認したが、H2全体の受入は未完了。2026-11-09のH3接続追加案はレビュー待ち。本記録は追加の実装・実送信を許可しない。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-08に設計とH1追加契約を承認し、<a href="../plans/2026-11-08-h2-supervision.md">H2実装plan</a>に基づく実装をmainへ統合済み。<a href="../../research/2026-11-08-h2-acceptance.md">受入記録</a>ではPhase Aと限定的なJev実接続を確認したが、H2全体の受入は未完了。2026-11-09にH3接続追加契約を承認済み、追加部分は未実装。本記録は追加の実装・実送信を許可しない。</p>
 <p class="metadata"><strong>Chosen approach:</strong> 必須検証と安全条件をhostが検査し、モデルによる条件別の評価をhostが統合する。モデルは状態遷移・権限・完了条件を変更しない。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH2を扱う。<a href="2026-11-07-h1-runtime-design.md">H1</a>を実行・権限・保存の正本、<a href="../../../CONTEXT.md">CONTEXT.md</a>を用語の正本とする。H1は実装済みだが<a href="../../research/2026-11-08-h1-acceptance.md">受入未完了</a>。H2の設計承認とplan作成の指示は、H1の未確認項目を免除しない。</p>
 <section>
@@ -202,7 +202,7 @@
 </section>
 <section>
 <h2 id="h3-integration-additions">H3 integration additions</h2>
-<p>2026-11-09の<a href="2026-11-09-h3-html-sync-design.md">H3設計案</a>に対する追加案。保存は許可済みだが、追加契約はレビュー待ち・未実装である。既存の閾値・送信同意・人間待ち・予算・許可優先順位は緩めない。</p>
+<p>2026-11-09の<a href="2026-11-09-h3-html-sync-design.md">H3設計</a>に対する追加契約。同日、利用者がH3 specと本追加契約を承認した。契約は未実装であり、承認は本実装の開始許可ではない。既存の閾値・送信同意・人間待ち・予算・許可優先順位は緩めない。</p>
 <ol>
 <li><strong>不変の作業packetと実scope:</strong> ownerが渡す初回指示、snapshot参照、制約を保存し、初回・追加run・復元時の入力へ渡す。モデルによる条件改変やgenericな指示への置換を行わない。ExecutionScopeは保存するだけでなくH1の実grantへ適用し、候補以外への書込み・shell禁止を実tool経路で保証する。一般の監督対象にも既存のscopeを実際に適用する。</li>
 <li><strong>承認済みownerの起動:</strong> host内部の信頼されたowner境界は、現在のH3設定承認・job・条件digest・scope・profile・同意・上限を照合して初回起動できる。単にOwnerKindを指定したIPC・model要求・repo内データを信頼せず、H3側の設定承認registryと照合する。人間が直接作る対象の開始確認や、復旧後の人間再開は省略しない。</li>

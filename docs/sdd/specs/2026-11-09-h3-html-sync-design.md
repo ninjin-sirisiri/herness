@@ -2,7 +2,7 @@
 
 **Classification:** architectural
 
-**Status:** 2026-11-09の面談に基づくレビュー待ちの設計。設計文書の保存は許可済みだが、本spec・H1/H2追加契約の承認、sdd-plan、本実装、追加の実モデル送信はまだ行っていない。
+**Status:** 2026-11-09、利用者が本specとH1/H2のH3 integration additionsを承認し、H3のsdd-planへ進む。設計承認は本実装・追加の実モデル送信・pushの許可ではない。
 
 **Chosen approach:** Rust hostによる変更イベント監視と定期照合、候補領域でのagent著作、SDD共通検証とH2評価、履歴を残すhost反映を組み合わせる。
 
@@ -193,4 +193,4 @@ H3の受入には自動検証、実adapter・実Tauriのlifecycle、代表文書
 
 parserの具体的な依存選択、SVG allowlistとreceipt schemaの実装定義、browser capture adapterはplanで具体化する。ただし本specの全unit coverage・厳密保持対象・静的安全性・network/IPC遮断・評価必須を弱めない。採用するprofileの画像能力・入力上限・実文書での判別力は有効化前の検証事項であり、満たせないprofileは利用不可とする。
 
-本specとH1/H2追加契約はレビュー待ちである。承認後にH3だけのsdd-planへ進み、実装・packへの変更・実接続・pushは別の指示と必要な許可の後に行う。
+2026-11-09、保存済みspecとH1/H2のH3 integration additionsのレビュー依頼に、利用者が「ok」と回答した。本specと追加契約の承認を記録し、H3だけのsdd-planへ進む。本実装・packへの変更・実接続・pushは別の指示と必要な許可の後に行う。

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:ba154837ab99d9116d886b0324a50ecfedc1531a747d248164f4d5ebb35a4329">
+<meta name="sdd-source-digest" content="sha256:0ddc574b3831d29e9e65f09eea441c9b9243d7d32ecf7460e628c9f94aa8d42e">
 <title>H3: HTML companionの自動更新と視覚的再構成</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -37,7 +37,7 @@
 <main id="content" tabindex="-1">
 <h1 id="h3-html-companionの自動更新と視覚的再構成">H3: HTML companionの自動更新と視覚的再構成</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> 2026-11-09の面談に基づくレビュー待ちの設計。設計文書の保存は許可済みだが、本spec・H1/H2追加契約の承認、sdd-plan、本実装、追加の実モデル送信はまだ行っていない。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-09、利用者が本specとH1/H2のH3 integration additionsを承認し、H3のsdd-planへ進む。設計承認は本実装・追加の実モデル送信・pushの許可ではない。</p>
 <p class="metadata"><strong>Chosen approach:</strong> Rust hostによる変更イベント監視と定期照合、候補領域でのagent著作、SDD共通検証とH2評価、履歴を残すhost反映を組み合わせる。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH3だけを扱う。実行・許可・保存は<a href="2026-11-07-h1-runtime-design.md">H1</a>、監督・判定・送信は<a href="2026-11-08-h2-supervision-design.md">H2</a>、用語は<a href="../../../CONTEXT.md">CONTEXT.md</a>を正本とする。H1/H2の実装はmainへ統合済みだが、<a href="../../research/2026-11-08-h1-acceptance.md">H1受入</a>・<a href="../../research/2026-11-08-h2-acceptance.md">H2受入</a>は未完了であり、本specで免除しない。</p>
 <section>
@@ -212,7 +212,7 @@
 <h2 id="open-items-and-approval">Open items and approval</h2>
 <p>面談で合意したのは、project単位の有効化、失敗時は通常作業を続け完了だけ保留、意味を保つ言い換え、外部HTML競合での確認待ち、削除・移動時の旧成果物保持、履歴付き自動反映、意味評価とoffline CIの分担である。利用者はこの設計理解に基づくspecとH1/H2追加案の保存・検証・設計文書だけのcommitを許可した。</p>
 <p>parserの具体的な依存選択、SVG allowlistとreceipt schemaの実装定義、browser capture adapterはplanで具体化する。ただし本specの全unit coverage・厳密保持対象・静的安全性・network/IPC遮断・評価必須を弱めない。採用するprofileの画像能力・入力上限・実文書での判別力は有効化前の検証事項であり、満たせないprofileは利用不可とする。</p>
-<p>本specとH1/H2追加契約はレビュー待ちである。承認後にH3だけのsdd-planへ進み、実装・packへの変更・実接続・pushは別の指示と必要な許可の後に行う。</p>
+<p>2026-11-09、保存済みspecとH1/H2のH3 integration additionsのレビュー依頼に、利用者が「ok」と回答した。本specと追加契約の承認を記録し、H3だけのsdd-planへ進む。本実装・packへの変更・実接続・pushは別の指示と必要な許可の後に行う。</p>
 </section>
 </main>
 </div>

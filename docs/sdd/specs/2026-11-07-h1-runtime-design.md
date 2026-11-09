@@ -214,7 +214,7 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 
 ## H3 integration additions
 
-2026-11-09の[H3設計案](2026-11-09-h3-html-sync-design.md)が必要とする追加契約。保存は許可済みだが、追加契約自体はレビュー待ち・未実装である。既存の許可優先順位、native file toolのroot検証、停止と復旧の意味は変えない。
+2026-11-09の[H3設計](2026-11-09-h3-html-sync-design.md)が必要とする追加契約。同日、利用者がH3 specと本追加契約を承認した。契約は未実装であり、承認は本実装の開始許可ではない。既存の許可優先順位、native file toolのroot検証、停止と復旧の意味は変えない。
 
 1. **候補専用の著作境界:** hostはproject・job・世代に束縛された候補参照を発行し、不変の原文・既存HTML・CSS等を読取り専用で渡す。候補の作成・編集はH1 gatewayのschema・grant・policy・停止・変更理由・意図保存を経由する。正式な原文・companion・CSS・設定への書込みやshellを許可しない。候補保存のためにnative path検証を無効にしたり、一般的なproject外書込みを許可したりしない。
 2. **hostによる反映:** H3が承認・検証を確定した候補だけを、host専用境界から指定のcompanionへ反映する。model/toolから直接この境界を呼べない。hostは反映要求ID、期待する現在版、前後bytesの指紋、旧版保存結果、反映結果を保存し、path・symlink・許可・停止を副作用直前にも照合する。失敗・不明は再実行せず照合する。HTMLと補助receiptの複数ファイル反映を原子的なfilesystem transactionと偽らない。
