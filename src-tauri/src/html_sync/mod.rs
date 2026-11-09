@@ -7,6 +7,7 @@
 //! module writes a formal file, creates HTML, or bypasses those gates.
 
 pub mod assessment;
+pub mod composition;
 pub mod observer;
 pub mod operations;
 pub mod policy;
@@ -43,6 +44,14 @@ pub use verification::{
     render_facts, verify_candidate,
 };
 pub use assessment::{HTML_ASSESSMENT_PURPOSE, HtmlAssessmentHost};
+pub use composition::{
+    DesktopH4Barrier, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView,
+    HtmlSyncCapability, HtmlSyncCapabilityReport, HtmlSyncCapabilityState, HtmlSyncDocumentCommand,
+    HtmlSyncDocumentView, HtmlSyncEnableView, HtmlSyncH2View, HtmlSyncHistoryEntryView,
+    HtmlSyncHistoryView, HtmlSyncMissingCompanion, HtmlSyncObserverView, HtmlSyncOperationView,
+    HtmlSyncProjectView, HtmlSyncPublicationView, HtmlSyncPurposeView, HtmlSyncSendScopeView,
+    HtmlSyncServices, HtmlSyncSettingsView, MULTI_CYCLE_COST_WARNING,
+};
 pub use operations::{
     DesktopHtmlSyncOperations, PrivateHistoryReader, validate_current_html,
 };

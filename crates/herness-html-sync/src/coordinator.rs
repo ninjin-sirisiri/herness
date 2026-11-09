@@ -1151,6 +1151,26 @@ impl SyncCoordinator {
             .remove(&(document.project_id(), document.clone()))
     }
 
+    /// Removes and returns the active owner for one document after a confirmed
+    /// human stop.
+    ///
+    /// This is host-only. It does not stop the H1 run, persist state, or clear
+    /// a latch; the caller must have confirmed the stop first and must commit
+    /// the stopped state itself. An active owner for another document is left
+    /// untouched.
+    pub fn take_active(&mut self, document: &DocumentKey) -> Option<ActiveOwner> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.owner.document() == document)
+        {
+            self.queue.retain(|queued| &queued.document != document);
+            self.active.take().map(|active| active.owner)
+        } else {
+            None
+        }
+    }
+
     /// Every seeded/observed latch in canonical order.
     pub fn latches(&self) -> impl Iterator<Item = &HeldAuthoring> {
         self.latches.values()

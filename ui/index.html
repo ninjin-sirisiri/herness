@@ -185,6 +185,21 @@
       </section>
 
       <section>
+        <h2>HTML sync (H3)</h2>
+        <p class="muted">
+          This view reads the saved H3/H2 state and project sequence. It does not create a
+          success flag or show hidden model reasoning. Unapproved projects are scan-only; the
+          HtmlWorker is enabled only when every required host capability is present.
+        </p>
+        <div class="row">
+          <button id="html-sync-refresh" type="button">Refresh H3 state</button>
+          <button id="html-sync-enable" type="button">Enable approved H3 worker</button>
+        </div>
+        <p id="html-sync-status" class="muted"></p>
+        <pre id="html-sync-state" class="history"></pre>
+      </section>
+
+      <section>
         <h2>Quit</h2>
         <p id="quit-status" class="muted">No quit has been requested.</p>
         <div id="quit-actions" class="row" hidden>

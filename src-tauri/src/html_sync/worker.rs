@@ -201,6 +201,59 @@ impl HtmlSyncWorker {
         self.coordinator.clear_latch(document).is_some()
     }
 
+    /// Requests a cooperative stop for the document's active H1 run.
+    ///
+    /// A confirmed stop releases the app-wide authoring slot so a human pause or
+    /// cancel cannot leave the slot allocated. An unconfirmed stop keeps the
+    /// slot and returns `Unconfirmed`; the caller must persist the recovery
+    /// latch rather than claiming the stop succeeded.
+    pub fn stop_active(
+        &mut self,
+        runtime: &mut DesktopRuntime,
+        document: &DocumentKey,
+    ) -> Result<Option<StopOutcome>, H3Error> {
+        let Some(owner) = self.coordinator.active_owner().cloned() else {
+            return Ok(None);
+        };
+        if owner.document() != document {
+            return Ok(None);
+        }
+        let outcome = self.stop_run(runtime, &owner)?;
+        if outcome == StopOutcome::Confirmed {
+            self.coordinator.take_active(document);
+        }
+        Ok(Some(outcome))
+    }
+
+    /// Releases the app-wide authoring slot after a stop that was already
+    /// confirmed by the host.
+    pub fn release_active(&mut self, document: &DocumentKey) -> bool {
+        self.coordinator.take_active(document).is_some()
+    }
+
+    fn stop_run(
+        &self,
+        runtime: &mut DesktopRuntime,
+        owner: &ActiveOwner,
+    ) -> Result<StopOutcome, H3Error> {
+        let outcome = runtime
+            .stop_run(
+                owner.job().project_id(),
+                owner.run(),
+                StopReason::UserRequest,
+            )
+            .map_err(|error| H3Error::Unavailable {
+                capability: "h1.stop".to_owned(),
+                detail: error.to_string(),
+            })?;
+        Ok(match outcome.report() {
+            herness_core::StopReport::Stopped | herness_core::StopReport::NotRunning => {
+                StopOutcome::Confirmed
+            }
+            herness_core::StopReport::Unconfirmed => StopOutcome::Unconfirmed,
+        })
+    }
+
     /// Runs one app-wide authoring pass.
     pub fn pump(
         &mut self,

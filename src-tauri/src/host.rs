@@ -21,13 +21,17 @@ use herness_core::{
     FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery,
     ModelRequestObservation, NativeFileTools, OperationEvidence, OperationId, OperationIntent,
     OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, PortFeature,
-    ProcessSupervisor, ProjectId, ProjectRoot, RequestGateIntent, RunId, SharedPermissionEvaluator,
-    StorePort, Timestamp, ToolExecutor, ToolName,
+    ProcessSupervisor, ProjectId, ProjectRoot, RequestGateIntent, RunControl, RunId,
+    SharedPermissionEvaluator, StorePort, Timestamp, ToolExecutor, ToolName, ToolchainConfig,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
 
+use crate::html_sync::assessment::HtmlAssessmentHost;
+use crate::html_sync::composition::HtmlSyncServices;
 use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
+use herness_html_sync::observer::{DependencyKind, DependencyPath};
+use herness_html_sync::H3StorePort;
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -51,6 +55,7 @@ pub struct DesktopHost {
     store: Arc<Mutex<Store>>,
     supervision: SupervisionHost,
     html_sync: HtmlSyncRecoveryHost,
+    html_sync_services: HtmlSyncServices,
     connections: ConnectionAdmin,
     directory: ConnectionDirectory,
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
@@ -77,6 +82,32 @@ impl DesktopHost {
             AssessmentEndpoints::official(),
             None,
             None,
+            None,
+        )
+    }
+
+    /// Production composition seam with an explicit Common SDD pack root.
+    ///
+    /// The desktop application passes the selected pack checkout from its host
+    /// configuration. The pack root is not an approval; the stored human H3
+    /// approval is still required. An absent root only makes the policy bridge
+    /// explicitly unavailable.
+    pub fn open_with_html_sync_pack(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        pack_root: Option<PathBuf>,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            AssessmentEndpoints::official(),
+            None,
+            None,
+            pack_root,
         )
     }
 
@@ -99,6 +130,7 @@ impl DesktopHost {
             credentials,
             endpoints,
             assessment_endpoints,
+            None,
             None,
             None,
         )
@@ -131,6 +163,7 @@ impl DesktopHost {
             AssessmentEndpoints::official(),
             evaluator,
             Some((assessment, checks)),
+            None,
         )
     }
 
@@ -145,6 +178,7 @@ impl DesktopHost {
             Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
             Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>,
         )>,
+        pack_root: Option<PathBuf>,
     ) -> Result<(Self, ReconciliationReport), String> {
         let config = StoreConfig::new(app_data_root.as_ref()).map_err(|error| error.to_string())?;
         let store = Store::open(config).map_err(|error| error.to_string())?;
@@ -178,7 +212,8 @@ impl DesktopHost {
             policy,
             executor,
         )
-        .with_shared_evaluator(evaluator);
+        .with_shared_evaluator(evaluator)
+        .with_capabilities(herness_core::HostCapabilities::h3_complete());
         let (runtime, report) =
             Runtime::restore(dependencies).map_err(|error| error.to_string())?;
         let supervision_config = ConfigStore::new();
@@ -199,6 +234,7 @@ impl DesktopHost {
                 )
             }
         };
+        let html_assessment_host = assessment_host.clone();
         let supervision = SupervisionHost::with_permission(
             store_handle,
             supervision_config,
@@ -220,7 +256,48 @@ impl DesktopHost {
         let mut html_sync = HtmlSyncRecoveryHost::new(recovery_store, candidate_root)
             .map_err(|error| error.to_string())?;
         for view in &project_views {
-            html_sync.register_project(view.project_id(), view.path().as_path(), Vec::new());
+            html_sync.register_project(
+                view.project_id(),
+                view.path().as_path(),
+                default_dependencies(view.path().as_path()),
+            );
+        }
+        let mut html_sync_services = HtmlSyncServices::new(
+            StoreHandle::new(Arc::clone(&store)),
+            app_data_root.as_ref(),
+            pack_root,
+            ToolchainConfig::from_environment(),
+            RunControl::new(),
+            Some(HtmlAssessmentHost::new(
+                StoreHandle::new(Arc::clone(&store)),
+                supervision.config(),
+                html_assessment_host,
+            )),
+        )?;
+        // Evaluate the real capabilities for approved projects before restore
+        // binds the one worker. An unavailable capability is explicit; the pack
+        // definition alone never activates the worker.
+        for view in &project_views {
+            let project = view.project_id();
+            let Ok(Some(record)) = html_sync_services
+                .store_handle()
+                .load_html_sync_settings(project)
+            else {
+                continue;
+            };
+            let settings = record.settings();
+            if !settings.enabled() || settings.approval().is_none() {
+                continue;
+            }
+            let h2 = approved_supervision(&supervision, &html_sync_services, project)
+                .and_then(|supervision_id| supervision.get(project, supervision_id).ok());
+            let report = html_sync_services.evaluate(
+                project,
+                view.path().as_path(),
+                settings,
+                h2.as_ref(),
+            );
+            html_sync.set_capability_report(project, report);
         }
         let startup = html_sync.restore(&mut runtime, &mut supervision, Timestamp::now());
         for failure in startup.failures() {
@@ -234,6 +311,7 @@ impl DesktopHost {
             store: Arc::clone(&store),
             supervision,
             html_sync,
+            html_sync_services,
             connections,
             directory,
             credentials,
@@ -473,6 +551,47 @@ impl DesktopHost {
     /// This is not an IPC surface; Task 22 owns the trusted command wiring.
     pub fn html_sync_mut(&mut self) -> &mut HtmlSyncRecoveryHost {
         &mut self.html_sync
+    }
+
+    /// Read-only H3 service composition.
+    pub const fn html_sync_services(&self) -> &HtmlSyncServices {
+        &self.html_sync_services
+    }
+
+    /// Mutable H3 service composition for explicit trusted operations.
+    pub fn html_sync_services_mut(&mut self) -> &mut HtmlSyncServices {
+        &mut self.html_sync_services
+    }
+
+    /// Requests a cooperative stop for one project's active H3 authoring run.
+    pub fn html_sync_stop_active(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+    ) -> Result<Option<herness_html_sync::StopOutcome>, String> {
+        let Self {
+            runtime, html_sync, ..
+        } = self;
+        html_sync
+            .stop_active(runtime, document)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Runs the read-only human resume preflight with the real runtime facts.
+    pub fn html_sync_resume_preflight(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+        expected_revision: u64,
+        now: Timestamp,
+    ) -> Result<herness_html_sync::ResumePreflight, String> {
+        let Self {
+            runtime,
+            supervision,
+            html_sync,
+            ..
+        } = self;
+        html_sync
+            .resume_preflight(runtime, supervision, document, expected_revision, now)
+            .map_err(|error| error.to_string())
     }
 
     /// Reads a saved supervision record through the shared store.
@@ -785,9 +904,20 @@ impl DesktopHost {
                     .to_owned(),
             );
         }
-        self.runtime
+        let Self {
+            runtime,
+            html_sync,
+            ..
+        } = self;
+        let view = runtime
             .open_project(&project)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        html_sync.register_project(
+            view.project_id(),
+            project.as_path(),
+            default_dependencies(project.as_path()),
+        );
+        Ok(view)
     }
 
     /// Non-secret connection views for the UI.
@@ -884,6 +1014,46 @@ impl DesktopHost {
     pub const fn endpoints(&self) -> &ProviderEndpoints {
         &self.endpoints
     }
+}
+
+/// Registers the shared CSS dependency when the project contains it.
+///
+/// Task 22 registers the canonical shared stylesheet only. Referenced images and
+/// other resources are added by later acceptance work; an unsupplied path is
+/// never treated as a dependency change.
+fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
+    let mut dependencies = Vec::new();
+    let css = "docs/sdd/assets/sdd.css";
+    if root.join(css).is_file()
+        && let Ok(dependency) = DependencyPath::new(css, DependencyKind::Css)
+    {
+        dependencies.push(dependency);
+    }
+    dependencies
+}
+
+/// Finds the H2 target whose plan owner matches the human H3 owner binding.
+fn approved_supervision(
+    supervision: &SupervisionHost,
+    services: &HtmlSyncServices,
+    project: ProjectId,
+) -> Option<SupervisionId> {
+    let owner = services
+        .store_handle()
+        .load_html_sync_settings(project)
+        .ok()
+        .flatten()?
+        .settings()
+        .approval()?
+        .owner_binding()
+        .owner()
+        .clone();
+    let plans = supervision.plans();
+    let plans = plans.lock().ok()?;
+    plans
+        .iter()
+        .find(|((candidate, _), plan)| *candidate == project && plan.owner == owner)
+        .map(|((_, supervision), _)| *supervision)
 }
 
 // ---------------------------------------------------------------------------

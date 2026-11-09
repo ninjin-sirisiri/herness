@@ -337,6 +337,115 @@ async function loadSupervision() {
   renderSupervision();
 }
 
+async function loadHtmlSync() {
+  if (!ui.project) {
+    setText("html-sync-status", "No project is open.");
+    setText("html-sync-state", "");
+    return;
+  }
+  const state = await call("html_sync_state", { project: ui.project });
+  const lines = [];
+  lines.push(`Project sequence: ${state.projectSequence}`);
+  lines.push(
+    `Capabilities checked: ${state.capabilities.checked ? "yes" : "no"} · ` +
+      `HtmlWorker: ${state.capabilities.available ? "available" : "unavailable"}`
+  );
+  for (const capability of state.capabilities.states || []) {
+    if (!capability.available) {
+      lines.push(`  missing ${capability.capability}: ${capability.detail}`);
+    }
+  }
+  lines.push(`Scan only: ${state.scanOnly ? "yes" : "no"}`);
+  if (state.settings) {
+    lines.push(
+      `Settings v${state.settings.version} (revision ${state.settings.revision}) · ` +
+        `approved: ${state.settings.approved} · enabled: ${state.settings.enabled} · ` +
+        `approval: ${state.settings.approvalId || "none"} (${state.settings.approvalState || "none"})`
+    );
+    if (state.settings.authoring) {
+      const scope = state.settings.authoring;
+      lines.push(
+        `Authoring (${scope.purpose}) · ${scope.connectionId} · ${scope.origin} · ` +
+          `data: ${scope.dataKinds.join(", ")} · targets: ${scope.targets.join(", ")}`
+      );
+    }
+    if (state.settings.assessment) {
+      const scope = state.settings.assessment;
+      lines.push(
+        `Assessment (${scope.purpose}) · ${scope.connectionId} · ${scope.origin} · ` +
+          `data: ${scope.dataKinds.join(", ")} · targets: ${scope.targets.join(", ")}`
+      );
+    }
+  }
+  for (const purpose of state.purposes || []) {
+    lines.push(
+      `Profile ${purpose.purpose}/${purpose.role}: configured=${purpose.configured} ` +
+        `verified=${purpose.verified} supported=${purpose.supported} ` +
+        `consent=${purpose.consentState} — ${purpose.detail}`
+    );
+  }
+  for (const missing of state.missingCompanions || []) {
+    lines.push(`Missing companion: ${missing.companion} for ${missing.target}`);
+  }
+  lines.push(`Cost: ${state.multiCycleCostWarning}`);
+  if (state.observer) {
+    lines.push(
+      `Observer: watcher=${state.observer.watcherHealthy ? "healthy" : "unavailable"} · ` +
+        `pending=${state.observer.pendingDocuments} · uncertain=${state.observer.uncertainDocuments.length}`
+    );
+  }
+  if (state.h2) {
+    lines.push(
+      `H2 ${state.h2.supervisionId} · ${state.h2.state} · revision ${state.h2.revision} · ` +
+        `target v${state.h2.targetVersion} · unmet: ${state.h2.unmetConditions.join(", ") || "none"}`
+    );
+    if (state.h2.budget) {
+      lines.push(
+        `Budget: ${state.h2.budget.remainingActiveSeconds}s remaining · ` +
+          `${state.h2.budget.usage.runsStarted} runs started`
+      );
+    }
+    for (const evidence of state.h2.evidence || []) {
+      lines.push(`Evidence ${evidence.evidenceId}: ${evidence.status} — ${evidence.outcome}`);
+    }
+    for (const condition of state.h2.conditions || []) {
+      lines.push(
+        `Condition ${condition.conditionId}: ${condition.title} · approved=${condition.approved}`
+      );
+    }
+  }
+  for (const document of state.documents || []) {
+    lines.push(
+      `Document ${document.status.document.documentKey.targetPath} · ${document.state} · ` +
+        `revision ${document.status.revision} · sequence ${document.status.finalProjectSequence} · ` +
+        `unsynced=${document.unsynced} undetermined=${document.undetermined}`
+    );
+    if (document.requiredActions.length > 0) {
+      lines.push(`  required: ${document.requiredActions.join(", ")}`);
+    }
+    for (const entry of document.history || []) {
+      lines.push(
+        `  generation ${entry.generation} (${entry.generationStatus}) · ` +
+          `source revision ${entry.sourceRevision}` +
+          (entry.publication ? ` · publication ${entry.publication.status}` : "")
+      );
+    }
+    if (document.publication) {
+      lines.push(
+        `  publication ${document.publication.publicationId}: ${document.publication.status}` +
+          (document.publication.finalProjectSequence !== null
+            ? ` at sequence ${document.publication.finalProjectSequence}`
+            : "")
+      );
+    }
+    if (document.conflict) {
+      lines.push(`  conflict: ${document.conflict.cause}`);
+    }
+  }
+  setText("html-sync-state", lines.join("\n"));
+  setText("html-sync-status", "Saved H3/H2 state loaded.");
+}
+
 function renderSupervision() {
   clear("supervision-list");
   const list = ui.supervision || [];
@@ -710,6 +819,7 @@ async function refreshAll() {
   await loadHistory();
   await loadLoginStatus();
   await loadSupervision();
+  await loadHtmlSync();
 }
 
 async function refreshQuit() {
@@ -989,6 +1099,32 @@ function bind() {
   byId("sup-refresh").addEventListener("click", async () => {
     try {
       await loadSupervision();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("html-sync-refresh").addEventListener("click", async () => {
+    try {
+      await loadHtmlSync();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("html-sync-enable").addEventListener("click", async () => {
+    try {
+      if (!ui.project) {
+        throw new Error("No project is open.");
+      }
+      const result = await call("html_sync_enable", { project: ui.project });
+      setText(
+        "html-sync-status",
+        result.workerBound
+          ? `HtmlWorker bound for settings v${result.settingsVersion}.`
+          : `HtmlWorker unavailable for settings v${result.settingsVersion}; see the missing capabilities.`
+      );
+      await loadHtmlSync();
     } catch (error) {
       showError(errorText(error));
     }

@@ -26,12 +26,17 @@ use herness_supervision::{
     DisclosureDataKind, ProfilePurpose, ProviderOrigin, SupervisionId, SupervisionRequestId,
     TargetVersion,
 };
+use herness_html_sync::{BarrierOutcome, H3Operation, H3OperationRequest};
 use serde::Serialize;
 use tauri::{Manager, State};
 
 use crate::app::AppState;
 use crate::guard;
 use crate::host::DesktopHost;
+use crate::html_sync::composition::{
+    self, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView, HtmlSyncDocumentCommand,
+    HtmlSyncEnableView, HtmlSyncHistoryView, HtmlSyncOperationView, HtmlSyncProjectView,
+};
 use crate::lifecycle::quit::{self as quit_flow, QuitChoice, QuitSnapshot};
 use crate::supervision::{
     BudgetView, ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, EvidenceView,
@@ -981,6 +986,226 @@ pub fn supervision_recovery(
         lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
     host.supervision_recovery(project, supervision)
         .map_err(CommandFailure::supervision)
+}
+
+// ---------------------------------------------------------------------------
+// H3 HTML sync minimal trusted operations
+// ---------------------------------------------------------------------------
+
+/// Every H3 command that mutates approval or document state. The command layer
+/// and the desktop regression test share this list so a newly added mutation
+/// cannot silently skip the trusted-main guard.
+pub const HTML_SYNC_MUTATION_COMMANDS: &[&str] = &[
+    "html_sync_approve",
+    "html_sync_enable",
+    "html_sync_pause",
+    "html_sync_cancel",
+    "html_sync_resume",
+    "html_sync_reassess",
+    "html_sync_resolve_conflict",
+    "html_sync_restore",
+];
+
+fn html_sync_failure(error: impl Into<String>) -> CommandFailure {
+    CommandFailure::new("html_sync", error)
+}
+
+fn document_request(
+    command: &HtmlSyncDocumentCommand,
+    operation: H3Operation,
+) -> Result<H3OperationRequest, CommandFailure> {
+    H3OperationRequest::new(
+        command.request_id,
+        command.project_id,
+        Some(command.document.clone()),
+        Some(command.expected_revision),
+        command.expected_source_digest.clone(),
+        operation,
+        herness_core::Timestamp::now(),
+    )
+    .map_err(|error| CommandFailure::new("invalid_request", error.to_string()))
+}
+
+fn run_document_command(
+    window: &tauri::WebviewWindow,
+    state: &State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+    operation: H3Operation,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    verify_supervision_source(window)?;
+    let request = document_request(&command, operation)?;
+    let mut host = lock_host(state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let _confirmation = host.confirm_supervision(ConfirmationKind::H3DocumentOperation);
+    composition::apply_document_operation(&mut host, request).map_err(html_sync_failure)
+}
+
+/// Returns saved H3/H2 state for one project. It never reuses a command result.
+#[tauri::command(async)]
+pub fn html_sync_state(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<HtmlSyncProjectView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    composition::project_view(&host, project).map_err(html_sync_failure)
+}
+
+/// Returns saved generation history for one document.
+#[tauri::command(async)]
+pub fn html_sync_history(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    document: herness_html_sync::DocumentKey,
+    limit: u32,
+) -> Result<HtmlSyncHistoryView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    composition::history_view(&host, project, &document, limit).map_err(html_sync_failure)
+}
+
+/// Returns the saved H3/H2 budget state for one project.
+#[tauri::command(async)]
+pub fn html_sync_budget(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<HtmlSyncBudgetView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    composition::budget_view(&host, project).map_err(html_sync_failure)
+}
+
+/// Checks whether a requested document version and its dependent inputs are
+/// still the saved synced state. This does not implement H4 Task progress.
+#[tauri::command(async)]
+pub fn html_sync_barrier(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: herness_html_sync::BarrierRequest,
+) -> Result<BarrierOutcome, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    composition::barrier_view(&host, &request, herness_core::Timestamp::now())
+        .map_err(html_sync_failure)
+}
+
+/// Records one explicit human configuration approval.
+#[tauri::command(async)]
+pub fn html_sync_approve(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: HtmlSyncApprovalRequest,
+) -> Result<HtmlSyncApprovalView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let _confirmation = host.confirm_supervision(ConfirmationKind::ApproveHtmlSync);
+    composition::approve(&mut host, &request).map_err(html_sync_failure)
+}
+
+/// Explicitly enables the approved settings when every required capability is
+/// present. Otherwise it returns the explicit missing-capability report.
+#[tauri::command(async)]
+pub fn html_sync_enable(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+) -> Result<HtmlSyncEnableView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let _confirmation = host.confirm_supervision(ConfirmationKind::ApproveHtmlSync);
+    composition::enable(&mut host, project).map_err(html_sync_failure)
+}
+
+/// Pauses automatic work for one document. It never rolls back a published file.
+#[tauri::command(async)]
+pub fn html_sync_pause(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    run_document_command(&window, &state, command, H3Operation::Pause)
+}
+
+/// Cancels the current cycle for one document without deleting history.
+#[tauri::command(async)]
+pub fn html_sync_cancel(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    run_document_command(&window, &state, command, H3Operation::Cancel)
+}
+
+/// Resumes one stopped/waiting document after the read-only human preflight.
+#[tauri::command(async)]
+pub fn html_sync_resume(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    run_document_command(&window, &state, command, H3Operation::Resume)
+}
+
+/// Reassesses the current source through the normal authoring/verification path.
+#[tauri::command(async)]
+pub fn html_sync_reassess(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    run_document_command(&window, &state, command, H3Operation::Reassess)
+}
+
+/// Records one explicit human conflict decision. `keep_waiting` is always
+/// non-destructive; adopt/replace require their explicit validated payloads and
+/// are refused rather than approximated from a structural-only result.
+#[tauri::command(async)]
+pub fn html_sync_resolve_conflict(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+    resolution: String,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    let resolution = match resolution.trim().to_ascii_lowercase().as_str() {
+        "keep_waiting" => herness_html_sync::ConflictResolution::KeepWaiting,
+        "adopt_current" => herness_html_sync::ConflictResolution::AdoptCurrent,
+        "replace_with_candidate" => {
+            herness_html_sync::ConflictResolution::ReplaceWithCandidate
+        }
+        other => {
+            return Err(CommandFailure::invalid(
+                "resolution",
+                format!("unknown conflict resolution {other:?}"),
+            ));
+        }
+    };
+    run_document_command(
+        &window,
+        &state,
+        command,
+        H3Operation::ResolveConflict { resolution },
+    )
+}
+
+/// Restores one published generation through the normal history-before-replace
+/// path. The document stays unsynchronized and requires a human reassessment.
+#[tauri::command(async)]
+pub fn html_sync_restore(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    command: HtmlSyncDocumentCommand,
+    generation: herness_html_sync::GenerationId,
+) -> Result<HtmlSyncOperationView, CommandFailure> {
+    run_document_command(
+        &window,
+        &state,
+        command,
+        H3Operation::RestoreHistory { generation },
+    )
 }
 
 // ---------------------------------------------------------------------------

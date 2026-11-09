@@ -181,11 +181,14 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 }
             };
-            let (host, reconciliation) = DesktopHost::open(
+            let (host, reconciliation) = DesktopHost::open_with_html_sync_pack(
                 &root,
                 connections,
                 credentials,
                 ProviderEndpoints::official(),
+                std::env::var_os("SDD_PACK_ROOT")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute()),
             )?;
 
             app.manage(AppState {
@@ -250,6 +253,18 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
             commands::supervision_evidence,
             commands::supervision_budget,
             commands::supervision_recovery,
+            commands::html_sync_state,
+            commands::html_sync_history,
+            commands::html_sync_budget,
+            commands::html_sync_barrier,
+            commands::html_sync_approve,
+            commands::html_sync_enable,
+            commands::html_sync_pause,
+            commands::html_sync_cancel,
+            commands::html_sync_resume,
+            commands::html_sync_reassess,
+            commands::html_sync_resolve_conflict,
+            commands::html_sync_restore,
             commands::quit_app,
             commands::quit_state,
             commands::quit_choice,

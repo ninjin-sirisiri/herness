@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use herness_core::{
     ArchivedVersion, EventDraft, ExpectedTargetVersion, OldVersionArchive, ProjectId, ProjectRoot,
@@ -146,18 +147,25 @@ impl PublicationFileReadPort for ProjectPublicationFiles {
 /// Common SDD final `candidate-check` over exact supplied bytes.
 #[derive(Debug)]
 pub struct PolicyFinalCheck {
-    bridge: ConnectedPolicyBridge,
+    bridge: Arc<ConnectedPolicyBridge>,
 }
 
 impl PolicyFinalCheck {
     /// Uses one already-verified policy connection.
-    pub const fn new(bridge: ConnectedPolicyBridge) -> Self {
+    pub fn new(bridge: ConnectedPolicyBridge) -> Self {
+        Self {
+            bridge: Arc::new(bridge),
+        }
+    }
+
+    /// Uses the app-lifetime verified connection without reconnecting.
+    pub fn shared(bridge: Arc<ConnectedPolicyBridge>) -> Self {
         Self { bridge }
     }
 
     /// The verified connection.
-    pub const fn bridge(&self) -> &ConnectedPolicyBridge {
-        &self.bridge
+    pub fn bridge(&self) -> &ConnectedPolicyBridge {
+        self.bridge.as_ref()
     }
 }
 
@@ -562,7 +570,7 @@ impl DesktopPublisher {
     }
 
     /// The verified Common SDD policy connection used by this publisher.
-    pub const fn bridge(&self) -> &ConnectedPolicyBridge {
+    pub fn bridge(&self) -> &ConnectedPolicyBridge {
         self.final_check.bridge()
     }
 

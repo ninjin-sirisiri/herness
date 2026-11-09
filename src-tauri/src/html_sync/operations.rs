@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use herness_core::{ExpectedTargetVersion, ProjectId, RunControl, Timestamp};
 use herness_html_sync::{
@@ -310,6 +311,25 @@ impl DesktopHtmlSyncOperations {
         bridge: ConnectedPolicyBridge,
         control: RunControl,
     ) -> Result<Self, H3Error> {
+        Self::from_shared(
+            project,
+            project_root,
+            store,
+            archive_root,
+            Arc::new(bridge),
+            control,
+        )
+    }
+
+    /// Creates the host operation set over the app-lifetime verified bridge.
+    pub fn from_shared(
+        project: ProjectId,
+        project_root: impl AsRef<Path>,
+        store: StoreHandle,
+        archive_root: impl AsRef<Path>,
+        bridge: Arc<ConnectedPolicyBridge>,
+        control: RunControl,
+    ) -> Result<Self, H3Error> {
         let files = ProjectPublicationFiles::new(project_root.as_ref())?;
         let history =
             PrivateHistoryReader::new(archive_root.as_ref(), store.clone(), files.clone())?;
@@ -318,7 +338,7 @@ impl DesktopHtmlSyncOperations {
             project_root.as_ref(),
             store.clone(),
             archive_root.as_ref(),
-            PolicyFinalCheck::new(bridge),
+            PolicyFinalCheck::shared(bridge),
             control,
         )?;
         Ok(Self {
@@ -330,7 +350,7 @@ impl DesktopHtmlSyncOperations {
     }
 
     /// The verified policy connection.
-    pub const fn bridge(&self) -> &ConnectedPolicyBridge {
+    pub fn bridge(&self) -> &ConnectedPolicyBridge {
         self.publisher.bridge()
     }
 

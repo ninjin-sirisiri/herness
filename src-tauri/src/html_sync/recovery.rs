@@ -19,24 +19,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use herness_core::{ProjectId, StopReason, Timestamp};
 use herness_html_sync::observer::{
-    DependencyKind, DependencyPath, FilesystemSourceReader, SourceReadError, dependency_fingerprint,
+    ChangeSignal, DependencyKind, DependencyPath, FilesystemSourceReader, ObservationEligibility,
+    ObservationTargets, ObserverHealth, ObserverTick, ProjectObserver, SourceChange, SourceReadError,
+    SystemObservationClock, dependency_fingerprint,
 };
 use herness_html_sync::recovery::{
     self, CandidateBytes, H2RecoveryFacts, H2RequestUnknown, ProjectRecoveryReport,
     QuitProjectReport, RecoveryReadPort, RecoveryRuntimePort, RecoveryService, RecoverySideEffects,
-    RecoveryStop,
+    RecoveryStop, ResumePreflight,
 };
 use herness_html_sync::{
-    CandidateArtifactStore, CoordinatorTick, CycleLatch, DocumentKey, H3Error, JobId,
-    StoreBackedOwnerApprovalRegistry, SyncCycle,
+    CandidateArtifactStore, CoordinatorTick, CycleLatch, DocumentKey, H3Error, H3StorePort, JobId,
+    OfferOutcome, SourceObservation, StopOutcome, StoreBackedOwnerApprovalRegistry, SyncCycle,
 };
 use herness_supervision::{BudgetUsage, ClockPort, ContentDigest, SupervisionId, SupervisionState};
 use serde::Serialize;
 
 use crate::host::DesktopRuntime;
+use crate::html_sync::composition::HtmlSyncCapabilityReport;
+use crate::html_sync::observer::{ProjectFilesystemWatcher, WatchNotice};
 use crate::html_sync::worker::HtmlSyncWorker;
 use crate::supervision::SupervisionHost;
 use crate::supervision::runtime::DesktopH1;
@@ -140,6 +145,11 @@ pub struct HtmlSyncRecoveryHost {
     worker: HtmlSyncWorker,
     projects: BTreeMap<ProjectId, RecoveryProject>,
     bound: BTreeSet<ProjectId>,
+    capabilities: BTreeMap<ProjectId, HtmlSyncCapabilityReport>,
+    observers: BTreeMap<ProjectId, ProjectObserver<FilesystemSourceReader, SystemObservationClock>>,
+    watchers: BTreeMap<ProjectId, ProjectFilesystemWatcher>,
+    watch_tx: Sender<WatchNotice>,
+    watch_rx: Receiver<WatchNotice>,
     accepting: bool,
     last_startup: Option<HtmlSyncStartupReport>,
 }
@@ -157,15 +167,229 @@ impl HtmlSyncRecoveryHost {
         };
         let candidates = CandidateArtifactStore::new(candidate_root)?;
         let worker = HtmlSyncWorker::new(store.clone(), candidates.clone());
+        let (watch_tx, watch_rx) = channel();
         Ok(Self {
             store,
             candidates,
             worker,
             projects: BTreeMap::new(),
             bound: BTreeSet::new(),
+            capabilities: BTreeMap::new(),
+            observers: BTreeMap::new(),
+            watchers: BTreeMap::new(),
+            watch_tx,
+            watch_rx,
             accepting: true,
             last_startup: None,
         })
+    }
+
+    /// Shared store handle used by the one H3 worker.
+    pub fn store_handle(&self) -> StoreHandle {
+        self.store.clone()
+    }
+
+    /// Private candidate root used by the one H3 worker.
+    pub fn candidate_root(&self) -> &Path {
+        self.candidates.root()
+    }
+
+    /// This host owns exactly one worker. The value is a stable invariant used
+    /// by the desktop composition test.
+    pub const fn worker_count(&self) -> usize {
+        1
+    }
+
+    /// Registered project root.
+    pub fn project_root(&self, project: ProjectId) -> Option<&Path> {
+        self.projects.get(&project).map(|binding| binding.root.as_path())
+    }
+
+    /// Whether the project is bound to the app-lifetime worker.
+    pub fn is_bound(&self, project: ProjectId) -> bool {
+        self.bound.contains(&project)
+    }
+
+    /// Last capability report stored by the trusted composition.
+    pub fn capability_report(&self, project: ProjectId) -> Option<&HtmlSyncCapabilityReport> {
+        self.capabilities.get(&project)
+    }
+
+    /// Stores one host-computed capability report. An unavailable report
+    /// unbinds the project's worker so a missing capability cannot keep
+    /// authoring active.
+    pub fn set_capability_report(
+        &mut self,
+        project: ProjectId,
+        report: HtmlSyncCapabilityReport,
+    ) {
+        if !report.available() {
+            self.bound.remove(&project);
+            self.observers.remove(&project);
+            self.watchers.remove(&project);
+        }
+        self.capabilities.insert(project, report);
+    }
+
+    /// Current observer health, when the project has an observer.
+    pub fn observer_health(&self, project: ProjectId) -> Option<ObserverHealth> {
+        self.observers.get(&project).map(ProjectObserver::health)
+    }
+
+    /// Delivers one project-relative signal to the project observer.
+    ///
+    /// This is the seam used by H1 persisted file-change notifications. It does
+    /// not author or send by itself; the next pump settles the observation.
+    pub fn observe_signal(&mut self, project: ProjectId, signal: ChangeSignal) -> bool {
+        self.observers
+            .get_mut(&project)
+            .is_some_and(|observer| observer.notify(signal))
+    }
+
+    /// Binds one approved project only when its capability report is complete.
+    ///
+    /// It creates the per-project observer and watcher, seeds the stored source
+    /// revisions, and performs one initial scan. The scan only offers stable
+    /// observations to the one worker; the normal gate still decides whether a
+    /// run may start.
+    pub fn activate_project(
+        &mut self,
+        project: ProjectId,
+        root: impl AsRef<Path>,
+        settings: herness_html_sync::H3Settings,
+        supervision: SupervisionId,
+        dependencies: Vec<DependencyPath>,
+    ) -> Result<bool, H3Error> {
+        if !self
+            .capabilities
+            .get(&project)
+            .is_some_and(HtmlSyncCapabilityReport::available)
+        {
+            return Ok(false);
+        }
+        self.worker.bind_project(
+            project,
+            root.as_ref(),
+            settings.clone(),
+            supervision,
+            dependencies.clone(),
+        )?;
+        self.bound.insert(project);
+        self.start_observer(project, root.as_ref(), &settings, dependencies)?;
+        Ok(true)
+    }
+
+    /// Offers the saved current source after an explicit human resume.
+    ///
+    /// This does not send, start, or publish. It queues one normal authoring
+    /// observation; the existing H2 budget/approval gate still applies.
+    pub fn requeue_document(
+        &mut self,
+        project: ProjectId,
+        document: &DocumentKey,
+    ) -> Result<OfferOutcome, H3Error> {
+        let settings = self
+            .store
+            .load_html_sync_settings(project)?
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.settings".to_owned(),
+                detail: "the project has no stored settings".to_owned(),
+            })?;
+        let state = self
+            .store
+            .load_html_sync_document(project, document)?
+            .ok_or_else(|| H3Error::NotFound {
+                record: "document state",
+                id: document.target_path().to_owned(),
+            })?;
+        let observation = SourceObservation {
+            document: document.clone(),
+            snapshot: state.state().source().clone(),
+            change: SourceChange::Modified,
+            trigger: herness_html_sync::ObservationTrigger::FileNotification,
+            observed_via: vec![herness_html_sync::ChangeSource::ExternalEditor],
+            eligibility: ObservationEligibility::from_settings(
+                Some(settings.settings()),
+                Timestamp::now(),
+            ),
+        };
+        Ok(self.worker.observe(&observation))
+    }
+
+    fn start_observer(
+        &mut self,
+        project: ProjectId,
+        root: &Path,
+        settings: &herness_html_sync::H3Settings,
+        dependencies: Vec<DependencyPath>,
+    ) -> Result<(), H3Error> {
+        if self.observers.contains_key(&project) {
+            return Ok(());
+        }
+        let targets = ObservationTargets::from_settings(settings, dependencies)?;
+        let eligibility = ObservationEligibility::from_settings(Some(settings), Timestamp::now());
+        let reader = FilesystemSourceReader::new(root)?;
+        let mut observer =
+            ProjectObserver::new(targets, eligibility, reader, SystemObservationClock::new())?;
+        if let Ok(documents) = self.store.list_html_sync_documents(project) {
+            for record in documents {
+                let _ = observer.seed_source(
+                    record.state().document_key(),
+                    record.state().source().clone(),
+                );
+            }
+        }
+        let tick = observer.initial_scan();
+        self.feed_tick(&tick);
+        self.observers.insert(project, observer);
+        match ProjectFilesystemWatcher::start(root, self.watch_tx.clone()) {
+            Ok(watcher) => {
+                self.watchers.insert(project, watcher);
+            }
+            Err(_) => {
+                if let Some(observer) = self.observers.get_mut(&project) {
+                    observer.report_watcher_failure();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn feed_tick(&mut self, tick: &ObserverTick) {
+        // Generated HTML and receipts are companion observations. They never
+        // become Markdown authoring work.
+        for observation in &tick.sources {
+            if observation.is_authoring_candidate() {
+                self.worker.observe(observation);
+            }
+        }
+    }
+
+    fn drain_watch_notices(&mut self) {
+        while let Ok(notice) = self.watch_rx.try_recv() {
+            for observer in self.observers.values_mut() {
+                match &notice {
+                    WatchNotice::Signal(signal) => {
+                        observer.notify(signal.clone());
+                    }
+                    WatchNotice::Failure => {
+                        observer.report_watcher_failure();
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_observers(&mut self) {
+        let mut sources = Vec::new();
+        for observer in self.observers.values_mut() {
+            sources.extend(observer.poll().sources);
+        }
+        for observation in &sources {
+            if observation.is_authoring_candidate() {
+                self.worker.observe(observation);
+            }
+        }
     }
 
     /// Registers one open project without starting anything.
@@ -188,6 +412,9 @@ impl HtmlSyncRecoveryHost {
     pub fn remove_project(&mut self, project: ProjectId) {
         self.projects.remove(&project);
         self.bound.remove(&project);
+        self.capabilities.remove(&project);
+        self.observers.remove(&project);
+        self.watchers.remove(&project);
     }
 
     /// Last startup report.
@@ -259,15 +486,19 @@ impl HtmlSyncRecoveryHost {
                         && settings.enabled()
                         && settings.approval().is_some()
                         && let Some(supervision_id) = self.supervision_for(project)
+                        && self
+                            .capabilities
+                            .get(&project)
+                            .is_some_and(HtmlSyncCapabilityReport::available)
                     {
-                        match self.worker.bind_project(
+                        match self.activate_project(
                             project,
                             &binding.root,
                             settings.clone(),
                             supervision_id,
                             binding.dependencies.clone(),
                         ) {
-                            Ok(_) => {
+                            Ok(true) => {
                                 if let Some(job_id) = self.durable_job_id(project) {
                                     if let Err(error) =
                                         self.worker.restore_job_id(project, job_id)
@@ -293,6 +524,7 @@ impl HtmlSyncRecoveryHost {
                                     }
                                 }
                             }
+                            Ok(false) => {}
                             Err(error) => {
                                 failures.push(HtmlSyncRecoveryFailure {
                                     project_id: project,
@@ -344,6 +576,123 @@ impl HtmlSyncRecoveryHost {
         self.worker.clear_latch(document)
     }
 
+    /// Seeds one persisted human-stop/recovery latch.
+    pub fn seed_latch(
+        &mut self,
+        document: DocumentKey,
+        latch: Option<CycleLatch>,
+        detail: impl Into<String>,
+    ) {
+        self.worker.seed_latch(document, latch, detail);
+    }
+
+    /// Requests a cooperative stop for one project's active authoring run.
+    pub fn stop_active(
+        &mut self,
+        runtime: &mut DesktopRuntime,
+        document: &DocumentKey,
+    ) -> Result<Option<StopOutcome>, H3Error> {
+        self.worker.stop_active(runtime, document)
+    }
+
+    /// Runs the read-only human resume preflight for one document.
+    ///
+    /// The current source is read from the project, H2 facts come from the real
+    /// supervision recovery path, and the approved profile/consent/policy/pack
+    /// values come from the saved human approval. It never sends or writes.
+    pub fn resume_preflight(
+        &mut self,
+        runtime: &mut DesktopRuntime,
+        supervision: &mut SupervisionHost,
+        document: &DocumentKey,
+        expected_revision: u64,
+        now: Timestamp,
+    ) -> Result<ResumePreflight, H3Error> {
+        let project = document.project_id();
+        let settings = self
+            .store
+            .load_html_sync_settings(project)?
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.settings".to_owned(),
+                detail: "the project has no stored settings".to_owned(),
+            })?;
+        let approval = settings
+            .settings()
+            .approval()
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.approval".to_owned(),
+                detail: "the stored settings carry no human approval".to_owned(),
+            })?
+            .clone();
+        let job = self
+            .worker
+            .job(project)
+            .cloned()
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.job".to_owned(),
+                detail: "the project is not bound to an approved H3 job".to_owned(),
+            })?;
+        let binding = self.projects.get(&project).ok_or_else(|| H3Error::NotFound {
+            record: "open project",
+            id: project.to_string(),
+        })?;
+        let reader = FilesystemSourceReader::new(&binding.root)?;
+        let reads = DesktopRecoveryReads {
+            reader,
+            candidates: self.candidates.clone(),
+        };
+        let bytes = reads.read_source(document)?.ok_or_else(|| H3Error::NotFound {
+            record: "source",
+            id: document.target_path().to_owned(),
+        })?;
+        let record = self
+            .store
+            .load_html_sync_document(project, document)?
+            .ok_or_else(|| H3Error::NotFound {
+                record: "document state",
+                id: document.target_path().to_owned(),
+            })?;
+        let observed_source = herness_html_sync::SourceSnapshot::new(
+            herness_html_sync::SourceRevision::new(record.state().source().revision().get())?,
+            ContentDigest::sha256(&bytes),
+        );
+        let dependencies = self.dependency_map();
+        let mut runtime_port = DesktopRecoveryRuntime {
+            runtime,
+            supervision,
+            store: self.store.clone(),
+        };
+        let cycle = match record.state().cycle_id() {
+            Some(cycle_id) => self.store.load_html_sync_cycle(project, cycle_id)?,
+            None => None,
+        };
+        let h2 = runtime_port.h2_facts(document, record.state().h2(), cycle.as_ref())?;
+        let clock = FixedClock(now);
+        let mut service = RecoveryService::new(
+            &mut self.store,
+            &reads,
+            &mut runtime_port,
+            &clock,
+            &dependencies,
+        );
+        service.resume_preflight(herness_html_sync::ResumePreflightRequest {
+            document,
+            expected_revision,
+            job: &job,
+            settings: &settings,
+            observed_source: &observed_source,
+            policy_version: approval.versions().policy_version(),
+            policy_digest: approval.versions().policy_fingerprint(),
+            pack_digest: approval.versions().pack_fingerprint(),
+            h2: h2.as_ref(),
+            current_authoring_profile: Some(&approval.authoring().profile()),
+            current_authoring_consent: Some(&approval.authoring().consent()),
+            current_html_profile: Some(&approval.assessment().profile()),
+            current_html_consent: Some(&approval.assessment().consent()),
+            now,
+        })
+    }
+
     /// One app-lifetime worker pass. It never creates a window or selects a
     /// project; the host pump calls it for every registered project.
     pub fn pump(
@@ -354,6 +703,8 @@ impl HtmlSyncRecoveryHost {
         if !self.accepting || self.bound.is_empty() {
             return Ok(None);
         }
+        self.drain_watch_notices();
+        self.poll_observers();
         let registry_store = self.store.clone();
         let registry = StoreBackedOwnerApprovalRegistry::new(&registry_store);
         self.worker.pump(runtime, supervision, &registry).map(Some)
@@ -369,6 +720,7 @@ impl HtmlSyncRecoveryHost {
         now: Timestamp,
     ) -> HtmlSyncQuitReport {
         self.accepting = false;
+        self.watchers.clear();
         let mut projects = Vec::new();
         let mut failures = Vec::new();
         for project in self.projects.keys().copied().collect::<Vec<_>>() {
@@ -412,7 +764,15 @@ impl HtmlSyncRecoveryHost {
             .collect()
     }
 
-    fn supervision_for(&self, project: ProjectId) -> Option<SupervisionId> {
+    /// The exact dependency paths registered for one project.
+    pub fn dependencies(&self, project: ProjectId) -> Vec<DependencyPath> {
+        self.projects
+            .get(&project)
+            .map(|binding| binding.dependencies.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn supervision_for(&self, project: ProjectId) -> Option<SupervisionId> {
         let store = self.store.lock();
         let documents = store
             .list_html_sync_documents(project)

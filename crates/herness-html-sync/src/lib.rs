@@ -13,6 +13,7 @@
 
 #![doc = "H3 numeric defaults remain the approved spec values; this crate does not weaken them."]
 
+pub mod barrier;
 pub mod candidate;
 pub mod config;
 pub mod coordinator;
@@ -32,6 +33,10 @@ pub mod state;
 pub mod version;
 pub mod workspace;
 
+pub use barrier::{
+    BarrierDependency, BarrierMismatch, BarrierMismatchKind, BarrierOutcome, BarrierRequest,
+    H4Barrier,
+};
 pub use candidate::{
     CandidateArtifactStore, CandidateGenerationRequest, CandidateVerification, MAX_CANDIDATE_BYTES,
     MAX_SOURCE_MARKDOWN_BYTES, OpenedCandidateGeneration,

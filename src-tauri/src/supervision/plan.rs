@@ -60,6 +60,10 @@ pub enum ConfirmationKind {
     Profile,
     /// Grant or revoke per-purpose consent.
     Consent,
+    /// Approve or enable one H3 HTML sync configuration.
+    ApproveHtmlSync,
+    /// Apply one explicit H3 document operation.
+    H3DocumentOperation,
 }
 
 impl HumanConfirmation {

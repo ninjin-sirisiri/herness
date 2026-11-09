@@ -264,6 +264,21 @@ pub enum FingerprintKind {
     Evidence,
 }
 
+impl FingerprintKind {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+            Self::Policy => "policy",
+            Self::Css => "css",
+            Self::Resources => "resources",
+            Self::Candidate => "candidate",
+            Self::Provenance => "provenance",
+            Self::Evidence => "evidence",
+        }
+    }
+}
+
 /// Separate fingerprints for every dependency that can invalidate a sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

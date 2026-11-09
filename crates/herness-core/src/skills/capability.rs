@@ -128,6 +128,24 @@ impl HostCapabilities {
         }
     }
 
+    /// The complete H3 desktop capability set.
+    ///
+    /// This reports what the host implements, not that any project has approved
+    /// or enabled it. The per-project H3 capability report still requires the
+    /// real policy connection, render, assessment, and human approval before the
+    /// HtmlWorker is bound. SDD Task progress remains outside H3.
+    pub const fn h3_complete() -> Self {
+        Self {
+            skill_read: CapabilityStatus::Available,
+            html_worker: CapabilityStatus::Available,
+            sdd_task_controller: CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::NotImplementedInH1,
+            },
+            authoring_dispatch: CapabilityStatus::Available,
+            policy_bridge: CapabilityStatus::Available,
+        }
+    }
+
     /// Returns a copy with one capability replaced.
     pub const fn with_status(self, capability: HostCapability, status: CapabilityStatus) -> Self {
         let mut next = self;
