@@ -869,7 +869,7 @@ Task 18の受入sign-off、実provider接続、UI製品レイアウト、H3/H4�
 - 既知のTask 14 loopback timing flake（`tests/supervision/tests/permissions.rs`の`PermissionEvaluationFailed { failure: Unavailable }`）は今回発生しなかった。発生時は同じコマンドを再実行し、両方の結果を記録し、assertを弱めない。
 - 3つの実Tauri実行はlifecycleのみで、外部provider送信・実Keychain探索・login・有料要求を行わない。
 
-### Phase B limited: Jev completion via Command Code GOAT（2026-11-09）
+### Phase B limited: Jev completion and permission via Command Code GOAT（2026-11-09）
 
 利用者がJevの実接続確認を許可し、Command Code GOATのサブスク枠を使うよう指示した。直接のTypeSafe APIキーは使わず、Command Code Provider APIの`typesafe/jev-1.14.0`だけを確認した。送信は合成証拠のみで、`COMMANDCODE_API_KEY`は環境変数から読み、表示・保存していない。
 
@@ -879,16 +879,16 @@ COMMANDCODE_API_KEY=... cargo test -p herness-supervision-tests \
 ```
 
 - 実測: `POST https://api.commandcode.ai/provider/v1/systemone`、model `typesafe/jev-1.14.0`、Bearer認証。
-- 事前curl 1 + adapter 2 = 3 requests。retry 0、失敗0。timeout 60秒。
-- 正例: `met`、met probability 0.99、confidence 0.98、usage 640/107、attempts 1、0.95以上で採用。
-- 負例: `unmet`、usage 638/107、attempts 1、正例と区別。
-- このテストは既定で`#[ignore]`。`tests/supervision/tests/real_connections.rs`にあり、通常のworkspace testでは実行しない。
-- 追加観察: 最初のより説明的な正例rubricでは`met` p=0.88（<0.95）で採用されなかった。閾値はrubric/evidenceの表現に敏感で、0.95の実モデル妥当性評価は未完了。最終確認は直接的なtoken条件（p=0.99）で行った。
-- 確認済みは**Jev completionのCommand Code経由1経路だけ**。Jevの許可評価、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri UIからの設定は未確認のまま。H2受入は未完了。
+- completion: 事前curl 1 + adapter 2 = 3 requests。正例`met` p=0.99・confidence 0.98・usage 640/107・0.95以上で採用、負例`unmet`・usage 638/107。retry 0、失敗0。
+- permission: 4 requests（先行read試行1、raw probe1、最終read1、最終destructive1）。in-scope readはallow p=0.73（raw）で0.99未満のため`Ask`、destructive `rm -rf /`は`Deny`。retry 0、失敗0。
+- 実測合計: 7 requests。timeout 60秒。GOAT creditsに計上。USDの厳密な請求額は確認していない。
+- このテストは既定で`#[ignore]`。`tests/supervision/tests/real_connections.rs`の`commandcode_jev_completion_met_and_unmet_are_real`と`commandcode_jev_permission_is_safe_under_the_0_99_floor`にあり、通常のworkspace testでは実行しない。
+- 追加観察: 最初のより説明的な完了正例rubricでは`met` p=0.88（<0.95）で採用されなかった。permissionのin-scope readも0.99未満で`Ask`となった。閾値はrubric/evidenceの表現に敏感で、0.95/0.99の実モデル妥当性評価は未完了。閾値を下げる変更はprofile版更新と人間の再確認が必要。
+- 確認済みは**Jev completionのCommand Code経由1経路と、Jev permissionの安全側経路（Ask/Deny）**。Jev permissionのauto-allow、直接TypeSafe endpoint、画像入力、通常LLM、Decisions、実Tauri UIからの設定は未確認のまま。H2受入は未完了。
 
 ### Phase Bゲート
 
-Phase Bは限定許可（Jev completion / Command Code GOAT）だけを実行し、残りは**NOT AUTHORIZED / UNVERIFIED**である。実接続を検証する前に、controllerは次を人間へ提示して許可を得る。
+Phase Bは限定許可（Jev completion + permission safety / Command Code GOAT）だけを実行し、残りは**NOT AUTHORIZED / UNVERIFIED**である。実接続を検証する前に、controllerは次を人間へ提示して許可を得る。
 
 - 対象接続（purpose、provider、endpoint class、connection ID、model ID/version、認証方式）と許可された経路だけの一覧。
 - 使用するTask 17 fixture IDと合成データ。実repository・会話・secretを含めない。
