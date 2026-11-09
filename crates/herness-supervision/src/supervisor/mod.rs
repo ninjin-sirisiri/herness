@@ -383,6 +383,7 @@ impl<'a> Supervisor<'a> {
                 record.target_version(),
                 record.profile(),
                 record.consent(),
+                contract.work_packet().clone(),
                 deficiency.clone(),
             );
             self.ports.runtime.continue_child(&continuation)
@@ -397,10 +398,7 @@ impl<'a> Supervisor<'a> {
                 record.target_version(),
                 record.profile(),
                 record.consent(),
-                record
-                    .supervisor()
-                    .pending_deficiency()
-                    .map(|deficiency| deficiency.instruction().to_owned()),
+                contract.work_packet().clone(),
             );
             self.ports.runtime.start_child(&start)
         };

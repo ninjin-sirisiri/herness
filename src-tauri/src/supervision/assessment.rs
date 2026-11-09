@@ -314,7 +314,7 @@ impl HostAssessmentPort {
     > {
         let project = request.project_id();
         let plan =
-            crate::supervision::plan::load_plan(&self.store, project, request.supervision_id())
+            crate::supervision::plan::load_plan(&self.store, project, request.supervision_id())?
                 .ok_or(SupervisionError::Unsupported {
                     feature: "assessment budget plan is unavailable".to_owned(),
                 })?;

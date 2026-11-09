@@ -185,6 +185,37 @@ pub enum SupervisionError {
         /// Sanitized description; never contains stored content.
         detail: String,
     },
+    /// The immutable work packet is missing, unsupported, or was altered.
+    WorkPacketRejected {
+        /// Structured reason.
+        reason: WorkPacketRejection,
+    },
+}
+
+/// Why an immutable work packet cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum WorkPacketRejection {
+    /// The stored plan predates the work packet and no packet can be recovered.
+    Missing,
+    /// The packet format version is not supported by this build.
+    UnsupportedFormat {
+        /// Version found.
+        found: u32,
+        /// Version written by this build.
+        expected: u32,
+    },
+    /// The SHA-256 fingerprint does not match the canonical packet fields.
+    FingerprintMismatch,
+    /// One packet constraint differs from the approved plan or contract.
+    Mismatch {
+        /// Constraint field that differs.
+        field: String,
+    },
 }
 
 /// Why an approval was rejected.
@@ -330,6 +361,9 @@ impl fmt::Display for SupervisionError {
             }
             Self::StorageFailure { detail } => {
                 write!(f, "supervision storage failed: {detail}")
+            }
+            Self::WorkPacketRejected { reason } => {
+                write!(f, "work packet rejected: {reason:?}")
             }
         }
     }

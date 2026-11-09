@@ -17,14 +17,15 @@ use herness_supervision::consent::{
     ConsentBlock, DisclosureDataKind, DisclosureScope, ProviderOrigin,
 };
 use herness_supervision::contract::{
-    OwnerKind, OwnerRef, RunGroup, SupervisionSubject, same_approval_kind,
+    ExecutionScope, OwnerKind, OwnerRef, RunGroup, SupervisionSubject, same_approval_kind,
 };
-use herness_supervision::error::{ApprovalRejection, SupervisionError};
+use herness_supervision::error::{ApprovalRejection, SupervisionError, WorkPacketRejection};
 use herness_supervision::evidence::{
     CheckStatus, EvidenceAcquirer, EvidenceOutcome, EvidenceRecord, EvidenceScope,
     RequiredCheckResult, TargetScope, TargetVersion, VerificationOperation,
 };
 use herness_supervision::profiles::{ProfilePurpose, ProfileThresholds};
+use herness_supervision::packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 use herness_supervision::state::{
     CompletionBlocker, HumanAction, StopCause, SupervisionFailure, SupervisionRecord,
     SupervisionState,
@@ -1000,6 +1001,176 @@ fn permission_ask_uncertainty_and_low_probability_never_authorize_execution() {
         None
     );
     assert!(!uncertain.allows_execution(ProfileThresholds::normal_llm()));
+}
+
+#[test]
+fn immutable_work_packet_is_versioned_fingerprinted_and_bound_to_the_contract() {
+    let project = project();
+    let target = target_scope(project, 1);
+    let execution = ExecutionScope::new(
+        project,
+        vec!["src".to_owned(), "Cargo.toml".to_owned()],
+        vec!["src".to_owned()],
+        false,
+    )
+    .expect("execution scope");
+    let profile = completion_profile(project);
+    let consent = consent(project, ProfilePurpose::Completion, 1);
+    let budget = BudgetPolicy::h2_default();
+    let conditions = approved_condition_set(project);
+    let packet = work_packet(
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "owner instruction for the approved target",
+    );
+
+    packet.verify().expect("fresh packet");
+    assert_eq!(packet.format_version(), WORK_PACKET_FORMAT_VERSION);
+    assert_eq!(packet.packet_version(), 1);
+    assert_eq!(
+        packet.instruction(),
+        "owner instruction for the approved target"
+    );
+    assert_eq!(packet.execution_scope(), &execution);
+    assert!(!packet.prompt().contains("Work toward the approved completion conditions."));
+
+    let json = serde_json::to_value(&packet).expect("packet json");
+    let decoded: WorkPacket = serde_json::from_value(json.clone()).expect("packet decode");
+    assert_eq!(decoded, packet);
+    decoded.verify().expect("decoded packet verifies");
+
+    let mut changed_instruction = json.clone();
+    changed_instruction["instruction"] = serde_json::json!("a different owner instruction");
+    let tampered: WorkPacket =
+        serde_json::from_value(changed_instruction).expect("tampered packet shape");
+    assert!(matches!(
+        tampered.verify(),
+        Err(SupervisionError::WorkPacketRejected {
+            reason: WorkPacketRejection::FingerprintMismatch
+        })
+    ));
+
+    let mut changed_format = json.clone();
+    changed_format["formatVersion"] = serde_json::json!(99);
+    let unsupported: WorkPacket =
+        serde_json::from_value(changed_format).expect("unsupported packet shape");
+    assert!(matches!(
+        unsupported.verify(),
+        Err(SupervisionError::WorkPacketRejected {
+            reason: WorkPacketRejection::UnsupportedFormat {
+                found: 99,
+                expected: WORK_PACKET_FORMAT_VERSION
+            }
+        })
+    ));
+
+    let other_scope = ExecutionScope::new(
+        project,
+        vec!["src".to_owned()],
+        vec!["src".to_owned()],
+        true,
+    )
+    .expect("other scope");
+    assert!(matches!(
+        packet.ensure_binding(
+            &other_scope,
+            conditions.condition_version(),
+            profile.binding(),
+            consent.binding(),
+            &target,
+            &budget,
+        ),
+        Err(SupervisionError::WorkPacketRejected {
+            reason: WorkPacketRejection::Mismatch { .. }
+        })
+    ));
+
+    let mut reordered = target.read_set().to_vec();
+    reordered.reverse();
+    assert_eq!(
+        read_set_digest(target.read_set()).expect("read-set digest"),
+        read_set_digest(&reordered).expect("reordered read-set digest")
+    );
+
+    let mismatched_packet = work_packet(
+        project,
+        &target,
+        &other_scope,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "owner instruction for the approved target",
+    );
+    let subject = SupervisionSubject::new(
+        project,
+        ids(project).supervision,
+        AgentId::new(project),
+        SessionId::new(project),
+        OwnerRef::new(OwnerKind::Human, "fixture-human").expect("owner"),
+    )
+    .expect("subject");
+    assert!(matches!(
+        herness_supervision::contract::SupervisionContract::new(
+            ApprovalActor::Human,
+            subject,
+            execution.clone(),
+            RunGroup::new(ids(project).run_group),
+            conditions.clone(),
+            target.clone(),
+            &profile,
+            &consent,
+            budget.clone(),
+            mismatched_packet,
+            now(),
+        ),
+        Err(SupervisionError::WorkPacketRejected {
+            reason: WorkPacketRejection::Mismatch { .. }
+        })
+    ));
+
+    let contract = herness_supervision::contract::SupervisionContract::new(
+        ApprovalActor::Human,
+        SupervisionSubject::new(
+            project,
+            ids(project).supervision,
+            AgentId::new(project),
+            SessionId::new(project),
+            OwnerRef::new(OwnerKind::Human, "fixture-human").expect("owner"),
+        )
+        .expect("subject"),
+        execution,
+        RunGroup::new(ids(project).run_group),
+        conditions.clone(),
+        target,
+        &profile,
+        &consent,
+        budget,
+        packet.clone(),
+        now(),
+    )
+    .expect("contract");
+    assert_eq!(contract.work_packet(), &packet);
+
+    let mut revised = contract.clone();
+    let next_conditions = approved_condition_set_at(project, 2);
+    revised
+        .revise_conditions(ApprovalActor::Human, next_conditions, now())
+        .expect("condition revision");
+    assert!(revised.work_packet().packet_version() > packet.packet_version());
+    assert_ne!(revised.work_packet().fingerprint(), packet.fingerprint());
+    assert_eq!(
+        revised.work_packet().condition_version(),
+        ConditionVersion::new(2).expect("version")
+    );
+    revised
+        .validate_for_start(now())
+        .expect("revised packet still verifies");
 }
 
 fn set_version(version: u64) -> ConditionVersion {

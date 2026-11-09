@@ -22,6 +22,7 @@ use crate::freshness::{TargetManifest, TargetReadSet, WorkspaceSnapshotPort};
 use crate::ids::{
     BudgetRequestId, CheckId, ConditionId, EvidenceId, SupervisionId, SupervisionRequestId,
 };
+use crate::packet::WorkPacket;
 use crate::ports::{BudgetStorePort, ClockPort, EvidenceStorePort, SupervisionStorePort};
 use crate::profiles::{AdapterVersion, ProfileBinding, ProfileThresholds, RubricVersion};
 use crate::state::{SupervisionReason, SupervisionState};
@@ -31,7 +32,8 @@ use crate::state::{SupervisionReason, SupervisionState};
 /// Start and continuation requests name the run and input IDs the supervisor
 /// already persisted, so a repeated request with the same ID can be answered
 /// without starting a second run. The runtime implementation must use the same
-/// child agent/session and the unchanged approved execution scope.
+/// child agent/session, the request's immutable work packet, and the unchanged
+/// approved execution scope.
 pub trait SupervisionRuntimePort {
     /// Starts the first child run and submits its initial input.
     fn start_child(&mut self, request: &ChildRunStart) -> Result<(), SupervisionError>;
@@ -68,7 +70,7 @@ pub struct ChildRunStart {
     target_version: TargetVersion,
     profile: ProfileBinding,
     consent: ConsentBinding,
-    instruction: Option<String>,
+    packet: WorkPacket,
 }
 
 impl ChildRunStart {
@@ -85,7 +87,7 @@ impl ChildRunStart {
         target_version: TargetVersion,
         profile: ProfileBinding,
         consent: ConsentBinding,
-        instruction: Option<String>,
+        packet: WorkPacket,
     ) -> Self {
         Self {
             request_id,
@@ -97,7 +99,7 @@ impl ChildRunStart {
             target_version,
             profile,
             consent,
-            instruction,
+            packet,
         }
     }
 
@@ -146,9 +148,9 @@ impl ChildRunStart {
         self.consent
     }
 
-    /// Owner-supplied initial instruction, when any.
-    pub fn instruction(&self) -> Option<&str> {
-        self.instruction.as_deref()
+    /// Owner-supplied immutable work packet for this run.
+    pub const fn packet(&self) -> &WorkPacket {
+        &self.packet
     }
 }
 
@@ -166,6 +168,7 @@ pub struct ChildRunContinuation {
     target_version: TargetVersion,
     profile: ProfileBinding,
     consent: ConsentBinding,
+    packet: WorkPacket,
     deficiency: ContinuationDeficiency,
 }
 
@@ -183,6 +186,7 @@ impl ChildRunContinuation {
         target_version: TargetVersion,
         profile: ProfileBinding,
         consent: ConsentBinding,
+        packet: WorkPacket,
         deficiency: ContinuationDeficiency,
     ) -> Self {
         Self {
@@ -196,6 +200,7 @@ impl ChildRunContinuation {
             target_version,
             profile,
             consent,
+            packet,
             deficiency,
         }
     }
@@ -248,6 +253,11 @@ impl ChildRunContinuation {
     /// Unchanged disclosure consent.
     pub const fn consent(&self) -> ConsentBinding {
         self.consent
+    }
+
+    /// Owner-supplied immutable work packet for this run.
+    pub const fn packet(&self) -> &WorkPacket {
+        &self.packet
     }
 
     /// Host-generated deficiency and evidence to return to the child.

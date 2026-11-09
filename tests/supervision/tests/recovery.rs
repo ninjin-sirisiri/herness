@@ -435,16 +435,28 @@ fn contract_with_versions(
         true,
     )
     .expect("scope");
+    let target = target_scope(project_id, 1);
+    let conditions = approved_condition_set_at(project_id, condition_version);
     SupervisionContract::new(
         ApprovalActor::Human,
         subject,
-        execution,
+        execution.clone(),
         RunGroup::new(ids.run_group),
-        approved_condition_set_at(project_id, condition_version),
-        target_scope(project_id, 1),
+        conditions.clone(),
+        target.clone(),
         &profile,
         &consent,
-        budget,
+        budget.clone(),
+        herness_supervision_tests::work_packet(
+            project_id,
+            &target,
+            &execution,
+            conditions.condition_version(),
+            &profile,
+            &consent,
+            &budget,
+            "fixture recovery instruction",
+        ),
         now(),
     )
     .expect("contract")

@@ -16,12 +16,19 @@ use herness_supervision::{
     DisclosureScope, ExecutionScope, Money, MoneyCap, OwnerApprovalSource, OwnerRef, PriceVersion,
     ProfilePurpose, ProviderOrigin, RequiredCheck, RunGroup, SupervisionContract, SupervisionError,
     SupervisionId, SupervisionRecord, SupervisionSubject, TargetScope, TargetVersion,
-    VerificationOperation,
+    VerificationOperation, WorkPacket, WorkPacketRejection,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::supervision::runtime::ChildIdentity;
 use crate::supervision::store::StoreHandle;
+
+/// Format version written for the durable supervision plan.
+///
+/// Format 1 stored the contract without an immutable work packet and cannot be
+/// restarted: the owner instruction was not persisted, so a packet must not be
+/// fabricated from the remaining fields.
+pub const PLAN_FORMAT_VERSION: u32 = 2;
 
 /// One host-minted confirmation of a human action.
 ///
@@ -205,6 +212,8 @@ impl BudgetSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredPlan {
+    /// Durable plan format version.
+    pub format_version: u32,
     /// Human or approved-owner actor used to build the contract.
     pub actor: RequestActor,
     /// Subject owner.
@@ -225,11 +234,85 @@ pub struct StoredPlan {
     pub budget: BudgetSnapshot,
     /// Durable budget policy version.
     pub budget_version: u64,
+    /// Immutable owner packet sent to first and additional runs.
+    pub packet: WorkPacket,
     /// Exact approved contract at create/change time.
     pub contract: SupervisionContract,
 }
 
 impl StoredPlan {
+    /// Verifies the plan format, packet fingerprint, and packet/contract/plan
+    /// binding. Any mismatch is an explicit error; no field is repaired.
+    pub fn verify(&self) -> Result<(), SupervisionError> {
+        if self.format_version != PLAN_FORMAT_VERSION {
+            return Err(SupervisionError::Unsupported {
+                feature: format!(
+                    "supervision plan format {} is not supported; this build reads format {}",
+                    self.format_version, PLAN_FORMAT_VERSION
+                ),
+            });
+        }
+        self.packet.verify()?;
+        self.packet.ensure_binding(
+            &self.execution_scope,
+            self.conditions.condition_version(),
+            self.profile.binding(),
+            self.consent.binding(),
+            &self.evidence_target,
+            &self.budget.policy()?,
+        )?;
+        if self.packet.budget_policy_version() != self.budget_version {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "budgetPolicyVersion".to_owned(),
+                },
+            });
+        }
+        if self.contract.work_packet() != &self.packet {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.workPacket".to_owned(),
+                },
+            });
+        }
+        if self.contract.execution_scope() != &self.execution_scope {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.executionScope".to_owned(),
+                },
+            });
+        }
+        if self.contract.evidence_target() != &self.evidence_target {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.evidenceTarget".to_owned(),
+                },
+            });
+        }
+        if self.contract.conditions().condition_version() != self.conditions.condition_version() {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.conditions".to_owned(),
+                },
+            });
+        }
+        if self.contract.profile() != self.profile.binding() {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.profile".to_owned(),
+                },
+            });
+        }
+        if self.contract.consent() != self.consent.binding() {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "contract.consent".to_owned(),
+                },
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the exact contract approved at create/change time.
     ///
     /// The record versions must still match. Live approval/consent validity is
@@ -239,7 +322,9 @@ impl StoredPlan {
         record: &SupervisionRecord,
         _now: Timestamp,
     ) -> Result<SupervisionContract, SupervisionError> {
-        if self.conditions.condition_version() != record.condition_version()
+        self.verify()?;
+        if self.packet.condition_version() != record.condition_version()
+            || self.conditions.condition_version() != record.condition_version()
             || self.contract.conditions().condition_version() != record.condition_version()
         {
             return Err(SupervisionError::InvalidValue {
@@ -247,7 +332,19 @@ impl StoredPlan {
                 detail: "the stored condition content does not match the record version".to_owned(),
             });
         }
-        if self.profile.binding() != record.profile() || self.contract.profile() != record.profile()
+        if self.packet.project_id() != record.project_id()
+            || self.packet.target_version() != record.target_version()
+            || self.evidence_target.version() != record.target_version()
+            || self.contract.evidence_target().version() != record.target_version()
+        {
+            return Err(SupervisionError::InvalidValue {
+                field: "plan.target".to_owned(),
+                detail: "the stored target scope does not match the record version".to_owned(),
+            });
+        }
+        if self.packet.profile() != record.profile()
+            || self.profile.binding() != record.profile()
+            || self.contract.profile() != record.profile()
         {
             return Err(SupervisionError::ProfileUnavailable {
                 reason: herness_supervision::ProfileUnavailable::VersionMismatch {
@@ -256,18 +353,12 @@ impl StoredPlan {
                 },
             });
         }
-        if self.consent.binding() != record.consent() || self.contract.consent() != record.consent()
+        if self.packet.consent() != record.consent()
+            || self.consent.binding() != record.consent()
+            || self.contract.consent() != record.consent()
         {
             return Err(SupervisionError::ConsentBlocked {
                 reason: herness_supervision::ConsentBlock::VersionMismatch,
-            });
-        }
-        if self.evidence_target.version() != record.target_version()
-            || self.contract.evidence_target().version() != record.target_version()
-        {
-            return Err(SupervisionError::InvalidValue {
-                field: "plan.target".to_owned(),
-                detail: "the stored target scope does not match the record version".to_owned(),
             });
         }
         Ok(self.contract.clone())
@@ -275,14 +366,16 @@ impl StoredPlan {
 
     /// Rebuilds and stores the exact contract after an explicit change.
     ///
-    /// This enforces a current approved condition set and granted consent. It
-    /// is used before a change is committed, so an invalid change fails before
-    /// the record mutation.
+    /// This refreshes the work packet first: if any approved constraint
+    /// changed, the packet gets a new content version and fingerprint. A model
+    /// cannot call this path; the host reaches it only from an explicit human
+    /// or approved-owner change.
     pub fn rebuild_contract(
         &mut self,
         record: &SupervisionRecord,
         now: Timestamp,
     ) -> Result<(), SupervisionError> {
+        self.refresh_packet(record)?;
         let subject = SupervisionSubject::new(
             record.project_id(),
             record.supervision_id(),
@@ -300,9 +393,40 @@ impl StoredPlan {
             &self.profile,
             &self.consent,
             self.budget.policy()?,
+            self.packet.clone(),
             now,
         )?;
         Ok(())
+    }
+
+    fn refresh_packet(&mut self, record: &SupervisionRecord) -> Result<(), SupervisionError> {
+        let current = self.packet_for(record, self.packet.packet_version())?;
+        if current.same_constraints(&self.packet) {
+            self.packet.verify()?;
+            return Ok(());
+        }
+        let next_version = self.packet.packet_version().saturating_add(1);
+        self.packet = self.packet_for(record, next_version)?;
+        Ok(())
+    }
+
+    fn packet_for(
+        &self,
+        record: &SupervisionRecord,
+        packet_version: u64,
+    ) -> Result<WorkPacket, SupervisionError> {
+        WorkPacket::new(
+            packet_version,
+            self.packet.instruction(),
+            record.project_id(),
+            &self.evidence_target,
+            self.execution_scope.clone(),
+            self.conditions.condition_version(),
+            self.profile.binding(),
+            self.consent.binding(),
+            self.budget_version,
+            self.budget.policy()?,
+        )
     }
 
     /// Updates the condition content and version after an explicit change.
@@ -441,26 +565,105 @@ fn plan_key(project: ProjectId, supervision: SupervisionId) -> String {
     format!("h2.supervision.plan:{project}:{supervision}")
 }
 
+/// Decodes one durable plan with an explicit format switch.
+///
+/// A plan without `formatVersion` is the former format 1. It did not persist
+/// the owner instruction, so no work packet can be recovered; decoding proves
+/// the legacy shape and then refuses it rather than fabricating a packet.
+pub fn decode_plan(bytes: &[u8]) -> Result<StoredPlan, SupervisionError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct VersionProbe {
+        #[serde(default)]
+        format_version: Option<u32>,
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| SupervisionError::StorageFailure {
+            detail: format!("could not decode the supervision plan: {error}"),
+        })?;
+    let probe: VersionProbe =
+        serde_json::from_value(value.clone()).map_err(|error| SupervisionError::StorageFailure {
+            detail: format!("could not read the supervision plan format: {error}"),
+        })?;
+    match probe.format_version {
+        Some(PLAN_FORMAT_VERSION) => {
+            let plan: StoredPlan = serde_json::from_value(value).map_err(|error| {
+                SupervisionError::StorageFailure {
+                    detail: format!("could not decode the supervision plan format 2: {error}"),
+                }
+            })?;
+            plan.verify()?;
+            Ok(plan)
+        }
+        Some(found) => Err(SupervisionError::Unsupported {
+            feature: format!(
+                "supervision plan format {found} is not supported; this build reads format \
+                 {PLAN_FORMAT_VERSION}"
+            ),
+        }),
+        None => {
+            let _legacy: LegacyStoredPlan = serde_json::from_value(value).map_err(|error| {
+                SupervisionError::StorageFailure {
+                    detail: format!("could not decode the supervision plan format 1: {error}"),
+                }
+            })?;
+            Err(SupervisionError::Unsupported {
+                feature: "supervision plan format 1 has no recoverable work packet; the owner \
+                          instruction was not stored, so the target must be recreated and \
+                          started under the current format"
+                    .to_owned(),
+            })
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)] // Shape probe: fields exist only to prove the legacy layout.
+struct LegacyStoredPlan {
+    actor: serde_json::Value,
+    owner: serde_json::Value,
+    child: ChildIdentity,
+    execution_scope: serde_json::Value,
+    conditions: serde_json::Value,
+    evidence_target: serde_json::Value,
+    profile: serde_json::Value,
+    consent: serde_json::Value,
+    budget: serde_json::Value,
+    budget_version: u64,
+    contract: serde_json::Value,
+}
+
 /// Loads one durable plan from host state.
+///
+/// A missing record is `Ok(None)`. A present but undecodable or unsupported
+/// record is an explicit error; it is never treated as an empty plan.
 pub fn load_plan(
     store: &StoreHandle,
     project: ProjectId,
     supervision: SupervisionId,
-) -> Option<StoredPlan> {
+) -> Result<Option<StoredPlan>, SupervisionError> {
     let bytes = store
         .lock()
         .load_host_state(&plan_key(project, supervision))
-        .ok()??;
-    serde_json::from_slice(&bytes).ok()
+        .map_err(|error| SupervisionError::StorageFailure {
+            detail: error.to_string(),
+        })?;
+    bytes
+        .as_deref()
+        .map(decode_plan)
+        .transpose()
 }
 
-/// Persists one durable plan.
+/// Persists one durable plan after verifying its packet binding.
 pub fn save_plan(
     store: &StoreHandle,
     project: ProjectId,
     supervision: SupervisionId,
     plan: &StoredPlan,
 ) -> Result<(), SupervisionError> {
+    plan.verify()?;
     let bytes = serde_json::to_vec(plan).map_err(|error| SupervisionError::StorageFailure {
         detail: format!("could not encode the supervision plan: {error}"),
     })?;

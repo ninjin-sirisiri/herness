@@ -1135,6 +1135,16 @@ fn fixable_fail_and_unmet_continue_the_same_child_with_a_new_run_and_input() {
     assert_eq!(continuation.target_version(), h.record().target_version());
     assert_eq!(continuation.profile(), h.record().profile());
     assert_eq!(continuation.consent(), h.record().consent());
+    assert_eq!(
+        continuation.packet(),
+        h.contract.work_packet(),
+        "the continuation must carry the same immutable work packet"
+    );
+    assert_eq!(
+        h.runtime.starts[0].packet(),
+        h.contract.work_packet(),
+        "the first run must carry the immutable work packet"
+    );
     assert!(
         continuation
             .deficiency()

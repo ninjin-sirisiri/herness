@@ -247,6 +247,44 @@ impl TargetScope {
             })
         }
     }
+
+    /// Stable SHA-256 reference over the exact target version, read set,
+    /// observed HEAD, and content fingerprints.
+    ///
+    /// Fingerprints are sorted by path so a value read back from storage keeps
+    /// the same reference regardless of the original manifest enumeration
+    /// order.
+    pub fn snapshot_digest(&self) -> Result<ContentDigest, SupervisionError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Material<'a> {
+            project_id: String,
+            version: u64,
+            read_set: &'a [String],
+            head: Option<&'a str>,
+            fingerprints: Vec<(&'a str, &'a str)>,
+        }
+
+        let mut fingerprints = self
+            .fingerprints
+            .iter()
+            .map(|fingerprint| (fingerprint.path(), fingerprint.digest().as_str()))
+            .collect::<Vec<_>>();
+        fingerprints.sort_unstable();
+        let material = Material {
+            project_id: self.project_id.to_string(),
+            version: self.version.get(),
+            read_set: &self.read_set,
+            head: self.head.as_deref(),
+            fingerprints,
+        };
+        let bytes =
+            serde_json::to_vec(&material).map_err(|error| SupervisionError::InvalidValue {
+                field: "target.snapshot".to_owned(),
+                detail: format!("could not serialize the target snapshot digest: {error}"),
+            })?;
+        Ok(ContentDigest::sha256(&bytes))
+    }
 }
 
 /// Exact command or equivalent operation used to acquire evidence.

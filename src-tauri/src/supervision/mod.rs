@@ -37,6 +37,7 @@ use herness_supervision::{
     BudgetUsage, ConditionVersion, ConsentBinding, ConsentState, DisclosureDataKind, HumanAction,
     ProfileBinding, ProfilePurpose, ProviderOrigin, SupervisionCommand, SupervisionError,
     SupervisionId, SupervisionRecord, SupervisionRequestId, SupervisionState, TargetVersion,
+    WorkPacket,
 };
 use serde::Serialize;
 
@@ -48,7 +49,10 @@ pub use plan::{
 use assessment::{AssessmentHost, build_profile};
 use checks::HostCheckPort;
 use permission::PermissionRuntime;
-use plan::{BudgetSnapshot, ConfigStore, build_conditions, load_plan, plan_child, save_plan};
+use plan::{
+    BudgetSnapshot, ConfigStore, PLAN_FORMAT_VERSION, build_conditions, load_plan, plan_child,
+    save_plan,
+};
 use runtime::DesktopSupervisionRuntime;
 use store::{HostBudgetClock, HostClock, StoreHandle};
 
@@ -510,11 +514,23 @@ impl SupervisionHost {
                 .supervision_records_for_project(project)
                 .unwrap_or_default();
             for record in records {
-                if let Some(plan) = load_plan(&self.store, *project, record.supervision_id()) {
-                    self.plans
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert((*project, record.supervision_id()), plan);
+                match load_plan(&self.store, *project, record.supervision_id()) {
+                    Ok(Some(plan)) => {
+                        self.plans
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert((*project, record.supervision_id()), plan);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Restore never fabricates a plan. A legacy or damaged
+                        // record stays unavailable until a human recreates it;
+                        // start/continue/resume surface the explicit error.
+                        eprintln!(
+                            "SUPERVISION_PLAN_RESTORE_ERROR: {project} {}: {error}",
+                            record.supervision_id()
+                        );
+                    }
                 }
             }
         }
@@ -595,7 +611,7 @@ impl SupervisionHost {
             Some(budget) => budget.policy()?,
             None => herness_supervision::BudgetPolicy::h2_default(),
         };
-        let child = runtime.create_child(project, request.connection)?;
+        let child = runtime.create_child(project, request.connection, &execution_scope)?;
         let supervision_id = SupervisionId::new(project);
         let owner = match &actor {
             plan::RequestActor::Human => herness_supervision::OwnerRef::new(
@@ -618,6 +634,18 @@ impl SupervisionHost {
         )?;
         let run_group =
             herness_supervision::RunGroup::new(herness_supervision::RunGroupId::new(project));
+        let packet = WorkPacket::new(
+            1,
+            &request.instructions,
+            project,
+            &evidence_target,
+            execution_scope.clone(),
+            conditions.condition_version(),
+            profile.profile.binding(),
+            consent.binding(),
+            1,
+            budget.clone(),
+        )?;
         let contract = herness_supervision::SupervisionContract::new(
             actor.approval_actor(),
             subject,
@@ -628,9 +656,11 @@ impl SupervisionHost {
             &profile.profile,
             consent,
             budget.clone(),
+            packet.clone(),
             now,
         )?;
         let plan = StoredPlan {
+            format_version: PLAN_FORMAT_VERSION,
             actor: actor.clone(),
             owner,
             child,
@@ -641,6 +671,7 @@ impl SupervisionHost {
             consent: consent.clone(),
             budget: BudgetSnapshot::from_policy(&budget),
             budget_version: 1,
+            packet,
             contract: contract.clone(),
         };
         save_plan(&self.store, project, supervision_id, &plan)?;
@@ -810,7 +841,10 @@ impl SupervisionHost {
             });
         }
         self.set_active(project, supervision, true);
-        self.tick_one(runtime, project, supervision, request_id)?;
+        if let Err(error) = self.tick_one(runtime, project, supervision, request_id) {
+            self.set_active(project, supervision, false);
+            return Err(error);
+        }
         self.view(project, supervision)
     }
 
@@ -868,7 +902,10 @@ impl SupervisionHost {
         }
         self.set_active(project, supervision, true);
         let request_id = SupervisionRequestId::new(project);
-        self.tick_one(runtime, project, supervision, request_id)?;
+        if let Err(error) = self.tick_one(runtime, project, supervision, request_id) {
+            self.set_active(project, supervision, false);
+            return Err(error);
+        }
         self.view(project, supervision)
     }
 
@@ -889,7 +926,10 @@ impl SupervisionHost {
         }
         self.set_active(project, supervision, true);
         let request_id = SupervisionRequestId::new(project);
-        self.tick_one(runtime, project, supervision, request_id)?;
+        if let Err(error) = self.tick_one(runtime, project, supervision, request_id) {
+            self.set_active(project, supervision, false);
+            return Err(error);
+        }
         self.view(project, supervision)
     }
 
@@ -1194,7 +1234,7 @@ impl SupervisionHost {
         ) {
             return Ok(());
         }
-        let Some(plan) = self.plan_opt(project, supervision) else {
+        let Some(plan) = self.stored_plan(project, supervision)? else {
             return self.force_waiting(runtime, &record, HumanAction::ReconcileRecovery);
         };
         let now = self.clock.now();
@@ -1328,19 +1368,46 @@ impl SupervisionHost {
         project: ProjectId,
         supervision: SupervisionId,
     ) -> Result<StoredPlan, SupervisionError> {
-        self.plan_opt(project, supervision)
+        self.stored_plan(project, supervision)?
             .ok_or(SupervisionError::Unsupported {
                 feature: "supervision plan is not available".to_owned(),
             })
     }
 
-    fn plan_opt(&self, project: ProjectId, supervision: SupervisionId) -> Option<StoredPlan> {
-        self.plans
+    /// Loads one plan strictly. A legacy or altered stored plan returns its
+    /// explicit error instead of being treated as absent.
+    fn stored_plan(
+        &self,
+        project: ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<Option<StoredPlan>, SupervisionError> {
+        let cached = self
+            .plans
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(project, supervision))
-            .cloned()
-            .or_else(|| load_plan(&self.store, project, supervision))
+            .cloned();
+        let plan = match cached {
+            Some(plan) => Some(plan),
+            None => load_plan(&self.store, project, supervision)?,
+        };
+        if let Some(plan) = &plan {
+            plan.verify()?;
+            if plan.packet.project_id() != project {
+                return Err(SupervisionError::CrossProjectReference {
+                    id_kind: "supervision plan".to_owned(),
+                    expected: project,
+                    found: plan.packet.project_id(),
+                });
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Read-only plan for views. Decode/verification errors leave the target
+    /// without plan detail; they never substitute a fabricated plan.
+    fn plan_opt(&self, project: ProjectId, supervision: SupervisionId) -> Option<StoredPlan> {
+        self.stored_plan(project, supervision).ok().flatten()
     }
 
     fn ledger(

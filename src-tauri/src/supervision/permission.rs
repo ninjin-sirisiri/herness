@@ -200,11 +200,13 @@ impl HostPermissionEvaluator {
         let mut remaining = None;
         let gate = match supervision {
             Some(supervision) => {
-                let plan = load_plan(&self.store, project, supervision).ok_or(
-                    CoreError::PermissionEvaluationFailed {
+                let plan = load_plan(&self.store, project, supervision)
+                    .map_err(|_| CoreError::PermissionEvaluationFailed {
                         failure: EvaluationFailureKind::Unavailable,
-                    },
-                )?;
+                    })?
+                    .ok_or(CoreError::PermissionEvaluationFailed {
+                        failure: EvaluationFailureKind::Unavailable,
+                    })?;
                 let policy = plan.budget.policy().map_err(supervision_error)?;
                 let mut ledger = BudgetLedger::open(
                     self.store.clone(),

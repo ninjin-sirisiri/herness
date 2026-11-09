@@ -23,8 +23,7 @@ use herness_desktop::guard::{self, GuardError, Navigation};
 use herness_desktop::supervision::ChangeSupervisionRequest;
 use herness_desktop::supervision::assessment::AssessmentHost;
 use herness_desktop::supervision::plan::ConfigStore;
-use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};
-use herness_desktop::supervision::store::StoreHandle;
+use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};use herness_desktop::supervision::store::StoreHandle;
 use herness_desktop::supervision::{
     CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
     SupervisionHost,
@@ -45,7 +44,7 @@ use herness_supervision::{
     CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
     EvidenceRecord, EvidenceScope, ProfilePurpose, ProfileThresholds, ProviderKind, ProviderOrigin,
     RubricVersion, SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId,
-    TargetReadSet, TargetVersion,
+    TargetReadSet, TargetVersion, WorkPacketRejection,
 };
 use tempfile::TempDir;
 
@@ -266,6 +265,7 @@ impl DesktopSupervisionRuntime for FakeRuntime {
         &mut self,
         project: ProjectId,
         _connection: ConnectionId,
+        _scope: &herness_supervision::ExecutionScope,
     ) -> Result<ChildIdentity, SupervisionError> {
         self.children
             .get(&project)
@@ -1137,6 +1137,21 @@ fn explicit_condition_change_updates_the_plan_contract_before_resume() {
     assert_eq!(changed.condition_version, 2);
     assert_eq!(changed.state, "waiting_human");
     assert!(changed.plan_available);
+    let plan = harness
+        .host
+        .plans()
+        .lock()
+        .expect("plans")
+        .get(&(harness.project, created.supervision_id))
+        .cloned()
+        .expect("stored plan");
+    assert_eq!(plan.packet.condition_version().get(), 2);
+    assert_eq!(
+        plan.packet.packet_version(),
+        2,
+        "an explicit condition change must create a new packet version"
+    );
+    assert_eq!(plan.contract.work_packet(), &plan.packet);
     let resume = SupervisionOperationRequest::new(
         SupervisionRequestId::new(harness.project),
         created.supervision_id,
@@ -1411,6 +1426,126 @@ fn reopen_restores_saved_plan_state_and_purpose_configuration() {
 }
 
 // ---------------------------------------------------------------------------
+// Work packet format and integrity.
+// ---------------------------------------------------------------------------
+
+fn plan_key(project: ProjectId, supervision: SupervisionId) -> String {
+    format!("h2.supervision.plan:{project}:{supervision}")
+}
+
+#[test]
+fn legacy_plan_without_a_recoverable_packet_is_refused_explicitly() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let project = harness.project;
+    let supervision = created.supervision_id;
+    let plan = harness
+        .host
+        .plans()
+        .lock()
+        .expect("plans")
+        .get(&(project, supervision))
+        .cloned()
+        .expect("stored plan");
+    plan.verify().expect("current plan verifies");
+
+    // The former format is the exact current value without the new fields.
+    let mut legacy = serde_json::to_value(&plan).expect("plan value");
+    let object = legacy.as_object_mut().expect("plan object");
+    object.remove("formatVersion");
+    object.remove("packet");
+    if let Some(contract) = object.get_mut("contract").and_then(|value| value.as_object_mut()) {
+        contract.remove("workPacket");
+    }
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy bytes");
+    assert!(matches!(
+        herness_desktop::supervision::plan::decode_plan(&legacy_bytes),
+        Err(SupervisionError::Unsupported { .. })
+    ));
+
+    harness
+        .store
+        .lock()
+        .save_host_state(&plan_key(project, supervision), &legacy_bytes)
+        .expect("save legacy plan");
+    harness.host.plans().lock().expect("plans").clear();
+    harness.host.restore(&[project]);
+
+    let start = harness.host.start(
+        &mut harness.runtime,
+        project,
+        supervision,
+        SupervisionRequestId::new(project),
+        created.revision,
+        Some(harness.host.confirm(ConfirmationKind::Start)),
+    );
+    assert!(
+        matches!(start, Err(SupervisionError::Unsupported { .. })),
+        "a legacy plan must not start or fabricate a packet: {start:?}"
+    );
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+}
+
+#[test]
+fn tampered_packet_fingerprint_is_refused_before_any_child_run() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let created = harness.create();
+    let project = harness.project;
+    let supervision = created.supervision_id;
+    let plan = harness
+        .host
+        .plans()
+        .lock()
+        .expect("plans")
+        .get(&(project, supervision))
+        .cloned()
+        .expect("stored plan");
+
+    let mut tampered = serde_json::to_value(&plan).expect("plan value");
+    tampered["packet"]["instruction"] = serde_json::json!("a silently different task");
+    let tampered_bytes = serde_json::to_vec(&tampered).expect("tampered bytes");
+    assert!(matches!(
+        herness_desktop::supervision::plan::decode_plan(&tampered_bytes),
+        Err(SupervisionError::WorkPacketRejected {
+            reason: WorkPacketRejection::FingerprintMismatch
+        })
+    ));
+
+    harness
+        .store
+        .lock()
+        .save_host_state(&plan_key(project, supervision), &tampered_bytes)
+        .expect("save tampered plan");
+    harness.host.plans().lock().expect("plans").clear();
+    harness.host.restore(&[project]);
+
+    let start = harness.host.start(
+        &mut harness.runtime,
+        project,
+        supervision,
+        SupervisionRequestId::new(project),
+        created.revision,
+        Some(harness.host.confirm(ConfirmationKind::Start)),
+    );
+    assert!(
+        matches!(
+            start,
+            Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::FingerprintMismatch
+            })
+        ),
+        "a changed packet must be refused, not replaced: {start:?}"
+    );
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Default no-child-continuation.
 // ---------------------------------------------------------------------------
 
@@ -1458,35 +1593,139 @@ mod permission_composition {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use herness_assessment::AssessmentEndpoints;
     use herness_core::{
         AbsolutePath, ArgumentsDigest, AuthMethod, ConnectionAdmin,
         ConnectionCapabilityDeclaration, ConnectionId, ConnectionSettings, CredentialAvailability,
         CredentialKind, CredentialPort, Endpoint, EndpointClass, EvaluationContext,
-        EvaluatorAvailability, FrozenOperation, InputCapabilities, NonEmptyText, OperationId,
-        PermissionEvaluatorPort, PermissionMode, PermissionOutcome, PermissionPolicy,
+        EvaluatorAvailability, FrozenOperation, InputCapabilities, InputId, NonEmptyText,
+        OperationId, PermissionEvaluatorPort, PermissionMode, PermissionOutcome, PermissionPolicy,
         PermissionRule, PolicyAdmin, ProjectId, Provider, Rationale, ResolvedCredential,
-        RuleTarget, RunId, SecretString, ToolArguments, ToolExecutor, ToolGateway, ToolName,
-        WriteArgs,
+        RuleTarget, RunId, SecretString, Timestamp, ToolArguments, ToolExecutor, ToolGateway,
+        ToolName, WriteArgs,
     };
     use herness_desktop::host::DesktopHost;
+    use herness_desktop::supervision::runtime::DesktopH1;
     use herness_desktop::supervision::store::HostBudgetClock;
     use herness_desktop::supervision::{
         ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
     };
     use herness_engine_pi::ProviderEndpoints;
+    use herness_supervision::supervisor::{
+        AssessmentProfileFacts, CheckExecution, CheckExecutionRequest, ChildRunStart,
+        ConditionAssessmentPort, RequiredCheckPort, SupervisionRuntimePort,
+    };
     use herness_supervision::{
-        BudgetLedger, BudgetPolicy, DisclosureDataKind, ProfilePurpose, ProviderOrigin,
-        TargetVersion,
+        AssessmentRequest, AssessmentResult, BudgetLedger, BudgetPolicy, CheckStatus, Condition,
+        DisclosureDataKind, ProfileBinding, ProfilePurpose, ProviderOrigin, RequiredCheckResult,
+        SupervisionError, SupervisionRequestId, TargetVersion, WorkPacket, WorkPacketRejection,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     const API_KEY: &str = "sk-permission-desktop-canary-98ac";
     const MODEL: &str = "permission-llm";
+    const PACKET_INSTRUCTION: &str = "Owner packet canary: implement the approved H2 scope change.";
     const CONVERSATION_CANARY: &str = "whole-conversation-canary-1f4d";
+
+    /// A deterministic failing check: the continuation must be requested
+    /// without executing a required shell command.
+    struct FailingCheck;
+
+    impl RequiredCheckPort for FailingCheck {
+        fn execute(
+            &mut self,
+            request: &CheckExecutionRequest,
+        ) -> Result<CheckExecution, SupervisionError> {
+            let result = RequiredCheckResult::new(
+                request.check_id(),
+                request.condition_id(),
+                CheckStatus::Fail,
+                None,
+                request.condition_version(),
+                request.target_version(),
+                Timestamp::now(),
+            )?;
+            Ok(CheckExecution::new(result, None))
+        }
+    }
+
+    /// The failing required check is sufficient; no semantic model judgment is
+    /// needed to decide that the condition is unmet.
+    struct DeterministicAssessment;
+
+    impl ConditionAssessmentPort for DeterministicAssessment {
+        fn requires_assessment(&self, _condition: &Condition) -> bool {
+            false
+        }
+
+        fn profile(
+            &self,
+            _binding: ProfileBinding,
+        ) -> Result<AssessmentProfileFacts, SupervisionError> {
+            Err(SupervisionError::Unsupported {
+                feature: "deterministic test checks do not use a profile".to_owned(),
+            })
+        }
+
+        fn assess(
+            &mut self,
+            _request: &AssessmentRequest,
+        ) -> Result<AssessmentResult, SupervisionError> {
+            Err(SupervisionError::Unsupported {
+                feature: "deterministic test checks do not use assessment".to_owned(),
+            })
+        }
+    }
+
+    fn data_event(data: Value) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    fn completions_text(text: &str) -> String {
+        let mut body = String::new();
+        body.push_str(&data_event(json!({
+            "id": "chatcmpl-text",
+            "choices": [{"index": 0, "delta": {"content": text}}]
+        })));
+        body.push_str(&data_event(json!({
+            "id": "chatcmpl-text",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        })));
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn completions_tool_call(call_id: &str, name: &str, arguments: Value) -> String {
+        let arguments = arguments.to_string();
+        let split = arguments.len() / 2;
+        let (first, second) = arguments.split_at(split);
+        let mut body = String::new();
+        body.push_str(&data_event(json!({
+            "id": "chatcmpl-tool",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": first}
+            }]}}]
+        })));
+        body.push_str(&data_event(json!({
+            "id": "chatcmpl-tool",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": second}
+            }]}}]
+        })));
+        body.push_str(&data_event(json!({
+            "id": "chatcmpl-tool",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        })));
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
 
     #[derive(Debug, Clone)]
     struct RecordedRequest {
@@ -1494,10 +1733,16 @@ mod permission_composition {
         body: Vec<u8>,
     }
 
+    #[derive(Debug, Clone)]
+    struct MockReply {
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
     struct PermissionMock {
         address: SocketAddr,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
-        responses: Arc<Mutex<VecDeque<Value>>>,
+        responses: Arc<Mutex<VecDeque<MockReply>>>,
         stop: Arc<AtomicBool>,
     }
 
@@ -1553,7 +1798,20 @@ mod permission_composition {
             self.responses
                 .lock()
                 .expect("responses")
-                .push_back(response);
+                .push_back(MockReply {
+                    content_type: "application/json",
+                    body: serde_json::to_vec(&response).expect("encode mock response"),
+                });
+        }
+
+        fn push_sse(&self, body: String) {
+            self.responses
+                .lock()
+                .expect("responses")
+                .push_back(MockReply {
+                    content_type: "text/event-stream",
+                    body: body.into_bytes(),
+                });
         }
 
         fn count(&self) -> usize {
@@ -1575,7 +1833,7 @@ mod permission_composition {
     fn handle_connection(
         mut stream: TcpStream,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
-        responses: Arc<Mutex<VecDeque<Value>>>,
+        responses: Arc<Mutex<VecDeque<MockReply>>>,
     ) {
         let Some((head, body)) = read_request(&mut stream) else {
             return;
@@ -1594,14 +1852,18 @@ mod permission_composition {
             .lock()
             .expect("responses")
             .pop_front()
-            .unwrap_or_else(|| json!({"error": "mock exhausted"}));
-        let payload = serde_json::to_vec(&response).expect("encode mock response");
+            .unwrap_or_else(|| MockReply {
+                content_type: "application/json",
+                body: serde_json::to_vec(&json!({"error": "mock exhausted"}))
+                    .expect("encode mock error"),
+            });
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            payload.len()
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.content_type,
+            response.body.len()
         );
         let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(&payload);
+        let _ = stream.write_all(&response.body);
         let _ = stream.flush();
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
@@ -1702,6 +1964,14 @@ mod permission_composition {
 
     impl PermissionHost {
         fn new() -> Self {
+            Self::build(false)
+        }
+
+        fn with_test_boundaries() -> Self {
+            Self::build(true)
+        }
+
+        fn build(test_boundaries: bool) -> Self {
             let temp = tempfile::tempdir().expect("temp");
             let root = temp.path().join("project");
             std::fs::create_dir_all(root.join("src")).expect("project dirs");
@@ -1735,14 +2005,29 @@ mod permission_composition {
                 AssessmentEndpoints::for_loopback(server.url(), server.api_base(), server.url())
                     .expect("assessment loopback endpoints");
             let app_data = temp.path().join("app-data");
-            let (mut host, _) = DesktopHost::open_with_assessment_endpoints(
-                &app_data,
-                admin,
-                credentials.clone(),
-                engine_endpoints,
-                assessment_endpoints,
-            )
-            .expect("desktop host");
+            let mut host = if test_boundaries {
+                let (host, _) = DesktopHost::open_with_test_boundaries(
+                    &app_data,
+                    admin,
+                    credentials.clone(),
+                    engine_endpoints,
+                    None,
+                    Box::new(DeterministicAssessment),
+                    Box::new(FailingCheck),
+                )
+                .expect("desktop host with test boundaries");
+                host
+            } else {
+                let (host, _) = DesktopHost::open_with_assessment_endpoints(
+                    &app_data,
+                    admin,
+                    credentials.clone(),
+                    engine_endpoints,
+                    assessment_endpoints,
+                )
+                .expect("desktop host");
+                host
+            };
             let project = host
                 .runtime_mut()
                 .open_project(&root)
@@ -1756,6 +2041,23 @@ mod permission_composition {
                 host,
                 server,
                 credentials,
+            }
+        }
+
+        /// Allows write and bash at the policy layer so the child grant is the
+        /// only reason an operation is denied.
+        fn allow_write_and_shell_at_policy(&mut self) {
+            let admin = self.host.runtime_mut().policy_admin_mut();
+            for tool in [ToolName::Write, ToolName::Bash] {
+                admin
+                    .add_rule(
+                        PermissionRule::allow(
+                            RuleTarget::Tool { tool },
+                            herness_core::MatchMethod::AnyInvocation,
+                        )
+                        .expect("policy rule"),
+                    )
+                    .expect("add policy rule");
             }
         }
 
@@ -1790,6 +2092,96 @@ mod permission_composition {
                 .supervision()
                 .mark_profile_verified(self.project, ProfilePurpose::Permission, true)
                 .expect("verify permission profile");
+        }
+
+        fn create_packet_ready(
+            &mut self,
+        ) -> (
+            herness_desktop::supervision::SupervisionView,
+            herness_supervision::SupervisionId,
+        ) {
+            self.configure_purpose(ProfilePurpose::Completion);
+            let view = self
+                .host
+                .supervision_create(
+                    PlanRequestActor::Human,
+                    CreateSupervisionRequest {
+                        project: self.project,
+                        connection: self.connection,
+                        instructions: PACKET_INSTRUCTION.to_owned(),
+                        conditions: vec![super::ConditionInput {
+                            title: "The real check passes".to_owned(),
+                            rubric: "The failing scripted check forces one continuation.".to_owned(),
+                            checks: vec![super::CheckInput {
+                                command: "false".to_owned(),
+                                description: "scripted failing check".to_owned(),
+                            }],
+                        }],
+                        read_set: vec!["src/main.rs".to_owned()],
+                        write_paths: vec!["src".to_owned()],
+                        allow_shell: false,
+                        condition_version: Some(1),
+                        target_version: Some(1),
+                        budget: Some(herness_desktop::supervision::BudgetInput {
+                            active_seconds: 60,
+                            additional_runs: 1,
+                            money_limit_micros: None,
+                            price_version: None,
+                        }),
+                    },
+                    Some(self.host.confirm_supervision(ConfirmationKind::Create)),
+                )
+                .expect("create supervision");
+            let supervision = view.supervision_id;
+            (view, supervision)
+        }
+
+        fn create_packet_started(
+            &mut self,
+        ) -> (
+            herness_desktop::supervision::SupervisionView,
+            herness_supervision::SupervisionId,
+        ) {
+            let (view, supervision) = self.create_packet_ready();
+            self.host
+                .supervision_start(
+                    self.project,
+                    supervision,
+                    herness_supervision::SupervisionRequestId::new(self.project),
+                    view.revision,
+                    Some(self.host.confirm_supervision(ConfirmationKind::Start)),
+                )
+                .expect("start supervision");
+            (view, supervision)
+        }
+
+        fn pump_until(
+            &mut self,
+            supervision: herness_supervision::SupervisionId,
+            requests: usize,
+            runs: usize,
+        ) -> herness_desktop::supervision::SupervisionView {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                self.host.pump().expect("pump host");
+                let view = self
+                    .host
+                    .supervision_get(self.project, supervision)
+                    .expect("supervision view");
+                if self.server.count() >= requests && view.run_group.len() >= runs {
+                    return view;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {requests} requests and {runs} runs; \
+                     requests={} runs={:?} state={} reason={:?}",
+                    self.server.count(),
+                    view.run_group,
+                    view.state,
+                    view.reason
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
         }
 
         fn create_started(&mut self) -> (herness_desktop::supervision::SupervisionView, RunId) {
@@ -2104,6 +2496,194 @@ mod permission_composition {
             .expect("authorize deny rule");
         assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
         assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.server.count(), 0);
+    }
+
+    #[test]
+    fn real_pi_uses_the_owner_packet_scope_and_conversation_for_two_runs() {
+        let mut harness = PermissionHost::with_test_boundaries();
+        harness.allow_write_and_shell_at_policy();
+        harness.server.push_sse(completions_tool_call(
+            "call_outside",
+            "write",
+            json!({
+                "path": "outside.txt",
+                "content": "outside once",
+                "rationale": "attempt outside the approved write scope",
+            }),
+        ));
+        harness.server.push_sse(completions_tool_call(
+            "call_inside",
+            "write",
+            json!({
+                "path": "src/inside.txt",
+                "content": "inside once",
+                "rationale": "write inside the approved write scope",
+            }),
+        ));
+        harness.server.push_sse(completions_tool_call(
+            "call_shell",
+            "bash",
+            json!({
+                "command": "printf x >> shell-ran.txt",
+                "purpose": "attempt shell while allowShell is false",
+            }),
+        ));
+        harness.server.push_sse(completions_text("first turn complete"));
+        harness.server.push_sse(completions_text("second turn complete"));
+
+        let (_created, supervision) = harness.create_packet_started();
+        let view = harness.pump_until(supervision, 5, 2);
+        assert!(
+            view.run_group.len() >= 2,
+            "the failing check must start an additional run"
+        );
+
+        let requests = harness.server.requests();
+        assert!(
+            requests.len() >= 5,
+            "expected the first and second run requests, got {}",
+            requests.len()
+        );
+        let first = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            first.contains(PACKET_INSTRUCTION),
+            "the real Pi initial input must contain the owner instruction"
+        );
+        assert!(
+            first.contains("Immutable work packet"),
+            "the initial input must contain the immutable packet"
+        );
+        assert!(first.contains("read paths: src/main.rs"));
+        assert!(first.contains("write paths: src"));
+        assert!(first.contains("shell: not allowed"));
+        assert!(
+            !first.contains("Work toward the approved completion conditions."),
+            "the generic fallback instruction must never replace the packet"
+        );
+
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                String::from_utf8_lossy(&request.body).contains("Current deficiency:")
+            })
+            .expect("the second run must include the current deficiency");
+        let continuation = String::from_utf8_lossy(&continuation.body);
+        assert!(
+            continuation.contains(PACKET_INSTRUCTION),
+            "the continuation must repeat the invariant owner packet"
+        );
+        assert!(
+            continuation.contains("first turn complete"),
+            "the second run must keep the first conversation"
+        );
+        assert!(
+            continuation.contains("Required checks not passing")
+                || continuation.contains("not passing"),
+            "the continuation must carry the current deficiency"
+        );
+
+        assert!(
+            !harness.root.join("outside.txt").exists(),
+            "a write outside the approved write paths must execute zero changes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(harness.root.join("src/inside.txt")).expect("inside file"),
+            "inside once",
+            "a write inside the approved write paths must execute"
+        );
+        assert!(
+            !harness.root.join("shell-ran.txt").exists(),
+            "allowShell=false must execute zero model shell commands"
+        );
+    }
+
+    #[test]
+    fn desktop_h1_refuses_changed_packets_before_starting_a_run() {
+        let mut harness = PermissionHost::with_test_boundaries();
+        let (_view, supervision) = harness.create_packet_ready();
+        let store = harness.host.store_handle();
+        let plans = harness.host.supervision().plans();
+        let plan = plans
+            .lock()
+            .expect("plans")
+            .get(&(harness.project, supervision))
+            .cloned()
+            .expect("stored plan");
+
+        let request_id = SupervisionRequestId::new(harness.project);
+        let run_id = RunId::new(harness.project);
+        let input_id = InputId::new(harness.project);
+        let condition_version = plan.contract.conditions().condition_version();
+        let target_version = plan.contract.evidence_target().version();
+        let profile = plan.contract.profile();
+        let consent = plan.contract.consent();
+
+        let mut tampered = serde_json::to_value(&plan.packet).expect("packet value");
+        tampered["instruction"] = json!("tampered packet instruction");
+        let tampered: WorkPacket = serde_json::from_value(tampered).expect("tampered shape");
+        let start = ChildRunStart::new(
+            request_id,
+            harness.project,
+            supervision,
+            run_id,
+            input_id,
+            condition_version,
+            target_version,
+            profile,
+            consent,
+            tampered,
+        );
+        let mut adapter = DesktopH1::new(harness.host.runtime_mut(), store.clone(), plans.clone());
+        let result = adapter.start_child(&start);
+        assert!(
+            matches!(
+                result,
+                Err(SupervisionError::WorkPacketRejected {
+                    reason: WorkPacketRejection::FingerprintMismatch
+                })
+            ),
+            "a request packet with a bad fingerprint must be refused: {result:?}"
+        );
+        drop(adapter);
+        assert_eq!(harness.server.count(), 0);
+
+        let alternate = WorkPacket::new(
+            plan.packet.packet_version(),
+            "a different but validly fingerprinted instruction",
+            harness.project,
+            &plan.evidence_target,
+            plan.execution_scope.clone(),
+            plan.conditions.condition_version(),
+            plan.profile.binding(),
+            plan.consent.binding(),
+            plan.budget_version,
+            plan.budget.policy().expect("budget policy"),
+        )
+        .expect("alternate packet");
+        let start = ChildRunStart::new(
+            SupervisionRequestId::new(harness.project),
+            harness.project,
+            supervision,
+            RunId::new(harness.project),
+            InputId::new(harness.project),
+            condition_version,
+            target_version,
+            profile,
+            consent,
+            alternate,
+        );
+        let mut adapter = DesktopH1::new(harness.host.runtime_mut(), store, plans);
+        let result = adapter.start_child(&start);
+        assert!(
+            matches!(
+                result,
+                Err(SupervisionError::WorkPacketRejected {
+                    reason: WorkPacketRejection::Mismatch { .. }
+                })
+            ),
+            "a valid but different packet must be refused as a mismatch: {result:?}"
+        );
         assert_eq!(harness.server.count(), 0);
     }
 }

@@ -24,7 +24,7 @@ use herness_supervision::profiles::{
 };
 use herness_supervision::state::{CompletionSnapshot, SupervisionRecord};
 
-use crate::{approved_condition_set_at, consent, ids, now, target_scope};
+use crate::{approved_condition_set_at, consent, ids, now, target_scope, work_packet};
 
 /// How a fixture was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,13 +618,23 @@ pub fn completion_record(
     let contract = SupervisionContract::new(
         ApprovalActor::Human,
         subject,
-        execution,
+        execution.clone(),
         RunGroup::new(fixture_ids.run_group),
-        conditions,
-        target,
+        conditions.clone(),
+        target.clone(),
         profile,
         &consent,
         BudgetPolicy::h2_default(),
+        work_packet(
+            project_id,
+            &target,
+            &execution,
+            conditions.condition_version(),
+            profile,
+            &consent,
+            &BudgetPolicy::h2_default(),
+            "fixture completion instruction",
+        ),
         now(),
     )
     .expect("fixture contract");

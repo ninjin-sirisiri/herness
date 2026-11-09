@@ -5,13 +5,14 @@
 //! input identifiers are used directly so a retry after a crash is idempotent.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use herness_core::permissions::{MatchMethod, PermissionRule, RuleTarget};
 use herness_core::runtime::{AgentSpec, RecoveryMode};
 use herness_core::{
-    ContinuationPort, ContinuationRequest, InputId, InputPhase, InputProgress, ProjectId, RunId,
-    RunState, StopReason,
+    AbsolutePath, ContinuationPort, ContinuationRequest, InputId, InputPhase, InputProgress,
+    ProjectId, RunId, RunState, StopReason, ToolName,
 };
 use herness_supervision::freshness::TargetManifest;
 use herness_supervision::operations::OperationRuntimePort;
@@ -22,7 +23,9 @@ use herness_supervision::supervisor::{
     ChildRunContinuation, ChildRunStart, StopDisposition, SupervisionRuntimePort,
     TargetSnapshotRequest, capture_target_snapshot,
 };
-use herness_supervision::{SupervisionError, SupervisionId};
+use herness_supervision::{
+    ExecutionScope, SupervisionError, SupervisionId, WorkPacket, WorkPacketRejection,
+};
 
 use crate::host::DesktopRuntime;
 use crate::supervision::plan::StoredPlan;
@@ -64,14 +67,42 @@ impl<'a> DesktopH1<'a> {
         project: ProjectId,
         supervision: SupervisionId,
     ) -> Result<StoredPlan, SupervisionError> {
-        self.plans
+        let plan = self
+            .plans
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(project, supervision))
             .cloned()
             .ok_or(SupervisionError::Unsupported {
                 feature: "supervision plan is not available".to_owned(),
-            })
+            })?;
+        plan.verify()?;
+        if plan.packet.project_id() != project {
+            return Err(SupervisionError::CrossProjectReference {
+                id_kind: "supervision plan".to_owned(),
+                expected: project,
+                found: plan.packet.project_id(),
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Rechecks that the request packet is byte-for-byte the stored immutable
+    /// packet after verifying both fingerprints.
+    fn verified_packet<'p>(
+        &self,
+        plan: &'p StoredPlan,
+        request: &WorkPacket,
+    ) -> Result<&'p WorkPacket, SupervisionError> {
+        request.verify()?;
+        if request != &plan.packet {
+            return Err(SupervisionError::WorkPacketRejected {
+                reason: WorkPacketRejection::Mismatch {
+                    field: "packet".to_owned(),
+                },
+            });
+        }
+        Ok(&plan.packet)
     }
 
     fn runtime_error(error: impl std::fmt::Display) -> SupervisionError {
@@ -85,16 +116,13 @@ impl<'a> DesktopH1<'a> {
 impl SupervisionRuntimePort for DesktopH1<'_> {
     fn start_child(&mut self, request: &ChildRunStart) -> Result<(), SupervisionError> {
         let plan = self.plan(request.project_id(), request.supervision_id())?;
-        let instruction = request
-            .instruction()
-            .filter(|instruction| !instruction.trim().is_empty())
-            .unwrap_or("Work toward the approved completion conditions.");
+        let text = self.verified_packet(&plan, request.packet())?.prompt();
         self.runtime
             .start_run_with_id(
                 request.project_id(),
                 plan.child.agent_id,
                 request.run_id(),
-                instruction,
+                &text,
             )
             .map_err(Self::runtime_error)?;
         self.runtime
@@ -102,7 +130,7 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
                 request.project_id(),
                 request.run_id(),
                 request.input_id(),
-                instruction,
+                text,
             )
             .map_err(Self::runtime_error)?;
         Ok(())
@@ -110,6 +138,7 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
 
     fn continue_child(&mut self, request: &ChildRunContinuation) -> Result<(), SupervisionError> {
         let plan = self.plan(request.project_id(), request.supervision_id())?;
+        let text = self.continuation_input(&plan, request)?;
         let policy = self.runtime.policy();
         let continuation = ContinuationRequest::new(
             request.project_id(),
@@ -123,7 +152,6 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
         )
         .map_err(Self::runtime_error)?;
         ContinuationPort::continue_run(self.runtime, &continuation).map_err(Self::runtime_error)?;
-        let text = continuation_text(request);
         self.runtime
             .submit_input_as(
                 request.project_id(),
@@ -191,6 +219,87 @@ impl DesktopH1<'_> {
             .as_path()
             .to_path_buf())
     }
+
+    fn continuation_input(
+        &self,
+        plan: &StoredPlan,
+        request: &ChildRunContinuation,
+    ) -> Result<String, SupervisionError> {
+        let packet = self.verified_packet(plan, request.packet())?;
+        Ok(format!(
+            "{}\n\nCurrent deficiency:\n{}",
+            packet.prompt(),
+            continuation_text(request)
+        ))
+    }
+}
+
+/// Maps one approved execution scope to the H1 grant rules the child runs
+/// with. Read/search become path-prefix rules on read paths, write/edit on
+/// write paths, and bash is absent unless the scope allows it.
+fn scope_permission_rules(
+    scope: &ExecutionScope,
+    root: &Path,
+) -> Result<Vec<PermissionRule>, SupervisionError> {
+    let mut rules = Vec::new();
+    for path in scope.read_paths() {
+        for tool in [ToolName::Read, ToolName::Search] {
+            rules.push(file_scope_rule(tool, path, root)?);
+        }
+    }
+    for path in scope.write_paths() {
+        for tool in [ToolName::Write, ToolName::Edit] {
+            rules.push(file_scope_rule(tool, path, root)?);
+        }
+    }
+    if scope.allow_shell() {
+        rules.push(
+            PermissionRule::allow(
+                RuleTarget::Tool {
+                    tool: ToolName::Bash,
+                },
+                MatchMethod::AnyInvocation,
+            )
+            .map_err(|error| SupervisionError::InvalidValue {
+                field: "executionScope.allowShell".to_owned(),
+                detail: error.to_string(),
+            })?,
+        );
+    }
+    Ok(rules)
+}
+
+fn file_scope_rule(
+    tool: ToolName,
+    path: &str,
+    root: &Path,
+) -> Result<PermissionRule, SupervisionError> {
+    let relative = Path::new(path);
+    if relative.is_absolute() {
+        return Err(SupervisionError::InvalidValue {
+            field: "executionScope.path".to_owned(),
+            detail: "scope paths must be project-relative".to_owned(),
+        });
+    }
+    let joined = root.join(relative);
+    let text = joined
+        .to_str()
+        .ok_or_else(|| SupervisionError::InvalidValue {
+            field: "executionScope.path".to_owned(),
+            detail: "the project root or scope path is not valid UTF-8".to_owned(),
+        })?;
+    let absolute = AbsolutePath::new(text).map_err(|error| SupervisionError::InvalidValue {
+        field: "executionScope.path".to_owned(),
+        detail: error.to_string(),
+    })?;
+    PermissionRule::allow(
+        RuleTarget::FilePath { tool, root: absolute },
+        MatchMethod::PathPrefix,
+    )
+    .map_err(|error| SupervisionError::InvalidValue {
+        field: "executionScope.path".to_owned(),
+        detail: error.to_string(),
+    })
 }
 
 impl RecoveryRuntimePort for DesktopH1<'_> {
@@ -292,10 +401,14 @@ pub trait DesktopSupervisionRuntime:
     SupervisionRuntimePort + RecoveryRuntimePort + OperationRuntimePort
 {
     /// Creates the isolated child agent/session for one supervision target.
+    ///
+    /// The approved execution scope becomes the child grant: read/search on
+    /// read paths, write/edit on write paths, and bash only when allowed.
     fn create_child(
         &mut self,
         project: ProjectId,
         connection: herness_core::ConnectionId,
+        scope: &ExecutionScope,
     ) -> Result<ChildIdentity, SupervisionError>;
 
     /// Canonical project root used by manifests and check execution.
@@ -320,12 +433,22 @@ impl DesktopSupervisionRuntime for DesktopH1<'_> {
         &mut self,
         project: ProjectId,
         connection: herness_core::ConnectionId,
+        scope: &ExecutionScope,
     ) -> Result<ChildIdentity, SupervisionError> {
+        if scope.project_id() != project {
+            return Err(SupervisionError::CrossProjectReference {
+                id_kind: "execution scope".to_owned(),
+                expected: project,
+                found: scope.project_id(),
+            });
+        }
+        let root = self.project_root(project)?;
+        let rules = scope_permission_rules(scope, &root)?;
         let agent = self
             .runtime
             .create_agent(
                 project,
-                AgentSpec::new("supervision-child", "implementer", connection),
+                AgentSpec::new("supervision-child", "implementer", connection).with_scope(rules),
             )
             .map_err(Self::runtime_error)?;
         Ok(ChildIdentity {

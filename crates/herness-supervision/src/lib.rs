@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod freshness;
 pub mod ids;
 pub mod operations;
+pub mod packet;
 pub mod ports;
 pub mod profiles;
 pub mod recovery;
@@ -59,7 +60,7 @@ pub use contract::{
     ExecutionScope, OwnerKind, OwnerRef, RunGroup, SupervisionContract, SupervisionSubject,
     approval_matches_conditions, disclosure_purpose, same_approval_kind,
 };
-pub use error::{ApprovalRejection, SupervisionError};
+pub use error::{ApprovalRejection, SupervisionError, WorkPacketRejection};
 pub use evidence::{
     CheckStatus, ContentDigest, ContentFingerprint, EvidenceAcquirer, EvidenceOutcome,
     EvidenceRecord, EvidenceScope, RequiredCheckResult, TargetScope, TargetVersion,
@@ -79,6 +80,7 @@ pub use operations::{
     HumanOperation, OperationBudgetPort, OperationPorts, OperationResult, OperationRuntimePort,
     SupervisionChange, SupervisionOperationRequest, execute_operation,
 };
+pub use packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 pub use ports::{
     AssessmentPort, BudgetStorePort, ClockPort, EvidenceStorePort, StoredBudgetRecord,
     SupervisionFeature, SupervisionStorePort, unsupported,

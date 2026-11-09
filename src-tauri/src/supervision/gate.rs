@@ -93,6 +93,9 @@ impl SupervisionAwareGate {
         supervision: SupervisionId,
     ) -> Option<crate::supervision::plan::StoredPlan> {
         load_plan(&self.store, project, supervision)
+            .ok()
+            .flatten()
+            .filter(|plan| plan.verify().is_ok())
     }
 
     fn ledger(

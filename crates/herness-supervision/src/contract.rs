@@ -15,6 +15,7 @@ use crate::consent::{ConsentBinding, ConsentBlock, DisclosureConsent, Disclosure
 use crate::error::SupervisionError;
 use crate::evidence::TargetScope;
 use crate::ids::{RunGroupId, SupervisionId, verify_core_id, verify_scoped};
+use crate::packet::WorkPacket;
 use crate::profiles::{AssessmentProfile, ProfileBinding, ProfilePurpose};
 use crate::version::current_contract_version;
 
@@ -222,6 +223,12 @@ fn validate_relative_scope_path(field: &str, path: &str) -> Result<(), Supervisi
             detail: "an unbounded scope path is not allowed".to_owned(),
         });
     }
+    if std::path::Path::new(trimmed).is_absolute() {
+        return Err(SupervisionError::InvalidValue {
+            field: field.to_owned(),
+            detail: "scope paths must be project-relative".to_owned(),
+        });
+    }
     if trimmed.split('/').any(|part| part == "..") {
         return Err(SupervisionError::InvalidValue {
             field: field.to_owned(),
@@ -301,6 +308,7 @@ pub struct SupervisionContract {
     profile: ProfileBinding,
     consent: ConsentBinding,
     budget: BudgetPolicy,
+    work_packet: WorkPacket,
 }
 
 impl SupervisionContract {
@@ -317,6 +325,7 @@ impl SupervisionContract {
         profile: &AssessmentProfile,
         consent: &DisclosureConsent,
         budget: BudgetPolicy,
+        work_packet: WorkPacket,
         now: Timestamp,
     ) -> Result<Self, SupervisionError> {
         if actor.is_model() {
@@ -369,6 +378,14 @@ impl SupervisionContract {
         }
         conditions.require_approval(now)?;
         consent.require_granted()?;
+        work_packet.ensure_binding(
+            &execution_scope,
+            conditions.condition_version(),
+            profile.binding(),
+            consent.binding(),
+            &evidence_target,
+            &budget,
+        )?;
 
         Ok(Self {
             contract_version: current_contract_version(),
@@ -381,6 +398,7 @@ impl SupervisionContract {
             profile: profile.binding(),
             consent: consent.binding(),
             budget,
+            work_packet,
         })
     }
 
@@ -434,6 +452,11 @@ impl SupervisionContract {
         &self.budget
     }
 
+    /// Immutable owner work packet fixed by the same approval.
+    pub const fn work_packet(&self) -> &WorkPacket {
+        &self.work_packet
+    }
+
     /// Project that owns the contract.
     pub const fn project_id(&self) -> ProjectId {
         self.subject.project_id
@@ -442,6 +465,15 @@ impl SupervisionContract {
     /// Validates the contract again before a start or resume.
     pub fn validate_for_start(&self, now: Timestamp) -> Result<(), SupervisionError> {
         crate::version::ensure_current_version(self.contract_version)?;
+        self.work_packet.verify()?;
+        self.work_packet.ensure_binding(
+            &self.execution_scope,
+            self.conditions.condition_version(),
+            self.profile,
+            self.consent,
+            &self.evidence_target,
+            &self.budget,
+        )?;
         self.conditions.require_approval(now)?;
         if self.profile.purpose() != self.consent.purpose() {
             return Err(SupervisionError::InvalidValue {
@@ -479,6 +511,7 @@ impl SupervisionContract {
             });
         }
         conditions.require_approval(now)?;
+        self.work_packet = self.work_packet.revised_conditions(conditions.condition_version())?;
         self.conditions = conditions;
         self.bump_revision();
         Ok(())
@@ -501,6 +534,7 @@ impl SupervisionContract {
             });
         }
         self.profile = profile.binding();
+        self.work_packet = self.work_packet.revised_profile(profile.binding())?;
         self.bump_revision();
         Ok(())
     }
@@ -512,7 +546,10 @@ impl SupervisionContract {
         budget: BudgetPolicy,
     ) -> Result<(), SupervisionError> {
         self.reject_model(actor, "change the budget")?;
-        self.budget = budget;
+        self.budget = budget.clone();
+        self.work_packet = self
+            .work_packet
+            .revised_budget(budget, self.work_packet.budget_policy_version())?;
         self.bump_revision();
         Ok(())
     }
@@ -532,6 +569,9 @@ impl SupervisionContract {
             });
         }
         self.execution_scope = scope;
+        self.work_packet = self
+            .work_packet
+            .revised_scope(self.execution_scope.clone())?;
         self.bump_revision();
         Ok(())
     }

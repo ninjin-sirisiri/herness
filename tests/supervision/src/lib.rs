@@ -44,6 +44,7 @@ use herness_supervision::profiles::{
     ProfileThresholds, ProfileVersion, ProviderKind, RubricVersion,
 };
 use herness_supervision::state::{CompletionSnapshot, SupervisionRecord};
+use herness_supervision::WorkPacket;
 
 /// Deterministic project UUID used by every fixture.
 pub const PROJECT_UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -790,19 +791,60 @@ pub fn contract(project: ProjectId) -> SupervisionContract {
     .expect("scope");
     let profile = completion_profile(project);
     let consent = consent(project, ProfilePurpose::Completion, 1);
+    let target = target_scope(project, 1);
+    let budget = BudgetPolicy::h2_default();
+    let conditions = approved_condition_set(project);
+    let packet = work_packet(
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "fixture owner instruction",
+    );
     SupervisionContract::new(
         ApprovalActor::Human,
         subject,
         execution,
         RunGroup::new(ids.run_group),
-        approved_condition_set(project),
-        target_scope(project, 1),
+        conditions,
+        target,
         &profile,
         &consent,
-        BudgetPolicy::h2_default(),
+        budget,
+        packet,
         now(),
     )
     .expect("contract")
+}
+
+/// A fixture work packet matching the supplied approved values.
+#[allow(clippy::too_many_arguments)]
+pub fn work_packet(
+    project: ProjectId,
+    target: &TargetScope,
+    execution: &ExecutionScope,
+    condition_version: ConditionVersion,
+    profile: &AssessmentProfile,
+    consent: &DisclosureConsent,
+    budget: &BudgetPolicy,
+    instruction: &str,
+) -> WorkPacket {
+    WorkPacket::new(
+        1,
+        instruction,
+        project,
+        target,
+        execution.clone(),
+        condition_version,
+        profile.binding(),
+        consent.binding(),
+        1,
+        budget.clone(),
+    )
+    .expect("work packet")
 }
 
 /// A mutable supervision record for the fixture contract.
