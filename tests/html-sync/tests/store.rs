@@ -17,10 +17,10 @@ use herness_html_sync::{
     document_state_event, settings_event,
 };
 use herness_html_sync_tests::fixtures::{
-    TARGET_PATH, candidate, cycle, digest, document_commit, document_key, fingerprints, generation,
-    h2_reference, ids, now, other_document_key, other_project, pending_document,
-    pending_document_with, project, publication, request_commit, settings, settings_commit, source,
-    source_at, synced_document,
+    TARGET_PATH, authored_fingerprints, candidate, cycle, digest, document_commit, document_key,
+    fingerprints, generation, h2_reference, ids, now, other_document_key, other_project,
+    pending_document, pending_document_with, project, publication, request_commit, settings,
+    settings_commit, source, source_at, synced_document,
 };
 use herness_store::test_support::{
     CommitFault, MigrationFault, open_at_schema_version, open_with_migration_fault,
@@ -1066,6 +1066,84 @@ fn generation_status_can_progress_but_immutable_source_or_evidence_cannot_shrink
                 .with_events(vec![event]),
         )
         .expect_err("immutable source change");
+    assert!(matches!(error, StoreError::HtmlSyncRecordConflict { .. }));
+}
+
+#[test]
+fn active_generation_accepts_its_candidate_and_rejects_a_fingerprint_rewrite() {
+    let harness = Harness::new();
+    let mut store = harness.open();
+    let project = project();
+    let key = document_key();
+    let ids = ids(project);
+    create_settings(&mut store);
+
+    let active = generation(ids.generation_one, 1, source("source v1"), fingerprints());
+    let state = pending_document_with(source("source v1"), Some(ids.generation_one));
+    let event = document_state_event(&key, None, &state, now()).expect("event");
+    store
+        .commit_html_sync(
+            HtmlSyncCommit::new()
+                .with_document(document_commit(state))
+                .with_generation(active.clone())
+                .with_events(vec![event]),
+        )
+        .expect("active generation");
+
+    let authored = candidate(
+        ids.candidate_one,
+        ids.generation_one,
+        "<html>candidate</html>",
+        "{\"units\":[]}",
+    );
+    let with_candidate = active
+        .clone()
+        .with_candidate(authored.clone())
+        .expect("attach candidate");
+    let state = pending_document_with(source("source v1"), Some(ids.generation_one));
+    let event = document_state_event(&key, Some(H3State::Pending), &state, now()).expect("event");
+    store
+        .commit_html_sync(
+            HtmlSyncCommit::new()
+                .with_document(DocumentCommit::new(Some(1), state).expect("commit"))
+                .with_generation(with_candidate)
+                .with_candidate(authored.clone())
+                .with_events(vec![event]),
+        )
+        .expect("active generation candidate attach");
+
+    let loaded = store
+        .load_html_sync_candidate(project, ids.candidate_one)
+        .expect("load candidate")
+        .expect("candidate");
+    assert_eq!(loaded.generation_id(), ids.generation_one);
+    let stored = store
+        .html_sync_generations(project, &key)
+        .expect("generations")
+        .into_iter()
+        .find(|record| record.generation_id() == ids.generation_one)
+        .expect("generation");
+    assert!(stored.candidate().is_some());
+    assert_eq!(stored.status(), herness_html_sync::GenerationStatus::Active);
+
+    let rewritten = generation(
+        ids.generation_one,
+        1,
+        source("source v1"),
+        authored_fingerprints("<html>candidate</html>", "{\"units\":[]}"),
+    )
+    .with_candidate(authored)
+    .expect("candidate");
+    let state = pending_document_with(source("source v1"), Some(ids.generation_one));
+    let event = document_state_event(&key, Some(H3State::Pending), &state, now()).expect("event");
+    let error = store
+        .commit_html_sync(
+            HtmlSyncCommit::new()
+                .with_document(DocumentCommit::new(Some(2), state).expect("commit"))
+                .with_generation(rewritten)
+                .with_events(vec![event]),
+        )
+        .expect_err("fingerprint rewrite");
     assert!(matches!(error, StoreError::HtmlSyncRecordConflict { .. }));
 }
 

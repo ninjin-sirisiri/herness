@@ -6,7 +6,7 @@
 //! source, dependency, or HTML changes invalidate current applicability.
 
 use herness_core::{
-    ExpectedTargetVersion, HostActivityId, ProjectId, PublicationRequestId, Timestamp,
+    ExpectedTargetVersion, HostActivityId, ProjectId, PublicationRequestId, RunId, Timestamp,
 };
 use herness_supervision::{
     ConditionVersion, ContentDigest, EvidenceId, RunGroupId, SupervisionId, SupervisionState,
@@ -679,6 +679,9 @@ pub struct CandidateRecord {
     html_digest: ContentDigest,
     provenance_digest: ContentDigest,
     authored_at: Timestamp,
+    /// H1 run whose candidate artifact events produced these bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    h1_run: Option<RunId>,
 }
 
 impl CandidateRecord {
@@ -705,6 +708,7 @@ impl CandidateRecord {
             html_digest,
             provenance_digest,
             authored_at,
+            h1_run: None,
         })
     }
 
@@ -746,6 +750,20 @@ impl CandidateRecord {
     /// When the candidate was authored.
     pub const fn authored_at(&self) -> Timestamp {
         self.authored_at
+    }
+
+    /// H1 run whose candidate artifact events produced these bytes.
+    pub const fn h1_run(&self) -> Option<RunId> {
+        self.h1_run
+    }
+
+    /// Links this candidate to the H1 run that produced it.
+    ///
+    /// This link is persisted in the same H3 commit as the candidate metadata
+    /// and generation state; the H1 artifact events remain the audit source.
+    pub fn with_h1_run(mut self, run: RunId) -> Self {
+        self.h1_run = Some(run);
+        self
     }
 }
 
@@ -902,6 +920,19 @@ impl GenerationRecord {
         self.status = GenerationStatus::Completed;
         self.completed = true;
         self.completed_at = Some(at);
+        Ok(self)
+    }
+
+    /// Marks an active generation failed. The immutable source, fingerprints,
+    /// cycle, job, candidate, and H2 references are preserved.
+    pub fn fail(mut self) -> Result<Self, H3Error> {
+        if self.status != GenerationStatus::Active {
+            return Err(H3Error::invalid(
+                "generationStatus",
+                "only an active generation can fail",
+            ));
+        }
+        self.status = GenerationStatus::Failed;
         Ok(self)
     }
 

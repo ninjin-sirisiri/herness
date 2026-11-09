@@ -498,6 +498,7 @@ fn supersede_request(
         budget: None,
         settings_version: 1,
         job_id: "h3-job-1".to_owned(),
+        packet_instruction: None,
     }
 }
 

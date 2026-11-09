@@ -400,10 +400,20 @@ fn ensure_generation_update(
         || existing.job_id() != next.job_id()
         || existing.source() != next.source()
         || existing.fingerprints() != next.fingerprints()
+        || existing.started_at() != next.started_at()
     {
         return Err(conflict());
     }
-    let allowed = match existing.status() {
+    // An active generation may accept the candidate authored after it
+    // started. This is not a completion claim: the status stays active and the
+    // immutable source, fingerprints, cycle, job, and start time are unchanged.
+    let same_active = existing.status() == herness_html_sync::GenerationStatus::Active
+        && next.status() == herness_html_sync::GenerationStatus::Active
+        && existing.completed() == next.completed()
+        && existing.completed_at() == next.completed_at()
+        && existing.superseded_at() == next.superseded_at();
+    let allowed = same_active
+        || match existing.status() {
         herness_html_sync::GenerationStatus::Active => matches!(
             next.status(),
             herness_html_sync::GenerationStatus::Completed

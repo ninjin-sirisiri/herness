@@ -15,6 +15,7 @@
 
 pub mod candidate;
 pub mod config;
+pub mod coordinator;
 pub mod document;
 pub mod error;
 pub mod events;
@@ -24,6 +25,7 @@ pub mod ports;
 pub mod request;
 pub mod state;
 pub mod version;
+pub mod workspace;
 
 pub use candidate::{
     CandidateArtifactStore, CandidateGenerationRequest, MAX_CANDIDATE_BYTES,
@@ -39,6 +41,13 @@ pub use config::{
     MAX_APPROVED_RENDER_TIMEOUT_MS, MAX_APPROVED_SETTLE_MS, MAX_APPROVED_SOURCE_BYTES,
     MAX_APPROVED_SVG_ELEMENTS, PACK_INTEGRATION_HOST, PACK_INTEGRATION_SCHEMA,
     PACK_POLICY_VERSION, StoreBackedOwnerApprovalRegistry,
+};
+pub use coordinator::{
+    ActiveOwner, APP_WIDE_AUTHORING_CONCURRENCY, AuthoringBrief, AuthoringControlPort,
+    AuthoringGate, AuthoringJob, CandidateAuthored, CandidateIntake, CoordinatorPorts,
+    CoordinatorTick, DOCUMENT_PUBLICATION_CONCURRENCY, GenerationStarted, HeldAuthoring,
+    OfferOutcome, OwnerGateRequest, OwnerProgress, OwnerStartRequest, OwnerStarted,
+    OwnerSupersedeRequest, StaleCandidate, StopOutcome, SupersessionOutcome, SyncCoordinator,
 };
 pub use document::{
     DocumentKey, FingerprintKind, FingerprintSet, MAX_DOCUMENT_PATH_BYTES, SourceRevision,
@@ -80,3 +89,8 @@ pub use state::{
     PublicationStatus, RequiredAction, SyncCycle, project_activity_id,
 };
 pub use version::{H3_FORMAT_VERSION, H3Record, decode_record, encode_record, ensure_format};
+pub use workspace::{
+    AuthoringPolicy, AuthoringSnapshot, AuthoringWorkspace, CapturedInput, CapturedResource,
+    DocumentKind, MAX_RESOURCE_BYTES, MAX_SHARED_CSS_BYTES, WorkspaceCaptureRequest,
+    WorkspaceReader,
+};

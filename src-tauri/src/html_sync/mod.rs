@@ -7,6 +7,8 @@
 
 pub mod observer;
 pub mod policy;
+pub mod store;
+pub mod worker;
 
 pub use observer::{
     ProjectFilesystemWatcher, WatchAdapterError, WatchNotice, external_editor_change,
@@ -17,3 +19,4 @@ pub use policy::{
     CandidateCheck, CandidateDecision, CandidateStage, ConnectedPolicyBridge, HtmlPolicyBridge,
     PackProbe, PolicyBootstrap, PolicyBridgeError, PolicyFinding,
 };
+pub use worker::{HtmlSyncWorker, ProjectWorkspaces};

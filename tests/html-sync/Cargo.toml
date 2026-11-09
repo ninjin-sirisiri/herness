@@ -19,6 +19,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 herness-desktop = { path = "../../src-tauri" }
+herness-engine-pi = { path = "../../crates/herness-engine-pi" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
 rusqlite.workspace = true
 tempfile.workspace = true

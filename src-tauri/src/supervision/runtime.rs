@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use herness_core::permissions::{MatchMethod, PermissionRule, RuleTarget};
 use herness_core::runtime::{AgentSpec, RecoveryMode};
 use herness_core::{
-    AbsolutePath, ContinuationPort, ContinuationRequest, InputId, InputPhase, InputProgress,
-    ProjectId, RunId, RunState, StopReason, ToolName,
+    AbsolutePath, ArtifactHandle, ContinuationPort, ContinuationRequest, InputId, InputPhase,
+    InputProgress, ProjectId, RunId, RunState, StopReason, ToolName,
 };
 use herness_supervision::freshness::TargetManifest;
 use herness_supervision::operations::OperationRuntimePort;
@@ -50,6 +50,7 @@ pub struct DesktopH1<'a> {
     runtime: &'a mut DesktopRuntime,
     store: StoreHandle,
     plans: PlanMap,
+    candidate_artifact: Option<ArtifactHandle>,
 }
 
 impl<'a> DesktopH1<'a> {
@@ -59,7 +60,19 @@ impl<'a> DesktopH1<'a> {
             runtime,
             store,
             plans,
+            candidate_artifact: None,
         }
+    }
+
+    /// Installs the host-issued candidate handle for the H3 generation this
+    /// adapter is about to start or continue.
+    ///
+    /// With a handle installed, the H1 run receives only the candidate tools
+    /// and the run grant is the candidate allowlist even though H2 created the
+    /// child agent from the approved execution scope. Without one, the normal
+    /// native supervision path is unchanged.
+    pub fn set_candidate_artifact(&mut self, handle: Option<ArtifactHandle>) {
+        self.candidate_artifact = handle;
     }
 
     fn plan(
@@ -117,14 +130,27 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
     fn start_child(&mut self, request: &ChildRunStart) -> Result<(), SupervisionError> {
         let plan = self.plan(request.project_id(), request.supervision_id())?;
         let text = self.verified_packet(&plan, request.packet())?.prompt();
-        self.runtime
-            .start_run_with_id(
-                request.project_id(),
-                plan.child.agent_id,
-                request.run_id(),
-                &text,
-            )
-            .map_err(Self::runtime_error)?;
+        match &self.candidate_artifact {
+            Some(handle) => self
+                .runtime
+                .start_candidate_run_with_id(
+                    request.project_id(),
+                    plan.child.agent_id,
+                    request.run_id(),
+                    &text,
+                    handle.clone(),
+                )
+                .map_err(Self::runtime_error)?,
+            None => self
+                .runtime
+                .start_run_with_id(
+                    request.project_id(),
+                    plan.child.agent_id,
+                    request.run_id(),
+                    &text,
+                )
+                .map_err(Self::runtime_error)?,
+        };
         self.runtime
             .submit_input_as(
                 request.project_id(),
@@ -151,7 +177,22 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
             policy.version(),
         )
         .map_err(Self::runtime_error)?;
-        ContinuationPort::continue_run(self.runtime, &continuation).map_err(Self::runtime_error)?;
+        match &self.candidate_artifact {
+            Some(handle) => {
+                self.runtime
+                    .continue_run_with_artifact(
+                        request.project_id(),
+                        request.previous_run_id(),
+                        text.clone(),
+                        handle.clone(),
+                    )
+                    .map_err(Self::runtime_error)?;
+            }
+            None => {
+                ContinuationPort::continue_run(self.runtime, &continuation)
+                    .map_err(Self::runtime_error)?;
+            }
+        }
         self.runtime
             .submit_input_as(
                 request.project_id(),

@@ -1396,6 +1396,7 @@ version = "0.1.0"
 dependencies = [
  "herness-core",
  "herness-desktop",
+ "herness-engine-pi",
  "herness-html-sync",
  "herness-store",
  "herness-supervision",

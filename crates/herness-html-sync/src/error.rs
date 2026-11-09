@@ -80,6 +80,13 @@ pub enum H3Error {
         /// Sanitized storage detail.
         detail: String,
     },
+    /// A required capability is not implemented or not currently available.
+    Unavailable {
+        /// Stable capability label.
+        capability: String,
+        /// Sanitized explanation. It never contains candidate bytes or secrets.
+        detail: String,
+    },
 }
 
 impl H3Error {
@@ -156,6 +163,9 @@ impl fmt::Display for H3Error {
                 write!(f, "stored {record} is invalid: {detail}")
             }
             Self::Storage { detail } => write!(f, "H3 storage failure: {detail}"),
+            Self::Unavailable { capability, detail } => {
+                write!(f, "H3 capability {capability} is unavailable: {detail}")
+            }
         }
     }
 }

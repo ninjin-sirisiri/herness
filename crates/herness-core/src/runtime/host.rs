@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::json;
 
 use crate::connections::{ConnectionDirectory, ConnectionSettings};
+use crate::contracts::artifact::ArtifactHandle;
 use crate::contracts::connection::{ConnectionId, ConnectionInfo, ConnectionStatus};
 use crate::contracts::errors::{
     ArgumentViolation, ConversationFailure, CoreError, EngineFailureKind,
@@ -990,6 +991,41 @@ where
         run_id: RunId,
         instructions: impl Into<String>,
     ) -> Result<RunView, RuntimeError> {
+        self.start_run_inner(project, agent, run_id, instructions, None)
+    }
+
+    /// Starts one candidate-only run with a host-issued artifact handle.
+    ///
+    /// Candidate runs receive only `candidate_read`, `candidate_write`, and
+    /// `candidate_edit`. The run grant is the candidate allowlist even when the
+    /// child agent was created with a broader native scope, and the engine
+    /// rejects every native file or shell operation in this run.
+    pub fn start_candidate_run_with_id(
+        &mut self,
+        project: ProjectId,
+        agent: AgentId,
+        run_id: RunId,
+        instructions: impl Into<String>,
+        handle: ArtifactHandle,
+    ) -> Result<RunView, RuntimeError> {
+        if handle.project_id() != project {
+            return Err(RuntimeError::CrossProject {
+                id_kind: IdKind::Artifact,
+                expected: project,
+                found: handle.project_id(),
+            });
+        }
+        self.start_run_inner(project, agent, run_id, instructions, Some(handle))
+    }
+
+    fn start_run_inner(
+        &mut self,
+        project: ProjectId,
+        agent: AgentId,
+        run_id: RunId,
+        instructions: impl Into<String>,
+        candidate: Option<ArtifactHandle>,
+    ) -> Result<RunView, RuntimeError> {
         run_id
             .validate_in(&project)
             .map_err(|_| RuntimeError::CrossProject {
@@ -1040,26 +1076,30 @@ where
         self.ensure_mode_usable(&policy)?;
         self.ensure_capabilities(&agent_record)?;
 
-        let grant = match &agent_record.grant {
-            Some(stored) => {
-                let grant = stored.to_scope(project)?;
-                if grant.policy_version() != policy.version() {
-                    return Err(RuntimeError::PermissionContextStale {
-                        detail: format!(
-                            "agent grant is at policy version {}, current version is {}",
-                            grant.policy_version(),
-                            policy.version()
-                        ),
-                    });
+        let grant = if candidate.is_some() {
+            GrantScope::for_candidate_run(project, &policy)
+        } else {
+            match &agent_record.grant {
+                Some(stored) => {
+                    let grant = stored.to_scope(project)?;
+                    if grant.policy_version() != policy.version() {
+                        return Err(RuntimeError::PermissionContextStale {
+                            detail: format!(
+                                "agent grant is at policy version {}, current version is {}",
+                                grant.policy_version(),
+                                policy.version()
+                            ),
+                        });
+                    }
+                    if grant.mode() != policy.mode() {
+                        return Err(RuntimeError::PermissionContextStale {
+                            detail: "agent grant mode differs from the current policy".to_owned(),
+                        });
+                    }
+                    grant
                 }
-                if grant.mode() != policy.mode() {
-                    return Err(RuntimeError::PermissionContextStale {
-                        detail: "agent grant mode differs from the current policy".to_owned(),
-                    });
-                }
-                grant
+                None => GrantScope::for_run(project, &policy),
             }
-            None => GrantScope::for_run(project, &policy),
         };
 
         let control = RunControl::new();
@@ -1075,6 +1115,10 @@ where
         )
         .map_err(RuntimeError::engine)?
         .with_permission(permission);
+        let start = match candidate {
+            Some(handle) => start.with_candidate_artifact(handle),
+            None => start,
+        };
         self.run_controls.insert(run_id, control);
 
         let now = Timestamp::now();
@@ -1299,6 +1343,38 @@ where
         previous_run: RunId,
         text: impl Into<String>,
     ) -> Result<ContinuationOutcome, RuntimeError> {
+        self.continue_run_inner(project, previous_run, text, None)
+    }
+
+    /// Continues a conversation with the same candidate artifact context.
+    ///
+    /// A continuation of a candidate run must keep the candidate tools and the
+    /// host-issued handle; H2 additional runs use this path so a continuation
+    /// can never fall back to native file or shell tools.
+    pub fn continue_run_with_artifact(
+        &mut self,
+        project: ProjectId,
+        previous_run: RunId,
+        text: impl Into<String>,
+        handle: ArtifactHandle,
+    ) -> Result<ContinuationOutcome, RuntimeError> {
+        if handle.project_id() != project {
+            return Err(RuntimeError::CrossProject {
+                id_kind: IdKind::Artifact,
+                expected: project,
+                found: handle.project_id(),
+            });
+        }
+        self.continue_run_inner(project, previous_run, text, Some(handle))
+    }
+
+    fn continue_run_inner(
+        &mut self,
+        project: ProjectId,
+        previous_run: RunId,
+        text: impl Into<String>,
+        candidate: Option<ArtifactHandle>,
+    ) -> Result<ContinuationOutcome, RuntimeError> {
         let text = text.into();
         if text.trim().is_empty() {
             return Err(RuntimeError::InvalidValue {
@@ -1321,7 +1397,7 @@ where
             policy.version(),
         )
         .map_err(RuntimeError::invalid_value)?;
-        self.start_continuation_run(&request)?;
+        self.start_continuation_run(&request, candidate.clone())?;
         self.send_accepted_input(project, run_id, input_id, text)?;
         let view = self.run(project, run_id)?;
         Ok(ContinuationOutcome::new(view, input_id))
@@ -1445,6 +1521,7 @@ where
     fn start_continuation_run(
         &mut self,
         request: &ContinuationRequest,
+        candidate: Option<ArtifactHandle>,
     ) -> Result<(), RuntimeError> {
         self.ensure_accepting()?;
         let project = request.project_id();
@@ -1526,26 +1603,30 @@ where
         }
         self.ensure_mode_usable(&policy)?;
         self.ensure_capabilities(&agent_record)?;
-        let grant = match &agent_record.grant {
-            Some(stored) => {
-                let grant = stored.to_scope(project)?;
-                if grant.policy_version() != policy.version() {
-                    return Err(RuntimeError::PermissionContextStale {
-                        detail: format!(
-                            "agent grant is at policy version {}, current version is {}",
-                            grant.policy_version(),
-                            policy.version()
-                        ),
-                    });
+        let grant = if candidate.is_some() {
+            GrantScope::for_candidate_run(project, &policy)
+        } else {
+            match &agent_record.grant {
+                Some(stored) => {
+                    let grant = stored.to_scope(project)?;
+                    if grant.policy_version() != policy.version() {
+                        return Err(RuntimeError::PermissionContextStale {
+                            detail: format!(
+                                "agent grant is at policy version {}, current version is {}",
+                                grant.policy_version(),
+                                policy.version()
+                            ),
+                        });
+                    }
+                    if grant.mode() != policy.mode() {
+                        return Err(RuntimeError::PermissionContextStale {
+                            detail: "agent grant mode differs from the current policy".to_owned(),
+                        });
+                    }
+                    grant
                 }
-                if grant.mode() != policy.mode() {
-                    return Err(RuntimeError::PermissionContextStale {
-                        detail: "agent grant mode differs from the current policy".to_owned(),
-                    });
-                }
-                grant
+                None => GrantScope::for_run(project, &policy),
             }
-            None => GrantScope::for_run(project, &policy),
         };
         if project_record
             .approvals
@@ -1596,6 +1677,10 @@ where
         )
         .map_err(RuntimeError::engine)?
         .with_permission(permission);
+        let start = match candidate {
+            Some(handle) => start.with_candidate_artifact(handle),
+            None => start,
+        };
         self.run_controls.insert(request.run_id(), control);
         self.engine
             .check_continuation(&start, &checkpoint)
@@ -3545,7 +3630,7 @@ where
     T: RuntimeToolExecutor,
 {
     fn continue_run(&mut self, request: &ContinuationRequest) -> Result<(), CoreError> {
-        self.start_continuation_run(request)
+        self.start_continuation_run(request, None)
             .map_err(runtime_error_to_core)
     }
 

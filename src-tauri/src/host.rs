@@ -434,6 +434,17 @@ impl DesktopHost {
         &self.supervision
     }
 
+    /// Mutable supervision composition for the host-owned H3 worker.
+    ///
+    /// This is not an IPC surface. The worker needs the same supervision host
+    /// and the same H1 runtime in one call; borrowing the two fields together
+    /// avoids a second composition.
+    pub fn runtime_and_supervision_mut(
+        &mut self,
+    ) -> (&mut DesktopRuntime, &mut SupervisionHost) {
+        (&mut self.runtime, &mut self.supervision)
+    }
+
     /// Mints a host-owned human confirmation after the command guard passed.
     pub fn confirm_supervision(&self, kind: ConfirmationKind) -> HumanConfirmation {
         self.supervision.confirm(kind)

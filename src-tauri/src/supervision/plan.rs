@@ -436,6 +436,36 @@ impl StoredPlan {
         )
     }
 
+    /// Replaces the immutable owner instruction and advances the packet
+    /// version. Used only by the host-owned H3 generation supersession path so
+    /// the new source snapshot's exact brief is carried into the same target.
+    pub fn replace_instruction(
+        &mut self,
+        instruction: impl AsRef<str>,
+    ) -> Result<(), SupervisionError> {
+        let instruction = instruction.as_ref();
+        if instruction.trim().is_empty() {
+            return Err(SupervisionError::InvalidValue {
+                field: "workPacket.instruction".to_owned(),
+                detail: "the replacement owner instruction must not be empty".to_owned(),
+            });
+        }
+        let next_version = self.packet.packet_version().saturating_add(1);
+        self.packet = WorkPacket::new(
+            next_version,
+            instruction,
+            self.contract.project_id(),
+            &self.evidence_target,
+            self.execution_scope.clone(),
+            self.conditions.condition_version(),
+            self.profile.binding(),
+            self.consent.binding(),
+            self.budget_version,
+            self.budget.policy()?,
+        )?;
+        Ok(())
+    }
+
     /// Updates the condition content and version after an explicit change.
     pub fn set_conditions(&mut self, conditions: ConditionSet) {
         self.conditions = conditions;

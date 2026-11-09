@@ -358,6 +358,10 @@ pub struct SupersedeSupervisionRequest {
     pub settings_version: u64,
     /// Current H3/H4 job identity.
     pub job_id: String,
+    /// Replacement owner instruction (exact H3 generation brief), when the
+    /// source snapshot changed. The packet version and fingerprint advance and
+    /// the H2 approval checks are unchanged.
+    pub packet_instruction: Option<String>,
 }
 
 /// One host-owned supervision composition.
@@ -1000,6 +1004,73 @@ impl SupervisionHost {
         self.view(project, supervision)
     }
 
+    /// Binds the exact H3 generation brief to the stored work packet without
+    /// changing the approved target version, conditions, scope, profile,
+    /// consent, or budget.
+    ///
+    /// This is a host-only, first-start preparation step. It requires the
+    /// non-serializable owner authority for the current approved contract, and
+    /// refuses a target that already has a run or is no longer ready. The packet
+    /// version and fingerprint advance; the H2 list of constraints and the
+    /// budget ledger do not change. It never starts a run and has no IPC shape.
+    pub fn bind_owner_instruction(
+        &mut self,
+        project: ProjectId,
+        supervision: SupervisionId,
+        expected_revision: u64,
+        instruction: &str,
+        authority: &HostOwnerAuthority,
+    ) -> Result<SupervisionView, SupervisionError> {
+        if authority.project_id() != project || authority.supervision_id() != supervision {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::TargetMismatch,
+            });
+        }
+        if authority.owner().kind() != herness_supervision::OwnerKind::H3HtmlJob {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::OwnerNotApproved,
+            });
+        }
+        if self.is_restored(project, supervision) {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::RestoredTarget,
+            });
+        }
+        let record = self.load(project, supervision)?;
+        if record.revision() != expected_revision {
+            return Err(SupervisionError::RevisionConflict {
+                expected: expected_revision,
+                found: record.revision(),
+            });
+        }
+        if record.state() != SupervisionState::Ready
+            || !record.run_group().runs().is_empty()
+            || record.supervisor().current_run().is_some()
+        {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::TargetNotReady {
+                    found: record.state(),
+                },
+            });
+        }
+        let mut plan = self.plan(project, supervision)?;
+        let now = self.clock.now();
+        let contract = plan.contract(&record, now)?;
+        authority.ensure_contract_binding(&contract, plan.budget_version)?;
+        if plan.packet.instruction() == instruction {
+            return self.view(project, supervision);
+        }
+        plan.replace_instruction(instruction)?;
+        plan.rebuild_contract(&record, now)?;
+        plan.verify()?;
+        save_plan(&self.store, project, supervision, &plan)?;
+        self.plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((project, supervision), plan);
+        self.view(project, supervision)
+    }
+
     /// Builds the exact replacement binding an H3/H4 owner must currently have
     /// approved before replacing a stale generation.
     ///
@@ -1240,6 +1311,9 @@ impl SupervisionHost {
         next.evidence_target = evidence_target;
         next.budget = BudgetSnapshot::from_policy(&budget);
         next.budget_version = budget_version;
+        if let Some(instruction) = &request.packet_instruction {
+            next.replace_instruction(instruction)?;
+        }
         next.rebuild_contract(record, now)?;
         let binding = OwnerLaunchBinding::from_contract(
             &next.contract,

@@ -39,6 +39,8 @@ pub enum IdKind {
     Activity,
     /// A connection identifier.
     Connection,
+    /// A host-issued candidate artifact handle.
+    Artifact,
 }
 
 impl IdKind {
@@ -55,6 +57,7 @@ impl IdKind {
             Self::Attempt => "attempt",
             Self::Activity => "activity",
             Self::Connection => "connection",
+            Self::Artifact => "artifact",
         }
     }
 }
