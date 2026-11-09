@@ -59,9 +59,9 @@ impl GrantScope {
 
     /// An unrestricted run scope for the policy's current mode and version.
     ///
-    /// This grants every H1 tool at the policy level. It is a ceiling, not an
-    /// approval: configured mode still requires an allow rule or a human
-    /// decision, and automatic mode still requires the evaluator.
+    /// This grants the five native H1 tools at the policy level. It is a
+    /// ceiling, not an approval: configured mode still requires an allow rule
+    /// or a human decision, and automatic mode still requires the evaluator.
     pub fn for_run(project_id: ProjectId, policy: &PermissionPolicy) -> Self {
         let grants = [
             ToolName::Read,
@@ -71,10 +71,31 @@ impl GrantScope {
             ToolName::Bash,
         ]
         .into_iter()
-        .map(|tool| {
-            PermissionRule::allow(RuleTarget::Tool { tool }, MatchMethod::AnyInvocation)
-                .expect("tool-wide allow rule is valid")
-        })
+        .map(tool_allow_rule)
+        .collect();
+        Self {
+            project_id,
+            grants,
+            mode: policy.mode(),
+            policy_version: policy.version(),
+        }
+    }
+
+    /// An unrestricted candidate-run scope for the policy's current mode and
+    /// version.
+    ///
+    /// Candidate runs receive only the three candidate artifact tools. The
+    /// native writers and shell are deliberately absent, so a candidate run
+    /// cannot write a formal Target, companion, CSS, or settings path even when
+    /// the policy would otherwise allow it.
+    pub fn for_candidate_run(project_id: ProjectId, policy: &PermissionPolicy) -> Self {
+        let grants = [
+            ToolName::CandidateRead,
+            ToolName::CandidateWrite,
+            ToolName::CandidateEdit,
+        ]
+        .into_iter()
+        .map(tool_allow_rule)
         .collect();
         Self {
             project_id,
@@ -213,6 +234,11 @@ pub enum GrantWidening {
         /// Requested version.
         requested: PolicyVersion,
     },
+}
+
+fn tool_allow_rule(tool: ToolName) -> PermissionRule {
+    PermissionRule::allow(RuleTarget::Tool { tool }, MatchMethod::AnyInvocation)
+        .expect("tool-wide allow rule is valid")
 }
 
 fn widening_for(grant: &PermissionRule, parent_grants: &[PermissionRule]) -> GrantWidening {

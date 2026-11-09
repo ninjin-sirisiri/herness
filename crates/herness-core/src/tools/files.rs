@@ -642,6 +642,11 @@ impl<S: StorePort> ToolExecutor for NativeFileTools<S> {
                 .apply_edit(operation, args)
                 .map(|change| FileToolOutput::Change(Box::new(change))),
             ToolArguments::Bash(_) => Err(tool_error(tool, FileFailure::Unsupported { tool })),
+            ToolArguments::CandidateRead(_)
+            | ToolArguments::CandidateWrite(_)
+            | ToolArguments::CandidateEdit(_) => {
+                Err(tool_error(tool, FileFailure::Unsupported { tool }))
+            }
         }
     }
 }

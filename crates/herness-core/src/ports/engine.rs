@@ -3,6 +3,7 @@
 //! Adapters translate their SDK into these host-owned types. SDK structs,
 //! checkpoint internals, and raw provider errors never appear here.
 
+use crate::contracts::artifact::ArtifactHandle;
 use crate::contracts::checkpoint::Checkpoint;
 use crate::contracts::connection::ConnectionId;
 use crate::contracts::errors::{CoreError, EngineFailureKind};
@@ -25,6 +26,7 @@ pub struct EngineStart {
     cwd: AbsolutePath,
     instructions: String,
     permission: Option<RunPermissionContext>,
+    candidate: Option<ArtifactHandle>,
 }
 
 impl EngineStart {
@@ -52,7 +54,25 @@ impl EngineStart {
             cwd,
             instructions: instructions.into(),
             permission: None,
+            candidate: None,
         })
+    }
+
+    /// Attaches the host-issued candidate artifact handle for this run.
+    ///
+    /// Supplying a handle is the host capability decision that authorizes the
+    /// engine adapter to expose the candidate artifact tools instead of the
+    /// five native tools. A handle from another project is rejected by the
+    /// adapter and executor.
+    #[must_use]
+    pub fn with_candidate_artifact(mut self, handle: ArtifactHandle) -> Self {
+        self.candidate = Some(handle);
+        self
+    }
+
+    /// Candidate artifact handle, when the host supplied one.
+    pub const fn candidate_artifact(&self) -> Option<&ArtifactHandle> {
+        self.candidate.as_ref()
     }
 
     /// Attaches the host-resolved permission context for this run.

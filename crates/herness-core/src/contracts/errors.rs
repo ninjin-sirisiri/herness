@@ -8,6 +8,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::artifact::ArtifactSlot;
 use crate::contracts::connection::{ConnectionId, Provider};
 use crate::contracts::ids::{IdKind, OperationId, ProjectId, RunId};
 use crate::contracts::run::RunState;
@@ -193,6 +194,13 @@ pub enum CoreError {
         /// Structured, non-secret failure detail.
         failure: ShellFailure,
     },
+    /// A candidate artifact tool could not complete safely.
+    ArtifactToolFailed {
+        /// Tool that failed.
+        tool: ToolName,
+        /// Structured, non-secret failure detail.
+        failure: ArtifactFailure,
+    },
     /// A skill could not be loaded, revalidated, or used for its declared
     /// flow.
     SkillFailed {
@@ -275,6 +283,13 @@ pub enum ArgumentViolation {
         /// Maximum permitted count.
         max: usize,
     },
+    /// The value exceeded the permitted number of UTF-8 bytes.
+    TooLongBytes {
+        /// Counted UTF-8 bytes.
+        actual: usize,
+        /// Maximum permitted count.
+        max: usize,
+    },
     /// The value must be a positive integer.
     MustBePositive,
     /// Another schema violation, described without secrets.
@@ -318,6 +333,8 @@ pub enum PortFeature {
     /// Installing the host-resolved grant, policy, evaluator, and stop control
     /// for a run's real tool path.
     RunPermission,
+    /// The host-owned candidate artifact store.
+    ArtifactStore,
 }
 
 impl PortFeature {
@@ -331,6 +348,7 @@ impl PortFeature {
             Self::StopDeadlineControl => "stop_deadline_control",
             Self::HostActivityEvents => "host_activity_events",
             Self::RunPermission => "run_permission",
+            Self::ArtifactStore => "artifact_store",
         }
     }
 }
@@ -594,6 +612,91 @@ pub enum ShellFailure {
     },
 }
 
+/// Structured, non-secret reason a candidate artifact tool failed.
+///
+/// Candidate artifacts are addressed by a host-issued handle and an artifact
+/// slot. These failures never carry a private storage path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ArtifactFailure {
+    /// This executor was invoked for a tool outside the candidate context.
+    ToolNotAllowed {
+        /// Requested tool.
+        tool: ToolName,
+    },
+    /// The supplied handle is not the current host-issued handle for the run.
+    StaleHandle {
+        /// Generation of the current handle.
+        expected_generation: u64,
+        /// Generation supplied by the operation.
+        found_generation: u64,
+    },
+    /// Write or edit named an immutable or formal artifact slot.
+    NotCandidateTarget {
+        /// Rejected slot.
+        artifact: ArtifactSlot,
+    },
+    /// The requested artifact has not been authored yet.
+    NotFound {
+        /// Missing slot.
+        artifact: ArtifactSlot,
+    },
+    /// The artifact changed since the caller observed it.
+    VersionConflict {
+        /// Slot whose version changed.
+        artifact: ArtifactSlot,
+        /// Version the caller expected.
+        expected: FileVersion,
+        /// Version observed now.
+        actual: FileVersion,
+    },
+    /// `candidate_edit.oldText` was empty.
+    EditTextEmpty,
+    /// `candidate_edit.oldText` did not occur in the artifact.
+    EditTextNotFound {
+        /// Slot that was searched.
+        artifact: ArtifactSlot,
+    },
+    /// `candidate_edit.oldText` occurred more than once.
+    EditTextNotUnique {
+        /// Slot that was searched.
+        artifact: ArtifactSlot,
+        /// Number of non-overlapping occurrences observed.
+        occurrences: u64,
+    },
+    /// `candidate_edit` would not change the artifact.
+    NoChange {
+        /// Slot that was not changed.
+        artifact: ArtifactSlot,
+    },
+    /// The host artifact port returned a different artifact or version than
+    /// the one the executor planned.
+    ContentMismatch {
+        /// Slot involved.
+        artifact: ArtifactSlot,
+    },
+    /// The host artifact store is not wired in this build or composition.
+    ///
+    /// Callers must surface this as an unsupported capability. It is never a
+    /// successful empty result.
+    Unavailable,
+    /// The intent could not be recorded, so no artifact side effect occurred.
+    NotExecutable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+    /// The side effect may have happened but its durable result could not be
+    /// recorded. Reconciliation is required; the host did not retry.
+    Unverifiable {
+        /// Sanitized explanation.
+        detail: String,
+    },
+}
+
 impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -628,6 +731,10 @@ impl fmt::Display for ArgumentViolation {
             Self::TooLong { actual, max } => write!(
                 f,
                 "must contain at most {max} Unicode scalar values, found {actual}"
+            ),
+            Self::TooLongBytes { actual, max } => write!(
+                f,
+                "must contain at most {max} UTF-8 bytes, found {actual}"
             ),
             Self::MustBePositive => f.write_str("must be a positive integer"),
             Self::Invalid { detail } => f.write_str(detail),
@@ -731,6 +838,9 @@ impl fmt::Display for CoreError {
                 write!(f, "{tool} failed: {failure}")
             }
             Self::ShellToolFailed { tool, failure } => {
+                write!(f, "{tool} failed: {failure}")
+            }
+            Self::ArtifactToolFailed { tool, failure } => {
                 write!(f, "{tool} failed: {failure}")
             }
             Self::SkillFailed { skill, failure } => {
@@ -855,3 +965,64 @@ impl fmt::Display for ShellFailure {
 }
 
 impl std::error::Error for CoreError {}
+
+impl fmt::Display for ArtifactFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ToolNotAllowed { tool } => {
+                write!(f, "{tool} is not allowed in a candidate artifact context")
+            }
+            Self::StaleHandle {
+                expected_generation,
+                found_generation,
+            } => write!(
+                f,
+                "the artifact handle is stale: expected generation {expected_generation}, found {found_generation}"
+            ),
+            Self::NotCandidateTarget { artifact } => {
+                write!(f, "{artifact} is not a writable candidate artifact")
+            }
+            Self::NotFound { artifact } => {
+                write!(f, "candidate artifact {artifact} has not been authored")
+            }
+            Self::VersionConflict {
+                artifact,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "candidate artifact {artifact} changed: expected version {expected}, observed {actual}"
+            ),
+            Self::EditTextEmpty => f.write_str("candidate edit oldText must not be empty"),
+            Self::EditTextNotFound { artifact } => {
+                write!(f, "candidate edit oldText was not found in {artifact}")
+            }
+            Self::EditTextNotUnique {
+                artifact,
+                occurrences,
+            } => write!(
+                f,
+                "candidate edit oldText occurs {occurrences} times in {artifact}; expected exactly one"
+            ),
+            Self::NoChange { artifact } => {
+                write!(f, "candidate edit would not change {artifact}")
+            }
+            Self::ContentMismatch { artifact } => write!(
+                f,
+                "the host artifact store returned an unexpected body or version for {artifact}"
+            ),
+            Self::Unavailable => {
+                f.write_str("the host candidate artifact store is not available")
+            }
+            Self::NotExecutable { detail } => {
+                write!(f, "operation was not executed: {detail}")
+            }
+            Self::Unverifiable { detail } => write!(
+                f,
+                "artifact side effect may be applied but the result is not durable; reconciliation required: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArtifactFailure {}

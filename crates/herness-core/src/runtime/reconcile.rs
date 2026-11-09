@@ -398,6 +398,19 @@ pub(crate) fn classify_operation(
             Some("the shell completed or failed without durable evidence".to_owned()),
         ),
         ToolName::Write | ToolName::Edit => classify_file_intent(project_root, operation),
+        ToolName::CandidateRead => (
+            OperationOutcome::NotApplied,
+            ReconciliationSource::NoSideEffect,
+            Some("candidate read has no side effect".to_owned()),
+        ),
+        ToolName::CandidateWrite | ToolName::CandidateEdit => (
+            OperationOutcome::Unverifiable,
+            ReconciliationSource::MissingEvidence,
+            Some(
+                "candidate artifact changes are reconciled by the host artifact store; H1 cannot classify them"
+                    .to_owned(),
+            ),
+        ),
     }
 }
 

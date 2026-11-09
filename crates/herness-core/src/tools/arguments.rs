@@ -11,9 +11,17 @@ use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::artifact::{ArtifactHandle, ArtifactSlot};
 use crate::contracts::errors::{ArgumentViolation, CoreError};
 use crate::tools::ToolName;
 use crate::tools::reason::{Purpose, Rationale};
+
+/// Maximum UTF-8 bytes accepted for one candidate artifact.
+///
+/// This is the H3 candidate HTML limit. It is applied to every candidate write
+/// so an oversized body is held as a capability failure instead of being
+/// truncated or silently stored.
+pub const MAX_CANDIDATE_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A trimmed, non-empty text value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -256,7 +264,107 @@ impl BashArgs {
     }
 }
 
-/// Final, schema-validated arguments for one native tool.
+/// Arguments for `candidate_read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateReadArgs {
+    /// Host-issued handle for this project/job/generation.
+    pub handle: ArtifactHandle,
+    /// Immutable snapshot or current candidate to read.
+    pub artifact: ArtifactSlot,
+}
+
+impl CandidateReadArgs {
+    /// Schema is enforced by the field types.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// Arguments for `candidate_write`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateWriteArgs {
+    /// Host-issued handle for this project/job/generation.
+    pub handle: ArtifactHandle,
+    /// Candidate slot to create or replace.
+    pub artifact: ArtifactSlot,
+    /// Full candidate content.
+    pub content: String,
+    /// Required rationale for the change.
+    pub rationale: Rationale,
+}
+
+impl CandidateWriteArgs {
+    /// Validates the target slot and size.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        require_candidate_target(ToolName::CandidateWrite, self.artifact)?;
+        if self.content.len() > MAX_CANDIDATE_ARTIFACT_BYTES {
+            return Err(invalid(
+                ToolName::CandidateWrite,
+                "content",
+                ArgumentViolation::TooLongBytes {
+                    actual: self.content.len(),
+                    max: MAX_CANDIDATE_ARTIFACT_BYTES,
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Arguments for `candidate_edit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateEditArgs {
+    /// Host-issued handle for this project/job/generation.
+    pub handle: ArtifactHandle,
+    /// Candidate slot to edit.
+    pub artifact: ArtifactSlot,
+    /// Exact text expected before the edit.
+    pub old_text: String,
+    /// Replacement text.
+    pub new_text: String,
+    /// Required rationale for the change.
+    pub rationale: Rationale,
+    /// Candidate version observed before the edit, when supplied.
+    pub expected_version: Option<FileVersion>,
+}
+
+impl CandidateEditArgs {
+    /// Validates the target slot and size.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        require_candidate_target(ToolName::CandidateEdit, self.artifact)?;
+        if self.new_text.len() > MAX_CANDIDATE_ARTIFACT_BYTES {
+            return Err(invalid(
+                ToolName::CandidateEdit,
+                "newText",
+                ArgumentViolation::TooLongBytes {
+                    actual: self.new_text.len(),
+                    max: MAX_CANDIDATE_ARTIFACT_BYTES,
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn require_candidate_target(tool: ToolName, artifact: ArtifactSlot) -> Result<(), CoreError> {
+    if artifact.is_candidate() {
+        return Ok(());
+    }
+    Err(invalid(
+        tool,
+        "artifact",
+        ArgumentViolation::Invalid {
+            detail: format!(
+                "{artifact} is read-only; write and edit accept candidate_html or candidate_provenance only"
+            ),
+        },
+    ))
+}
+
+/// Final, schema-validated arguments for one tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "tool", content = "arguments", rename_all = "snake_case")]
 pub enum ToolArguments {
@@ -270,6 +378,12 @@ pub enum ToolArguments {
     Edit(EditArgs),
     /// Arguments for `bash`.
     Bash(BashArgs),
+    /// Arguments for `candidate_read`.
+    CandidateRead(CandidateReadArgs),
+    /// Arguments for `candidate_write`.
+    CandidateWrite(CandidateWriteArgs),
+    /// Arguments for `candidate_edit`.
+    CandidateEdit(CandidateEditArgs),
 }
 
 impl ToolArguments {
@@ -281,6 +395,9 @@ impl ToolArguments {
             Self::Write(_) => ToolName::Write,
             Self::Edit(_) => ToolName::Edit,
             Self::Bash(_) => ToolName::Bash,
+            Self::CandidateRead(_) => ToolName::CandidateRead,
+            Self::CandidateWrite(_) => ToolName::CandidateWrite,
+            Self::CandidateEdit(_) => ToolName::CandidateEdit,
         }
     }
 
@@ -292,6 +409,9 @@ impl ToolArguments {
             Self::Write(args) => args.validate(),
             Self::Edit(args) => args.validate(),
             Self::Bash(args) => args.validate(),
+            Self::CandidateRead(args) => args.validate(),
+            Self::CandidateWrite(args) => args.validate(),
+            Self::CandidateEdit(args) => args.validate(),
         }
     }
 }
@@ -309,6 +429,9 @@ impl<'de> Deserialize<'de> for ToolArguments {
             Write(WriteArgs),
             Edit(EditArgs),
             Bash(BashArgs),
+            CandidateRead(CandidateReadArgs),
+            CandidateWrite(CandidateWriteArgs),
+            CandidateEdit(CandidateEditArgs),
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -318,6 +441,9 @@ impl<'de> Deserialize<'de> for ToolArguments {
             Wire::Write(args) => Self::Write(args),
             Wire::Edit(args) => Self::Edit(args),
             Wire::Bash(args) => Self::Bash(args),
+            Wire::CandidateRead(args) => Self::CandidateRead(args),
+            Wire::CandidateWrite(args) => Self::CandidateWrite(args),
+            Wire::CandidateEdit(args) => Self::CandidateEdit(args),
         };
         value.validate().map_err(de::Error::custom)?;
         Ok(value)

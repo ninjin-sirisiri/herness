@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use herness_core::{
-    AbsolutePath, AgentId, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
+    AbsolutePath, AgentId, ArtifactHandle, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
     CheckpointPayload, CommitReceipt, ConnectionId, CoreError, EngineFailureKind, EventDraft,
     EventKind, EventPayload, HistoryPage, HistoryQuery, OperationId, OperationIntent,
     OperationRecord, OperationResult, ProjectId, RunId, SessionId, StorePort, Timestamp,
@@ -50,6 +50,7 @@ pub(crate) struct RunAuditMetadata {
     pub(crate) connection: ConnectionId,
     pub(crate) cwd: AbsolutePath,
     pub(crate) instructions: String,
+    pub(crate) candidate: Option<ArtifactHandle>,
 }
 
 /// Versioned checkpoint body. Unknown formats are rejected, never guessed.
@@ -64,6 +65,8 @@ struct CheckpointEnvelope {
     connection: ConnectionId,
     cwd: AbsolutePath,
     instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate: Option<ArtifactHandle>,
     snapshot: SessionSnapshot,
 }
 
@@ -174,6 +177,7 @@ impl<S: StorePort> EngineStore<S> {
             connection: self.audit.connection,
             cwd: self.audit.cwd.clone(),
             instructions: self.audit.instructions.clone(),
+            candidate: self.audit.candidate.clone(),
             snapshot: sanitize_snapshot(snapshot),
         };
         let bytes = serde_json::to_vec(&envelope).map_err(|_| checkpoint_error())?;
@@ -566,7 +570,9 @@ fn is_audit_checkpoint(checkpoint: &Checkpoint) -> bool {
     };
     matches!(
         value.get("kind").and_then(Value::as_str),
-        Some("herness.file-operation") | Some("herness.shell-operation")
+        Some("herness.file-operation")
+            | Some("herness.shell-operation")
+            | Some("herness.artifact-operation")
     )
 }
 
@@ -612,6 +618,7 @@ pub(crate) fn parse_checkpoint(
             connection: envelope.connection,
             cwd: envelope.cwd,
             instructions: envelope.instructions,
+            candidate: envelope.candidate,
         },
         snapshot: envelope.snapshot,
     })
@@ -706,6 +713,7 @@ mod tests {
             connection: ConnectionId::new(),
             cwd: AbsolutePath::new("/tmp").expect("absolute path"),
             instructions: "test instructions".to_owned(),
+            candidate: None,
         }
     }
 

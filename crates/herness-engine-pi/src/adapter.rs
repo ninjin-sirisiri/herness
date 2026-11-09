@@ -17,13 +17,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use herness_core::runtime::StoreModelRequestGate;
 use herness_core::{
-    AbsolutePath, AuthMethod, BashExecutor, BoundedPermissionEvaluator, ConnectionDirectory,
+    AbsolutePath, ArtifactFailure, ArtifactHandle, ArtifactPort, AuthMethod, BashExecutor,
+    BoundedPermissionEvaluator, CandidateArtifactTools, CandidateToolOutput, ConnectionDirectory,
     ConnectionId, ConversationFailure, CoreError, CredentialPort, EngineEvent, EngineInput,
     EnginePort, EngineStart, EvaluationContext, FileFailure, FileLockRegistry, FileToolOutput,
     FrozenOperation, ModelRequestGatePort, NativeFileTools, OperationId, PermissionOutcome,
-    PermissionPolicy, ProcessSupervisor, ProjectRoot, Provider, ProviderFailureKind, RunId,
-    RunPermissionContext, RunState, ShellFailure, StopReason, StopReport, StorePort,
-    SystemLauncher, ToolArguments, ToolExecutor, ToolGateway, ToolName,
+    PermissionPolicy, PortFeature, ProcessSupervisor, ProjectRoot, Provider,
+    ProviderFailureKind, RunId, RunPermissionContext, RunState, SharedArtifactPort, ShellFailure,
+    StopReason, StopReport, StorePort, SystemLauncher, ToolArguments, ToolExecutor, ToolGateway,
+    ToolName,
 };
 use pi_embedded::SessionStatus;
 use pi_embedded::{
@@ -112,6 +114,8 @@ pub struct PiEngine<S: StorePort + Send + 'static> {
     catalog: Arc<ChatGptCatalog>,
     /// Injected pre-send gate shared with every run's stream bridge.
     request_gate: SharedRequestGate,
+    /// Host candidate artifact store used only by runs with a candidate handle.
+    artifact_port: Option<SharedArtifactPort>,
     runs: HashMap<RunId, Arc<RunContext<S>>>,
     /// Permission contexts installed before a resume rebuilds a run.
     pending_permissions: HashMap<RunId, RunPermissionContext>,
@@ -150,9 +154,20 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             file_locks: Arc::new(FileLockRegistry::new()),
             catalog,
             request_gate,
+            artifact_port: None,
             runs: HashMap::new(),
             pending_permissions: HashMap::new(),
         })
+    }
+
+    /// Installs the host candidate artifact store.
+    ///
+    /// Candidate tools are exposed only to runs whose [`EngineStart`] carries
+    /// an [`ArtifactHandle`]. A candidate run started without this port fails
+    /// with an explicit unsupported capability before any tool is exposed.
+    /// Existing runs keep the port they captured.
+    pub fn set_artifact_port(&mut self, port: Box<dyn ArtifactPort + Send>) {
+        self.artifact_port = Some(SharedArtifactPort::new(port));
     }
 
     /// Replaces the default store-backed model-request gate.
@@ -242,6 +257,24 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
         }
         let model = model_for(&settings, &self.config.endpoints)?;
         let root = ProjectRoot::new(start.cwd().as_path())?;
+        let candidate = start.candidate_artifact().cloned();
+        if let Some(handle) = &candidate
+            && handle.project_id() != start.project_id()
+        {
+            return Err(CoreError::CrossProjectReference {
+                id_kind: herness_core::IdKind::Project,
+                expected: start.project_id(),
+                found: handle.project_id(),
+            });
+        }
+        let artifact_port = match &candidate {
+            Some(_) => Some(self.artifact_port.clone().ok_or(
+                CoreError::UnsupportedPortFeature {
+                    feature: PortFeature::ArtifactStore,
+                },
+            )?),
+            None => None,
+        };
         let audit = RunAuditMetadata {
             project_id: start.project_id(),
             agent_id: start.agent_id(),
@@ -250,6 +283,7 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             connection: start.connection(),
             cwd: start.cwd().clone(),
             instructions: start.instructions().to_owned(),
+            candidate: candidate.clone(),
         };
         let store = match (&restore, kind) {
             (Some(restore), RestoreKind::Continuation) => EngineStore::seeded(
@@ -280,7 +314,21 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             SystemLauncher,
             supervisor.clone(),
         )?;
-        let gateway = ToolGateway::new(HostExecutors { files, shell });
+        let candidates = match (&candidate, &artifact_port) {
+            (Some(handle), Some(port)) => Some(CandidateArtifactTools::new(
+                store.clone(),
+                start.agent_id(),
+                start.session_id(),
+                handle.clone(),
+                port.clone(),
+            )?),
+            _ => None,
+        };
+        let gateway = ToolGateway::new(HostExecutors {
+            files,
+            shell,
+            candidates,
+        });
         let control = permission
             .as_ref()
             .map(|context| context.control().clone())
@@ -295,6 +343,7 @@ impl<S: StorePort + Send + 'static> PiEngine<S> {
             queue: queue.clone(),
             stopping: AtomicBool::new(false),
             supervisor,
+            candidate,
         });
         let stream = Arc::new(StreamBridge::new(
             start.project_id(),
@@ -704,6 +753,10 @@ impl<S: StorePort + Send + 'static> EnginePort for PiEngine<S> {
             meta.cwd.clone(),
             meta.instructions.clone(),
         )?;
+        let start = match meta.candidate.clone() {
+            Some(candidate) => start.with_candidate_artifact(candidate),
+            None => start,
+        };
         let context = self.build_run(start, Some(parsed), RestoreKind::Resume, permission)?;
         self.runs.insert(*run, context);
         Ok(())
@@ -753,6 +806,9 @@ struct ToolRuntime<S> {
     queue: EventQueue,
     stopping: AtomicBool,
     supervisor: ProcessSupervisor,
+    /// Host-issued candidate handle. `Some` means this run exposes only the
+    /// candidate artifact tools.
+    candidate: Option<ArtifactHandle>,
 }
 
 impl<S: StorePort + Send + 'static> ToolRuntime<S> {
@@ -778,6 +834,13 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
     }
 
     fn tools(self: &Arc<Self>) -> Vec<Arc<dyn EmbeddedTool>> {
+        if let Some(handle) = &self.candidate {
+            return vec![
+                self.make_candidate_tool(ToolName::CandidateRead, handle.clone()),
+                self.make_candidate_tool(ToolName::CandidateWrite, handle.clone()),
+                self.make_candidate_tool(ToolName::CandidateEdit, handle.clone()),
+            ];
+        }
         vec![
             self.make_tool(ToolName::Read),
             self.make_tool(ToolName::Search),
@@ -788,7 +851,20 @@ impl<S: StorePort + Send + 'static> ToolRuntime<S> {
     }
 
     fn make_tool(self: &Arc<Self>, tool: ToolName) -> Arc<dyn EmbeddedTool> {
-        let declaration = declaration(tool);
+        let declaration = declaration(tool, None);
+        let runtime = Arc::clone(self);
+        Arc::new(FnTool::new(declaration, move |args, context| {
+            let runtime = Arc::clone(&runtime);
+            Box::pin(async move { runtime.execute_host_tool(tool, args, context).await })
+        }))
+    }
+
+    fn make_candidate_tool(
+        self: &Arc<Self>,
+        tool: ToolName,
+        handle: ArtifactHandle,
+    ) -> Arc<dyn EmbeddedTool> {
+        let declaration = declaration(tool, Some(&handle));
         let runtime = Arc::clone(self);
         Arc::new(FnTool::new(declaration, move |args, context| {
             let runtime = Arc::clone(&runtime);
@@ -1017,6 +1093,10 @@ fn side_effect_is_uncertain(error: &CoreError) -> bool {
             failure: FileFailure::Unverifiable { .. },
             ..
         } => true,
+        CoreError::ArtifactToolFailed {
+            failure: ArtifactFailure::Unverifiable { .. },
+            ..
+        } => true,
         CoreError::ShellToolFailed { failure, .. } => matches!(
             failure,
             ShellFailure::Unverifiable { .. }
@@ -1070,6 +1150,7 @@ fn map_status(status: SessionStatus) -> RunState {
 struct HostExecutors<S> {
     files: NativeFileTools<EngineStore<S>>,
     shell: BashExecutor<EngineStore<S>, SystemLauncher>,
+    candidates: Option<CandidateArtifactTools<EngineStore<S>, SharedArtifactPort>>,
 }
 
 #[derive(serde::Serialize)]
@@ -1077,12 +1158,21 @@ struct HostExecutors<S> {
 enum HostToolOutput {
     File(Box<FileToolOutput>),
     Shell(Box<herness_core::BashOutput>),
+    Candidate(Box<CandidateToolOutput>),
 }
 
 impl<S: StorePort> ToolExecutor for HostExecutors<S> {
     type Output = HostToolOutput;
 
     fn execute(&mut self, operation: &FrozenOperation) -> Result<Self::Output, CoreError> {
+        if let Some(candidates) = self.candidates.as_mut() {
+            // A candidate run exposes only the candidate tools. Any native
+            // file or shell operation is rejected by the candidate executor
+            // instead of reaching the formal project writer.
+            return candidates
+                .execute(operation)
+                .map(|output| HostToolOutput::Candidate(Box::new(output)));
+        }
         match operation.tool() {
             ToolName::Read | ToolName::Search | ToolName::Write | ToolName::Edit => self
                 .files
@@ -1092,11 +1182,16 @@ impl<S: StorePort> ToolExecutor for HostExecutors<S> {
                 .shell
                 .execute(operation)
                 .map(|output| HostToolOutput::Shell(Box::new(output))),
+            ToolName::CandidateRead | ToolName::CandidateWrite | ToolName::CandidateEdit => {
+                Err(CoreError::UnsupportedPortFeature {
+                    feature: PortFeature::ArtifactStore,
+                })
+            }
         }
     }
 }
 
-fn declaration(tool: ToolName) -> ToolDeclaration {
+fn declaration(tool: ToolName, handle: Option<&ArtifactHandle>) -> ToolDeclaration {
     let (description, parameters) = match tool {
         ToolName::Read => (
             "Read a UTF-8 file from the project. Paths are resolved under the project root.",
@@ -1166,6 +1261,57 @@ fn declaration(tool: ToolName) -> ToolDeclaration {
                 }
             }),
         ),
+        ToolName::CandidateRead => (
+            "Read an immutable document snapshot or the current candidate through the host-issued artifact handle. Project paths are not accepted.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["handle", "artifact"],
+                "properties": {
+                    "handle": artifact_handle_schema(handle),
+                    "artifact": {
+                        "type": "string",
+                        "enum": ["source_markdown", "existing_html", "shared_css", "candidate_html", "candidate_provenance"]
+                    }
+                }
+            }),
+        ),
+        ToolName::CandidateWrite => (
+            "Create or replace one candidate artifact through the host-issued artifact handle. Only candidate_html and candidate_provenance are writable. A non-empty rationale is required.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["handle", "artifact", "content", "rationale"],
+                "properties": {
+                    "handle": artifact_handle_schema(handle),
+                    "artifact": {
+                        "type": "string",
+                        "enum": ["candidate_html", "candidate_provenance"]
+                    },
+                    "content": {"type": "string"},
+                    "rationale": {"type": "string", "minLength": 1, "maxLength": 1000}
+                }
+            }),
+        ),
+        ToolName::CandidateEdit => (
+            "Edit one candidate artifact with an exact old/new text replacement through the host-issued artifact handle. Only candidate_html and candidate_provenance are writable. A non-empty rationale is required.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["handle", "artifact", "oldText", "newText", "rationale"],
+                "properties": {
+                    "handle": artifact_handle_schema(handle),
+                    "artifact": {
+                        "type": "string",
+                        "enum": ["candidate_html", "candidate_provenance"]
+                    },
+                    "oldText": {"type": "string"},
+                    "newText": {"type": "string"},
+                    "rationale": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "expectedVersion": {"type": "string", "minLength": 1}
+                }
+            }),
+        ),
     };
     ToolDeclaration {
         name: tool.as_str().to_owned(),
@@ -1179,6 +1325,34 @@ fn declaration(tool: ToolName) -> ToolDeclaration {
         effect: ToolEffect::Read,
         approval: false,
     }
+}
+
+fn artifact_handle_schema(handle: Option<&ArtifactHandle>) -> serde_json::Value {
+    let (project_id, job_id, generation, token) = match handle {
+        Some(handle) => (
+            serde_json::json!({"type": "string", "const": handle.project_id().to_string()}),
+            serde_json::json!({"type": "string", "const": handle.job_id()}),
+            serde_json::json!({"type": "integer", "const": handle.generation()}),
+            serde_json::json!({"type": "string", "const": handle.token()}),
+        ),
+        None => (
+            serde_json::json!({"type": "string"}),
+            serde_json::json!({"type": "string", "minLength": 1}),
+            serde_json::json!({"type": "integer", "minimum": 1}),
+            serde_json::json!({"type": "string", "minLength": 1}),
+        ),
+    };
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["projectId", "jobId", "generation", "token"],
+        "properties": {
+            "projectId": project_id,
+            "jobId": job_id,
+            "generation": generation,
+            "token": token
+        }
+    })
 }
 
 /// Schedules a future on `runtime` and waits for it without entering a nested
@@ -1224,9 +1398,45 @@ mod tests {
             ToolName::Bash,
         ]
         .into_iter()
-        .map(|tool| declaration(tool).name)
+        .map(|tool| declaration(tool, None).name)
         .collect();
         assert_eq!(names, vec!["read", "search", "write", "edit", "bash"]);
+    }
+
+    #[test]
+    fn candidate_declarations_bind_the_handle_and_list_only_candidate_slots() {
+        let project = ProjectId::new();
+        let handle = ArtifactHandle::new(project, "job-1", 3, "token-1").expect("handle");
+        let names: Vec<String> = [
+            ToolName::CandidateRead,
+            ToolName::CandidateWrite,
+            ToolName::CandidateEdit,
+        ]
+        .into_iter()
+        .map(|tool| declaration(tool, Some(&handle)).name)
+        .collect();
+        assert_eq!(
+            names,
+            vec!["candidate_read", "candidate_write", "candidate_edit"]
+        );
+
+        let write = declaration(ToolName::CandidateWrite, Some(&handle));
+        assert_eq!(
+            write.parameters["required"],
+            serde_json::json!(["handle", "artifact", "content", "rationale"])
+        );
+        assert_eq!(
+            write.parameters["properties"]["handle"]["properties"]["generation"]["const"],
+            3
+        );
+        assert_eq!(
+            write.parameters["properties"]["artifact"]["enum"],
+            serde_json::json!(["candidate_html", "candidate_provenance"])
+        );
+        assert!(
+            write.parameters["properties"].get("path").is_none(),
+            "candidate tools must not accept a project path"
+        );
     }
 
     #[test]
@@ -1250,14 +1460,14 @@ mod tests {
     #[test]
     fn write_and_bash_declarations_require_rationale_and_purpose() {
         assert_eq!(
-            declaration(ToolName::Write).parameters["required"],
+            declaration(ToolName::Write, None).parameters["required"],
             serde_json::json!(["path", "content", "rationale"])
         );
         assert_eq!(
-            declaration(ToolName::Bash).parameters["required"],
+            declaration(ToolName::Bash, None).parameters["required"],
             serde_json::json!(["command", "purpose"])
         );
-        assert!(!declaration(ToolName::Bash).approval);
-        assert_eq!(declaration(ToolName::Bash).effect, ToolEffect::Read);
+        assert!(!declaration(ToolName::Bash, None).approval);
+        assert_eq!(declaration(ToolName::Bash, None).effect, ToolEffect::Read);
     }
 }

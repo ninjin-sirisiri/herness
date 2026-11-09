@@ -15,18 +15,20 @@ use herness_core::runtime::{
     AgentSpec, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor, ToolExecution,
 };
 use herness_core::{
-    AbsolutePath, AgentId, AuthMethod, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
+    AbsolutePath, AgentId, ArtifactFailure, ArtifactHandle, ArtifactPort, ArtifactSlot,
+    ArtifactSnapshot, AuthMethod, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
     CheckpointPayload, ConnectionAdmin, ConnectionDirectory, ConnectionId, ConnectionSettings,
     ConversationFailure, CoreError, CredentialAvailability, CredentialKind, CredentialPort,
     CredentialService, CredentialVault, Endpoint, EngineEvent, EngineFailureKind, EngineInput,
-    EnginePort, EngineStart, EvaluationRequest, EvaluatorAvailability, FrozenOperation, GrantScope,
-    HistoryLimit, MatchMethod, ModelRequestGatePort, ModelRequestObservation, OperationOutcome,
-    PermissionDecision, PermissionEvaluatorPort, PermissionMode, PermissionPolicy, PermissionRule,
-    PolicyAdmin, ProjectId, Provider, RequestGateIntent, RequestGateOutcome, RequestGateRefusal,
-    RequestOutcome, ResolvedCredential, RuleTarget, RunControl, RunId, RunPermissionContext,
-    RunState, SecretString, SessionId, SharedPermissionEvaluator, SharedPolicy, StopReason,
-    StopReport, StoreFailureKind, StorePort, TokenCount, TokenUsage, ToolExecutor, ToolName,
-    VaultAccount, VaultFailure,
+    EnginePort, EngineStart, EvaluationRequest, EvaluatorAvailability, FileVersion,
+    FrozenOperation, GrantScope, HistoryLimit, HistoryQuery, MatchMethod, ModelRequestGatePort,
+    ModelRequestObservation, OperationOutcome, PermissionDecision, PermissionEvaluatorPort,
+    PermissionMode, PermissionPolicy, PermissionRule, PolicyAdmin, PortFeature, ProjectId,
+    Provider, RequestGateIntent, RequestGateOutcome, RequestGateRefusal, RequestOutcome,
+    ResolvedCredential, RuleTarget, RunControl, RunId, RunPermissionContext, RunState,
+    SecretString, SessionId, SharedPermissionEvaluator, SharedPolicy, StopReason, StopReport,
+    StoreFailureKind, StorePort, TokenCount, TokenUsage, ToolExecutor, ToolName, VaultAccount,
+    VaultFailure, ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, hash_bytes,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -590,6 +592,10 @@ impl Responses {
         }
     }
 
+    fn push(&self, response: MockResponse) {
+        self.items.lock().expect("responses").push_back(response);
+    }
+
     fn next(&self) -> MockResponse {
         self.items
             .lock()
@@ -901,6 +907,49 @@ fn engine_start_with_control(
     )
     .expect("engine start")
     .with_permission(permission);
+    (agent, session, run, start)
+}
+
+fn engine_start_candidate(
+    fixture: &Fixture,
+    instructions: &str,
+    handle: ArtifactHandle,
+) -> (AgentId, SessionId, RunId, EngineStart) {
+    engine_start_candidate_with_control(fixture, instructions, RunControl::new(), handle)
+}
+
+fn engine_start_candidate_with_control(
+    fixture: &Fixture,
+    instructions: &str,
+    control: RunControl,
+    handle: ArtifactHandle,
+) -> (AgentId, SessionId, RunId, EngineStart) {
+    let project = fixture.project_id;
+    let agent = AgentId::new(project);
+    let session = SessionId::new(project);
+    let run = RunId::new(project);
+    let cwd = AbsolutePath::new(fixture.project.to_string_lossy().into_owned()).expect("cwd");
+    let permission = RunPermissionContext::new(
+        project,
+        run,
+        GrantScope::for_candidate_run(project, &fixture.policy),
+        SharedPolicy::new(fixture.policy.clone()),
+        None,
+        control,
+    )
+    .expect("candidate permission context");
+    let start = EngineStart::new(
+        project,
+        agent,
+        session,
+        run,
+        fixture.connection,
+        cwd,
+        instructions,
+    )
+    .expect("candidate engine start")
+    .with_permission(permission)
+    .with_candidate_artifact(handle);
     (agent, session, run, start)
 }
 
@@ -2738,8 +2787,429 @@ fn chatgpt_inference_auth_failure_is_reported_without_success() {
 }
 
 // ---------------------------------------------------------------------------
-// H2 continuation and recovery gates
+// Candidate artifact runs
 // ---------------------------------------------------------------------------
+
+struct EngineArtifactPort {
+    handle: ArtifactHandle,
+    project: ProjectId,
+    store: Arc<Mutex<Store>>,
+    state: Arc<Mutex<EngineArtifactState>>,
+}
+
+#[derive(Debug, Default)]
+struct EngineArtifactState {
+    artifacts: BTreeMap<ArtifactSlot, ArtifactSnapshot>,
+    writes: usize,
+    intent_seen_before_write: bool,
+}
+
+impl EngineArtifactPort {
+    fn new(
+        handle: ArtifactHandle,
+        project: ProjectId,
+        store: Arc<Mutex<Store>>,
+    ) -> (Self, Arc<Mutex<EngineArtifactState>>) {
+        let state = Arc::new(Mutex::new(EngineArtifactState::default()));
+        (
+            Self {
+                handle,
+                project,
+                store,
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl ArtifactPort for EngineArtifactPort {
+    fn read_artifact(
+        &mut self,
+        handle: &ArtifactHandle,
+        artifact: ArtifactSlot,
+    ) -> Result<Option<ArtifactSnapshot>, ArtifactFailure> {
+        if handle != &self.handle {
+            return Err(ArtifactFailure::StaleHandle {
+                expected_generation: self.handle.generation(),
+                found_generation: handle.generation(),
+            });
+        }
+        Ok(self
+            .state
+            .lock()
+            .expect("artifact state")
+            .artifacts
+            .get(&artifact)
+            .cloned())
+    }
+
+    fn write_artifact(
+        &mut self,
+        handle: &ArtifactHandle,
+        artifact: ArtifactSlot,
+        content: &str,
+        expected_version: Option<&FileVersion>,
+    ) -> Result<ArtifactSnapshot, ArtifactFailure> {
+        if handle != &self.handle {
+            return Err(ArtifactFailure::StaleHandle {
+                expected_generation: self.handle.generation(),
+                found_generation: handle.generation(),
+            });
+        }
+        let mut state = self.state.lock().expect("artifact state");
+        let current = state.artifacts.get(&artifact).cloned();
+        if expected_version != current.as_ref().map(ArtifactSnapshot::version) {
+            return Err(ArtifactFailure::VersionConflict {
+                artifact,
+                expected: expected_version
+                    .cloned()
+                    .unwrap_or_else(|| FileVersion::new("absent").expect("version")),
+                actual: current
+                    .as_ref()
+                    .map(|snapshot| snapshot.version().clone())
+                    .unwrap_or_else(|| FileVersion::new("absent").expect("version")),
+            });
+        }
+        {
+            let store = self.store.lock().expect("store");
+            let pending = store.pending_operations(&self.project).expect("pending");
+            let intended = store
+                .history(HistoryQuery::first(self.project))
+                .expect("history")
+                .events()
+                .iter()
+                .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND);
+            state.intent_seen_before_write = !pending.is_empty() && intended;
+        }
+        let snapshot = ArtifactSnapshot::new(
+            artifact,
+            hash_bytes(content.as_bytes()),
+            content.to_owned(),
+        );
+        state.artifacts.insert(artifact, snapshot.clone());
+        state.writes += 1;
+        Ok(snapshot)
+    }
+}
+
+fn candidate_policy() -> PermissionPolicy {
+    let mut admin = PolicyAdmin::new();
+    for tool in [
+        ToolName::CandidateRead,
+        ToolName::CandidateWrite,
+        ToolName::CandidateEdit,
+    ] {
+        admin
+            .add_rule(
+                PermissionRule::allow(RuleTarget::Tool { tool }, MatchMethod::AnyInvocation)
+                    .expect("rule"),
+            )
+            .expect("rule");
+    }
+    admin.policy().clone()
+}
+
+fn candidate_fixture(
+    connection: ConnectionId,
+    responses: Responses,
+) -> (MockServer, Fixture) {
+    let server = MockServer::start({
+        let responses = responses.clone();
+        move |_request| responses.next()
+    });
+    let endpoints = ProviderEndpoints::for_loopback(format!("{}/v1", server.url()), server.url())
+        .expect("loopback");
+    let fixture = fixture_with_policy(
+        FixtureOptions {
+            provider: Provider::OpenAi,
+            model: "gpt-test",
+            auth: AuthMethod::ApiKey,
+            endpoint: None,
+            endpoints,
+            credentials: default_credentials(connection, "sk-candidate"),
+            connection_id: Some(connection),
+        },
+        candidate_policy(),
+    );
+    (server, fixture)
+}
+
+fn artifact_handle(fixture: &Fixture, generation: u64, token: &str) -> ArtifactHandle {
+    ArtifactHandle::new(fixture.project_id, "job-1", generation, token).expect("artifact handle")
+}
+
+fn candidate_write_call(
+    call_id: &str,
+    handle: &ArtifactHandle,
+    artifact: &str,
+    content: &str,
+    rationale: &str,
+) -> MockResponse {
+    responses_tool_call(
+        call_id,
+        &format!("fc_{call_id}"),
+        "candidate_write",
+        json!({
+            "handle": handle,
+            "artifact": artifact,
+            "content": content,
+            "rationale": rationale
+        }),
+    )
+}
+
+fn candidate_events(store: &Arc<Mutex<Store>>, project: ProjectId) -> Vec<herness_core::Event> {
+    store
+        .lock()
+        .expect("store")
+        .events_after(&project, None, HistoryLimit::new(500).expect("limit"))
+        .expect("events")
+}
+
+#[test]
+fn candidate_context_exposes_only_candidate_tools_and_applies_one_change() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(Vec::new());
+    let (server, mut fixture) = candidate_fixture(connection, responses.clone());
+    let handle = artifact_handle(&fixture, 2, "candidate-token");
+    let (port, state) = EngineArtifactPort::new(
+        handle.clone(),
+        fixture.project_id,
+        Arc::clone(&fixture.store),
+    );
+    fixture.engine.set_artifact_port(Box::new(port));
+    responses.push(candidate_write_call(
+        "call_candidate_write",
+        &handle,
+        "candidate_html",
+        "<html><body>candidate</body></html>",
+        "author the candidate",
+    ));
+    responses.push(responses_text("candidate written"));
+
+    let (_, _, run, start) =
+        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let event_store = Arc::clone(&fixture.store);
+    let event_project = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("author the candidate".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    assert_eq!(text_of(&events), "candidate written");
+
+    let state = state.lock().expect("artifact state");
+    assert_eq!(state.writes, 1);
+    assert!(
+        state.intent_seen_before_write,
+        "the intent and intended event must be committed before the host write"
+    );
+    assert_eq!(
+        state
+            .artifacts
+            .get(&ArtifactSlot::CandidateHtml)
+            .expect("candidate html")
+            .content(),
+        "<html><body>candidate</body></html>"
+    );
+    drop(state);
+
+    let stored = candidate_events(&event_store, event_project);
+    let intended = stored
+        .iter()
+        .find(|event| event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND)
+        .expect("intended event");
+    assert_eq!(
+        intended.payload().as_value()["rationale"],
+        "author the candidate"
+    );
+    assert_eq!(
+        intended.payload().as_value()["artifact"],
+        "candidate_html"
+    );
+    assert!(stored.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+            && event.payload().as_value()["rationale"] == "author the candidate"
+    }));
+    assert!(
+        fixture
+            .store
+            .lock()
+            .expect("store")
+            .pending_operations(&fixture.project_id)
+            .expect("pending")
+            .is_empty()
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "tool round trip plus final text");
+    let first = &requests[0].body;
+    assert!(first.contains("\"candidate_read\""));
+    assert!(first.contains("\"candidate_write\""));
+    assert!(first.contains("\"candidate_edit\""));
+    assert!(!first.contains("\"bash\""), "candidate runs must not expose shell");
+    assert!(!first.contains("\"write\""), "candidate runs must not expose native write");
+    assert!(!first.contains("\"edit\""), "candidate runs must not expose native edit");
+    assert!(!first.contains("\"read\""), "candidate runs must not expose native read");
+}
+
+#[test]
+fn candidate_context_rejects_forbidden_targets_and_empty_rationale_without_changes() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(Vec::new());
+    let (_, mut fixture) = candidate_fixture(connection, responses.clone());
+    let handle = artifact_handle(&fixture, 2, "candidate-token");
+    let stale = artifact_handle(&fixture, 1, "stale-token");
+    let (port, state) = EngineArtifactPort::new(
+        handle.clone(),
+        fixture.project_id,
+        Arc::clone(&fixture.store),
+    );
+    fixture.engine.set_artifact_port(Box::new(port));
+    responses.push(candidate_write_call(
+        "call_stale",
+        &stale,
+        "candidate_html",
+        "<html>stale</html>",
+        "stale handle",
+    ));
+    responses.push(candidate_write_call(
+        "call_formal",
+        &handle,
+        "source_markdown",
+        "# overwritten",
+        "formal target",
+    ));
+    responses.push(candidate_write_call(
+        "call_empty",
+        &handle,
+        "candidate_html",
+        "<html>empty reason</html>",
+        "   ",
+    ));
+    let foreign_project = ProjectId::new();
+    let foreign =
+        ArtifactHandle::new(foreign_project, "job-1", 2, "foreign-token").expect("foreign handle");
+    responses.push(candidate_write_call(
+        "call_foreign",
+        &foreign,
+        "candidate_html",
+        "<html>foreign</html>",
+        "other project",
+    ));
+    responses.push(responses_text("forbidden attempts rejected"));
+
+    let (_, _, run, start) =
+        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let event_store = Arc::clone(&fixture.store);
+    let event_project = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("try forbidden changes".to_owned()))
+        .expect("input");
+    let events = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+    assert_eq!(text_of(&events), "forbidden attempts rejected");
+
+    let state = state.lock().expect("artifact state");
+    assert_eq!(state.writes, 0);
+    assert!(state.artifacts.is_empty());
+    drop(state);
+    let stored = candidate_events(&event_store, event_project);
+    assert!(!stored.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+            || event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND
+    }));
+    assert!(
+        fixture
+            .store
+            .lock()
+            .expect("store")
+            .pending_operations(&fixture.project_id)
+            .expect("pending")
+            .is_empty()
+    );
+}
+
+#[test]
+fn candidate_context_rejects_a_stopped_run_before_the_artifact_write() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(Vec::new());
+    let (server, mut fixture) = candidate_fixture(connection, responses.clone());
+    let handle = artifact_handle(&fixture, 2, "candidate-token");
+    let (port, state) = EngineArtifactPort::new(
+        handle.clone(),
+        fixture.project_id,
+        Arc::clone(&fixture.store),
+    );
+    fixture.engine.set_artifact_port(Box::new(port));
+    responses.push(
+        candidate_write_call(
+            "call_stopped",
+            &handle,
+            "candidate_html",
+            "<html>late</html>",
+            "must not be applied",
+        )
+        .delayed(Duration::from_millis(300)),
+    );
+    responses.push(responses_text("late candidate"));
+    let control = RunControl::new();
+    let (_, _, run, start) = engine_start_candidate_with_control(
+        &fixture,
+        "You are a test agent.",
+        control,
+        handle,
+    );
+    let event_store = Arc::clone(&fixture.store);
+    let event_project = fixture.project_id;
+    let mut engine = fixture.engine;
+    engine.start(start).expect("start");
+    let _ = engine.poll_events(&run);
+    engine
+        .send_input(&run, EngineInput::Text("write a candidate".to_owned()))
+        .expect("input");
+    wait_for_requests(&server, 1);
+    let _ = engine
+        .request_stop(&run, StopReason::UserRequest)
+        .expect("stop");
+    let _ = collect_until_terminal(&mut engine, &run, Duration::from_secs(10));
+
+    let state = state.lock().expect("artifact state");
+    assert_eq!(state.writes, 0, "a stopped run must not apply a candidate");
+    assert!(state.artifacts.is_empty());
+    drop(state);
+    let stored = candidate_events(&event_store, event_project);
+    assert!(!stored.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+            || event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND
+    }));
+}
+
+#[test]
+fn candidate_context_without_a_host_port_fails_explicitly() {
+    let connection = ConnectionId::new();
+    let responses = Responses::new(Vec::new());
+    let (server, fixture) = candidate_fixture(connection, responses);
+    let handle = artifact_handle(&fixture, 1, "candidate-token");
+    let (_, _, _, start) =
+        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let mut engine = fixture.engine;
+    let error = engine.start(start).expect_err("missing artifact port");
+    assert_eq!(
+        error,
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::ArtifactStore
+        }
+    );
+    assert_eq!(server.request_count(), 0);
+}
+
+
 
 fn rewritten_checkpoint(
     checkpoint: &Checkpoint,

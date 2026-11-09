@@ -427,7 +427,8 @@ impl FromStr for SimpleCommand {
 /// Resolves an operation's file argument to a normalized absolute path.
 ///
 /// Search without an explicit path scopes to the frozen working directory.
-/// Bash has no file argument and returns `None`.
+/// Bash and candidate artifact tools have no project file argument and return
+/// `None`.
 pub(crate) fn operation_file_path(operation: &FrozenOperation) -> Option<AbsolutePath> {
     let raw = match operation.arguments() {
         ToolArguments::Read(arguments) => arguments.path.as_str(),
@@ -437,7 +438,10 @@ pub(crate) fn operation_file_path(operation: &FrozenOperation) -> Option<Absolut
             .map_or_else(|| operation.cwd().as_str(), |path| path.as_str()),
         ToolArguments::Write(arguments) => arguments.path.as_str(),
         ToolArguments::Edit(arguments) => arguments.path.as_str(),
-        ToolArguments::Bash(_) => return None,
+        ToolArguments::Bash(_)
+        | ToolArguments::CandidateRead(_)
+        | ToolArguments::CandidateWrite(_)
+        | ToolArguments::CandidateEdit(_) => return None,
     };
     resolve_path(operation.cwd(), raw)
 }

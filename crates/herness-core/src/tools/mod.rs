@@ -4,6 +4,7 @@
 pub mod arguments;
 #[cfg(unix)]
 pub mod bash;
+pub mod candidate;
 pub mod diff;
 pub mod edit;
 pub mod files;
@@ -21,7 +22,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use arguments::{
-    BashArgs, EditArgs, FileVersion, NonEmptyText, ReadArgs, SearchArgs, ToolArguments, WriteArgs,
+    BashArgs, CandidateEditArgs, CandidateReadArgs, CandidateWriteArgs, EditArgs, FileVersion,
+    MAX_CANDIDATE_ARTIFACT_BYTES, NonEmptyText, ReadArgs, SearchArgs, ToolArguments, WriteArgs,
 };
 #[cfg(unix)]
 pub use bash::{
@@ -32,6 +34,10 @@ pub use diff::{FileDiff, MAX_DIFF_BYTES};
 pub use files::{
     FILE_CHANGE_EVENT_KIND, FILE_CHANGE_INTENDED_EVENT_KIND, FileChange, FileLockGuard,
     FileLockRegistry, FileToolOutput, NativeFileTools, hash_bytes,
+};
+pub use candidate::{
+    ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, CandidateArtifactTools,
+    CandidateChange, CandidateReadOutput, CandidateToolOutput,
 };
 pub use gateway::{GatewayError, ToolExecutor, ToolGateway};
 pub use path::{ProjectRoot, ResolvedPath};
@@ -50,7 +56,7 @@ pub use search::{
     SearchMatch, SearchOutput, glob_matches,
 };
 
-/// The five native tools available in H1.
+/// The native and candidate tool names understood by H1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
@@ -64,6 +70,12 @@ pub enum ToolName {
     Edit,
     /// Run a managed shell command.
     Bash,
+    /// Read an immutable snapshot or current candidate artifact.
+    CandidateRead,
+    /// Create or replace a candidate artifact.
+    CandidateWrite,
+    /// Edit an existing candidate artifact.
+    CandidateEdit,
 }
 
 impl ToolName {
@@ -75,17 +87,31 @@ impl ToolName {
             Self::Write => "write",
             Self::Edit => "edit",
             Self::Bash => "bash",
+            Self::CandidateRead => "candidate_read",
+            Self::CandidateWrite => "candidate_write",
+            Self::CandidateEdit => "candidate_edit",
         }
     }
 
     /// Whether this tool requires a file-level rationale.
     pub const fn requires_rationale(self) -> bool {
-        matches!(self, Self::Write | Self::Edit)
+        matches!(
+            self,
+            Self::Write | Self::Edit | Self::CandidateWrite | Self::CandidateEdit
+        )
     }
 
     /// Whether this tool requires a command-level purpose.
     pub const fn requires_purpose(self) -> bool {
         matches!(self, Self::Bash)
+    }
+
+    /// Whether this tool belongs to the candidate artifact context.
+    pub const fn is_candidate(self) -> bool {
+        matches!(
+            self,
+            Self::CandidateRead | Self::CandidateWrite | Self::CandidateEdit
+        )
     }
 }
 

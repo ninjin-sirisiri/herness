@@ -2864,6 +2864,9 @@ fn parse_tool(value: &str) -> Option<ToolName> {
         "write" => Some(ToolName::Write),
         "edit" => Some(ToolName::Edit),
         "bash" => Some(ToolName::Bash),
+        "candidate_read" => Some(ToolName::CandidateRead),
+        "candidate_write" => Some(ToolName::CandidateWrite),
+        "candidate_edit" => Some(ToolName::CandidateEdit),
         _ => None,
     }
 }
@@ -2888,6 +2891,9 @@ mod tests {
             ToolName::Write,
             ToolName::Edit,
             ToolName::Bash,
+            ToolName::CandidateRead,
+            ToolName::CandidateWrite,
+            ToolName::CandidateEdit,
         ] {
             assert_eq!(parse_tool(tool.as_str()), Some(tool));
         }

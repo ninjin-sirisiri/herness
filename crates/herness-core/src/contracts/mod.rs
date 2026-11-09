@@ -1,5 +1,6 @@
 //! Host-owned public contract values.
 
+pub mod artifact;
 pub mod checkpoint;
 pub mod connection;
 pub mod errors;
@@ -15,6 +16,7 @@ pub mod shell;
 pub mod time;
 pub mod version;
 
+pub use artifact::{ArtifactHandle, ArtifactSlot, ArtifactSnapshot};
 pub use checkpoint::{Checkpoint, CheckpointFormatVersion, CheckpointPayload};
 pub use connection::{
     AuthMethod, ConnectionCapabilities, ConnectionCapabilityDeclaration, ConnectionId,
@@ -22,9 +24,9 @@ pub use connection::{
     InputModality, Provider,
 };
 pub use errors::{
-    ArgumentViolation, ConversationFailure, CoreError, CredentialFailureKind, EngineFailureKind,
-    EvaluationFailureKind, FileFailure, PathViolation, PortFeature, ProviderFailureKind,
-    ShellFailure, StoreFailureKind,
+    ArgumentViolation, ArtifactFailure, ConversationFailure, CoreError, CredentialFailureKind,
+    EngineFailureKind, EvaluationFailureKind, FileFailure, PathViolation, PortFeature,
+    ProviderFailureKind, ShellFailure, StoreFailureKind,
 };
 pub use events::{
     Event, EventDraft, EventKind, EventPayload, EventSubject, HostActivitySubject, RunSubject,

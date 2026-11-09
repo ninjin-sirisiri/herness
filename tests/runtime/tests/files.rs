@@ -4,9 +4,10 @@
 //! application-data root, and the public `ToolGateway` boundary. No engine,
 //! Tauri, network, or real credential is involved.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use herness_core::*;
@@ -243,8 +244,8 @@ fn execute_through_gateway(
         })
 }
 
-fn expect_allow(
-    gateway: &mut ToolGateway<NativeFileTools<Store>>,
+fn expect_allow<E: ToolExecutor>(
+    gateway: &mut ToolGateway<E>,
     policy: &PermissionPolicy,
     grant: &GrantScope,
     operation: &FrozenOperation,
@@ -1151,4 +1152,730 @@ fn a_read_grant_is_not_a_write_grant_for_the_sdd_pack() {
 
     // The read authorization is independent and was not consumed by the write.
     let _ = read_authorization;
+}
+
+// ---------------------------------------------------------------------------
+// Candidate-only artifact tools
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct TestArtifactState {
+    artifacts: BTreeMap<ArtifactSlot, ArtifactSnapshot>,
+    writes: usize,
+    intent_seen_before_write: bool,
+}
+
+struct TestArtifactPort {
+    handle: ArtifactHandle,
+    project: ProjectId,
+    inspect_store: Option<Store>,
+    state: Arc<Mutex<TestArtifactState>>,
+}
+
+impl std::fmt::Debug for TestArtifactPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestArtifactPort")
+            .field("handle", &self.handle)
+            .field("project", &self.project)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestArtifactPort {
+    fn new(
+        handle: ArtifactHandle,
+        project: ProjectId,
+        inspect_store: Option<Store>,
+    ) -> (Self, Arc<Mutex<TestArtifactState>>) {
+        let state = Arc::new(Mutex::new(TestArtifactState::default()));
+        (
+            Self {
+                handle,
+                project,
+                inspect_store,
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+
+    fn seed(&mut self, artifact: ArtifactSlot, content: &str) {
+        self.state.lock().expect("state").artifacts.insert(
+            artifact,
+            ArtifactSnapshot::new(
+                artifact,
+                hash_bytes(content.as_bytes()),
+                content.to_owned(),
+            ),
+        );
+    }
+}
+
+impl ArtifactPort for TestArtifactPort {
+    fn read_artifact(
+        &mut self,
+        handle: &ArtifactHandle,
+        artifact: ArtifactSlot,
+    ) -> Result<Option<ArtifactSnapshot>, ArtifactFailure> {
+        if handle != &self.handle {
+            return Err(ArtifactFailure::StaleHandle {
+                expected_generation: self.handle.generation(),
+                found_generation: handle.generation(),
+            });
+        }
+        Ok(self
+            .state
+            .lock()
+            .expect("state")
+            .artifacts
+            .get(&artifact)
+            .cloned())
+    }
+
+    fn write_artifact(
+        &mut self,
+        handle: &ArtifactHandle,
+        artifact: ArtifactSlot,
+        content: &str,
+        expected_version: Option<&FileVersion>,
+    ) -> Result<ArtifactSnapshot, ArtifactFailure> {
+        if handle != &self.handle {
+            return Err(ArtifactFailure::StaleHandle {
+                expected_generation: self.handle.generation(),
+                found_generation: handle.generation(),
+            });
+        }
+        if !artifact.is_candidate() {
+            return Err(ArtifactFailure::NotCandidateTarget { artifact });
+        }
+        let mut state = self.state.lock().expect("state");
+        let current = state.artifacts.get(&artifact).cloned();
+        if expected_version != current.as_ref().map(ArtifactSnapshot::version) {
+            return Err(ArtifactFailure::VersionConflict {
+                artifact,
+                expected: expected_version.cloned().unwrap_or_else(|| {
+                    FileVersion::new("absent").expect("placeholder version")
+                }),
+                actual: current
+                    .as_ref()
+                    .map(|snapshot| snapshot.version().clone())
+                    .unwrap_or_else(|| FileVersion::new("absent").expect("placeholder version")),
+            });
+        }
+        if let Some(store) = &self.inspect_store {
+            let pending = store
+                .pending_operations(&self.project)
+                .expect("pending operations");
+            let intended = store
+                .history(HistoryQuery::first(self.project))
+                .expect("history")
+                .events()
+                .iter()
+                .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND);
+            state.intent_seen_before_write = !pending.is_empty() && intended;
+        }
+        let snapshot = ArtifactSnapshot::new(
+            artifact,
+            hash_bytes(content.as_bytes()),
+            content.to_owned(),
+        );
+        state.artifacts.insert(artifact, snapshot.clone());
+        state.writes += 1;
+        Ok(snapshot)
+    }
+}
+
+fn allow_candidate_tools(harness: &mut Harness) {
+    for tool in [
+        ToolName::CandidateRead,
+        ToolName::CandidateWrite,
+        ToolName::CandidateEdit,
+    ] {
+        harness.allow_tool(tool);
+    }
+}
+
+fn candidate_grant(harness: &Harness, policy: &PermissionPolicy) -> GrantScope {
+    GrantScope::for_candidate_run(harness.fixture.project_id, policy)
+}
+
+fn candidate_write_op(
+    harness: &Harness,
+    handle: &ArtifactHandle,
+    artifact: ArtifactSlot,
+    content: &str,
+    rationale: &str,
+) -> FrozenOperation {
+    harness.freeze(
+        ToolName::CandidateWrite,
+        ToolArguments::CandidateWrite(CandidateWriteArgs {
+            handle: handle.clone(),
+            artifact,
+            content: content.to_owned(),
+            rationale: Rationale::new(rationale).expect("rationale"),
+        }),
+    )
+}
+
+fn candidate_edit_op(
+    harness: &Harness,
+    handle: &ArtifactHandle,
+    artifact: ArtifactSlot,
+    old_text: &str,
+    new_text: &str,
+    rationale: &str,
+    expected_version: Option<FileVersion>,
+) -> FrozenOperation {
+    harness.freeze(
+        ToolName::CandidateEdit,
+        ToolArguments::CandidateEdit(CandidateEditArgs {
+            handle: handle.clone(),
+            artifact,
+            old_text: old_text.to_owned(),
+            new_text: new_text.to_owned(),
+            rationale: Rationale::new(rationale).expect("rationale"),
+            expected_version,
+        }),
+    )
+}
+
+fn candidate_read_op(
+    harness: &Harness,
+    handle: &ArtifactHandle,
+    artifact: ArtifactSlot,
+) -> FrozenOperation {
+    harness.freeze(
+        ToolName::CandidateRead,
+        ToolArguments::CandidateRead(CandidateReadArgs {
+            handle: handle.clone(),
+            artifact,
+        }),
+    )
+}
+
+fn expect_artifact_failure(error: CoreError) -> (ToolName, ArtifactFailure) {
+    match error {
+        CoreError::ArtifactToolFailed { tool, failure } => (tool, failure),
+        other => panic!("expected a candidate artifact failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn candidate_write_and_edit_persist_intent_before_the_host_artifact_change() {
+    let mut harness = Harness::new();
+    allow_candidate_tools(&mut harness);
+    let policy = harness.policy();
+    let grant = candidate_grant(&harness, &policy);
+    let handle = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        2,
+        "capability-token",
+    )
+    .expect("handle");
+    let (port, state) =
+        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, Some(harness.store()));
+    let mut gateway = ToolGateway::new(
+        CandidateArtifactTools::new(
+            harness.store(),
+            harness.fixture.agent_id,
+            harness.fixture.session_id,
+            handle.clone(),
+            port,
+        )
+        .expect("candidate executor"),
+    );
+
+    let write = candidate_write_op(
+        &harness,
+        &handle,
+        ArtifactSlot::CandidateHtml,
+        "<html><body>v1</body></html>",
+        "author the first candidate",
+    );
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &write);
+    let output = gateway
+        .execute(&policy, &write, &authorization)
+        .expect("candidate write");
+    let change = match output {
+        CandidateToolOutput::Change(change) => *change,
+        other => panic!("expected a candidate change, got {other:?}"),
+    };
+    assert!(change.created());
+    assert_eq!(change.artifact(), ArtifactSlot::CandidateHtml);
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .artifacts
+            .get(&ArtifactSlot::CandidateHtml)
+            .expect("candidate")
+            .content(),
+        "<html><body>v1</body></html>"
+    );
+    assert!(
+        state.lock().expect("state").intent_seen_before_write,
+        "the intent and intended event must be durable before the host write"
+    );
+
+    let stored_events = events(gateway.executor().store(), harness.fixture.project_id);
+    let intended =
+        event_of_kind(&stored_events, ARTIFACT_CHANGE_INTENDED_EVENT_KIND).expect("intended");
+    assert_eq!(
+        intended.payload().as_value()["rationale"],
+        "author the first candidate"
+    );
+    assert_eq!(intended.payload().as_value()["artifact"], "candidate_html");
+    assert!(event_of_kind(&stored_events, ARTIFACT_CHANGE_EVENT_KIND).is_some());
+    let record = operation_record(gateway.executor().store(), write.operation_id()).expect("record");
+    assert_eq!(
+        record.result().expect("result").outcome(),
+        OperationOutcome::Applied
+    );
+    assert!(
+        gateway
+            .executor()
+            .store()
+            .pending_operations(&harness.fixture.project_id)
+            .expect("pending")
+            .is_empty()
+    );
+
+    let edit = candidate_edit_op(
+        &harness,
+        &handle,
+        ArtifactSlot::CandidateHtml,
+        "v1",
+        "v2",
+        "revise the candidate",
+        Some(change.after_version().clone()),
+    );
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &edit);
+    let output = gateway
+        .execute(&policy, &edit, &authorization)
+        .expect("candidate edit");
+    let changed = match output {
+        CandidateToolOutput::Change(change) => *change,
+        other => panic!("expected a candidate change, got {other:?}"),
+    };
+    assert!(!changed.created());
+    assert_eq!(
+        changed.before_version().expect("before"),
+        change.after_version()
+    );
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .artifacts
+            .get(&ArtifactSlot::CandidateHtml)
+            .expect("candidate")
+            .content(),
+        "<html><body>v2</body></html>"
+    );
+    let stored_events = events(gateway.executor().store(), harness.fixture.project_id);
+    assert!(stored_events.iter().filter(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+    }).count() >= 2);
+    assert!(stored_events.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+            && event.payload().as_value()["rationale"] == "revise the candidate"
+    }));
+}
+
+#[test]
+fn candidate_read_returns_immutable_snapshots_and_current_candidates() {
+    let mut harness = Harness::new();
+    allow_candidate_tools(&mut harness);
+    let policy = harness.policy();
+    let grant = candidate_grant(&harness, &policy);
+    let handle = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        2,
+        "capability-token",
+    )
+    .expect("handle");
+    let (mut port, state) =
+        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, None);
+    port.seed(ArtifactSlot::SourceMarkdown, "# Source\n");
+    port.seed(ArtifactSlot::ExistingHtml, "<html>old</html>");
+    let mut gateway = ToolGateway::new(
+        CandidateArtifactTools::new(
+            harness.store(),
+            harness.fixture.agent_id,
+            harness.fixture.session_id,
+            handle.clone(),
+            port,
+        )
+        .expect("candidate executor"),
+    );
+
+    let read = candidate_read_op(&harness, &handle, ArtifactSlot::SourceMarkdown);
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &read);
+    let output = gateway
+        .execute(&policy, &read, &authorization)
+        .expect("snapshot read");
+    let CandidateToolOutput::Read(read_output) = output else {
+        panic!("expected a candidate read");
+    };
+    assert_eq!(read_output.artifact(), ArtifactSlot::SourceMarkdown);
+    assert_eq!(read_output.content(), "# Source\n");
+    assert_eq!(state.lock().expect("state").writes, 0);
+
+    let missing = candidate_read_op(&harness, &handle, ArtifactSlot::CandidateHtml);
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &missing);
+    let error = gateway
+        .execute(&policy, &missing, &authorization)
+        .expect_err("missing candidate");
+    let (tool, failure) = expect_artifact_failure(executor_error(error));
+    assert_eq!(tool, ToolName::CandidateRead);
+    assert_eq!(
+        failure,
+        ArtifactFailure::NotFound {
+            artifact: ArtifactSlot::CandidateHtml
+        }
+    );
+}
+
+#[test]
+fn candidate_write_and_edit_reject_formal_or_snapshot_targets_at_schema() {
+    let handle = ArtifactHandle::new(ProjectId::new(), "job", 1, "token").expect("handle");
+    for artifact in [
+        ArtifactSlot::SourceMarkdown,
+        ArtifactSlot::ExistingHtml,
+        ArtifactSlot::SharedCss,
+    ] {
+        let json = serde_json::json!({
+            "tool": "candidate_write",
+            "arguments": {
+                "handle": &handle,
+                "artifact": &artifact,
+                "content": "x",
+                "rationale": "must not be accepted"
+            }
+        });
+        let error = serde_json::from_value::<ToolArguments>(json)
+            .expect_err("formal target must not deserialize");
+        assert!(
+            error.to_string().contains("candidate_html"),
+            "unexpected error: {error}"
+        );
+
+        let project = handle.project_id();
+        let operation = FrozenOperation::new(
+            OperationId::new(project),
+            RunId::new(project),
+            ToolName::CandidateWrite,
+            ToolArguments::CandidateWrite(CandidateWriteArgs {
+                handle: handle.clone(),
+                artifact,
+                content: "x".to_owned(),
+                rationale: Rationale::new("must not be accepted").expect("rationale"),
+            }),
+            AbsolutePath::new("/tmp/project").expect("absolute"),
+            PolicyVersion::INITIAL,
+            PermissionMode::Configured,
+        );
+        assert!(operation.is_err(), "formal target must not freeze");
+    }
+
+    let edit_json = serde_json::json!({
+        "tool": "candidate_edit",
+        "arguments": {
+            "handle": &handle,
+            "artifact": "shared_css",
+            "oldText": "a",
+            "newText": "b",
+            "rationale": "must not be accepted"
+        }
+    });
+    assert!(serde_json::from_value::<ToolArguments>(edit_json).is_err());
+}
+
+#[test]
+fn candidate_empty_rationale_is_rejected_before_any_side_effect() {
+    let handle = ArtifactHandle::new(ProjectId::new(), "job", 1, "token").expect("handle");
+    for rationale in ["", "   ", "\n\t"] {
+        let json = serde_json::json!({
+            "tool": "candidate_write",
+            "arguments": {
+                "handle": &handle,
+                "artifact": "candidate_html",
+                "content": "<html></html>",
+                "rationale": rationale
+            }
+        });
+        let error =
+            serde_json::from_value::<ToolArguments>(json).expect_err("empty rationale must fail");
+        assert!(
+            error.to_string().contains("invalid rationale"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn candidate_executor_rejects_stale_handles_other_projects_and_shell_before_persistence() {
+    let mut harness = Harness::new();
+    allow_candidate_tools(&mut harness);
+    harness.allow_tool(ToolName::Bash);
+    let policy = harness.policy();
+    let current = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        2,
+        "current-token",
+    )
+    .expect("current handle");
+    let (port, state) =
+        TestArtifactPort::new(current.clone(), harness.fixture.project_id, Some(harness.store()));
+    let mut gateway = ToolGateway::new(
+        CandidateArtifactTools::new(
+            harness.store(),
+            harness.fixture.agent_id,
+            harness.fixture.session_id,
+            current.clone(),
+            port,
+        )
+        .expect("candidate executor"),
+    );
+
+    let stale = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        1,
+        "stale-token",
+    )
+    .expect("stale handle");
+    let stale_write = candidate_write_op(
+        &harness,
+        &stale,
+        ArtifactSlot::CandidateHtml,
+        "<html>stale</html>",
+        "stale generation",
+    );
+    let authorization = expect_allow(
+        &mut gateway,
+        &policy,
+        &candidate_grant(&harness, &policy),
+        &stale_write,
+    );
+    let error = gateway
+        .execute(&policy, &stale_write, &authorization)
+        .expect_err("stale handle");
+    let (tool, failure) = expect_artifact_failure(executor_error(error));
+    assert_eq!(tool, ToolName::CandidateWrite);
+    assert_eq!(
+        failure,
+        ArtifactFailure::StaleHandle {
+            expected_generation: 2,
+            found_generation: 1
+        }
+    );
+    assert_eq!(state.lock().expect("state").writes, 0);
+
+    let other_project = ProjectFixture::new();
+    let foreign = ArtifactHandle::new(other_project.project_id, "job-1", 2, "foreign-token")
+        .expect("foreign handle");
+    let foreign_write = candidate_write_op(
+        &harness,
+        &foreign,
+        ArtifactSlot::CandidateHtml,
+        "<html>foreign</html>",
+        "foreign project",
+    );
+    let authorization = expect_allow(
+        &mut gateway,
+        &policy,
+        &candidate_grant(&harness, &policy),
+        &foreign_write,
+    );
+    let error = gateway
+        .execute(&policy, &foreign_write, &authorization)
+        .expect_err("foreign project");
+    assert!(matches!(
+        executor_error(error),
+        CoreError::CrossProjectReference {
+            id_kind: IdKind::Project,
+            ..
+        }
+    ));
+
+    let bash = harness.freeze(
+        ToolName::Bash,
+        ToolArguments::Bash(BashArgs {
+            command: NonEmptyText::new("printf 'shell' > formal.html").expect("command"),
+            purpose: Purpose::new("forbidden candidate shell").expect("purpose"),
+            timeout_ms: None,
+        }),
+    );
+    let shell_grant = GrantScope::new(
+        harness.fixture.project_id,
+        vec![
+            PermissionRule::allow(
+                RuleTarget::Tool {
+                    tool: ToolName::Bash,
+                },
+                MatchMethod::AnyInvocation,
+            )
+            .expect("bash rule"),
+        ],
+        policy.mode(),
+        policy.version(),
+    )
+    .expect("shell grant");
+    let authorization = expect_allow(&mut gateway, &policy, &shell_grant, &bash);
+    let error = gateway
+        .execute(&policy, &bash, &authorization)
+        .expect_err("shell in candidate context");
+    let (tool, failure) = expect_artifact_failure(executor_error(error));
+    assert_eq!(tool, ToolName::Bash);
+    assert_eq!(
+        failure,
+        ArtifactFailure::ToolNotAllowed {
+            tool: ToolName::Bash
+        }
+    );
+    assert_eq!(state.lock().expect("state").writes, 0);
+    assert!(!harness.path("formal.html").exists());
+
+    let events = events(gateway.executor().store(), harness.fixture.project_id);
+    assert!(!events.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
+            || event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND
+    }));
+    assert!(
+        gateway
+            .executor()
+            .store()
+            .pending_operations(&harness.fixture.project_id)
+            .expect("pending")
+            .is_empty()
+    );
+}
+
+#[test]
+fn candidate_edit_rejects_version_conflicts_and_non_unique_text_before_intent() {
+    let mut harness = Harness::new();
+    allow_candidate_tools(&mut harness);
+    let policy = harness.policy();
+    let grant = candidate_grant(&harness, &policy);
+    let handle = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        2,
+        "capability-token",
+    )
+    .expect("handle");
+    let (mut port, state) =
+        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, Some(harness.store()));
+    port.seed(ArtifactSlot::CandidateHtml, "<html>same same</html>");
+    let mut gateway = ToolGateway::new(
+        CandidateArtifactTools::new(
+            harness.store(),
+            harness.fixture.agent_id,
+            harness.fixture.session_id,
+            handle.clone(),
+            port,
+        )
+        .expect("candidate executor"),
+    );
+
+    let stale_version = candidate_edit_op(
+        &harness,
+        &handle,
+        ArtifactSlot::CandidateHtml,
+        "same",
+        "different",
+        "version conflict",
+        Some(FileVersion::new("0000").expect("version")),
+    );
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &stale_version);
+    let error = gateway
+        .execute(&policy, &stale_version, &authorization)
+        .expect_err("version conflict");
+    let (_, failure) = expect_artifact_failure(executor_error(error));
+    assert!(matches!(
+        failure,
+        ArtifactFailure::VersionConflict {
+            artifact: ArtifactSlot::CandidateHtml,
+            ..
+        }
+    ));
+
+    let non_unique = candidate_edit_op(
+        &harness,
+        &handle,
+        ArtifactSlot::CandidateHtml,
+        "same",
+        "different",
+        "non-unique text",
+        None,
+    );
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &non_unique);
+    let error = gateway
+        .execute(&policy, &non_unique, &authorization)
+        .expect_err("non-unique old text");
+    let (_, failure) = expect_artifact_failure(executor_error(error));
+    assert_eq!(
+        failure,
+        ArtifactFailure::EditTextNotUnique {
+            artifact: ArtifactSlot::CandidateHtml,
+            occurrences: 2
+        }
+    );
+    assert_eq!(state.lock().expect("state").writes, 0);
+    let events = events(gateway.executor().store(), harness.fixture.project_id);
+    assert!(!events.iter().any(|event| {
+        event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND
+    }));
+}
+
+#[test]
+fn unwired_candidate_capability_is_explicitly_unsupported() {
+    let mut harness = Harness::new();
+    allow_candidate_tools(&mut harness);
+    let policy = harness.policy();
+    let grant = candidate_grant(&harness, &policy);
+    let handle = ArtifactHandle::new(
+        harness.fixture.project_id,
+        "job-1",
+        1,
+        "capability-token",
+    )
+    .expect("handle");
+    let mut gateway = ToolGateway::new(
+        CandidateArtifactTools::new(
+            harness.store(),
+            harness.fixture.agent_id,
+            harness.fixture.session_id,
+            handle.clone(),
+            UnavailableArtifactPort,
+        )
+        .expect("candidate executor"),
+    );
+    let write = candidate_write_op(
+        &harness,
+        &handle,
+        ArtifactSlot::CandidateHtml,
+        "<html></html>",
+        "unavailable store",
+    );
+    let authorization = expect_allow(&mut gateway, &policy, &grant, &write);
+    let error = gateway
+        .execute(&policy, &write, &authorization)
+        .expect_err("unavailable artifact store");
+    assert_eq!(
+        executor_error(error),
+        CoreError::UnsupportedPortFeature {
+            feature: PortFeature::ArtifactStore
+        }
+    );
+    let events = events(gateway.executor().store(), harness.fixture.project_id);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND)
+    );
 }

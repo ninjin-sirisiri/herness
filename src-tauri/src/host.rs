@@ -20,9 +20,9 @@ use herness_core::{
     ConnectionDirectory, ConnectionSettings, CoreError, EventDraft, FileLockRegistry,
     FileObservation, FileToolOutput, FrozenOperation, HistoryPage, HistoryQuery,
     ModelRequestObservation, NativeFileTools, OperationEvidence, OperationId, OperationIntent,
-    OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, ProcessSupervisor, ProjectId,
-    ProjectRoot, RequestGateIntent, RunId, SharedPermissionEvaluator, StorePort, Timestamp,
-    ToolExecutor, ToolName,
+    OperationRecord, OperationResult, PermissionPolicy, PolicyAdmin, PortFeature,
+    ProcessSupervisor, ProjectId, ProjectRoot, RequestGateIntent, RunId, SharedPermissionEvaluator,
+    StorePort, Timestamp, ToolExecutor, ToolName,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -972,6 +972,14 @@ impl ToolExecutor for DesktopToolExecutor {
                 let evidence = OperationEvidence::empty().with_shell(output.observation().clone());
                 let summary = serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
                 Ok(ToolExecution::new(output.outcome(), evidence, summary))
+            }
+            ToolName::CandidateRead | ToolName::CandidateWrite | ToolName::CandidateEdit => {
+                // This desktop composition does not install a host artifact
+                // port. An explicit unsupported capability is required; never
+                // fabricate an empty candidate success.
+                Err(CoreError::UnsupportedPortFeature {
+                    feature: PortFeature::ArtifactStore,
+                })
             }
         }
     }
