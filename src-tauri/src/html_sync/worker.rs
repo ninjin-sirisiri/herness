@@ -144,6 +144,13 @@ impl HtmlSyncWorker {
         self.coordinator.active_generation()
     }
 
+    /// Project with the active authoring slot, when one exists.
+    pub fn active_project(&self) -> Option<ProjectId> {
+        self.coordinator
+            .active_owner()
+            .map(|owner| owner.job().project_id())
+    }
+
     /// Documents in dirty notification order.
     pub fn queued_documents(&self) -> Vec<DocumentKey> {
         self.coordinator.queued_documents()
@@ -152,6 +159,46 @@ impl HtmlSyncWorker {
     /// The current latch for one document, when observed by this process.
     pub fn latch(&self, document: &DocumentKey) -> Option<&herness_html_sync::HeldAuthoring> {
         self.coordinator.latch(document)
+    }
+
+    /// Restores the durable job identity of an already bound project.
+    pub fn restore_job_id(
+        &mut self,
+        project: ProjectId,
+        job_id: herness_html_sync::JobId,
+    ) -> Result<(), H3Error> {
+        let job = self.jobs.get(&project).cloned().ok_or_else(|| H3Error::NotFound {
+            record: "authoring job",
+            id: project.to_string(),
+        })?;
+        let job = job.with_durable_job_id(job_id)?;
+        self.jobs.insert(project, job.clone());
+        self.coordinator.bind_job(job);
+        Ok(())
+    }
+
+    /// Seeds one persisted latch after a restart.
+    ///
+    /// This never queues, starts, sends, or clears anything. A later human
+    /// resume/reassess must call [`Self::clear_latch`]; a new notification is
+    /// still held until then.
+    pub fn seed_latch(
+        &mut self,
+        document: DocumentKey,
+        latch: Option<CycleLatch>,
+        detail: impl Into<String>,
+    ) {
+        self.coordinator
+            .seed_latch(herness_html_sync::HeldAuthoring {
+                document,
+                latch,
+                detail: detail.into(),
+            });
+    }
+
+    /// Clears one latch after an explicit human resume.
+    pub fn clear_latch(&mut self, document: &DocumentKey) -> bool {
+        self.coordinator.clear_latch(document).is_some()
     }
 
     /// Runs one app-wide authoring pass.

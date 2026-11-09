@@ -152,6 +152,16 @@ impl AuthoringJob {
         })
     }
 
+    /// Restores the durable H3 job identity from a stored generation.
+    ///
+    /// A restart must not hallucinate a new job identity for work that already
+    /// has a generation. The host supplies the exact stored [`JobId`].
+    pub fn with_durable_job_id(mut self, job: JobId) -> Result<Self, H3Error> {
+        job.validate_in(self.project_id)?;
+        self.job = job;
+        Ok(self)
+    }
+
     /// Adds the caller-supplied CSS/resource dependency set.
     ///
     /// The host supplies the same canonical paths the observer uses. The
@@ -1120,6 +1130,30 @@ impl SyncCoordinator {
     /// Current latch for a document, when one was observed in this process.
     pub fn latch(&self, document: &DocumentKey) -> Option<&HeldAuthoring> {
         self.latches.get(&(document.project_id(), document.clone()))
+    }
+
+    /// Seeds one persisted latch after a restart.
+    ///
+    /// Recovery calls this with the saved H3 document/cycle latch. It never
+    /// queues, starts, sends, or clears anything; a new notification is still
+    /// held until an explicit human resume calls [`Self::clear_latch`].
+    pub fn seed_latch(&mut self, held: HeldAuthoring) {
+        self.latches
+            .insert((held.document.project_id(), held.document.clone()), held);
+    }
+
+    /// Clears one latch after an explicit human resume.
+    ///
+    /// This is host-only. It does not queue or start anything by itself; the
+    /// next observer notification must pass the normal gate again.
+    pub fn clear_latch(&mut self, document: &DocumentKey) -> Option<HeldAuthoring> {
+        self.latches
+            .remove(&(document.project_id(), document.clone()))
+    }
+
+    /// Every seeded/observed latch in canonical order.
+    pub fn latches(&self) -> impl Iterator<Item = &HeldAuthoring> {
+        self.latches.values()
     }
 
     /// Records one stable observer candidate.

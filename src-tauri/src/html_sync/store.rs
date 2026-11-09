@@ -103,6 +103,15 @@ impl H3StorePort for StoreHandle {
             .map_err(H3Error::from)
     }
 
+    fn list_html_sync_request_results(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<StoredRequestResult>, H3Error> {
+        self.lock()
+            .list_html_sync_request_results(project)
+            .map_err(H3Error::from)
+    }
+
     fn commit_html_sync(
         &mut self,
         commit: HtmlSyncCommit,

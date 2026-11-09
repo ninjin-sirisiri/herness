@@ -646,6 +646,39 @@ impl Store {
         load_request(&self.conn, project, request)
     }
 
+    /// Lists stored idempotent request results in durable recording order.
+    pub fn list_html_sync_request_results(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<StoredRequestResult>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT request_id, fingerprint, payload FROM html_sync_requests
+             WHERE project_id = ?1 ORDER BY recorded_at, request_id",
+        )?;
+        let rows = statement.query_map(params![project.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (request_id, fingerprint, payload) = row?;
+            let stored = decode_stored_request(&payload)?;
+            if stored.request().project_id() != project
+                || stored.request().request_id().to_string() != request_id
+                || stored.fingerprint().as_str() != fingerprint
+            {
+                return Err(StoreError::corrupt(
+                    "request row does not match its payload or fingerprint",
+                ));
+            }
+            results.push(stored);
+        }
+        Ok(results)
+    }
+
     /// Commits H3 state and events atomically.
     #[allow(clippy::too_many_lines)]
     pub fn commit_html_sync(
@@ -1024,6 +1057,13 @@ impl H3StorePort for Store {
         request: H3RequestId,
     ) -> Result<Option<StoredRequestResult>, H3Error> {
         Store::html_sync_request_result(self, project, request).map_err(H3Error::from)
+    }
+
+    fn list_html_sync_request_results(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<StoredRequestResult>, H3Error> {
+        Store::list_html_sync_request_results(self, project).map_err(H3Error::from)
     }
 
     fn commit_html_sync(

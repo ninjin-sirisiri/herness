@@ -11,6 +11,7 @@ pub mod observer;
 pub mod operations;
 pub mod policy;
 pub mod publish;
+pub mod recovery;
 pub mod render;
 #[cfg(target_os = "macos")]
 mod render_macos;
@@ -48,5 +49,9 @@ pub use operations::{
 pub use publish::{
     DesktopPublisher, H3PublicationRecords, H3PublicationSafety, ObserverWriteExpectations,
     PolicyFinalCheck, ProjectPublicationFiles, SharedHistoryArchive,
+};
+pub use recovery::{
+    HtmlSyncQuitReport, HtmlSyncRecoveryFailure, HtmlSyncRecoveryHost, HtmlSyncStartupReport,
+    RecoveryProject,
 };
 pub use worker::{HtmlSyncWorker, ProjectWorkspaces};

@@ -435,17 +435,26 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
         ),
     };
 
+    let mut h3_save_failure = None;
     let mut snapshot = match &stop_result {
         Ok(report) => {
-            // Mark H2 supervision state with the real H1 stop facts before the
-            // quit decision is evaluated. The hook never starts or resumes work.
-            if let Ok(mut host) = state.host.lock()
-                && let Err(error) = host.mark_supervision_for_quit(report)
-            {
-                eprintln!(
-                    "QUIT_INCOMPLETE: pid={} supervision-mark-failed=true detail={error}",
-                    std::process::id()
-                );
+            // Mark H2 supervision state and H3 document latches with the real
+            // H1 stop facts before the quit decision is evaluated. Neither hook
+            // starts, resumes, sends, or publishes anything.
+            if let Ok(mut host) = state.host.lock() {
+                if let Err(error) = host.mark_supervision_for_quit(report) {
+                    eprintln!(
+                        "QUIT_INCOMPLETE: pid={} supervision-mark-failed=true detail={error}",
+                        std::process::id()
+                    );
+                }
+                if let Err(error) = host.mark_html_sync_for_quit(report) {
+                    eprintln!(
+                        "QUIT_INCOMPLETE: pid={} html-sync-mark-failed=true detail={error}",
+                        std::process::id()
+                    );
+                    h3_save_failure = Some(error);
+                }
             }
             coordinator.note_stopped(report.clone())
         }
@@ -455,6 +464,9 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
         snapshot = coordinator.note_save_failure(error);
     }
     if let Some(error) = sync_failure {
+        snapshot = coordinator.note_save_failure(error);
+    }
+    if let Some(error) = h3_save_failure {
         snapshot = coordinator.note_save_failure(error);
     }
 

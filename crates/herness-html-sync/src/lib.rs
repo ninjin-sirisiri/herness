@@ -25,6 +25,7 @@ pub mod observer;
 pub mod operations;
 pub mod ports;
 pub mod publish;
+pub mod recovery;
 pub mod request;
 pub mod rubric;
 pub mod state;
@@ -32,7 +33,7 @@ pub mod version;
 pub mod workspace;
 
 pub use candidate::{
-    CandidateArtifactStore, CandidateGenerationRequest, MAX_CANDIDATE_BYTES,
+    CandidateArtifactStore, CandidateGenerationRequest, CandidateVerification, MAX_CANDIDATE_BYTES,
     MAX_SOURCE_MARKDOWN_BYTES, OpenedCandidateGeneration,
 };
 pub use config::{
@@ -112,6 +113,13 @@ pub use publish::{
     PublicationPolicyIdentity, PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
     PublicationWriteExpectationPort, RECEIPT_CONTRACT, RECEIPT_DIRECTORY, RECEIPT_SCHEMA,
     RECEIPT_VERSION, SHARED_STYLESHEET, build_publication_receipt,
+};
+pub use recovery::{
+    CandidateBytes, CandidateRecovery, DocumentRecovery, H2RecoveryFacts, H2RequestUnknown,
+    ProjectRecoveryReport, PublicationRecovery, QuitDocument, QuitProjectReport, RecoveryBoundary,
+    RecoveryFinding, RecoveryReadPort, RecoveryRuntimePort, RecoveryService, RecoverySideEffects,
+    RecoveryStop, ResumeBlock, ResumePreflight, ResumePreflightRequest, candidate_bytes,
+    receipt_path,
 };
 pub use request::{
     ConflictResolution, H3Operation, H3OperationOutcome, H3OperationRequest, H3OperationResult,

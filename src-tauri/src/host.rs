@@ -27,6 +27,7 @@ use herness_core::{
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
 
+use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -49,6 +50,7 @@ pub struct DesktopHost {
     runtime: DesktopRuntime,
     store: Arc<Mutex<Store>>,
     supervision: SupervisionHost,
+    html_sync: HtmlSyncRecoveryHost,
     connections: ConnectionAdmin,
     directory: ConnectionDirectory,
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
@@ -205,24 +207,39 @@ impl DesktopHost {
             check_mode,
             permission,
         );
+        let mut runtime = runtime;
+        let mut supervision = supervision;
+        let project_views = runtime.projects().map_err(|error| error.to_string())?;
+        let projects = project_views
+            .iter()
+            .map(|view| view.project_id())
+            .collect::<Vec<_>>();
+        supervision.restore(&projects);
+        let candidate_root = app_data_root.as_ref().join("html-sync-candidates");
+        let recovery_store = StoreHandle::new(Arc::clone(&store));
+        let mut html_sync = HtmlSyncRecoveryHost::new(recovery_store, candidate_root)
+            .map_err(|error| error.to_string())?;
+        for view in &project_views {
+            html_sync.register_project(view.project_id(), view.path().as_path(), Vec::new());
+        }
+        let startup = html_sync.restore(&mut runtime, &mut supervision, Timestamp::now());
+        for failure in startup.failures() {
+            eprintln!(
+                "HTML_SYNC_RECOVERY_ERROR: project={} detail={}",
+                failure.project_id, failure.detail
+            );
+        }
         let mut host = Self {
             runtime,
             store: Arc::clone(&store),
             supervision,
+            html_sync,
             connections,
             directory,
             credentials,
             app_data_root: app_data_root.as_ref().to_path_buf(),
             endpoints,
         };
-        let projects = host
-            .runtime
-            .projects()
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|view| view.project_id())
-            .collect::<Vec<_>>();
-        host.supervision.restore(&projects);
         let reconciliation = host.restore_connection_settings(report)?;
         Ok((host, reconciliation))
     }
@@ -348,14 +365,33 @@ impl DesktopHost {
             .into_iter()
             .map(|view| view.project_id())
             .collect::<Vec<_>>();
+        // An active H3 target must be pumped with its candidate handle installed;
+        // otherwise the H2 start tick could start a child with native tools. The
+        // H3 worker owns that tick. The generic H2 pump therefore skips exactly
+        // the project with the active H3 slot and still advances every other
+        // project independently of a window or UI selection.
+        let h3_active_project = self.html_sync.active_project();
+        let h2_projects = projects
+            .iter()
+            .copied()
+            .filter(|project| Some(*project) != h3_active_project)
+            .collect::<Vec<_>>();
         let plans = self.supervision.plans();
         let store = self.store_handle();
         let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
-        if let Err(error) = self.supervision.pump(&mut adapter, &projects) {
+        if let Err(error) = self.supervision.pump(&mut adapter, &h2_projects) {
             // Supervision progress is independent from the H1 pump. A single
             // H2 failure must not stop H1 event delivery; it is retried on the
             // next bounded interval.
             eprintln!("SUPERVISION_PUMP_ERROR: {error}");
+        }
+        // The app-lifetime H3 worker keeps ticking with no window and no
+        // selected project. A restart latch prevents it from starting authoring.
+        if let Err(error) = self
+            .html_sync
+            .pump(&mut self.runtime, &mut self.supervision)
+        {
+            eprintln!("HTML_SYNC_PUMP_ERROR: {error}");
         }
         Ok(report)
     }
@@ -392,6 +428,51 @@ impl DesktopHost {
             )?;
         }
         Ok(())
+    }
+
+    /// Marks H3 documents for quit after H1 coordinated stops.
+    ///
+    /// New H3 authoring/sends/publications are refused first. Each active
+    /// document requests a cooperative stop through the real H1 run and saves
+    /// `stopped` with a recovery latch. An unconfirmed stop is never reported as
+    /// success.
+    pub fn mark_html_sync_for_quit(
+        &mut self,
+        report: &herness_core::runtime::ShutdownReport,
+    ) -> Result<(), String> {
+        let quit = self.html_sync.begin_quit(
+            &mut self.runtime,
+            &mut self.supervision,
+            report,
+            herness_core::Timestamp::now(),
+        );
+        for failure in quit.failures() {
+            eprintln!(
+                "HTML_SYNC_QUIT_ERROR: project={} detail={}",
+                failure.project_id, failure.detail
+            );
+        }
+        if !quit.failures().is_empty() {
+            return Err("one or more H3 projects could not be saved for quit".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Last H3 startup reconciliation report, when startup ran.
+    pub const fn html_sync_startup(&self) -> Option<&HtmlSyncStartupReport> {
+        self.html_sync.last_startup()
+    }
+
+    /// App-lifetime H3 recovery host.
+    pub const fn html_sync(&self) -> &HtmlSyncRecoveryHost {
+        &self.html_sync
+    }
+
+    /// Mutable app-lifetime H3 recovery host for the trusted command layer.
+    ///
+    /// This is not an IPC surface; Task 22 owns the trusted command wiring.
+    pub fn html_sync_mut(&mut self) -> &mut HtmlSyncRecoveryHost {
+        &mut self.html_sync
     }
 
     /// Reads a saved supervision record through the shared store.
@@ -439,9 +520,7 @@ impl DesktopHost {
     /// This is not an IPC surface. The worker needs the same supervision host
     /// and the same H1 runtime in one call; borrowing the two fields together
     /// avoids a second composition.
-    pub fn runtime_and_supervision_mut(
-        &mut self,
-    ) -> (&mut DesktopRuntime, &mut SupervisionHost) {
+    pub fn runtime_and_supervision_mut(&mut self) -> (&mut DesktopRuntime, &mut SupervisionHost) {
         (&mut self.runtime, &mut self.supervision)
     }
 

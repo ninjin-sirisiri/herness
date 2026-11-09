@@ -389,7 +389,7 @@ impl HtmlSyncCommit {
 }
 
 /// One loaded settings value and its durable revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct H3SettingsRecord {
     revision: u64,
     settings: H3Settings,
@@ -547,6 +547,15 @@ pub trait H3StorePort {
         project: ProjectId,
         request: H3RequestId,
     ) -> Result<Option<StoredRequestResult>, H3Error>;
+
+    /// Lists stored idempotent request results in durable recording order.
+    ///
+    /// Recovery uses this to prove that previously committed operations were
+    /// loaded and are never replayed merely because the process restarted.
+    fn list_html_sync_request_results(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<StoredRequestResult>, H3Error>;
 
     /// Commits state and events atomically.
     fn commit_html_sync(

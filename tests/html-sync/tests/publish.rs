@@ -657,6 +657,13 @@ impl H3StorePort for FaultyH3Store {
         self.inner.html_sync_request_result(project, request)
     }
 
+    fn list_html_sync_request_results(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<herness_html_sync::StoredRequestResult>, H3Error> {
+        self.inner.list_html_sync_request_results(project)
+    }
+
     fn commit_html_sync(
         &mut self,
         commit: HtmlSyncCommit,

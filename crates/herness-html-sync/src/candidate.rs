@@ -43,6 +43,22 @@ const SLOT_CSS: &str = "shared.css";
 const SLOT_CANDIDATE: &str = "candidate.html";
 const SLOT_PROVENANCE: &str = "provenance.json";
 
+/// Result of checking the private bytes referenced by one candidate record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateVerification {
+    /// Both candidate slots exist with exactly the recorded digests.
+    Present,
+    /// The private namespace or one candidate slot is absent.
+    Missing,
+    /// The stored bytes differ from the candidate record.
+    Mismatch {
+        /// Candidate HTML bytes differ.
+        html: bool,
+        /// Provenance bytes differ.
+        provenance: bool,
+    },
+}
+
 /// Host-only request to open one candidate generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateGenerationRequest {
@@ -288,6 +304,65 @@ impl CandidateArtifactStore {
         })
     }
 
+    /// Verifies the private bytes referenced by one candidate record.
+    ///
+    /// This is the restart/recovery read: H3 persists only the namespace and
+    /// token digest, so it checks the manifest identity and token digest before
+    /// reading the exact candidate/provenance bytes. It never needs, returns,
+    /// or persists the raw capability token.
+    pub fn verify_candidate_record(
+        &self,
+        candidate: &crate::state::CandidateRecord,
+    ) -> Result<CandidateVerification, H3Error> {
+        let namespace = candidate.storage().namespace();
+        let directory = self.generation_directory(namespace);
+        let manifest_path = directory.join(MANIFEST_FILE);
+        let manifest_bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(CandidateVerification::Missing);
+            }
+            Err(error) => {
+                return Err(H3Error::Storage {
+                    detail: format!("candidate manifest: {error}"),
+                });
+            }
+        };
+        let manifest = crate::version::decode_record::<CandidateManifest>(&manifest_bytes)?;
+        if manifest.project_id != candidate.project_id()
+            || manifest.document != *candidate.document_key()
+            || manifest.token_digest != *candidate.storage().token_digest()
+        {
+            return Ok(CandidateVerification::Missing);
+        }
+        let html = read_optional_slot(&directory, ArtifactSlot::CandidateHtml).map_err(|error| {
+            H3Error::Storage {
+                detail: format!("candidate html read: {error}"),
+            }
+        })?;
+        let provenance = read_optional_slot(&directory, ArtifactSlot::CandidateProvenance).map_err(
+            |error| H3Error::Storage {
+                detail: format!("candidate provenance read: {error}"),
+            },
+        )?;
+        match (html, provenance) {
+            (None, _) | (_, None) => Ok(CandidateVerification::Missing),
+            (Some(html), Some(provenance)) => {
+                let html_matches = ContentDigest::sha256(&html) == *candidate.html_digest();
+                let provenance_matches =
+                    ContentDigest::sha256(&provenance) == *candidate.provenance_digest();
+                if html_matches && provenance_matches {
+                    Ok(CandidateVerification::Present)
+                } else {
+                    Ok(CandidateVerification::Mismatch {
+                        html: !html_matches,
+                        provenance: !provenance_matches,
+                    })
+                }
+            }
+        }
+    }
+
     fn generation_directory(&self, namespace: &str) -> PathBuf {
         self.root.join(namespace)
     }
@@ -518,6 +593,14 @@ fn slot_file(slot: ArtifactSlot) -> &'static str {
         ArtifactSlot::SharedCss => SLOT_CSS,
         ArtifactSlot::CandidateHtml => SLOT_CANDIDATE,
         ArtifactSlot::CandidateProvenance => SLOT_PROVENANCE,
+    }
+}
+
+fn read_optional_slot(directory: &Path, slot: ArtifactSlot) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(directory.join(slot_file(slot))) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
