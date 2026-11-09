@@ -1,0 +1,22 @@
+[package]
+name = "herness-html-sync-tests"
+description = "Black-box contract and store tests for H3 HTML sync."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+herness-core = { path = "../../crates/herness-core" }
+herness-html-sync = { path = "../../crates/herness-html-sync" }
+herness-supervision = { path = "../../crates/herness-supervision" }
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+rusqlite.workspace = true
+tempfile.workspace = true

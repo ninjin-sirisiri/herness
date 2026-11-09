@@ -762,7 +762,7 @@ fn assert_legacy_preserved(
     fixture: &ProjectFixture,
     before: &[LegacyEventRow],
 ) {
-    assert_eq!(store.lock().unwrap().schema_version().unwrap(), 8);
+    assert_eq!(store.lock().unwrap().schema_version().unwrap(), 9);
     let conn = raw(database_path);
     assert_eq!(legacy_rows(&conn), before);
     let next_sequence: i64 = conn

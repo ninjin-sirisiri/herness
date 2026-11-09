@@ -173,9 +173,9 @@ impl SupervisedStateRecord {
 
 /// Host-owned SQLite store.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     config: StoreConfig,
-    fault: FaultPlan,
+    pub(crate) fault: FaultPlan,
 }
 
 impl fmt::Debug for Store {
@@ -1961,7 +1961,7 @@ fn prepare_location(config: &StoreConfig) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn next_sequence(transaction: &Transaction<'_>, project: &ProjectId) -> Result<u64, StoreError> {
+pub(crate) fn next_sequence(transaction: &Transaction<'_>, project: &ProjectId) -> Result<u64, StoreError> {
     let current: Option<i64> = transaction
         .query_row(
             "SELECT next_sequence FROM project_sequences WHERE project_id = ?1",
@@ -1983,7 +1983,7 @@ fn next_sequence(transaction: &Transaction<'_>, project: &ProjectId) -> Result<u
     }
 }
 
-fn sequence_to_sql(sequence: u64) -> Result<i64, StoreError> {
+pub(crate) fn sequence_to_sql(sequence: u64) -> Result<i64, StoreError> {
     i64::try_from(sequence)
         .map_err(|_| StoreError::corrupt("sequence does not fit in sqlite integer"))
 }
@@ -1991,7 +1991,7 @@ fn sequence_to_sql(sequence: u64) -> Result<i64, StoreError> {
 /// Assigns project sequences to drafts, inserts them, and advances the project
 /// sequence counter. Returns the committed events and the sequence observed
 /// before the first draft.
-fn append_event_drafts(
+pub(crate) fn append_event_drafts(
     transaction: &Transaction<'_>,
     project: &ProjectId,
     drafts: &[EventDraft],

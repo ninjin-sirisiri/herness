@@ -10,6 +10,7 @@
 mod config;
 mod error;
 mod fault;
+mod html_sync;
 mod migrations;
 mod store;
 

@@ -149,6 +149,43 @@ pub enum StoreError {
         /// Reservation attempt identifier whose stored value differs.
         attempt: String,
     },
+    /// A different immutable H3 record is already stored for the same ID.
+    HtmlSyncRecordConflict {
+        /// H3 record kind.
+        record: &'static str,
+        /// Record identifier.
+        id: String,
+    },
+    /// The same H3 request identifier was recorded with another request.
+    HtmlSyncRequestConflict {
+        /// Request identifier.
+        request: String,
+        /// Recorded request description.
+        recorded: String,
+        /// Newly supplied request description.
+        supplied: String,
+    },
+    /// A saved H3 record declares an unknown format version.
+    HtmlSyncFormat {
+        /// H3 record kind.
+        record: &'static str,
+        /// Version found in the row.
+        found: u32,
+        /// Version written by this build.
+        expected: u32,
+    },
+    /// An H3 value belongs to another project.
+    HtmlSyncCrossProject {
+        /// Project the operation is bound to.
+        expected: ProjectId,
+        /// Project found on the value.
+        found: ProjectId,
+    },
+    /// An H3 commit is structurally invalid before any write.
+    HtmlSyncInvalidCommit {
+        /// Sanitized validation detail.
+        detail: String,
+    },
     /// Stored data failed an integrity check.
     CorruptData {
         /// Sanitized description of the failed check.
@@ -274,6 +311,32 @@ impl fmt::Display for StoreError {
                     "attempt {attempt} is already recorded with another budget reservation"
                 )
             }
+            Self::HtmlSyncRecordConflict { record, id } => {
+                write!(f, "{record} {id} is already stored with another value")
+            }
+            Self::HtmlSyncRequestConflict {
+                request,
+                recorded,
+                supplied,
+            } => write!(
+                f,
+                "H3 request {request} was already recorded as {recorded}, not {supplied}"
+            ),
+            Self::HtmlSyncFormat {
+                record,
+                found,
+                expected,
+            } => write!(
+                f,
+                "stored {record} format version {found} is not supported (expected {expected})"
+            ),
+            Self::HtmlSyncCrossProject { expected, found } => write!(
+                f,
+                "H3 value belongs to project {found}, not the expected project {expected}"
+            ),
+            Self::HtmlSyncInvalidCommit { detail } => {
+                write!(f, "invalid H3 commit: {detail}")
+            }
             Self::CrossProjectReference { expected, found } => write!(
                 f,
                 "history cursor belongs to project {found}, not the expected project {expected}"
@@ -375,12 +438,16 @@ impl From<StoreError> for CoreError {
             | StoreError::StaleRevision { .. }
             | StoreError::EvidenceRecordConflict { .. }
             | StoreError::CommandResultConflict { .. }
-            | StoreError::BudgetReservationConflict { .. } => CoreError::StoreUnavailable {
+            | StoreError::BudgetReservationConflict { .. }
+            | StoreError::HtmlSyncRecordConflict { .. }
+            | StoreError::HtmlSyncRequestConflict { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }
             | StoreError::Codec { .. }
-            | StoreError::ForeignDatabase => CoreError::StoreUnavailable {
+            | StoreError::ForeignDatabase
+            | StoreError::HtmlSyncFormat { .. }
+            | StoreError::HtmlSyncCrossProject { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::CorruptData,
             },
             StoreError::InvalidConfig { .. }
@@ -388,6 +455,7 @@ impl From<StoreError> for CoreError {
             | StoreError::UnknownOperation { .. }
             | StoreError::UnknownRequestAttempt { .. }
             | StoreError::InvalidStateKey
+            | StoreError::HtmlSyncInvalidCommit { .. }
             | StoreError::Database { .. }
             | StoreError::Io { .. }
             | StoreError::InjectedFault { .. } => CoreError::StoreUnavailable {

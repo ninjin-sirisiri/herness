@@ -1367,6 +1367,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "herness-html-sync"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-supervision",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "herness-html-sync-tests"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-html-sync",
+ "herness-store",
+ "herness-supervision",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "herness-runtime-tests"
 version = "0.1.0"
 dependencies = [
@@ -1389,6 +1415,7 @@ name = "herness-store"
 version = "0.1.0"
 dependencies = [
  "herness-core",
+ "herness-html-sync",
  "herness-supervision",
  "rusqlite",
  "serde",
