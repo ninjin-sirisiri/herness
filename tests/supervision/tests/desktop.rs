@@ -31,6 +31,9 @@ use herness_desktop::supervision::{
 use herness_store::{Store, StoreConfig};
 use herness_supervision::operations::SupervisionOperationRequest;
 use herness_supervision::operations::{HumanOperation, OperationRuntimePort};
+use herness_supervision::owner_launch::{
+    HostOwnerAuthority, OwnerLaunchBinding, authorize_owner_launch,
+};
 use herness_supervision::recovery::{
     ManagedProcessState, RecoveryCheckpoint, RecoveryRuntimePort, RecoveryStopState,
 };
@@ -42,10 +45,12 @@ use herness_supervision::supervisor::{
 use herness_supervision::{
     AdapterVersion, AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
     CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
-    EvidenceRecord, EvidenceScope, ProfilePurpose, ProfileThresholds, ProviderKind, ProviderOrigin,
-    RubricVersion, SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId,
-    TargetReadSet, TargetVersion, WorkPacketRejection,
+    EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind, OwnerLaunchRejection, OwnerRef,
+    ProfilePurpose, ProfileThresholds, ProviderKind, ProviderOrigin, RubricVersion,
+    SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId, TargetReadSet,
+    TargetVersion, WorkPacketRejection,
 };
+use herness_supervision_tests::ScriptedOwnerApprovalRegistry;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -584,6 +589,63 @@ impl Harness {
                 Some(self.host.confirm(ConfirmationKind::Create)),
             )
             .expect("create")
+    }
+
+    /// Creates a target owned by an already-approved H3 job. Creating a target
+    /// does not start it and does not call the owner registry.
+    fn create_h3(
+        &mut self,
+        job: &str,
+    ) -> (herness_desktop::supervision::SupervisionView, OwnerRef) {
+        let owner = OwnerRef::new(OwnerKind::H3HtmlJob, job).expect("H3 owner");
+        let actor = PlanRequestActor::ApprovedOwner {
+            owner: owner.clone(),
+            source: OwnerApprovalSource::H3ApprovedSettings,
+        };
+        let view = self
+            .host
+            .create(
+                &mut self.runtime,
+                actor,
+                request(self.project, self.connection),
+                None,
+            )
+            .expect("owned create");
+        (view, owner)
+    }
+
+    fn owner_binding(
+        &self,
+        supervision: SupervisionId,
+        settings_version: u64,
+        job: &str,
+    ) -> OwnerLaunchBinding {
+        self.host
+            .owner_launch_binding(self.project, supervision, settings_version, job)
+            .expect("owner binding")
+    }
+
+    fn matching_owner_registry(
+        &self,
+        supervision: SupervisionId,
+        settings_version: u64,
+        job: &str,
+    ) -> ScriptedOwnerApprovalRegistry {
+        let binding = self.owner_binding(supervision, settings_version, job);
+        let mut registry = ScriptedOwnerApprovalRegistry::new();
+        registry.insert(binding.approval().clone());
+        registry
+    }
+
+    fn owner_authority(
+        &self,
+        supervision: SupervisionId,
+        settings_version: u64,
+        job: &str,
+    ) -> HostOwnerAuthority {
+        let binding = self.owner_binding(supervision, settings_version, job);
+        let registry = self.matching_owner_registry(supervision, settings_version, job);
+        authorize_owner_launch(&registry, &binding, Timestamp::now()).expect("owner authority")
     }
 
     fn start(
@@ -1170,6 +1232,264 @@ fn explicit_condition_change_updates_the_plan_contract_before_resume() {
         .expect("resume after condition change");
     assert_eq!(resumed.condition_version, 2);
     assert_eq!(resumed.state, "running");
+}
+
+#[test]
+fn approved_h3_owner_starts_once_and_duplicate_request_does_not_run_again() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    assert_eq!(created.state, "ready");
+    assert_eq!(created.run_group.len(), 0);
+    assert_eq!(harness.runtime.starts, 0);
+
+    let request_id = SupervisionRequestId::new(harness.project);
+    let first_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let first = harness
+        .host
+        .start_approved_owner(
+            &mut harness.runtime,
+            first_authority,
+            request_id,
+            created.revision,
+        )
+        .expect("approved owner start");
+    assert_eq!(first.state, "running");
+    assert_eq!(first.run_group.len(), 1);
+    // `start` records the start intent; the child run is created by the
+    // host-owned pump, not by the registry check.
+    assert_eq!(harness.runtime.starts, 0);
+    harness
+        .host
+        .pump(&mut harness.runtime, &[harness.project])
+        .expect("pump start");
+    assert_eq!(harness.runtime.starts, 1);
+
+    let duplicate_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let duplicate = harness
+        .host
+        .start_approved_owner(
+            &mut harness.runtime,
+            duplicate_authority,
+            request_id,
+            first.revision,
+        )
+        .expect("duplicate owner start");
+    assert_eq!(duplicate.run_group.len(), 1);
+    assert_eq!(harness.runtime.starts, 1);
+
+    let second_authority = harness.owner_authority(created.supervision_id, 1, "h3-job-1");
+    let second = harness.host.start_approved_owner(
+        &mut harness.runtime,
+        second_authority,
+        SupervisionRequestId::new(harness.project),
+        duplicate.revision,
+    );
+    assert!(matches!(
+        second,
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::AlreadyStarted
+        })
+    ));
+    assert_eq!(harness.runtime.starts, 1);
+    assert_eq!(
+        harness
+            .host
+            .get(harness.project, created.supervision_id)
+            .expect("view")
+            .run_group
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn fake_owner_and_stale_settings_never_start_a_run() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let binding = harness.owner_binding(created.supervision_id, 1, "h3-job-1");
+
+    let empty = ScriptedOwnerApprovalRegistry::new();
+    assert!(matches!(
+        authorize_owner_launch(&empty, &binding, Timestamp::now()),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::MissingRegistryEntry
+        })
+    ));
+
+    let stale = harness.owner_binding(created.supervision_id, 2, "h3-job-1");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(stale.approval().clone());
+    assert!(matches!(
+        authorize_owner_launch(&registry, &binding, Timestamp::now()),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::StaleSettings {
+                requested: 1,
+                registered: 2
+            }
+        })
+    ));
+
+    let wrong_job = harness.owner_binding(created.supervision_id, 1, "other-job");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(wrong_job.approval().clone());
+    assert!(matches!(
+        authorize_owner_launch(&registry, &binding, Timestamp::now()),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::JobMismatch
+        })
+    ));
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+    let current = harness
+        .host
+        .get(harness.project, created.supervision_id)
+        .expect("view");
+    assert_eq!(current.state, "ready");
+    assert!(current.run_group.is_empty());
+}
+
+#[test]
+fn model_actor_missing_confirmation_and_h4_never_start_a_run() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+
+    let model = harness.host.create(
+        &mut harness.runtime,
+        PlanRequestActor::Model,
+        request(harness.project, harness.connection),
+        Some(harness.host.confirm(ConfirmationKind::Create)),
+    );
+    assert!(matches!(
+        model,
+        Err(SupervisionError::ModelCannotApproveOrChange { .. })
+    ));
+    assert_eq!(harness.runtime.starts, 0);
+    assert_eq!(harness.runtime.continuations, 0);
+
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let missing = harness.host.start(
+        &mut harness.runtime,
+        harness.project,
+        created.supervision_id,
+        SupervisionRequestId::new(harness.project),
+        created.revision,
+        None,
+    );
+    assert!(matches!(
+        missing,
+        Err(SupervisionError::Unsupported { .. })
+    ));
+    let wrong = harness.host.start(
+        &mut harness.runtime,
+        harness.project,
+        created.supervision_id,
+        SupervisionRequestId::new(harness.project),
+        created.revision,
+        Some(harness.host.confirm(ConfirmationKind::Create)),
+    );
+    assert!(matches!(
+        wrong,
+        Err(SupervisionError::Unsupported { .. })
+    ));
+    assert_eq!(harness.runtime.starts, 0);
+
+    let h4_owner = OwnerRef::new(OwnerKind::H4SddTask, "task-6-fixture").expect("H4 owner");
+    let h4_contract = herness_supervision_tests::owner_contract(
+        harness.project,
+        h4_owner,
+        OwnerApprovalSource::H4ApprovedPlan,
+    );
+    let h4_binding =
+        OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("H4 binding");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(h4_binding.approval().clone());
+    assert!(matches!(
+        authorize_owner_launch(&registry, &h4_binding, Timestamp::now()),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::H4ApprovalUnavailable
+        })
+    ));
+    assert_eq!(harness.runtime.starts, 0);
+}
+
+#[test]
+fn restored_target_is_not_auto_started_and_human_start_still_works() {
+    let mut harness = harness();
+    harness.configure_completion();
+    harness.grant_completion(1);
+    let (created, _owner) = harness.create_h3("h3-job-1");
+    let save_path = harness.store_path.clone();
+    let project = harness.project;
+    let supervision = created.supervision_id;
+    let revision = created.revision;
+    let project_root = harness._temp.path().join("project");
+
+    drop(harness.host);
+    drop(harness.runtime);
+    drop(harness.store);
+
+    let config = StoreConfig::new(&save_path).expect("reopen config");
+    let store = Store::open(config).expect("reopen store");
+    let store = StoreHandle::new(Arc::new(std::sync::Mutex::new(store)));
+    let assessment_host = AssessmentHost {
+        directory: harness.admin.directory(),
+        credentials: Arc::new(NoCredentials),
+        endpoints: loopback_assessment_endpoints(),
+    };
+    let mut host = SupervisionHost::with_config_for_test(
+        store.clone(),
+        ConfigStore::new(),
+        assessment_host,
+        Box::new(UnverifiedAssessment),
+        Box::new(UnavailableCheck),
+    );
+    host.restore(&[project]);
+    let mut runtime = FakeRuntime::new(store.clone(), project, project_root);
+
+    let restored = host.get(project, supervision).expect("restored view");
+    assert_eq!(restored.state, "ready");
+    assert!(restored.plan_available);
+    assert_eq!(restored.revision, revision);
+
+    let binding = host
+        .owner_launch_binding(project, supervision, 1, "h3-job-1")
+        .expect("restored binding");
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    registry.insert(binding.approval().clone());
+    let authority = authorize_owner_launch(&registry, &binding, Timestamp::now())
+        .expect("registry still matches");
+    let auto = host.start_approved_owner(
+        &mut runtime,
+        authority,
+        SupervisionRequestId::new(project),
+        revision,
+    );
+    assert!(matches!(
+        auto,
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::RestoredTarget
+        })
+    ));
+    assert_eq!(runtime.starts, 0);
+
+    let human = host
+        .start(
+            &mut runtime,
+            project,
+            supervision,
+            SupervisionRequestId::new(project),
+            revision,
+            Some(host.confirm(ConfirmationKind::Start)),
+        )
+        .expect("human start after restore");
+    assert_eq!(human.state, "running");
+    host.pump(&mut runtime, &[project]).expect("pump human start");
+    assert_eq!(runtime.starts, 1);
 }
 
 #[test]

@@ -25,6 +25,7 @@ use herness_supervision::operations::{
     HumanOperation, OperationPorts, SupervisionChange, SupervisionOperationRequest,
     execute_operation,
 };
+use herness_supervision::owner_launch::{HostOwnerAuthority, OwnerLaunchBinding};
 use herness_supervision::ports::{
     BudgetStorePort, ClockPort, EvidenceStorePort, SupervisionStorePort,
 };
@@ -336,6 +337,7 @@ pub struct SupervisionHost {
     permission: PermissionRuntime,
     active: Mutex<BTreeSet<(ProjectId, SupervisionId)>>,
     last_tick: Mutex<BTreeMap<(ProjectId, SupervisionId), Instant>>,
+    restored: Mutex<BTreeSet<(ProjectId, SupervisionId)>>,
     notifications: Arc<Mutex<VecDeque<NotificationView>>>,
     clock: HostClock,
 }
@@ -400,6 +402,7 @@ impl SupervisionHost {
             permission,
             active: Mutex::new(BTreeSet::new()),
             last_tick: Mutex::new(BTreeMap::new()),
+            restored: Mutex::new(BTreeSet::new()),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             clock: HostClock,
         }
@@ -514,6 +517,11 @@ impl SupervisionHost {
                 .supervision_records_for_project(project)
                 .unwrap_or_default();
             for record in records {
+                // Restore only reloads durable state. A target loaded by this
+                // process is never started automatically; an explicit human
+                // start (or a fresh owner launch after a new creation) may
+                // proceed.
+                self.set_restored(*project, record.supervision_id(), true);
                 match load_plan(&self.store, *project, record.supervision_id()) {
                     Ok(Some(plan)) => {
                         self.plans
@@ -682,6 +690,7 @@ impl SupervisionHost {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert((project, supervision_id), plan);
+        self.set_restored(project, supervision_id, false);
         self.view(project, supervision_id)
     }
 
@@ -845,6 +854,102 @@ impl SupervisionHost {
             self.set_active(project, supervision, false);
             return Err(error);
         }
+        self.set_restored(project, supervision, false);
+        self.view(project, supervision)
+    }
+
+    /// Builds the exact target binding an H3/H4 owner must have approved before
+    /// the automatic first start.
+    ///
+    /// The opaque settings version and job ID come from the owner phase. All
+    /// other constraints are read from the stored approved contract, so the
+    /// owner cannot request a weaker condition set, scope, profile, consent, or
+    /// budget than H2 recorded.
+    pub fn owner_launch_binding(
+        &self,
+        project: ProjectId,
+        supervision: SupervisionId,
+        settings_version: u64,
+        job_id: &str,
+    ) -> Result<OwnerLaunchBinding, SupervisionError> {
+        let record = self.load(project, supervision)?;
+        let plan = self.plan(project, supervision)?;
+        let contract = plan.contract(&record, self.clock.now())?;
+        OwnerLaunchBinding::from_contract(
+            &contract,
+            plan.budget_version,
+            settings_version,
+            job_id,
+        )
+    }
+
+    /// Starts the first run of a ready target using a host-minted approved-owner
+    /// authority.
+    ///
+    /// This path never accepts a `RequestActor` or `OwnerKind`: the
+    /// non-serializable [`HostOwnerAuthority`] can only come from
+    /// `authorize_owner_launch` after the current registry matched. A human
+    /// start still requires `HumanConfirmation`; a target loaded by `restore`,
+    /// an already-started target, and any non-ready target are refused without
+    /// a run.
+    pub fn start_approved_owner(
+        &mut self,
+        runtime: &mut dyn DesktopSupervisionRuntime,
+        authority: HostOwnerAuthority,
+        request_id: SupervisionRequestId,
+        expected_revision: u64,
+    ) -> Result<SupervisionView, SupervisionError> {
+        let project = authority.project_id();
+        let supervision = authority.supervision_id();
+        request_id.validate_in(project)?;
+        // A duplicate host request returns the already recorded result even if
+        // the target has since moved past ready. It never starts a second run.
+        if let Some(recorded) = self.store.command_result(request_id)? {
+            if recorded.project_id() != project
+                || recorded.supervision_id() != supervision
+                || recorded.command() != SupervisionCommand::Reassess
+            {
+                return Err(SupervisionError::DuplicateRequestConflict {
+                    request: request_id.to_string(),
+                    recorded: recorded.command().as_str().to_owned(),
+                    supplied: SupervisionCommand::Start.as_str().to_owned(),
+                });
+            }
+            return self.view(project, supervision);
+        }
+        let record = self.load(project, supervision)?;
+        if record.revision() != expected_revision {
+            return Err(SupervisionError::RevisionConflict {
+                expected: expected_revision,
+                found: record.revision(),
+            });
+        }
+        if self.is_restored(project, supervision) {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::RestoredTarget,
+            });
+        }
+        if !record.run_group().runs().is_empty() || record.supervisor().current_run().is_some() {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::AlreadyStarted,
+            });
+        }
+        if record.state() != SupervisionState::Ready {
+            return Err(SupervisionError::OwnerLaunchRejected {
+                reason: herness_supervision::OwnerLaunchRejection::TargetNotReady {
+                    found: record.state(),
+                },
+            });
+        }
+        let plan = self.plan(project, supervision)?;
+        let contract = plan.contract(&record, self.clock.now())?;
+        authority.ensure_contract_binding(&contract, plan.budget_version)?;
+        self.set_active(project, supervision, true);
+        if let Err(error) = self.tick_one(runtime, project, supervision, request_id) {
+            self.set_active(project, supervision, false);
+            return Err(error);
+        }
+        self.set_restored(project, supervision, false);
         self.view(project, supervision)
     }
 
@@ -1458,6 +1563,25 @@ impl SupervisionHost {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&(project, supervision));
         }
+    }
+
+    fn set_restored(&self, project: ProjectId, supervision: SupervisionId, restored: bool) {
+        let mut set = self
+            .restored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if restored {
+            set.insert((project, supervision));
+        } else {
+            set.remove(&(project, supervision));
+        }
+    }
+
+    fn is_restored(&self, project: ProjectId, supervision: SupervisionId) -> bool {
+        self.restored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&(project, supervision))
     }
 
     fn view(

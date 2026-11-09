@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use herness_core::contracts::{AgentId, ContractVersion, RunId, SessionId, Timestamp};
 use herness_supervision::approval::ApprovalActor;
+use herness_supervision::approval::OwnerApprovalSource;
 use herness_supervision::assessment::{ConditionVerdict, PermissionAssessment, PermissionVerdict};
 use herness_supervision::budget::{
     BudgetClockState, BudgetLimit, BudgetPolicy, BudgetUsage, H2_ACTIVE_SECONDS,
@@ -14,17 +15,24 @@ use herness_supervision::budget::{
 use herness_supervision::command::{SupervisionRequest, execute_command};
 use herness_supervision::conditions::{Condition, ConditionOrigin, ConditionSet, ConditionVersion};
 use herness_supervision::consent::{
-    ConsentBlock, DisclosureDataKind, DisclosureScope, ProviderOrigin,
+    ConsentBinding, ConsentBlock, DisclosureDataKind, DisclosureScope, ProviderOrigin,
 };
 use herness_supervision::contract::{
     ExecutionScope, OwnerKind, OwnerRef, RunGroup, SupervisionSubject, same_approval_kind,
 };
-use herness_supervision::error::{ApprovalRejection, SupervisionError, WorkPacketRejection};
+use herness_supervision::error::{
+    ApprovalRejection, OwnerLaunchRejection, SupervisionError, WorkPacketRejection,
+};
 use herness_supervision::evidence::{
     CheckStatus, EvidenceAcquirer, EvidenceOutcome, EvidenceRecord, EvidenceScope,
     RequiredCheckResult, TargetScope, TargetVersion, VerificationOperation,
 };
-use herness_supervision::profiles::{ProfilePurpose, ProfileThresholds};
+use herness_supervision::owner_launch::{
+    OwnerApproval, OwnerLaunchBinding, authorize_owner_launch,
+};
+use herness_supervision::profiles::{
+    ProfileBinding, ProfilePurpose, ProfileThresholds, ProfileVersion,
+};
 use herness_supervision::packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 use herness_supervision::state::{
     CompletionBlocker, HumanAction, StopCause, SupervisionFailure, SupervisionRecord,
@@ -1185,4 +1193,261 @@ impl IntoConditionIds for Ids {
     fn into_condition_ids(self) -> Vec<herness_supervision::ids::ConditionId> {
         vec![self.condition_a, self.condition_b]
     }
+}
+
+#[test]
+fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
+    let (project, fixture_ids) = project_set();
+    let h3_owner =
+        OwnerRef::new(OwnerKind::H3HtmlJob, "h3-job-1").expect("H3 owner");
+    let contract = owner_contract(
+        project,
+        h3_owner.clone(),
+        OwnerApprovalSource::H3ApprovedSettings,
+    );
+    let binding =
+        OwnerLaunchBinding::from_contract(&contract, 1, 7, "job-1").expect("binding");
+    assert_eq!(binding.project_id(), project);
+    assert_eq!(binding.supervision_id(), fixture_ids.supervision);
+    assert_eq!(binding.approval().owner(), &h3_owner);
+    assert_eq!(binding.approval().settings_version(), 7);
+
+    let mut registry = ScriptedOwnerApprovalRegistry::new();
+    assert_eq!(
+        rejected_reason(&registry, &binding),
+        OwnerLaunchRejection::MissingRegistryEntry
+    );
+
+    registry.insert(binding.approval().clone());
+    let authority = authorize_owner_launch(&registry, &binding, now()).expect("authority");
+    assert_eq!(authority.project_id(), project);
+    assert_eq!(authority.supervision_id(), fixture_ids.supervision);
+    assert_eq!(authority.owner(), &h3_owner);
+    assert_eq!(authority.settings_version(), 7);
+    assert_eq!(authority.job_id(), "job-1");
+    authority
+        .ensure_contract_binding(&contract, 1)
+        .expect("matches its contract");
+    assert!(matches!(
+        authority.ensure_contract_binding(&contract, 2),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::BudgetPolicyVersionMismatch { .. }
+        })
+    ));
+
+    let base = binding.approval().clone();
+    let cases = [
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    settings_version: Some(8),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::StaleSettings {
+                requested: 7,
+                registered: 8,
+            },
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    job_id: Some("other-job"),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::JobMismatch,
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    condition_version: Some(2),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::StaleConditions {
+                requested: 1,
+                registered: 2,
+            },
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    conditions_digest: Some(
+                        herness_supervision::conditions::ConditionDigest::sha256(b"different"),
+                    ),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::ConditionDigestMismatch,
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    execution_scope: Some(
+                        ExecutionScope::new(
+                            project,
+                            vec!["src".to_owned()],
+                            Vec::new(),
+                            false,
+                        )
+                        .expect("scope"),
+                    ),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::ScopeMismatch,
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    profile: Some(ProfileBinding::new(
+                        fixture_ids.profile,
+                        ProfileVersion::new(2).expect("version"),
+                        ProfilePurpose::Completion,
+                    )),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::ProfileMismatch,
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    consent: Some(ConsentBinding::new(
+                        fixture_ids.consent,
+                        2,
+                        ProfilePurpose::Completion,
+                        TargetVersion::new(1).expect("version"),
+                    )),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::ConsentMismatch,
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    budget_policy_version: Some(2),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::BudgetPolicyVersionMismatch {
+                requested: 1,
+                registered: 2,
+            },
+        ),
+        (
+            changed_approval(
+                &base,
+                ApprovalChange {
+                    budget: Some(
+                        BudgetPolicy::new(3_600, 1, None).expect("finite budget"),
+                    ),
+                    ..ApprovalChange::default()
+                },
+            ),
+            OwnerLaunchRejection::BudgetMismatch,
+        ),
+    ];
+    for (registered, expected) in cases {
+        let mut registry = ScriptedOwnerApprovalRegistry::new();
+        registry.insert(registered);
+        assert_eq!(rejected_reason(&registry, &binding), expected);
+    }
+
+    let human = OwnerRef::new(OwnerKind::Human, "fixture-human").expect("owner");
+    assert!(matches!(
+        OwnerApproval::new(
+            project,
+            human,
+            OwnerApprovalSource::H3ApprovedSettings,
+            1,
+            "job-1",
+            contract.conditions().condition_version(),
+            contract.conditions().digest().clone(),
+            contract.execution_scope().clone(),
+            contract.profile(),
+            contract.consent(),
+            1,
+            contract.budget().clone(),
+        ),
+        Err(SupervisionError::OwnerLaunchRejected {
+            reason: OwnerLaunchRejection::OwnerNotApproved
+        })
+    ));
+
+    let h4_owner =
+        OwnerRef::new(OwnerKind::H4SddTask, "task-6-fixture").expect("H4 owner");
+    let h4_contract = owner_contract(
+        project,
+        h4_owner,
+        OwnerApprovalSource::H4ApprovedPlan,
+    );
+    let h4_binding =
+        OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("binding");
+    assert_eq!(
+        rejected_reason(&ScriptedOwnerApprovalRegistry::new(), &h4_binding),
+        OwnerLaunchRejection::H4ApprovalUnavailable
+    );
+}
+
+fn rejected_reason(
+    registry: &ScriptedOwnerApprovalRegistry,
+    binding: &OwnerLaunchBinding,
+) -> OwnerLaunchRejection {
+    match authorize_owner_launch(registry, binding, now()) {
+        Err(SupervisionError::OwnerLaunchRejected { reason }) => reason,
+        other => panic!("expected an owner launch rejection, got {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct ApprovalChange {
+    settings_version: Option<u64>,
+    job_id: Option<&'static str>,
+    condition_version: Option<u64>,
+    conditions_digest: Option<herness_supervision::conditions::ConditionDigest>,
+    execution_scope: Option<ExecutionScope>,
+    profile: Option<ProfileBinding>,
+    consent: Option<ConsentBinding>,
+    budget_policy_version: Option<u64>,
+    budget: Option<BudgetPolicy>,
+}
+
+fn changed_approval(base: &OwnerApproval, change: ApprovalChange) -> OwnerApproval {
+    OwnerApproval::new(
+        base.project_id(),
+        base.owner().clone(),
+        base.source(),
+        change.settings_version.unwrap_or(base.settings_version()),
+        change.job_id.unwrap_or(base.job_id()),
+        ConditionVersion::new(
+            change
+                .condition_version
+                .unwrap_or(base.condition_version().get()),
+        )
+        .expect("version"),
+        change
+            .conditions_digest
+            .unwrap_or_else(|| base.conditions_digest().clone()),
+        change
+            .execution_scope
+            .unwrap_or_else(|| base.execution_scope().clone()),
+        change.profile.unwrap_or(base.profile()),
+        change.consent.unwrap_or(base.consent()),
+        change
+            .budget_policy_version
+            .unwrap_or(base.budget_policy_version()),
+        change.budget.unwrap_or_else(|| base.budget().clone()),
+    )
+    .expect("changed approval")
 }

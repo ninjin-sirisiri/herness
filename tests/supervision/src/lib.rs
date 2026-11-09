@@ -12,7 +12,9 @@ use herness_core::contracts::{
     AgentId, AuthMethod, ConnectionCapabilities, ConnectionId, ConnectionStatus, ConnectionUsage,
     EndpointClass, InputCapabilities, ModelId, ProjectId, Provider, SessionId, Timestamp,
 };
-use herness_supervision::approval::{ApprovalActor, ApprovalBasis, ConditionApproval};
+use herness_supervision::approval::{
+    ApprovalActor, ApprovalBasis, ConditionApproval, OwnerApprovalSource,
+};
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
     ConditionProbabilities, ConditionVerdict, NativeConfidence,
@@ -38,6 +40,7 @@ use herness_supervision::ids::{
     CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId, RunGroupId, SupervisionId,
     SupervisionRequestId,
 };
+use herness_supervision::owner_launch::{OwnerApproval, OwnerApprovalRegistryPort};
 use herness_supervision::ports::{ClockPort, SupervisionStorePort};
 use herness_supervision::profiles::{
     AdapterVersion, AssessmentProfile, ProfileCatalog, ProfileEntry, ProfileInputs, ProfilePurpose,
@@ -75,6 +78,52 @@ pub struct FixedClock;
 impl ClockPort for FixedClock {
     fn now(&self) -> Timestamp {
         now()
+    }
+}
+
+/// A deliberately scripted, in-memory implementation of the host owner
+/// approval registry port.
+///
+/// This exists only for the H2 contract tests. It is not an H3 registry and
+/// must never be used as production approval data: Task 14 supplies the real H3
+/// settings registry. Tests insert, replace, or remove an entry explicitly so a
+/// missing, stale, or mismatched registry value is observable.
+#[derive(Debug, Default)]
+pub struct ScriptedOwnerApprovalRegistry {
+    entries: BTreeMap<(ProjectId, OwnerRef), OwnerApproval>,
+}
+
+impl ScriptedOwnerApprovalRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts or replaces the current entry for one project and owner.
+    pub fn insert(&mut self, approval: OwnerApproval) {
+        self.entries.insert(
+            (approval.project_id(), approval.owner().clone()),
+            approval,
+        );
+    }
+
+    /// Removes the current entry for one project and owner.
+    pub fn remove(&mut self, project_id: ProjectId, owner: &OwnerRef) -> Option<OwnerApproval> {
+        self.entries.remove(&(project_id, owner.clone()))
+    }
+}
+
+impl OwnerApprovalRegistryPort for ScriptedOwnerApprovalRegistry {
+    fn current_owner_approval(
+        &self,
+        project_id: ProjectId,
+        owner: &OwnerRef,
+        _now: Timestamp,
+    ) -> Result<Option<OwnerApproval>, SupervisionError> {
+        Ok(self
+            .entries
+            .get(&(project_id, owner.clone()))
+            .cloned())
     }
 }
 
@@ -818,6 +867,84 @@ pub fn contract(project: ProjectId) -> SupervisionContract {
         now(),
     )
     .expect("contract")
+}
+
+/// A complete approved fixture contract owned by an approved H3/H4 owner.
+///
+/// The condition set carries the matching inherited approval so the contract is
+/// accepted by the same H2 rules as production.
+pub fn owner_contract(
+    project: ProjectId,
+    owner: OwnerRef,
+    source: OwnerApprovalSource,
+) -> SupervisionContract {
+    let ids = ids(project);
+    let mut conditions = condition_set(project);
+    let approval = ConditionApproval::new(
+        project,
+        ApprovalBasis::InheritedOwner {
+            owner: owner.clone(),
+            source,
+            approved_at: now(),
+            expires_at: None,
+        },
+        conditions.condition_version(),
+        conditions.digest().clone(),
+    )
+    .expect("owner condition approval");
+    conditions
+        .approve(
+            ApprovalActor::ApprovedOwner {
+                owner: owner.clone(),
+                source,
+            },
+            approval,
+            now(),
+        )
+        .expect("inherited approval");
+    let subject = SupervisionSubject::new(
+        project,
+        ids.supervision,
+        AgentId::new(project),
+        SessionId::new(project),
+        owner.clone(),
+    )
+    .expect("subject");
+    let execution = ExecutionScope::new(
+        project,
+        vec!["src".to_owned(), "Cargo.toml".to_owned()],
+        vec!["src".to_owned()],
+        true,
+    )
+    .expect("scope");
+    let profile = completion_profile(project);
+    let consent = consent(project, ProfilePurpose::Completion, 1);
+    let target = target_scope(project, 1);
+    let budget = BudgetPolicy::h2_default();
+    let packet = work_packet(
+        project,
+        &target,
+        &execution,
+        conditions.condition_version(),
+        &profile,
+        &consent,
+        &budget,
+        "owner fixture instruction",
+    );
+    SupervisionContract::new(
+        ApprovalActor::ApprovedOwner { owner, source },
+        subject,
+        execution,
+        RunGroup::new(ids.run_group),
+        conditions,
+        target,
+        &profile,
+        &consent,
+        budget,
+        packet,
+        now(),
+    )
+    .expect("owner contract")
 }
 
 /// A fixture work packet matching the supplied approved values.

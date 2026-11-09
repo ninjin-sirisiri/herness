@@ -190,6 +190,11 @@ pub enum SupervisionError {
         /// Structured reason.
         reason: WorkPacketRejection,
     },
+    /// An approved-owner automatic start was refused before any run.
+    OwnerLaunchRejected {
+        /// Structured reason.
+        reason: OwnerLaunchRejection,
+    },
 }
 
 /// Why an immutable work packet cannot be used.
@@ -216,6 +221,75 @@ pub enum WorkPacketRejection {
         /// Constraint field that differs.
         field: String,
     },
+}
+
+/// Why an approved-owner launch was rejected.
+///
+/// A rejection never performs a registry mutation, creates a child run, or
+/// sends a provider request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum OwnerLaunchRejection {
+    /// The owner kind is not an approved H3/H4 owner.
+    OwnerNotApproved,
+    /// H4 approval is not implemented in this build.
+    H4ApprovalUnavailable,
+    /// The owner's registry has no current approval entry.
+    MissingRegistryEntry,
+    /// The registry entry covers another project.
+    ProjectMismatch,
+    /// The authority covers another supervision target.
+    TargetMismatch,
+    /// The registry entry names another owner.
+    OwnerMismatch,
+    /// The owner kind and approval source disagree.
+    SourceMismatch,
+    /// The target requests an older or newer settings version.
+    StaleSettings {
+        /// Version the launch requested.
+        requested: u64,
+        /// Version currently registered.
+        registered: u64,
+    },
+    /// The registry entry covers another job.
+    JobMismatch,
+    /// The target requests an older or newer condition version.
+    StaleConditions {
+        /// Condition version the launch requested.
+        requested: u64,
+        /// Condition version currently registered.
+        registered: u64,
+    },
+    /// The condition content digest differs from the current approval.
+    ConditionDigestMismatch,
+    /// The execution scope differs from the current approval.
+    ScopeMismatch,
+    /// The assessment-profile binding differs from the current approval.
+    ProfileMismatch,
+    /// The disclosure-consent binding differs from the current approval.
+    ConsentMismatch,
+    /// The budget policy version differs from the current approval.
+    BudgetPolicyVersionMismatch {
+        /// Version the launch requested.
+        requested: u64,
+        /// Version currently registered.
+        registered: u64,
+    },
+    /// The finite budget limits differ from the current approval.
+    BudgetMismatch,
+    /// Only a ready target may start automatically.
+    TargetNotReady {
+        /// State found instead of ready.
+        found: SupervisionState,
+    },
+    /// The target already has at least one started run.
+    AlreadyStarted,
+    /// The target was loaded by restore in this process and needs a human start.
+    RestoredTarget,
 }
 
 /// Why an approval was rejected.
@@ -364,6 +438,9 @@ impl fmt::Display for SupervisionError {
             }
             Self::WorkPacketRejected { reason } => {
                 write!(f, "work packet rejected: {reason:?}")
+            }
+            Self::OwnerLaunchRejected { reason } => {
+                write!(f, "approved-owner launch rejected: {reason:?}")
             }
         }
     }
