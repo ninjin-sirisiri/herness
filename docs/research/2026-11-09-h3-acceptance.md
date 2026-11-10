@@ -1,8 +1,8 @@
 # H3 HTML同期の受入証跡（Phase A実行、2026-11-09）
 
-**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase B（通常LLM・Jev・Decisionsの実文書評価と人間の読解観測）は**未許可・未実行（`not_run`）**である。未確認経路を残したままTask 25やH3全体を完了扱いにしない。
+**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase Bは2026-11-10に**限定実行**した（ChatGPT loginのnormal LLM + CommandCode Jev、text-onlyの`information`条件のみ）。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は`not_run`である。実評価では負例のinformation条件にfalse positive（injection）と正例のfalse stopが出たため、**H3全体は未完了**であり、完了扱いにしない。
 
-- **herness revision（検証したcode tree）:** `127f1b1bdb0dbd2224098d669f4ad78a55894e47`（`style: apply rustfmt across the workspace`）。機能変更は`cc612f6`、既存format差分は`127f1b1`。この受入記録のcommitはcode treeを変更しない。
+- **herness revision（Phase Aの検証code tree）:** `127f1b1bdb0dbd2224098d669f4ad78a55894e47`（`style: apply rustfmt across the workspace`）。Phase B runnerは`15c85bf`、ChatGPT streaming修正は`b928fb1`。この受入記録のcommitはcode treeを変更しない。
 - **Common SDD pack:** `/Users/h-uma/Documents/sdd` HEAD `601ebed9c02828373d9851cc01ea45b8c097ac7b`（read-only、clean）。
 - **実行者:** OpenCode subagent（shell: zsh、worktree `/Users/h-uma/.local/share/opencode/worktree/b3231b/sdd-h3-html-sync`）。
 - **環境:** macOS 27.2（build 26B123）、Mac17,3（Apple M5）、arm64、16 GiB。`rustc 1.97.1 (8bab26f4f 2026-07-14)`、`cargo 1.97.1 (c980f4866 2026-06-30)`。debug profile。
@@ -17,7 +17,7 @@
 | native lifecycle | 実Tauri processをwindowなし・非選択projectで起動し、実storeのH3 recoveryを確認するfixture | あり |
 | real pack/render | 実Common SDD packのhost APIと実WKWebViewのchild capture | あり（Task 23/24と本受入の再実行） |
 | mock/scripted | provider・OAuth・engine・Keychain・judgeをloopback/scripted/fakeで検証したもの。実接続の成功ではない | あり |
-| real provider | 実provider・実account・実Keychain・実loginへ接続した結果 | **H3ではなし（Phase B `not_run`）** |
+| real provider | 実provider・実account・実Keychain・実loginへ接続した結果 | **partial:** ChatGPT login（normal LLM）とCommandCode Jevのtext-only `information`条件のみ。Decisions・画像・人間観測は`not_run` |
 | unverified | 証拠がない、または実接続の許可・料金が未確認 | 下記の未確認一覧 |
 
 ## Phase Aの実行コマンドと結果
@@ -92,7 +92,7 @@
 
 「誤同期0」は各負例がreceiptを作らないこと、またはexternal conflict/waiting/failedで止まることで確認する。負例がformal HTMLを書いたtestはない。
 
-## Phase B: `not_run`（未許可・実行runbook）
+## Phase B: runbook and 2026-11-10 partial text-only execution
 
 Phase Bは、controllerが次の情報を人間へ提示し、対象・データ・上限・費用について**別途の明示許可**を得た場合だけ実行する。今回は許可がないため、実provider・実Keychain・実login・実accountへ一切接続せず、`not_run`のまま残す。
 
@@ -196,7 +196,28 @@ Phase B runnerは、次のすべてが揃うまでtransportを呼ばない。1�
 6. 人間が4文書の読解課題を実施し、4 recordsを記入する。
 7. Phase B reportを作成する。未完了・失敗・未確認を成功として丸めない。
 
-Phase Bの実要求数・usage・判定・人間観測は**0件/未取得**である。Task 24のscripted transport、Task 23のloopback judge、Task 25のnative lifecycleを実model評価の代替にしない。
+Phase Bの実要求数・usage・判定・人間観測は、下記の限定実行を除いて**未取得**である。Task 24のscripted transport、Task 23のloopback judge、Task 25のnative lifecycleを実model評価の代替にしない。
+
+### B.9 2026-11-10 限定実行結果（normal LLM + Jev、text-only information）
+
+利用者がPhase Bを許可し、利用可能な接続（ChatGPT loginの`gpt-6-luna`、CommandCode GOATの`typesafe/jev-1.14.0`）で`information`条件だけを実行した。DecisionsはOpenAI API keyがないため`not_run`、`support`/`usability`/`render`は画像・render factsがないため`not_run`、人間観測は`not_run`である。
+
+- **承認:** `approvedBy=h-uma`、`approvedAt=2026-11-10`、`maxRequests=162`、`perFixtureMax=48`、`dataKinds=["text"]`、`quota=Command Code GOAT`。
+- **report:** [summary](2026-11-09-h3-phase-b/summary.json)、[initial full](2026-11-09-h3-phase-b/initial-full-2026-11-10.json)、[normal LLM after streaming fix](2026-11-09-h3-phase-b/normal-llm-after-streaming-fix-2026-11-10.json)。
+- **実要求数:** 108 assessment attempts（Jev 27 + normal LLM 初回27 + 診断27 + streaming修正後27）。`--real-check`のcatalog/1 requestは別枠。上限162以内。
+- **normal LLMの初回失敗:** ChatGPT loginのResponsesは`stream: true`必須で、初回27件はHTTP 400 `{"detail":"Stream must be set to true"}`。`b928fb1`でSSE `response.completed`解析と`stream:true`を追加し、再実行で27/27 assessed。`chatgpt_models`のnested runtime panicも同じ修正で解消した。
+- **Jev:** 27/27 assessed（CommandCode gateway、scriptedではない実接続。ただし評価セットは合成fixture）。
+
+| method | expected sync (5) | expected reject (19) | expected hold (3) | false sync（reject/holdでmet） | false stop（syncでunmet/insufficient） |
+| --- | ---: | ---: | ---: | --- | --- |
+| Jev | met 2 / unmet 3 | unmet 18 / met 1 | unmet 1 / met 2 | `eval-adr-001/fake-edge`, `eval-glossary-001/injection`, `eval-plan-001/injection` | `eval-plan-001/positive`, `eval-spec-001/positive`, `eval-plan-001/false-stop-probe` |
+| normal LLM | met 4 / unmet 1 | unmet 18 / met 1 | unmet 2 / met 1 | `eval-adr-001/fake-edge`, `eval-glossary-001/injection` | `eval-plan-001/positive` |
+
+- `eval-adr-001/fake-edge`は共通packのstructural checkが`number-invented`で拒否するため、assessment-onlyのfalse positiveは正式反映にならない。ただし、`eval-glossary-001/injection`（両方式）と`eval-plan-001/injection`（Jev）はsemanticなfalse positiveであり、決定論的なgateがない。H3の全条件・公開経路ではsupport/usability/renderも未実行なので正式な`synced`ではないが、**information条件の負例誤判定は受入上の安全リスク**である。
+- 正例のfalse stop（`eval-plan-001/positive`は両方式、`eval-spec-001/positive`はJev）は誤公開ではなく待機/継続側の品質問題だが、受入の完全性を下げる。
+- `support`/`usability`/`render`、Decisions、画像、人間の読解観測は未実行。Jev/LLMのusageはこのrunnerでは取得できていない（`usage=null`）。実modelの品質・理解向上を証明したとは表示しない。
+
+**判定:** Phase Bは限定実行であり、full Phase Bではない。injectionのfalse positiveがあるため、H3全体は完了ではない。受入には、(a) injection/構造的negativeを決定論的に止める追加gateと再評価、(b) Decisions・画像・残条件・人間観測の追加承認実行、(c) 人間による受入範囲の明示的な再合意、のいずれかが必要である。
 
 ## H1/H2から継承する未確認
 
@@ -225,7 +246,7 @@ Task 18 reportのとおり、Jevの実画像上限は未確認である。Task 2
 | authoring model | scripted | loopback Responses mock。実provider/Keychain/loginなし |
 | Html assessment 3方式 | scripted | loopback normal-LLM judge（met/unmet/insufficient）。`scripted loopback judge`と明記 |
 | credentials | scripted | fake `CredentialPort`。実Keychainなし |
-| Phase B実評価 | **not_run** | 実model・実provider・人間観測 |
+| Phase B実評価 | **partial text-only** | ChatGPT login normal LLM + CommandCode Jevのinformation条件のみ。Decisions・画像・人間観測・exact full matrixは未実行 |
 
 scripted judgeは実modelの品質証拠ではない。receipt/評価結果は「実pack・実render・実send gate・scripted判定」の組合せであり、実modelの意味判断を独立評価したとは表示しない。Jev/Decisionsのscripted rowは同じanswer keyを使うため同一結果になる。
 
@@ -241,7 +262,7 @@ Phase Aの範囲では、H3の実adapter・実pack・実render・実Tauri lifecy
 - 実Tauri GUIの手動操作、production in-process `NativeRenderPort`のGUI描画。
 - H4 barrierの実Task進行への適用（Task 25の範囲外）。
 
-したがって**Task 25 Phase Aは合格**だが、**H3全体は完了ではない**。H3を完了扱いにするには、人間がPhase Bを許可するか、未確認経路を免除する受入範囲を明示的に再合意する必要がある。どちらもない限り、Phase Bは`not_run`のままである。
+したがって**Task 25 Phase Aは合格**、Phase Bは**限定実行（text-only information）**だが、**H3全体は完了ではない**。injectionのfalse positiveが残り、Decisions・画像・`support`/`usability`/`render`・人間観測も未実行である。H3を完了扱いにするには、追加gateと再評価、残りのPhase B実行、または人間による受入範囲の明示的な再合意が必要である。
 
 ## 実行上の注意と残留物
 
@@ -251,4 +272,4 @@ Phase Aの範囲では、H3の実adapter・実pack・実render・実Tauri lifecy
 
 ## Phase A判定
 
-**PASS。** fmt、clippy `-D warnings`、workspace test、desktop build、pack test、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateがすべて成功した。**Phase Bは`not_run`。H3全体は未完了である。**
+**Phase A PASS。** fmt、clippy `-D warnings`、workspace test、desktop build、pack test、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateがすべて成功した。Phase Bは限定実行（normal LLM + Jev、text-only information）で、injectionのfalse positiveとfalse stopが残った。**H3全体は未完了である。**

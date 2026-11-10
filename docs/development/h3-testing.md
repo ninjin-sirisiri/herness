@@ -336,9 +336,11 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 最終workspaceはgreenだが、途中でH2のloopback/parallel-load flakeを2件観測した。`production_permission_profile_runs_the_real_evaluator_and_charges_the_shared_ledger`の`EvaluatorFailure::Unavailable`と、`permission_evaluator_failures_are_sanitized_and_never_allow`のrequest数不足である。どちらも単独再実行と最終workspaceで合格し、assertは変更していない。H3起因ではない。
 
-### Phase B gate（`not_run`、実行runbook）
+### Phase B gate and 2026-11-10 partial execution
 
-通常LLM・Jev・Decisionsの実文書評価と人間の読解観測は**未許可・未実行**である。記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
+Phase Bは2026-11-10に**限定実行**した。利用可能な接続はChatGPT login（normal LLM、`gpt-6-luna`）とCommandCode GOAT Jev（`typesafe/jev-1.14.0`）だけで、実行したのはtext-onlyの`information`条件のみ。Decisions、`support`/`usability`/`render`、画像、人間の読解観測は`not_run`である。injectionのfalse positiveとfalse stopが出たため、**H3全体は未完了**である。詳細は[受入証跡](../research/2026-11-09-h3-acceptance.md)のB.9と`docs/research/2026-11-09-h3-phase-b/`。
+
+記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
 
 opt-in runnerは`tests/html-sync/tests/phase_b.rs`。normal LLM（ChatGPT login）とJev（Command Code固定gateway）の`information`条件だけを実装し、`support` / `usability` / `render`とDecisionsは`not_run`として記録する。通常のtest runではignoredで、`H3_PHASE_B_REAL=1`と完全な承認ファイルが揃うまで送信しない。実runは別途の人間許可後だけ行う。
 
@@ -346,7 +348,7 @@ opt-in runnerは`tests/html-sync/tests/phase_b.rs`。normal LLM（ChatGPT login�
 cargo test -p herness-html-sync-tests --test phase_b --locked
 ```
 
-承認後の実run（このworktreeでは未実行。`COMMANDCODE_API_KEY`は事前に環境へ設定し、command line・approval・reportへ書かない）:
+承認後の実run（2026-11-10に限定実行済み。`COMMANDCODE_API_KEY`は事前に環境へ設定し、command line・approval・reportへ書かない）:
 
 ```bash
 H3_PHASE_B_REAL=1 \
@@ -383,7 +385,18 @@ cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --noc
 
 - `feeCapUsd`/`priceVersion`または承認済みquota path、`quotaLabel`、`quotaConfirmed`が必要。現在のdesktop compositionは`NoPriceEstimator`のため、money cap付き送信はestimateなしで**送信前に拒否**される。ダミーestimateを追加しない。money cap付きで実行するには別途承認されたprice estimatorが必要である。
 - 送信前gateはconnection（3 role）、exact fixtures/dataKinds、finite request budget、retry policy、fee/quota、approver/time、scope/期限のすべてを要求し、欠落時は不足fieldを列挙して送信0で拒否する。
-- 既存の`tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval`が、provider/connectionId/endpointClass/model、fixtures、dataKinds、maxRequests/perFixtureMax、retry、fee/quota、approvedBy/approvedAtの欠落を拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runnerはこのgateを3接続へ拡張して再利用する。production runnerはまだ実装していない。
+- 既存の`tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval`が、provider/connectionId/endpointClass/model、fixtures、dataKinds、maxRequests/perFixtureMax、retry、fee/quota、approvedBy/approvedAtの欠落を拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runnerはこのgateをnormal LLM + Jevのexact接続へ拡張して再利用する。production runnerは`tests/html-sync/tests/phase_b.rs`に実装済み。
+
+**2026-11-10 限定実行結果**
+
+| method | requests | assessed | false sync (information) | false stop |
+| --- | ---: | ---: | --- | --- |
+| Jev | 27 | 27 | `eval-adr-001/fake-edge`, `eval-glossary-001/injection`, `eval-plan-001/injection` | `eval-plan-001/positive`, `eval-spec-001/positive`, `eval-plan-001/false-stop-probe` |
+| normal LLM | 27 | 27（SSE修正後） | `eval-adr-001/fake-edge`, `eval-glossary-001/injection` | `eval-plan-001/positive` |
+
+- `eval-adr-001/fake-edge`は共通packの`number-invented`で正式反映前に拒否されるが、injectionは決定論的gateがなく、semanticなfalse positiveとして残る。
+- normal LLMの初回27件はChatGPT ResponsesのHTTP 400 `Stream must be set to true`で失敗した。`b928fb1`で`stream:true`とSSE `response.completed`解析を追加して再実行し、27/27 assessed。`chatgpt_models`のnested runtime panicも同期コマンド化で修正した。
+- reports: `docs/research/2026-11-09-h3-phase-b/summary.json`、`initial-full-2026-11-10.json`、`normal-llm-after-streaming-fix-2026-11-10.json`。合計108 assessment attempts。
 
 **人間観測**
 

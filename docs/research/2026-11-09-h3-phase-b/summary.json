@@ -1,0 +1,453 @@
+{
+  "schema": "h3-phase-b-summary-v1",
+  "generatedAt": "2026-11-10T13:01:05.532440+00:00",
+  "sources": [
+    "initial-full-2026-11-10.json",
+    "normal-llm-after-streaming-fix-2026-11-10.json"
+  ],
+  "normalLlmNote": "The initial normal-LLM rows failed HTTP 400 (Stream must be set to true); the fixed report uses the SSE streaming transport. Jev was not rerun in the fixed report.",
+  "jev": {
+    "counts": {
+      "reject:unmet": 18,
+      "reject:met": 1,
+      "sync:met": 2,
+      "hold:unmet": 1,
+      "hold:met": 2,
+      "sync:unmet": 3
+    },
+    "falseSync": [
+      "eval-adr-001/fake-edge",
+      "eval-glossary-001/injection",
+      "eval-plan-001/injection"
+    ],
+    "falseStop": [
+      "eval-plan-001/false-stop-probe",
+      "eval-plan-001/positive",
+      "eval-spec-001/positive"
+    ]
+  },
+  "normal_llm": {
+    "counts": {
+      "reject:unmet": 18,
+      "reject:met": 1,
+      "sync:met": 4,
+      "hold:unmet": 2,
+      "hold:met": 1,
+      "sync:unmet": 1
+    },
+    "falseSync": [
+      "eval-adr-001/fake-edge",
+      "eval-glossary-001/injection"
+    ],
+    "falseStop": [
+      "eval-plan-001/positive"
+    ]
+  },
+  "cases": [
+    {
+      "caseId": "eval-adr-001/caveat",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/code",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/fake-edge",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/link",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/negation",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/positive",
+      "expected": "sync",
+      "expectedVerdict": "met",
+      "jev": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/stale",
+      "expected": "hold",
+      "expectedVerdict": "insufficient",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-adr-001/threshold",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-glossary-001/avoid-term",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-glossary-001/hidden",
+      "expected": "reject",
+      "expectedVerdict": "insufficient",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-glossary-001/injection",
+      "expected": "hold",
+      "expectedVerdict": "insufficient",
+      "jev": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-glossary-001/permission",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-glossary-001/positive",
+      "expected": "sync",
+      "expectedVerdict": "met",
+      "jev": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/fake-value",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/false-stop-probe",
+      "expected": "sync",
+      "expectedVerdict": "met",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/hidden",
+      "expected": "reject",
+      "expectedVerdict": "insufficient",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/injection",
+      "expected": "hold",
+      "expectedVerdict": "insufficient",
+      "jev": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/order",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/positive",
+      "expected": "sync",
+      "expectedVerdict": "met",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-plan-001/threshold",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/code",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/link",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/negation",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/permission",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/positive",
+      "expected": "sync",
+      "expectedVerdict": "met",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "met",
+        "adopted": "met"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/table",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": null
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    },
+    {
+      "caseId": "eval-spec-001/viewport",
+      "expected": "reject",
+      "expectedVerdict": "unmet",
+      "jev": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      },
+      "normal_llm": {
+        "status": "assessed",
+        "actual": "unmet",
+        "adopted": "unmet"
+      }
+    }
+  ]
+}
