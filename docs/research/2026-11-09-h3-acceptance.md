@@ -1,6 +1,6 @@
 # H3 HTML同期の受入証跡（Phase A実行、2026-11-09）
 
-**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase Bは2026-11-10に**限定実行**した（ChatGPT loginのnormal LLM + CommandCode Jev、text-onlyの`information`条件のみ）。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は`not_run`である。実評価では負例のinformation条件にfalse positive（injection）と正例のfalse stopが出た。その後、明示的なinstruction overrideを送信前に止める決定論的gateを追加して再評価し、injectionのfalse syncは0になった（fake-edgeはpack structuralで拒否、false stopは残存）。full Phase Bではないため、**H3全体は未完了**であり、完了扱いにしない。
+**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase Bは2026-11-10に**限定実行**した（ChatGPT loginのnormal LLM + CommandCode Jev、text-onlyの`information`条件のみ）。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は`not_run`である。実評価では負例のinformation条件にfalse positive（injection）と正例のfalse stopが出た。その後、明示的なinstruction overrideを送信前に止める決定論的gateを追加して再評価し、injectionのfalse syncは0になった（fake-edgeはpack structuralで拒否、false stopは残存）。2026-11-10のcontinued improvementでは、通常LLMのadapter promptにverdict semanticsを明記し、`gpt-6.1-sol`で再評価してnormal LLMのfalse stopを0/5にした。Jev・Decisions・画像・残条件・人間観測は未実行のため、full Phase Bではなく、**H3全体は未完了**であり、完了扱いにしない。
 
 - **herness revision（Phase Aの検証code tree）:** `127f1b1bdb0dbd2224098d669f4ad78a55894e47`（`style: apply rustfmt across the workspace`）。Phase B runnerは`15c85bf`、ChatGPT streaming修正は`b928fb1`。この受入記録のcommitはcode treeを変更しない。
 - **Common SDD pack:** `/Users/h-uma/Documents/sdd` HEAD `601ebed9c02828373d9851cc01ea45b8c097ac7b`（read-only、clean）。
@@ -232,6 +232,22 @@ Phase Bの実要求数・usage・判定・人間観測は、下記の限定実�
 
 **判定（gate後）:** text-only informationの負例誤同期は、injection gateとpack structural checkの範囲で0になった。残るfalse stopは品質所見であり、安全性の誤公開ではない。ただしfull Phase B（Decisions・画像・残条件・人間観測）は未実行のため、**H3全体は依然未完了**である。H3を完了扱いにするには、残りのPhase B実行または人間による受入範囲の明示的な再合意が必要である。
 
+#### B.9.2 continued improvement: normal-LLM false stopの再評価（2026-11-10）
+
+normal LLMのfalse stop 2件（`eval-glossary-001/positive`、`eval-plan-001/false-stop-probe`）を、送信前の診断情報とadapter promptの明示で改善した。
+
+- **診断:** Phase B reportのassessed rowへmodelの短い`sanitize`済み`rationale`、`rationaleOrigin`、`uncertainty`を追加した。report rootの`diagnostics`はfalse stop/false syncをrationale付きで列挙し、heldを別に数える。hidden chain-of-thoughtやraw provider bodyは保存しない。
+- **prompt:** normal-LLM adapter promptへ「faithful paraphrase/reorderingとalternate correct reconstructionは`met`、`unmet`はsubstantive contradictionまたはchanged strict valueだけ、`insufficient`はmissing/unresolvable unitsだけ」を明記した。H3 rubric textと`H3_RUBRIC_VERSION=h3-html-evaluation-v1`は変更していない。Phase B adapter versionは`phase-b-normal-llm-2`、production normal-LLM adapter versionは`herness-llm-condition-v2`へ上げた。
+- **接続:** 既定app-data rootの一時copyを使い、host-state/connection/vaultAccount/shared Keychain credentialは同一のまま、copyしたnormal-LLM connectionのmodelだけを`gpt-6.1-sol`へ変更した。既定host-stateは`gpt-6-luna`のまま変更していない。共有ChatGPT login tokenが期限切れだったため、probe前にtoken refreshを1回だけ行った（assessment attemptではない）。
+- **承認:** `approvedBy=h-uma (continued improvement 2026-11-10)`、`maxRequests=100`、`perFixtureMax=25`、`dataKinds=["text"]`、quota path、retryは既存policy（同一接続・最大3 attempts）。Jev fieldsはselected/verifiedのまま保持し、`H3_PHASE_B_METHODS=normal_llm`でJev送信をskipした。injection 2 caseは両methodのheld row（4）として記録し、送信0。
+- **requests / usage:** 合計30 assessment attempts（5-positive probe 5 + full normal-LLM 25）。retryは0。probeはinput 16,111 / output 1,318 tokens、full runはinput 80,934 / output 5,956 tokens。上限100以内。
+- **false stop:** 5-positive probeは5/5 `met`、false stop 0。full normal-LLMは25/25 assessed、false stop **0**（`eval-glossary-001/positive`と`eval-plan-001/false-stop-probe`は`met`）。
+- **injection:** held 4 rows（`eval-glossary-001/injection`と`eval-plan-001/injection` × normal_llm/jev、後者は未選択のheld rowでrequest 0）。injectionのfalse syncは0。
+- **残るassessment-only false sync:** `eval-adr-001/fake-edge`と`eval-plan-001/fake-value`（normal LLM）。どちらもCommon SDD packのstructural `candidate-check`が`number-invented`で拒否するため、full pipelineのfalse syncにはならない。gated runの1件（fake-edge）からassessment-onlyでは2件に増えたが、pack structuralの安全境界は維持している。
+- **report:** [continued summary](2026-11-09-h3-phase-b/continued-summary-2026-11-10.json)、[positives probe](2026-11-09-h3-phase-b/continued-positives-gpt-6.1-sol-2026-11-10.json)、[full normal-LLM](2026-11-09-h3-phase-b/continued-normal-llm-gpt-6.1-sol-2026-11-10.json)。
+
+**判定（B.9.2）:** normal LLMのtext-only information false stopは0/5になり、injection gateは4 heldを維持した。ただしJev・Decisions・`support`/`usability`/`render`・画像・人間観測は未実行で、assessment-only false sync 2件（pack structuralで拒否）も残る。**H3全体は未完了**であり、full Phase Bまたは受入範囲の再合意が必要である。
+
 ## H1/H2から継承する未確認
 
 H3はH1/H2の未確認を免除しない。以下はH3受入でも未確認のままである。
@@ -275,7 +291,7 @@ Phase Aの範囲では、H3の実adapter・実pack・実render・実Tauri lifecy
 - 実Tauri GUIの手動操作、production in-process `NativeRenderPort`のGUI描画。
 - H4 barrierの実Task進行への適用（Task 25の範囲外）。
 
-したがって**Task 25 Phase Aは合格**、Phase Bは**限定実行（text-only information、injection gate後）**だが、**H3全体は完了ではない**。injectionのfalse syncはgateで0になったが、false stopが残り、Decisions・画像・`support`/`usability`/`render`・人間観測も未実行である。H3を完了扱いにするには、残りのPhase B実行、または人間による受入範囲の明示的な再合意が必要である。
+したがって**Task 25 Phase Aは合格**、Phase Bは**限定実行（text-only information、injection gate後、continued improvementでnormal LLM false stop 0/5）**だが、**H3全体は完了ではない**。injectionのfalse syncはgateで0になり、normal LLMのfalse stopも`gpt-6.1-sol`とprompt semanticsの再評価で0/5になった。ただしJevの再評価、Decisions・画像・`support`/`usability`/`render`・人間観測は未実行で、assessment-only false sync 2件（pack structuralで拒否）も残る。H3を完了扱いにするには、残りのPhase B実行、または人間による受入範囲の明示的な再合意が必要である。
 
 ## 実行上の注意と残留物
 
@@ -285,4 +301,4 @@ Phase Aの範囲では、H3の実adapter・実pack・実render・実Tauri lifecy
 
 ## Phase A判定
 
-**Phase A PASS。** fmt、clippy `-D warnings`、workspace test、desktop build、pack test、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateがすべて成功した。Phase Bは限定実行（normal LLM + Jev、text-only information）で、injection gate後の再評価ではinjectionのfalse syncは0、fake-edgeはpack structuralで拒否、false stopは残った。**H3全体は未完了である。**
+**Phase A PASS。** fmt、clippy `-D warnings`、workspace test、desktop build、pack test、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateがすべて成功した。Phase Bは限定実行（normal LLM + Jev、text-only information）で、injection gate後の再評価ではinjectionのfalse syncは0、fake-edgeはpack structuralで拒否、normal LLMのfalse stopは`gpt-6.1-sol`とprompt semanticsのcontinued runで0/5になった。Jev再評価・Decisions・画像・残条件・人間観測は未実行である。**H3全体は未完了である。**

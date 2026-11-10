@@ -46,6 +46,7 @@ pub use jev::{
 };
 pub use llm::{
     EvidenceContent, EvidenceDocument, InconclusiveReason, LlmAssessment, LlmAssessmentAdapter,
+    LlmUsage,
 };
 pub use permission::{
     PermissionBudgetScope, PermissionConsentHandle, PermissionEvaluator, PermissionEvaluatorConfig,

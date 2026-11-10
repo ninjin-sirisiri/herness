@@ -30,6 +30,14 @@ partial run. It is **not** a complete Phase B and does not make H3 complete.
   instruction gate: 50 sends + 4 held injection cases; Jev and normal LLM each
   25/25 assessed.
 - `gated-summary.json` — gated counts, held cases, false-sync/false-stop lists.
+- `continued-positives-gpt-6.1-sol-2026-11-10.json` — 5-positive diagnostic
+  probe with `gpt-6.1-sol`: 5/5 assessed, 0 false stops, 4 held rows.
+- `continued-normal-llm-gpt-6.1-sol-2026-11-10.json` — full normal-LLM
+  information-condition run: 25/25 sendable cases assessed, 2 held injection
+  cases for the selected method (plus 2 held rows for the unselected Jev
+  method), 0 false stops.
+- `continued-summary-2026-11-10.json` — exact attempts, usage, budget,
+  before/after false-stop lists, held and residual false-sync notes.
 
 ## Findings
 
@@ -65,16 +73,61 @@ pack final check. This run alone is not a `synced` result. H3 remains incomplete
 until the remaining Phase B scope or an explicit reduced acceptance scope is
 agreed.
 
+## Continued improvement (2026-11-10)
+
+The false-stop diagnosis added two things before the next real run:
+
+1. every assessed Phase B row now stores the model's short `rationale`,
+   `rationaleOrigin`, and `uncertainty`, and the report has a `diagnostics`
+   object that lists false stops/false syncs with that rationale; and
+2. the normal-LLM adapter prompt now states the verdict semantics explicitly:
+   a faithful paraphrase/reordering and an alternate correct reconstruction are
+   `met`; `unmet` only for a substantive contradiction or changed strict value;
+   `insufficient` only for missing/unresolvable units. The H3 rubric text and
+   `h3-html-evaluation-v1` are unchanged; the normal-LLM adapter version is
+   `phase-b-normal-llm-2` (production `herness-llm-condition-v2`).
+
+The run used a temporary copy of the default app-data root. The copied
+connection kept the same host-state, connection, vault account and shared
+Keychain credential; only the copied model slug was changed from `gpt-6-luna`
+to `gpt-6.1-sol`. The default host-state was not edited. One ChatGPT login
+token refresh was needed before the probe (an authentication request, not an
+assessment attempt).
+
+- Budget: 100 assessment attempts approved (`maxRequests=100`,
+  `perFixtureMax=25`); 30 used (5-positive probe + 25 full normal-LLM).
+  No request used more than one attempt.
+- False stops: 2 before (`eval-glossary-001/positive`,
+  `eval-plan-001/false-stop-probe`) → 0 after. The five expected-sync positives
+  were all `met` in the probe and remained `met` in the full run.
+- Injection: all four method/case held rows remain held with zero requests
+  (`adversarial_instruction_detected: ignore previous instructions`). Jev was
+  not selected, so it sent no request.
+- Usage: 16,111 input / 1,318 output tokens in the probe; 80,934 input /
+  5,956 output tokens in the full run (recorded per row).
+- Residual: `eval-adr-001/fake-edge` and `eval-plan-001/fake-value` are
+  assessment-only false syncs (both reported `met`). The common pack structural
+  `candidate-check` denies both as `number-invented`, so they do not become
+  full-pipeline false syncs. The model treated the added strict values as
+  additional facts rather than as changed source values. The pack structural
+  check remains the required safety boundary.
+- Not run: Jev, Decisions, `support`, `usability`, `render`, images, and human
+  observation. This is still not a complete Phase B.
+
 ## Reproduce (requires a new human approval; no credentials are stored here)
 
 ```bash
 H3_PHASE_B_REAL=1 \
 H3_PHASE_B_APPROVAL=/absolute/path/to/filled-phase-b.approval.json \
 H3_PHASE_B_REPORT=/absolute/path/to/new-report.json \
-HERNESS_APP_DATA_ROOT="$HOME/Library/Application Support/dev.herness.desktop/herness" \
+H3_PHASE_B_METHODS=normal_llm \
+HERNESS_APP_DATA_ROOT=/absolute/path/to/copied/app-data-root \
 cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --nocapture
 ```
 
-`COMMANDCODE_API_KEY` must be set in the environment (never in the approval,
-report, or repository). The approval template is
+For a 5-positive diagnostic probe, add `H3_PHASE_B_CASES=positives` and
+`H3_PHASE_B_DIAGNOSTIC=1`. The diagnostic flag only relaxes the final
+completeness panic; it never relaxes the approval gate or the injection gate.
+`COMMANDCODE_API_KEY` is required only when Jev is selected (never in the
+approval, report, or repository). The approval template is
 `tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`.

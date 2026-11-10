@@ -338,7 +338,7 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 ### Phase B gate and 2026-11-10 partial execution
 
-Phase Bは2026-11-10に**限定実行**した。利用可能な接続はChatGPT login（normal LLM、`gpt-6-luna`）とCommandCode GOAT Jev（`typesafe/jev-1.14.0`）だけで、実行したのはtext-onlyの`information`条件のみ。Decisions、`support`/`usability`/`render`、画像、人間の読解観測は`not_run`である。injectionのfalse positiveとfalse stopが出たため、**H3全体は未完了**である。詳細は[受入証跡](../research/2026-11-09-h3-acceptance.md)のB.9と`docs/research/2026-11-09-h3-phase-b/`。
+Phase Bは2026-11-10に**限定実行**した。利用可能な接続はChatGPT login（normal LLM、`gpt-6-luna` → continued runでは`gpt-6.1-sol`）とCommandCode GOAT Jev（`typesafe/jev-1.14.0`）だけで、実行したのはtext-onlyの`information`条件のみ。Decisions、`support`/`usability`/`render`、画像、人間の読解観測は`not_run`である。injectionのfalse positiveとfalse stopが出たためgateを追加し、continued improvementではnormal LLMのfalse stopを0/5にした。Jev再評価・残条件・人間観測は未実行のため、**H3全体は未完了**である。詳細は[受入証跡](../research/2026-11-09-h3-acceptance.md)のB.9と`docs/research/2026-11-09-h3-phase-b/`。
 
 記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
 
@@ -354,8 +354,12 @@ cargo test -p herness-html-sync-tests --test phase_b --locked
 H3_PHASE_B_REAL=1 \
 H3_PHASE_B_APPROVAL=/absolute/path/to/filled-phase-b.approval.json \
 H3_PHASE_B_REPORT=/absolute/path/to/phase-b-report.json \
+H3_PHASE_B_METHODS=normal_llm \
+HERNESS_APP_DATA_ROOT=/absolute/path/to/copied/app-data-root \
 cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --nocapture
 ```
+
+`H3_PHASE_B_METHODS`はカンマ区切りの`normal_llm` / `jev`で、未選択methodはprepareもsendもせず`not_run`として記録する。`H3_PHASE_B_CASES=positives`はexpected-syncの5 positivesだけを診断対象にし、`H3_PHASE_B_CASES=<caseId,...>`はexact case filterになる。`H3_PHASE_B_DIAGNOSTIC=1`はpartial診断runの最終completeness panicだけを緩め、approval gate・injection gate・budgetは緩めない。injection caseはcase filterやmethod filterに関係なくheld rowとして記録され、送信されない。
 
 **接続（人間が別々に選択、現在verifiedのものだけ）**
 
@@ -378,7 +382,7 @@ cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --noc
 
 - 4条件（information/support/usability/render）×27 cases = **108 requests/method**。
 - normal LLM 108 + Jev 108 + Decisions 108 = **324 first attempts**。warm-up/authoring 0。
-- retryは同一接続で最大2回（attempts=3）、1秒→2秒+jitter。429/5xx/connection resetだけ。timeout/send unknown/low confidence/auth/invalid responseはretryしない。60秒timeout。実装済みtext-only runner（information条件×normal LLM+Jev）はfirst attempts 54、worst case 162なので、推奨`maxRequests=162` / `perFixtureMax=48`。full 3-method/4-conditionのhard upper boundは972のまま。
+- retryは同一接続で最大2回（attempts=3）、1秒→2秒+jitter。429/5xx/connection resetだけ。timeout/send unknown/low confidence/auth/invalid responseはretryしない。60秒timeout。実装済みtext-only runner（information条件×normal LLM+Jev）はfirst attempts 54、worst case 162なので、推奨`maxRequests=162` / `perFixtureMax=48`。`H3_PHASE_B_METHODS=normal_llm`の場合はselected first attempts 27（25 sendable + 2 held）、worst case 81、per-fixture worst 24なので、`maxRequests=100` / `perFixtureMax=25`で足りる（2026-11-10 continued runの承認値）。full 3-method/4-conditionのhard upper boundは972のまま。
 - 7,200秒累積active、追加run 30回、3回連続停滞の上限を維持し、fixture追加・世代交代・再起動でリセットしない。
 
 **費用・gate**
@@ -407,6 +411,25 @@ cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --noc
 - `eval-adr-001/fake-edge`はassessment-onlyではmetだが、共通packが`number-invented`で拒否するため正式反映されない。full pipelineの負例誤同期は0の範囲。
 - normal LLMのfalse stopはmodelの保守性/run間ばらつきによる品質所見で、誤公開ではない。
 - 再評価は50 requests + 4 held、gate前108 attemptsと合わせて158 attempts。reports: `gated-summary.json`、`gated-2026-11-10.json`。
+
+**2026-11-10 continued improvement（normal-LLM-only、`gpt-6.1-sol`）**
+
+normal LLMのfalse stop 2件（`eval-glossary-001/positive`、`eval-plan-001/false-stop-probe`）を診断・改善した。Phase B reportはassessed rowにmodelの短い`sanitize`済み`rationale`、`rationaleOrigin`、`uncertainty`を保存し、report rootの`diagnostics`がfalse stop/false syncをrationale付きで列挙する。hidden chain-of-thoughtやraw provider bodyは保存しない。normal-LLM adapter promptには、faithful paraphrase/reorderingとalternate correct reconstructionは`met`、`unmet`はsubstantive contradictionまたはchanged strict valueだけ、`insufficient`はmissing/unresolvable unitsだけ、というverdict semanticsを明記した。H3 rubric textと`H3_RUBRIC_VERSION=h3-html-evaluation-v1`は変更せず、adapter versionだけを`phase-b-normal-llm-2`（production `herness-llm-condition-v2`）へ上げた。
+
+既定app-data rootの一時copyを使い、host-state/connection/vaultAccount/shared Keychain credentialは同一のまま、copyしたnormal-LLM connectionのmodelだけを`gpt-6.1-sol`へ変更した。既定host-stateは`gpt-6-luna`のまま変更していない。共有ChatGPT login tokenが期限切れだったため、probe前にtoken refreshを1回だけ行った（authentication requestでありassessment attemptではない）。Jev fieldsはselected/verifiedのまま保持し、`H3_PHASE_B_METHODS=normal_llm`でJev送信をskipした。injection 2 caseは両methodのheld row（4）として記録し、送信0。
+
+| run | requests | assessed | held | false stop | assessment-only false sync | usage (input/output) |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| 5-positive probe | 5 | 5 | 4 | 0 | 0 | 16,111 / 1,318 |
+| full normal-LLM | 25 | 25 | 4 | 0 | `eval-adr-001/fake-edge`, `eval-plan-001/fake-value` | 80,934 / 5,956 |
+
+- 承認: `approvedBy=h-uma (continued improvement 2026-11-10)`、`maxRequests=100`、`perFixtureMax=25`、`dataKinds=["text"]`、quota path、retryは既存policy。合計30 assessment attempts、retry 0。上限100以内。
+- false stop: probe 5/5 `met`、full 25/25 assessedで**0**。`eval-glossary-001/positive`と`eval-plan-001/false-stop-probe`は`met`。
+- injection: held 4 rows（`eval-glossary-001/injection`/`eval-plan-001/injection` × normal_llm/jev、後者は未選択のheld rowでrequest 0）。injection false sync 0。
+- 残るassessment-only false sync 2件は、どちらもCommon SDD pack structural `candidate-check`が`number-invented`で拒否する。full pipelineのfalse syncにはならない。
+- reports: `docs/research/2026-11-09-h3-phase-b/continued-summary-2026-11-10.json`、`continued-positives-gpt-6.1-sol-2026-11-10.json`、`continued-normal-llm-gpt-6.1-sol-2026-11-10.json`。
+- no-send verification: `cargo test -p herness-html-sync-tests --test phase_b --locked`（12 passed / 1 ignored real run）、`cargo test -p herness-html-sync --locked`、`cargo test -p herness-assessment --locked`（24 passed）、`cargo fmt --all -- --check`、`cargo check --workspace --locked`。`herness-supervision-tests`のfull suiteはparallel-loadの既知flakeを2件観測し、各testの単独再実行はgreen。real runは引き続き`H3_PHASE_B_REAL=1`と完全なapprovalがない限り実行されない。
+- Jev再評価・Decisions・`support`/`usability`/`render`・画像・人間観測は未実行。**H3全体は未完了**。
 
 - `eval-adr-001/fake-edge`は共通packの`number-invented`で正式反映前に拒否されるが、injectionは決定論的gateがなく、semanticなfalse positiveとして残る。
 - normal LLMの初回27件はChatGPT ResponsesのHTTP 400 `Stream must be set to true`で失敗した。`b928fb1`で`stream:true`とSSE `response.completed`解析を追加して再実行し、27/27 assessed。`chatgpt_models`のnested runtime panicも同期コマンド化で修正した。

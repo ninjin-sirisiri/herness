@@ -13,8 +13,8 @@ use herness_supervision::ids::{ConditionId, EvidenceId};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::InconclusiveReason;
 use super::request::Route;
+use super::{InconclusiveReason, LlmUsage};
 
 const MAX_RATIONALE_CHARS: usize = 2_000;
 const MAX_UNCERTAINTY_CHARS: usize = 2_000;
@@ -69,6 +69,25 @@ pub(crate) fn extract_text(route: Route, body: &[u8]) -> Result<String, Inconclu
         Route::AnthropicMessages => anthropic_text(&value),
         Route::OpenAiCompletions => openai_completions_text(&value),
     }
+}
+
+/// Extracts provider-reported token usage from the same response envelope.
+///
+/// Responses and Anthropic use `input_tokens`/`output_tokens`; OpenAI
+/// completions use `prompt_tokens`/`completion_tokens`. A missing, malformed,
+/// or negative count yields `None`, never zero.
+pub(crate) fn extract_usage(body: &[u8]) -> Option<LlmUsage> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?.as_object()?;
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))?
+        .as_u64()?;
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))?
+        .as_u64()?;
+    Some(LlmUsage::new(input, output))
 }
 
 /// Parses and strictly validates one condition answer.
@@ -295,5 +314,42 @@ fn single_answer(mut texts: Vec<String>) -> Result<String, InconclusiveReason> {
         0 => Err(InconclusiveReason::EmptyAnswer),
         1 => Ok(texts.remove(0)),
         _ => Err(InconclusiveReason::MultipleAnswers),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_reads_responses_anthropic_and_completions_shapes() {
+        for body in [
+            br#"{"usage":{"input_tokens":16,"output_tokens":7}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":16,"output_tokens":7,"total_tokens":23}}"#.as_slice(),
+        ] {
+            assert_eq!(extract_usage(body), Some(LlmUsage::new(16, 7)));
+        }
+        assert_eq!(
+            extract_usage(br#"{"usage":{"prompt_tokens":12,"completion_tokens":3}}"#),
+            Some(LlmUsage::new(12, 3))
+        );
+        assert_eq!(
+            extract_usage(br#"{"usage":{"input_tokens":0,"output_tokens":0}}"#),
+            Some(LlmUsage::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_usage_is_none_not_zero() {
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"usage":null}"#.as_slice(),
+            br#"{"usage":{"input_tokens":"16","output_tokens":7}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":16}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":-1,"output_tokens":7}}"#.as_slice(),
+            b"not json".as_slice(),
+        ] {
+            assert_eq!(extract_usage(body), None);
+        }
     }
 }

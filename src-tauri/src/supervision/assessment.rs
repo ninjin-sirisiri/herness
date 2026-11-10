@@ -226,7 +226,7 @@ pub fn build_profile(
 /// Adapter version label recorded in the fixed profile.
 pub const fn adapter_version(provider: herness_supervision::ProviderKind) -> &'static str {
     match provider {
-        herness_supervision::ProviderKind::NormalLlm => "herness-llm-condition-v1",
+        herness_supervision::ProviderKind::NormalLlm => "herness-llm-condition-v2",
         herness_supervision::ProviderKind::Jev => "herness-jev-systemone-v1",
         herness_supervision::ProviderKind::Decisions => "herness-openai-decisions-v1",
     }

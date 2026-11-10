@@ -405,7 +405,7 @@ impl ConditionAssessmentPort for MetAssessment {
         _binding: herness_supervision::ProfileBinding,
     ) -> Result<AssessmentProfileFacts, SupervisionError> {
         Ok(AssessmentProfileFacts::new(
-            AdapterVersion::new("herness-llm-condition-v1")?,
+            AdapterVersion::new("herness-llm-condition-v2")?,
             RubricVersion::new("herness-conditions-v1")?,
             ProfileThresholds::normal_llm(),
         ))
@@ -427,7 +427,7 @@ impl ConditionAssessmentPort for UnmetAssessment {
         _binding: herness_supervision::ProfileBinding,
     ) -> Result<AssessmentProfileFacts, SupervisionError> {
         Ok(AssessmentProfileFacts::new(
-            AdapterVersion::new("herness-llm-condition-v1")?,
+            AdapterVersion::new("herness-llm-condition-v2")?,
             RubricVersion::new("herness-conditions-v1")?,
             ProfileThresholds::normal_llm(),
         ))
@@ -975,7 +975,7 @@ fn real_assessment_port_returns_unverified_without_any_network_request() {
         .mark_profile_verified(harness.project, ProfilePurpose::Completion, true)
         .expect("mark verified");
     let facts = port.profile(view.profile).expect("verified profile facts");
-    assert_eq!(facts.adapter_version().as_str(), "herness-llm-condition-v1");
+    assert_eq!(facts.adapter_version().as_str(), "herness-llm-condition-v2");
 }
 
 #[test]
@@ -3837,7 +3837,7 @@ mod permission_composition {
             .expect("html profile facts");
         assert_eq!(
             html_facts.adapter_version().as_str(),
-            "herness-llm-condition-v1"
+            "herness-llm-condition-v2"
         );
         let result = port.assess(&request).expect("html assessment");
         assert_eq!(result.purpose(), ProfilePurpose::Html);
@@ -4405,7 +4405,7 @@ mod permission_composition {
             ProviderKind::NormalLlm,
             harness.connection,
             ModelId::new(MODEL).expect("model"),
-            AdapterVersion::new("herness-llm-condition-v1").expect("adapter"),
+            AdapterVersion::new("herness-llm-condition-v2").expect("adapter"),
             RubricVersion::new("herness-conditions-v1").expect("rubric"),
             herness_supervision::ProfileInputs::text_only(),
             ProfileThresholds::normal_llm(),

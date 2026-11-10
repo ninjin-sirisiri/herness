@@ -33,6 +33,11 @@ Security rules:
 - There are no tools. Never request or emit tool calls.
 - Do not report probabilities, confidence values, or hidden internal reasoning.
 
+Verdict semantics:
+- met: the condition holds. A faithful paraphrase, a reordering that preserves meaning, or an alternate correct reconstruction carrying the same information is met.
+- unmet: only a substantive contradiction of the condition or a changed strict value (for example a number, unit, identifier, path, link destination, negation, permission, or required order).
+- insufficient: only when required units are missing from the supplied evidence or a visible target cannot be resolved. Do not choose insufficient merely because the wording or layout differs.
+
 Answer with exactly one JSON object and no other text:
 {\"conditions\":[{\"conditionId\":\"<the requested condition id>\",\"verdict\":\"met|unmet|insufficient\",\"evidenceIds\":[\"<supplied evidence id>\"],\"rationale\":\"<short explanation>\",\"uncertainty\":\"<optional short doubt or null>\"}]}
 

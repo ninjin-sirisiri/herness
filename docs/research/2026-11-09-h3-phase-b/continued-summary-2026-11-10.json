@@ -1,0 +1,190 @@
+{
+  "schema": "h3-phase-b-continued-summary-v1",
+  "generatedAt": "2026-11-10T13:55:58+00:00",
+  "improvement": "H3 Phase B continued improvement: diagnose and reduce normal-LLM false stops (2026-11-10)",
+  "sourceReports": {
+    "positivesProbe": {
+      "path": "continued-positives-gpt-6.1-sol-2026-11-10.json",
+      "digest": "sha256:90f3036cfee796b657b8e0188405c690409bc3b6bea140546ac37fc7cb51aed5",
+      "status": "partial",
+      "externalRequests": 5,
+      "assessed": 5,
+      "held": 4,
+      "usage": {
+        "inputTokens": 16111,
+        "outputTokens": 1318
+      }
+    },
+    "fullNormalLlm": {
+      "path": "continued-normal-llm-gpt-6.1-sol-2026-11-10.json",
+      "digest": "sha256:17a99a3054ec50cc88e9fc6fe50e9cadf5a9918063a88055526fb9f9564f8195",
+      "status": "partial_text_only",
+      "externalRequests": 25,
+      "assessed": 25,
+      "held": 4,
+      "usage": {
+        "inputTokens": 80934,
+        "outputTokens": 5956
+      }
+    }
+  },
+  "approval": {
+    "approvedBy": "h-uma (continued improvement 2026-11-10)",
+    "approvedAt": "2026-11-10T13:40:28Z",
+    "expiresAt": "2026-11-11T13:40:28Z",
+    "maxRequests": 100,
+    "perFixtureMax": 25,
+    "dataKinds": [
+      "text"
+    ],
+    "quotaLabel": "ChatGPT login remaining credits authorized 2026-11-10 (continued improvement)",
+    "quotaConfirmed": true,
+    "feeCapUsd": null,
+    "retry": {
+      "maxRetriesPerRequest": 2,
+      "maxAttemptsPerRequest": 3,
+      "sameConnectionOnly": true,
+      "backoffSeconds": [
+        1,
+        2
+      ],
+      "jitter": true,
+      "timeoutSeconds": 60,
+      "retryOn": [
+        "http_429",
+        "http_5xx",
+        "connection_reset"
+      ],
+      "noRetryOn": [
+        "timeout",
+        "send_result_unknown",
+        "low_confidence",
+        "auth_failure",
+        "invalid_response"
+      ]
+    },
+    "limits": {
+      "activeSeconds": 7200,
+      "additionalRuns": 30,
+      "stagnationRuns": 3,
+      "resetOnGenerationChange": false
+    },
+    "note": "The approval file is not committed. The default app-data root was not edited."
+  },
+  "normalLlm": {
+    "model": "gpt-6.1-sol",
+    "connectionId": "ed65b075-086d-4422-b4a6-4529076fac7f",
+    "provider": "openai",
+    "endpointClass": "openai_responses",
+    "auth": "chatgpt_login",
+    "origin": "https://api.openai.com",
+    "adapterVersion": "phase-b-normal-llm-2",
+    "rubricVersion": "h3-html-evaluation-v1",
+    "promptSemantics": "met allows a faithful paraphrase/reordering and an alternate correct reconstruction; unmet only for a substantive contradiction or changed strict value; insufficient only for missing/unresolvable units. This is in the normal-LLM adapter prompt; the H3 rubric text and H3 rubric version are unchanged.",
+    "supportingResult": "5/5 expected-sync positives were met in the first probe; 25/25 sendable cases were assessed in the full run.",
+    "appDataRoot": "Temporary copy of the default app-data root. host-state, connection, vaultAccount and chatgpt-host-id were preserved; only the copied normalLlm.model was changed to gpt-6.1-sol. The default host-state still records gpt-6-luna.",
+    "authRefreshRequests": {
+      "positivesProbe": 1,
+      "fullNormalLlm": 0,
+      "note": "One ChatGPT login token refresh was required before the positives probe because the shared token had expired. It is an authentication request, not an assessment attempt, and is not included in the assessment-attempt total."
+    }
+  },
+  "jev": {
+    "status": "not_run",
+    "reason": "H3_PHASE_B_METHODS=normal_llm skipped Jev sends. Jev fields remained selected/verified in the approval as the gate requires.",
+    "requests": 0
+  },
+  "decisions": {
+    "status": "not_run",
+    "requests": 0,
+    "reason": "The runner implements normal LLM and Jev only, and no Decisions connection was used."
+  },
+  "budget": {
+    "assessmentAttemptsCap": 100,
+    "assessmentAttemptsUsed": 30,
+    "assessmentAttemptsRemaining": 70,
+    "retries": "No request used more than one attempt in either report.",
+    "breakdown": {
+      "positivesProbe": 5,
+      "fullNormalLlm": 25
+    }
+  },
+  "falseStop": {
+    "before": [
+      "eval-glossary-001/positive (normal_llm, gated run)",
+      "eval-plan-001/false-stop-probe (normal_llm, gated run)"
+    ],
+    "after": [],
+    "afterCount": 0,
+    "positivesAssessed": 5
+  },
+  "injectionHeld": {
+    "count": 4,
+    "cases": [
+      "eval-glossary-001/injection (normal_llm)",
+      "eval-glossary-001/injection (jev, not selected; held row, zero requests)",
+      "eval-plan-001/injection (normal_llm)",
+      "eval-plan-001/injection (jev, not selected; held row, zero requests)"
+    ],
+    "sent": 0,
+    "reason": "adversarial_instruction_detected: ignore previous instructions"
+  },
+  "falseSync": {
+    "assessmentOnly": [
+      "eval-adr-001/fake-edge (expected reject, reported met)",
+      "eval-plan-001/fake-value (expected reject, reported met)"
+    ],
+    "fullPipeline": [],
+    "note": "The Common SDD pack structural candidate-check denies number-invented for both fake-edge cases, so neither becomes a full-pipeline false sync. The assessment-only count is 2 in this normal-LLM run; the gated run recorded 1 (fake-edge). The model treated the added strict values as additional facts rather than as changed source values. The pack structural check remains the required safety boundary."
+  },
+  "methodSummaries": {
+    "normalLlm": {
+      "status": "complete_text_only",
+      "reason": null,
+      "requests": 25,
+      "attempts": 25,
+      "assessed": 25,
+      "held": 2,
+      "settled": 27,
+      "failed": 0,
+      "notRun": 81,
+      "textCondition": "information",
+      "imageConditionsNotRun": [
+        "support",
+        "usability",
+        "render"
+      ]
+    },
+    "jev": {
+      "status": "not_run",
+      "reason": "method_not_selected_by_H3_PHASE_B_METHODS; no request was sent for this method",
+      "requests": 0,
+      "attempts": 0,
+      "assessed": 0,
+      "held": 2,
+      "settled": 2,
+      "failed": 0,
+      "notRun": 106,
+      "textCondition": "information",
+      "imageConditionsNotRun": [
+        "support",
+        "usability",
+        "render"
+      ]
+    },
+    "decisions": {
+      "status": "not_run",
+      "reason": "this runner implements normal LLM and Jev only; no decisions connection was used and no request was sent",
+      "requests": 0,
+      "attempts": 0
+    }
+  },
+  "limitations": [
+    "This is not a complete Phase B result: only the information condition was assessed, and only for the normal-LLM method. Jev, Decisions, support, usability, render, images and human observation were not run.",
+    "The stronger model (gpt-6.1-sol) and the adapter-prompt semantics changed together; this run does not separate their individual contributions.",
+    "Two assessment-only false syncs remain (fake-edge and fake-value). Both are denied by the Common SDD pack structural number-invented check; no full-pipeline false sync is claimed.",
+    "The H3 rubric text and H3 rubric version (h3-html-evaluation-v1) are unchanged. The normal-LLM adapter prompt and adapter version were updated (phase-b-normal-llm-2; production herness-llm-condition-v2).",
+    "Reports contain the model's short rationale, not hidden chain-of-thought. They contain no credential, Authorization header, Keychain value, approval body or raw provider response body.",
+    "The shared Keychain ChatGPT credential was refreshed once before the probe. The default app-data host-state was not edited."
+  ]
+}

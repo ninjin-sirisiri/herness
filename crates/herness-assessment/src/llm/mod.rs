@@ -232,6 +232,35 @@ impl InconclusiveReason {
     }
 }
 
+/// Token usage reported by one normal-LLM response.
+///
+/// Missing or malformed usage is `None`, never zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl LlmUsage {
+    /// Creates a known usage value.
+    pub const fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    /// Input (prompt) tokens.
+    pub const fn input_tokens(self) -> u64 {
+        self.input_tokens
+    }
+
+    /// Output (completion) tokens.
+    pub const fn output_tokens(self) -> u64 {
+        self.output_tokens
+    }
+}
+
 /// Result of one normal-LLM assessment.
 ///
 /// `rejection()` is `None` only when the answer matched the strict schema. An
@@ -242,6 +271,7 @@ pub struct LlmAssessment {
     result: AssessmentResult,
     rejection: Option<InconclusiveReason>,
     attempts: u8,
+    usage: Option<LlmUsage>,
 }
 
 impl LlmAssessment {
@@ -262,6 +292,13 @@ impl LlmAssessment {
     /// configured maximum.
     pub const fn attempts(&self) -> u8 {
         self.attempts
+    }
+
+    /// Provider-reported usage, when both counts were present and valid.
+    ///
+    /// Missing or malformed usage is `None`, never zero.
+    pub const fn usage(&self) -> Option<LlmUsage> {
+        self.usage
     }
 
     /// Consumes the wrapper and returns the result.
@@ -335,6 +372,7 @@ impl LlmAssessmentAdapter {
             transport_request = transport_request.with_image(image.clone());
         }
         let response = self.transport.send(transport_request, control)?;
+        let usage = wire::extract_usage(response.body());
         let (verdict, cited, rationale, uncertainty, rejection) =
             match wire::extract_text(preflight.route, response.body()) {
                 Ok(text) => match wire::parse_condition(&text, request, &preflight.requested) {
@@ -383,6 +421,7 @@ impl LlmAssessmentAdapter {
             result,
             rejection,
             attempts: response.attempts(),
+            usage,
         })
     }
 }

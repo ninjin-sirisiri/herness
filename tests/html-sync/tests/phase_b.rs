@@ -48,6 +48,7 @@ use herness_engine_pi::ProviderEndpoints;
 use herness_html_sync::{H3_RUBRIC_VERSION, H3Condition, condition_rubric};
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentRequest as ConditionRequest, AssessmentResult, ConditionVerdict,
+    RationaleOrigin,
 };
 use herness_supervision::conditions::ConditionVersion;
 use herness_supervision::evidence::TargetVersion;
@@ -67,7 +68,7 @@ use sha2::{Digest, Sha256};
 const APPROVAL_SCHEMA: &str = "h3-phase-b-approval-v1";
 const MANIFEST_RELATIVE: &str = "tests/html-sync/fixtures/evaluation/manifest.json";
 const APPROVAL_TEMPLATE: &str = "phase-b.approval.template.json";
-const NORMAL_LLM_ADAPTER_VERSION: &str = "phase-b-normal-llm-1";
+const NORMAL_LLM_ADAPTER_VERSION: &str = "phase-b-normal-llm-2";
 const JEV_ADAPTER_VERSION: &str = "phase-b-jev-1";
 const NORMAL_LLM_ORIGIN: &str = "https://api.openai.com";
 const JEV_GATEWAY_ORIGIN: &str = "https://api.commandcode.ai";
@@ -111,6 +112,139 @@ impl Method {
         match self {
             Self::NormalLlm => "Normal LLM",
             Self::Jev => "Jev",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit run selection (method filter and diagnostic case filter).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum CaseSelection {
+    All,
+    Names(BTreeSet<String>),
+    ExpectedSync,
+}
+
+impl CaseSelection {
+    fn selects(&self, evidence: &CaseEvidence) -> bool {
+        match self {
+            Self::All => true,
+            Self::Names(names) => names.contains(&evidence.case_id),
+            Self::ExpectedSync => evidence.expected_verdict == ConditionVerdict::Met,
+        }
+    }
+
+    fn label(&self) -> Value {
+        match self {
+            Self::All => Value::Null,
+            Self::Names(names) => json!(names.iter().collect::<Vec<_>>()),
+            Self::ExpectedSync => json!("positives"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunSelection {
+    methods: Vec<Method>,
+    cases: CaseSelection,
+}
+
+impl RunSelection {
+    fn all() -> Self {
+        Self {
+            methods: Method::RUNNABLE.to_vec(),
+            cases: CaseSelection::All,
+        }
+    }
+
+    fn from_environment() -> Result<Self, Refusal> {
+        let methods = match env::var("H3_PHASE_B_METHODS")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            None => Method::RUNNABLE.to_vec(),
+            Some(value) => {
+                let mut methods = Vec::new();
+                for token in value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                {
+                    let method = Method::RUNNABLE
+                        .iter()
+                        .copied()
+                        .find(|method| method.id() == token)
+                        .ok_or_else(|| Refusal {
+                            reasons: vec![format!(
+                                "H3_PHASE_B_METHODS contains unsupported method {token:?}; expected normal_llm or jev"
+                            )],
+                        })?;
+                    if !methods.contains(&method) {
+                        methods.push(method);
+                    }
+                }
+                if methods.is_empty() {
+                    return Err(Refusal {
+                        reasons: vec!["H3_PHASE_B_METHODS selects no method".to_owned()],
+                    });
+                }
+                methods
+            }
+        };
+        let cases = match env::var("H3_PHASE_B_CASES")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            None => CaseSelection::All,
+            Some(value) if value == "positives" || value == "sync" => CaseSelection::ExpectedSync,
+            Some(value) => {
+                let names = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                if names.is_empty() {
+                    return Err(Refusal {
+                        reasons: vec!["H3_PHASE_B_CASES selects no case".to_owned()],
+                    });
+                }
+                CaseSelection::Names(names)
+            }
+        };
+        Ok(Self { methods, cases })
+    }
+
+    fn selects_method(&self, method: Method) -> bool {
+        self.methods.contains(&method)
+    }
+
+    fn selects_case(&self, evidence: &CaseEvidence) -> bool {
+        self.cases.selects(evidence)
+    }
+
+    fn method_ids(&self) -> Vec<&'static str> {
+        self.methods.iter().map(|method| method.id()).collect()
+    }
+
+    fn methods_not_selected(&self) -> Vec<&'static str> {
+        Method::RUNNABLE
+            .iter()
+            .copied()
+            .filter(|method| !self.selects_method(*method))
+            .map(|method| method.id())
+            .collect()
+    }
+
+    fn selected_case_rule(&self) -> Value {
+        match &self.cases {
+            CaseSelection::All => json!("all 27 manifest cases"),
+            CaseSelection::Names(names) => json!(format!("{} explicit case ids", names.len())),
+            CaseSelection::ExpectedSync => json!("the 5 expected-sync positives"),
         }
     }
 }
@@ -319,6 +453,7 @@ struct PlannedCall {
 #[derive(Debug, Clone)]
 struct ApprovedPlan {
     approval: ApprovalFacts,
+    selection: RunSelection,
     fixtures: Vec<PlannedFixture>,
     calls: Vec<PlannedCall>,
     budget: BudgetPlan,
@@ -947,6 +1082,7 @@ fn validate_approval(
     fixture_root: &Path,
     now_ms: u64,
     limits_snapshot: RunLimitsSnapshot,
+    selection: &RunSelection,
 ) -> Result<ApprovedPlan, Refusal> {
     let Some(document) = approval else {
         return Err(Refusal {
@@ -1403,8 +1539,29 @@ fn validate_approval(
             }
         }
     }
+    // Validate the diagnostic case filter against the exact manifest.
+    if let CaseSelection::Names(names) = &selection.cases {
+        let known = calls
+            .iter()
+            .map(|call| call.case_id.clone())
+            .collect::<BTreeSet<_>>();
+        for name in names {
+            if !known.contains(name) {
+                refusal.push(format!("H3_PHASE_B_CASES names unknown case {name:?}"));
+            }
+        }
+    }
+    let selected_calls = calls
+        .iter()
+        .filter(|call| {
+            selection.selects_method(call.method) && selection.selects_case(&call.evidence)
+        })
+        .collect::<Vec<_>>();
+    if selected_calls.is_empty() {
+        refusal.push("the run selection selects no assessment calls".to_owned());
+    }
     let mut per_fixture_first: BTreeMap<String, u64> = BTreeMap::new();
-    for call in &calls {
+    for call in &selected_calls {
         *per_fixture_first
             .entry(call.fixture_id.clone())
             .or_insert(0) += 1;
@@ -1413,17 +1570,18 @@ fn validate_approval(
         .iter()
         .map(|(fixture, first)| (fixture.clone(), (*first).saturating_mul(RETRY_MAX_ATTEMPTS)))
         .collect::<BTreeMap<_, _>>();
-    let planned_first_requests = calls.len() as u64;
+    let planned_first_requests = selected_calls.len() as u64;
     let planned_worst_case_attempts = planned_first_requests.saturating_mul(RETRY_MAX_ATTEMPTS);
     if max_requests != 0 && max_requests < planned_worst_case_attempts {
         refusal.push(format!(
-            "requestPlan.requestBudget.maxRequests must be at least {planned_worst_case_attempts} for this text-only two-method plan"
+            "requestPlan.requestBudget.maxRequests must be at least {planned_worst_case_attempts} for this selected text-only plan (methods: {})",
+            selection.method_ids().join(",")
         ));
     }
     if let Some((fixture, required)) = per_fixture_worst.iter().max_by_key(|(_, value)| *value) {
         if per_fixture_max != 0 && per_fixture_max < *required {
             refusal.push(format!(
-                "requestPlan.requestBudget.perFixtureMax must be at least {required} for fixture {fixture}"
+                "requestPlan.requestBudget.perFixtureMax must be at least {required} for fixture {fixture} under the selected plan"
             ));
         }
     }
@@ -1448,6 +1606,7 @@ fn validate_approval(
             money,
             limits,
         },
+        selection: selection.clone(),
         fixtures: planned_fixtures,
         calls,
         budget: BudgetPlan {
@@ -1482,6 +1641,9 @@ struct CallObservation {
     reported_model: Option<String>,
     rejection: Option<String>,
     uncertainty: bool,
+    rationale: String,
+    rationale_origin: &'static str,
+    uncertainty_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1496,11 +1658,42 @@ struct SendFailure {
 trait PhaseBDriver {
     fn prepare(&mut self, plan: &ApprovedPlan) -> Result<(), Refusal>;
 
+    fn auth_refreshes(&self) -> u64 {
+        0
+    }
+
     fn send(
         &mut self,
         call: &PlannedCall,
         remaining: Duration,
     ) -> Result<CallObservation, SendFailure>;
+}
+
+fn sanitized_model_text(value: &str, limit: usize) -> String {
+    let mut text = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\n' || character == '\t' || !character.is_control() {
+            text.push(character);
+        } else {
+            text.push(' ');
+        }
+    }
+    let text = text.trim();
+    if text.chars().count() > limit {
+        let mut truncated = text.chars().take(limit).collect::<String>();
+        truncated.push('…');
+        truncated
+    } else {
+        text.to_owned()
+    }
+}
+
+fn rationale_origin_label(origin: RationaleOrigin) -> &'static str {
+    match origin {
+        RationaleOrigin::Model => "model",
+        RationaleOrigin::Host => "host",
+        RationaleOrigin::Unspecified => "unspecified",
+    }
 }
 
 fn observation_from_result(
@@ -1548,6 +1741,11 @@ fn observation_from_result(
             .map(|model| model.as_str().to_owned()),
         rejection,
         uncertainty: result.uncertainty().is_some(),
+        rationale: sanitized_model_text(result.rationale(), 1_000),
+        rationale_origin: rationale_origin_label(result.rationale_origin()),
+        uncertainty_detail: result
+            .uncertainty()
+            .map(|value| sanitized_model_text(value, 500)),
     }
 }
 
@@ -1602,10 +1800,31 @@ struct JevRuntime {
     thresholds: ProfileThresholds,
 }
 
+fn login_status_state(
+    login: &LoginManager<MacKeychainVault>,
+    connection: ConnectionId,
+) -> Result<(String, bool), ()> {
+    match login.status(connection) {
+        Ok(status) => {
+            let status = serde_json::to_value(status).unwrap_or(Value::Null);
+            Ok((
+                status
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                status.get("pending").and_then(Value::as_bool) == Some(true),
+            ))
+        }
+        Err(_) => Err(()),
+    }
+}
+
 struct RealPhaseBDriver {
     normal_llm: Option<NormalLlmRuntime>,
     jev: Option<JevRuntime>,
     project: herness_core::ProjectId,
+    auth_refreshes: u64,
 }
 
 impl RealPhaseBDriver {
@@ -1614,6 +1833,7 @@ impl RealPhaseBDriver {
             normal_llm: None,
             jev: None,
             project: herness_core::ProjectId::new(),
+            auth_refreshes: 0,
         }
     }
 
@@ -1685,27 +1905,56 @@ impl RealPhaseBDriver {
         if !origin_matches(&approval.normal_llm.origin, NORMAL_LLM_ORIGIN) {
             refusal.push("the approved normal-LLM origin is not the official OpenAI origin");
         }
-        match login.status(connection_id) {
-            Ok(status) => {
-                let status = serde_json::to_value(status).unwrap_or(Value::Null);
-                if status.get("state").and_then(Value::as_str) != Some("available") {
-                    refusal.push("the ChatGPT-login connection is not currently available");
-                }
-                if status.get("pending").and_then(Value::as_bool) == Some(true) {
-                    refusal.push("a ChatGPT login attempt is still pending");
-                }
+        let mut login_state = "unknown".to_owned();
+        let mut login_pending = false;
+        match login_status_state(&login, connection_id) {
+            Ok((state, pending)) => {
+                login_state = state;
+                login_pending = pending;
             }
-            Err(_) => refusal.push("the ChatGPT-login status is unavailable"),
+            Err(_) => refusal.push("the ChatGPT-login status is unavailable".to_owned()),
+        }
+        if login_state == "auth_required" && refusal.is_empty() {
+            match login.force_refresh(connection_id) {
+                Ok(_) => {
+                    self.auth_refreshes = self.auth_refreshes.saturating_add(1);
+                    match login_status_state(&login, connection_id) {
+                        Ok((state, pending)) => {
+                            login_state = state;
+                            login_pending = pending;
+                        }
+                        Err(_) => refusal.push(
+                            "the ChatGPT-login status is unavailable after refresh".to_owned(),
+                        ),
+                    }
+                }
+                Err(_) => refusal.push(
+                    "the ChatGPT-login token refresh failed; a fresh human login may be required"
+                        .to_owned(),
+                ),
+            }
+        }
+        if login_state != "available" {
+            refusal.push(format!(
+                "the ChatGPT-login connection is not currently available (state={login_state})"
+            ));
+        }
+        if login_pending {
+            refusal.push("a ChatGPT login attempt is still pending".to_owned());
         }
         match login.credential_port().availability(&connection_id) {
             Ok(CredentialAvailability::Available) => {}
             Ok(CredentialAvailability::LoginRequired) => {
-                refusal.push("the ChatGPT-login credential requires a human login");
+                refusal.push(format!(
+                    "the ChatGPT-login credential requires a human login (state={login_state})"
+                ));
             }
             Ok(CredentialAvailability::Unavailable) => {
-                refusal.push("the ChatGPT-login credential is unavailable");
+                refusal.push(format!(
+                    "the ChatGPT-login credential is unavailable (state={login_state})"
+                ));
             }
-            Err(_) => refusal.push("the ChatGPT-login credential could not be checked"),
+            Err(_) => refusal.push("the ChatGPT-login credential could not be checked".to_owned()),
         }
         if !refusal.is_empty() {
             return Err(refusal);
@@ -1852,12 +2101,9 @@ impl PhaseBDriver for RealPhaseBDriver {
     fn prepare(&mut self, plan: &ApprovedPlan) -> Result<(), Refusal> {
         self.normal_llm = None;
         self.jev = None;
+        self.auth_refreshes = 0;
         let mut refusal = Refusal::default();
-        if plan
-            .calls
-            .iter()
-            .any(|call| call.method == Method::NormalLlm)
-        {
+        if plan.selection.selects_method(Method::NormalLlm) {
             match self.prepare_normal_llm(&plan.approval) {
                 Ok(runtime) => self.normal_llm = Some(runtime),
                 Err(error) => {
@@ -1867,7 +2113,7 @@ impl PhaseBDriver for RealPhaseBDriver {
                 }
             }
         }
-        if plan.calls.iter().any(|call| call.method == Method::Jev) {
+        if plan.selection.selects_method(Method::Jev) {
             match self.prepare_jev(&plan.approval) {
                 Ok(runtime) => self.jev = Some(runtime),
                 Err(error) => {
@@ -1882,6 +2128,10 @@ impl PhaseBDriver for RealPhaseBDriver {
         } else {
             Err(refusal)
         }
+    }
+
+    fn auth_refreshes(&self) -> u64 {
+        self.auth_refreshes
     }
 
     fn send(
@@ -1905,13 +2155,16 @@ impl PhaseBDriver for RealPhaseBDriver {
                     .adapter
                     .assess(&request, &runtime.entry, &evidence, control)
                     .map_err(assessment_failure)?;
+                let usage = assessment
+                    .usage()
+                    .map(|usage| (usage.input_tokens(), usage.output_tokens()));
                 Ok(observation_from_result(
                     assessment.result(),
                     assessment.attempts(),
                     assessment
                         .rejection()
                         .map(|reason| reason.as_str().to_owned()),
-                    None,
+                    usage,
                     runtime.thresholds,
                 ))
             }
@@ -2095,6 +2348,9 @@ fn base_row(call: &PlannedCall) -> Value {
         "attempts": 0,
         "latencyMs": 0,
         "rejection": Value::Null,
+        "rationale": Value::Null,
+        "rationaleOrigin": Value::Null,
+        "uncertainty": Value::Null,
         "lowConfidence": Value::Null,
         "unverifiedReason": Value::Null,
         "failureReason": Value::Null,
@@ -2128,6 +2384,9 @@ fn assessed_row(call: &PlannedCall, observation: &CallObservation, latency_ms: u
     row["attempts"] = json!(observation.attempts);
     row["latencyMs"] = json!(latency_ms);
     row["rejection"] = json!(observation.rejection);
+    row["rationale"] = json!(observation.rationale);
+    row["rationaleOrigin"] = json!(observation.rationale_origin);
+    row["uncertainty"] = json!(observation.uncertainty_detail);
     row["lowConfidence"] = json!(low_confidence);
     if observation.rejection.is_some() || observation.uncertainty {
         row["unverifiedReason"] = json!(
@@ -2206,6 +2465,9 @@ fn not_run_condition_row(
         "attempts": 0,
         "latencyMs": 0,
         "rejection": Value::Null,
+        "rationale": Value::Null,
+        "rationaleOrigin": Value::Null,
+        "uncertainty": Value::Null,
         "lowConfidence": Value::Null,
         "unverifiedReason": reason,
         "failureReason": Value::Null,
@@ -2294,8 +2556,16 @@ fn base_report(plan: &ApprovedPlan, now_ms: u64, limits_snapshot: RunLimitsSnaps
             },
         },
         "plan": {
-            "methods": ["normal_llm", "jev"],
-            "methodsNotRun": ["decisions"],
+            "approvedMethods": ["normal_llm", "jev"],
+            "methods": plan.selection.method_ids(),
+            "methodsNotSelected": plan.selection.methods_not_selected(),
+            "methodsNotRun": methods_not_run(&plan.selection),
+            "runSelection": {
+                "methods": plan.selection.method_ids(),
+                "caseFilter": plan.selection.cases.label(),
+                "caseRule": plan.selection.selected_case_rule(),
+                "selectedFirstRequests": plan.budget.planned_first_requests,
+            },
             "conditionsPerCase": 4,
             "textConditionsSent": ["information"],
             "imageConditionsNotRun": ["support", "usability", "render"],
@@ -2308,12 +2578,14 @@ fn base_report(plan: &ApprovedPlan, now_ms: u64, limits_snapshot: RunLimitsSnaps
             "perFixtureMax": plan.budget.per_fixture_max,
             "effectiveMaxAttempts": plan.budget.effective_max_attempts,
             "requestTimeoutSeconds": REQUEST_TIMEOUT_SECONDS,
+            "rubricVersion": H3_RUBRIC_VERSION,
+            "normalLlmAdapterVersion": NORMAL_LLM_ADAPTER_VERSION,
             "activeSecondsLimit": plan.approval.limits.active_seconds,
             "additionalRunsLimit": plan.approval.limits.additional_runs,
             "runsUsedBefore": limits_snapshot.runs_used,
             "activeSecondsUsedBefore": limits_snapshot.active_seconds_used,
             "coverage": {
-                "methodsRun": 2,
+                "methodsRun": plan.selection.methods.len(),
                 "methodsTotal": 3,
                 "conditionsRun": 1,
                 "conditionsTotal": 4,
@@ -2336,13 +2608,21 @@ fn base_report(plan: &ApprovedPlan, now_ms: u64, limits_snapshot: RunLimitsSnaps
         "limitations": [
             "Only the information condition was assessed: support, usability and render require approved image/PNG and real render evidence and were not run.",
             "Decisions was not run. This is not a complete three-method Phase B result.",
+            "A method or case filter narrows the run; every unselected method/case is recorded as not_run with zero requests. The approval still covers both normal LLM and Jev, and the injection gate stays active for every planned case.",
+            "The normal-LLM adapter prompt states the met/unmet/insufficient semantics explicitly (faithful paraphrase/reordering and alternate correct reconstruction are met; unmet only for a substantive contradiction or changed strict value; insufficient only for missing/unresolvable units). The H3 rubric text and H3 rubric version are unchanged.",
             "No credential material, Authorization value, Keychain value, approval body or raw provider response body is stored in this report.",
             "The scripted dry-run and gate results are not model accuracy or evidence of documentation understanding.",
         ],
     })
 }
 
-fn method_summary(rows: &[Value], method: Method) -> Value {
+fn methods_not_run(selection: &RunSelection) -> Vec<&'static str> {
+    let mut methods = selection.methods_not_selected();
+    methods.push("decisions");
+    methods
+}
+
+fn method_summary(rows: &[Value], method: Method, selected: bool) -> Value {
     let rows = rows
         .iter()
         .filter(|row| row.get("method").and_then(Value::as_str) == Some(method.id()))
@@ -2350,6 +2630,10 @@ fn method_summary(rows: &[Value], method: Method) -> Value {
     let assessed = rows
         .iter()
         .filter(|row| row.get("status").and_then(Value::as_str) == Some("assessed"))
+        .count();
+    let held = rows
+        .iter()
+        .filter(|row| row.get("status").and_then(Value::as_str) == Some("held"))
         .count();
     let failed = rows
         .iter()
@@ -2359,6 +2643,10 @@ fn method_summary(rows: &[Value], method: Method) -> Value {
         .iter()
         .filter(|row| row.get("status").and_then(Value::as_str) == Some("not_run"))
         .count();
+    let information = rows
+        .iter()
+        .filter(|row| row.get("condition").and_then(Value::as_str) == Some("information"))
+        .count();
     let requests = rows
         .iter()
         .filter_map(|row| row.get("requestCount").and_then(Value::as_u64))
@@ -2367,22 +2655,97 @@ fn method_summary(rows: &[Value], method: Method) -> Value {
         .iter()
         .filter_map(|row| row.get("attempts").and_then(Value::as_u64))
         .sum::<u64>();
-    let status = if failed > 0 {
+    let settled = assessed + held;
+    let status = if !selected {
+        "not_run"
+    } else if failed > 0 {
         if assessed > 0 { "partial" } else { "failed" }
-    } else if assessed == 27 {
+    } else if settled == information && information > 0 {
         "complete_text_only"
     } else {
         "partial"
     };
+    let reason = if selected {
+        Value::Null
+    } else {
+        json!("method_not_selected_by_H3_PHASE_B_METHODS; no request was sent for this method")
+    };
     json!({
         "status": status,
+        "reason": reason,
         "requests": requests,
         "attempts": attempts,
         "assessed": assessed,
+        "held": held,
+        "settled": settled,
         "failed": failed,
         "notRun": not_run,
         "textCondition": "information",
         "imageConditionsNotRun": ["support", "usability", "render"],
+    })
+}
+
+fn diagnostic_entry(row: &Value) -> Value {
+    json!({
+        "fixtureId": row.get("fixtureId").cloned().unwrap_or(Value::Null),
+        "caseId": row.get("caseId").cloned().unwrap_or(Value::Null),
+        "method": row.get("method").cloned().unwrap_or(Value::Null),
+        "condition": row.get("condition").cloned().unwrap_or(Value::Null),
+        "expectedVerdict": row.get("expectedVerdict").cloned().unwrap_or(Value::Null),
+        "actualVerdict": row.get("actualVerdict").cloned().unwrap_or(Value::Null),
+        "adoptedVerdict": row.get("adoptedVerdict").cloned().unwrap_or(Value::Null),
+        "rationale": row.get("rationale").cloned().unwrap_or(Value::Null),
+        "rationaleOrigin": row.get("rationaleOrigin").cloned().unwrap_or(Value::Null),
+        "uncertainty": row.get("uncertainty").cloned().unwrap_or(Value::Null),
+        "rejection": row.get("rejection").cloned().unwrap_or(Value::Null),
+        "lowConfidence": row.get("lowConfidence").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn diagnostics_json(rows: &[Value]) -> Value {
+    let mut false_stops = Vec::new();
+    let mut false_syncs = Vec::new();
+    let mut held = Vec::new();
+    let mut assessed = 0_u64;
+    for row in rows {
+        let status = row
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status == "held" {
+            held.push(json!({
+                "caseId": row.get("caseId").cloned().unwrap_or(Value::Null),
+                "method": row.get("method").cloned().unwrap_or(Value::Null),
+                "reason": row.get("unverifiedReason").cloned().unwrap_or(Value::Null),
+            }));
+            continue;
+        }
+        if status != "assessed" {
+            continue;
+        }
+        assessed = assessed.saturating_add(1);
+        let expected = row
+            .get("expectedVerdict")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let actual = row.get("actualVerdict").and_then(Value::as_str);
+        match (expected, actual) {
+            ("met", Some("unmet" | "insufficient")) => false_stops.push(diagnostic_entry(row)),
+            ("unmet" | "insufficient", Some("met")) => false_syncs.push(diagnostic_entry(row)),
+            _ => {}
+        }
+    }
+    json!({
+        "rule": "falseStop: an assessed expected-met row reported unmet or insufficient. falseSync: an assessed expected-unmet or expected-hold row reported met. Held rows are counted separately and were never sent. Every entry carries the model's sanitized short rationale, not hidden reasoning.",
+        "counts": {
+            "assessed": assessed,
+            "falseStops": false_stops.len(),
+            "falseSyncs": false_syncs.len(),
+            "held": held.len(),
+        },
+        "falseStops": false_stops,
+        "falseSyncs": false_syncs,
+        "held": held,
     })
 }
 
@@ -2414,9 +2777,22 @@ fn execute_phase_b(
     fixture_root: &Path,
     driver: &mut dyn PhaseBDriver,
     limits_snapshot: RunLimitsSnapshot,
+    selection: Result<RunSelection, Refusal>,
     now_ms: u64,
 ) -> PhaseBRun {
     let run_started = Instant::now();
+    let selection = match selection {
+        Ok(selection) => selection,
+        Err(refusal) => {
+            let reasons = refusal.into_vec();
+            return PhaseBRun {
+                status: "refused".to_owned(),
+                external_requests: 0,
+                refusal_reasons: reasons.clone(),
+                report: refusal_report(&reasons, None, now_ms),
+            };
+        }
+    };
     let loaded = match load_approval(approval_path, fixture_root) {
         Ok(value) => value,
         Err(refusal) => {
@@ -2429,7 +2805,13 @@ fn execute_phase_b(
             };
         }
     };
-    let plan = match validate_approval(Some(&loaded), fixture_root, now_ms, limits_snapshot) {
+    let plan = match validate_approval(
+        Some(&loaded),
+        fixture_root,
+        now_ms,
+        limits_snapshot,
+        &selection,
+    ) {
         Ok(plan) => plan,
         Err(refusal) => {
             let reasons = refusal.into_vec();
@@ -2442,7 +2824,9 @@ fn execute_phase_b(
         }
     };
     let mut report = base_report(&plan, now_ms, limits_snapshot);
-    if let Err(refusal) = driver.prepare(&plan) {
+    let prepare_result = driver.prepare(&plan);
+    report["plan"]["authRefreshRequests"] = json!(driver.auth_refreshes());
+    if let Err(refusal) = prepare_result {
         let reasons = refusal.into_vec();
         report["status"] = json!("refused");
         report["refusalReasons"] = json!(reasons);
@@ -2464,27 +2848,36 @@ fn execute_phase_b(
     let mut rows = Vec::new();
     let mut stopped_calls = BTreeMap::<(usize, usize, Method), String>::new();
 
-    let method_filter = env::var("H3_PHASE_B_METHODS").ok();
     for call in &plan.calls {
-        if let Some(filter) = &method_filter
-            && !filter
-                .split(',')
-                .map(str::trim)
-                .any(|method| method == call.method.id())
-        {
-            continue;
-        }
+        let key = (
+            call.fixture_index,
+            call.case_index,
+            call.method,
+            call.condition,
+        );
         if let Some(marker) = herness_html_sync::adversarial_instruction(&call.evidence.source_text)
             .or_else(|| herness_html_sync::adversarial_instruction(&call.evidence.candidate_text))
         {
+            rows.push((key, adversarial_hold_row(call, marker)));
+            continue;
+        }
+        if !plan.selection.selects_method(call.method) {
             rows.push((
-                (
-                    call.fixture_index,
-                    call.case_index,
-                    call.method,
-                    call.condition,
+                key,
+                not_run_call_row(
+                    call,
+                    "method_not_selected_by_H3_PHASE_B_METHODS; no request was sent for this method",
                 ),
-                adversarial_hold_row(call, marker),
+            ));
+            continue;
+        }
+        if !plan.selection.selects_case(&call.evidence) {
+            rows.push((
+                key,
+                not_run_call_row(
+                    call,
+                    "case_not_selected_for_diagnostic_run; no request was sent for this case",
+                ),
             ));
             continue;
         }
@@ -2520,12 +2913,6 @@ fn execute_phase_b(
         let call_started = Instant::now();
         let result = driver.send(call, remaining);
         let latency_ms = u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let key = (
-            call.fixture_index,
-            call.case_index,
-            call.method,
-            call.condition,
-        );
         match result {
             Ok(observation) => {
                 attempts_total = attempts_total.saturating_add(u64::from(observation.attempts));
@@ -2604,29 +2991,42 @@ fn execute_phase_b(
         }
     }
     let ordered_rows = row_map.into_values().collect::<Vec<_>>();
-    let normal_summary = method_summary(&ordered_rows, Method::NormalLlm);
-    let jev_summary = method_summary(&ordered_rows, Method::Jev);
-    let normal_ok =
-        normal_summary.get("status").and_then(Value::as_str) == Some("complete_text_only");
-    let jev_ok = jev_summary.get("status").and_then(Value::as_str) == Some("complete_text_only");
-    let status = if normal_ok && jev_ok && stop_reason.is_none() {
-        "partial_text_only"
-    } else if normal_summary
+    let diagnostics = diagnostics_json(&ordered_rows);
+    let normal_summary = method_summary(
+        &ordered_rows,
+        Method::NormalLlm,
+        plan.selection.selects_method(Method::NormalLlm),
+    );
+    let jev_summary = method_summary(
+        &ordered_rows,
+        Method::Jev,
+        plan.selection.selects_method(Method::Jev),
+    );
+    let selected_complete = plan.selection.methods.iter().all(|method| {
+        let summary = match method {
+            Method::NormalLlm => &normal_summary,
+            Method::Jev => &jev_summary,
+        };
+        summary.get("status").and_then(Value::as_str) == Some("complete_text_only")
+    });
+    let assessed_total = normal_summary
         .get("assessed")
         .and_then(Value::as_u64)
         .unwrap_or(0)
         + jev_summary
             .get("assessed")
             .and_then(Value::as_u64)
-            .unwrap_or(0)
-        > 0
-    {
+            .unwrap_or(0);
+    let status = if selected_complete && stop_reason.is_none() {
+        "partial_text_only"
+    } else if assessed_total > 0 {
         "partial"
     } else {
         "failed"
     };
     report["status"] = json!(status);
     report["results"] = json!(ordered_rows);
+    report["diagnostics"] = diagnostics;
     report["methodSummaries"]["normal_llm"] = normal_summary;
     report["methodSummaries"]["jev"] = jev_summary;
     report["externalRequests"] = json!(attempts_total);
@@ -2790,6 +3190,9 @@ impl PhaseBDriver for RecordingDriver {
             reported_model: None,
             rejection: None,
             uncertainty: false,
+            rationale: "scripted answer-key rationale".to_owned(),
+            rationale_origin: "model",
+            uncertainty_detail: None,
         })
     }
 }
@@ -2865,6 +3268,22 @@ fn run_with_value(
     fixture_root: &Path,
     snapshot: RunLimitsSnapshot,
 ) -> PhaseBRun {
+    run_with_selection(
+        approval,
+        driver,
+        fixture_root,
+        snapshot,
+        Ok(RunSelection::all()),
+    )
+}
+
+fn run_with_selection(
+    approval: Option<&Value>,
+    driver: &mut RecordingDriver,
+    fixture_root: &Path,
+    snapshot: RunLimitsSnapshot,
+    selection: Result<RunSelection, Refusal>,
+) -> PhaseBRun {
     let temp = tempfile::tempdir().expect("approval temp dir");
     let path = temp.path().join("approval.json");
     if let Some(approval) = approval {
@@ -2875,6 +3294,7 @@ fn run_with_value(
             fixture_root,
             driver,
             snapshot,
+            selection,
             unix_seconds_now() * 1_000,
         )
     } else {
@@ -2883,6 +3303,7 @@ fn run_with_value(
             fixture_root,
             driver,
             snapshot,
+            selection,
             unix_seconds_now() * 1_000,
         )
     }
@@ -3391,7 +3812,7 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
         &fixture_root(),
         RunLimitsSnapshot::default(),
     );
-    assert_eq!(run.status, "partial");
+    assert_eq!(run.status, "partial_text_only");
     assert_eq!(driver.prepare_calls, 1);
     // Two injection cases are held by the deterministic adversarial gate and
     // are never sent, for either method.
@@ -3495,12 +3916,216 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
         4,
         "two injection cases x two methods are held"
     );
+    assert!(
+        information
+            .iter()
+            .filter(|row| row["status"] == json!("assessed"))
+            .all(|row| row["rationale"] == json!("scripted answer-key rationale")),
+        "every assessed row carries the sanitized short rationale"
+    );
+    assert_eq!(run.report["diagnostics"]["counts"]["held"], json!(4));
+    assert_eq!(run.report["diagnostics"]["counts"]["falseStops"], json!(0));
+    assert_eq!(run.report["diagnostics"]["counts"]["falseSyncs"], json!(0));
+    assert_eq!(
+        run.report["methodSummaries"]["normal_llm"]["status"],
+        json!("complete_text_only")
+    );
     let not_run = rows
         .iter()
         .filter(|row| row["status"] == json!("not_run"))
         .collect::<Vec<_>>();
     assert_eq!(not_run.len(), 27 * 2 * 3);
     assert!(not_run.iter().all(|row| row["requestCount"] == json!(0)));
+}
+
+#[test]
+fn normal_llm_only_selection_accepts_the_100_request_budget_and_keeps_injection_held() {
+    let root = fixture_root();
+    let mut approval = valid_approval();
+    approval["requestPlan"]["requestBudget"] = json!({
+        "maxRequests": 100,
+        "perFixtureMax": 25,
+    });
+    let mut driver = RecordingDriver {
+        scripted: true,
+        ..RecordingDriver::default()
+    };
+    let selection = RunSelection {
+        methods: vec![Method::NormalLlm],
+        cases: CaseSelection::All,
+    };
+    let run = run_with_selection(
+        Some(&approval),
+        &mut driver,
+        &root,
+        RunLimitsSnapshot::default(),
+        Ok(selection),
+    );
+    assert_eq!(run.status, "partial_text_only");
+    assert_eq!(driver.prepare_calls, 1);
+    assert_eq!(driver.sends.len(), 25, "25 sendable normal-LLM cases");
+    assert!(
+        driver
+            .sends
+            .iter()
+            .all(|send| send.method == Method::NormalLlm),
+        "Jev is not selected and no Jev request is prepared or sent"
+    );
+    assert_eq!(run.external_requests, 25);
+    let held = run.report["results"]
+        .as_array()
+        .expect("result rows")
+        .iter()
+        .filter(|row| row["status"] == json!("held"))
+        .count();
+    assert_eq!(held, 4, "both injection cases are held for both methods");
+    assert_eq!(run.report["plan"]["methods"], json!(["normal_llm"]));
+    assert_eq!(run.report["plan"]["methodsNotSelected"], json!(["jev"]));
+    assert_eq!(
+        run.report["plan"]["methodsNotRun"],
+        json!(["jev", "decisions"])
+    );
+    assert_eq!(
+        run.report["plan"]["plannedFirstRequests"],
+        json!(27),
+        "the selected plan includes the two held injection calls"
+    );
+    assert_eq!(
+        run.report["plan"]["plannedWorstCaseAttempts"],
+        json!(81),
+        "27 selected first requests x 3 attempts is within maxRequests=100"
+    );
+    assert_eq!(run.report["plan"]["maxRequests"], json!(100));
+    assert_eq!(run.report["plan"]["perFixtureMax"], json!(25));
+    assert_eq!(
+        run.report["methodSummaries"]["normal_llm"]["status"],
+        json!("complete_text_only")
+    );
+    assert_eq!(
+        run.report["methodSummaries"]["normal_llm"]["settled"],
+        json!(27)
+    );
+    assert_eq!(
+        run.report["methodSummaries"]["jev"]["status"],
+        json!("not_run")
+    );
+    assert_eq!(run.report["methodSummaries"]["jev"]["requests"], json!(0));
+    assert_eq!(run.report["diagnostics"]["counts"]["held"], json!(4));
+}
+
+#[test]
+fn diagnostic_positive_case_filter_sends_only_the_five_positives() {
+    let root = fixture_root();
+    let mut approval = valid_approval();
+    approval["requestPlan"]["requestBudget"] = json!({
+        "maxRequests": 100,
+        "perFixtureMax": 25,
+    });
+    let mut driver = RecordingDriver {
+        scripted: true,
+        ..RecordingDriver::default()
+    };
+    let selection = RunSelection {
+        methods: vec![Method::NormalLlm],
+        cases: CaseSelection::ExpectedSync,
+    };
+    let run = run_with_selection(
+        Some(&approval),
+        &mut driver,
+        &root,
+        RunLimitsSnapshot::default(),
+        Ok(selection),
+    );
+    assert_eq!(run.status, "partial");
+    assert_eq!(driver.sends.len(), 5, "only the five expected-sync cases");
+    let expected = [
+        "eval-glossary-001/positive",
+        "eval-adr-001/positive",
+        "eval-spec-001/positive",
+        "eval-plan-001/positive",
+        "eval-plan-001/false-stop-probe",
+    ]
+    .iter()
+    .map(|case| (*case).to_owned())
+    .collect::<BTreeSet<_>>();
+    let sent = driver
+        .sends
+        .iter()
+        .map(|send| send.case_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(sent, expected);
+    assert_eq!(run.external_requests, 5);
+    assert_eq!(
+        run.report["plan"]["runSelection"]["caseFilter"],
+        json!("positives")
+    );
+    assert_eq!(run.report["plan"]["plannedFirstRequests"], json!(5));
+    assert_eq!(
+        run.report["diagnostics"]["counts"]["held"],
+        json!(4),
+        "injection cases stay held even when a diagnostic case filter excludes them"
+    );
+    assert_eq!(run.report["diagnostics"]["counts"]["falseStops"], json!(0));
+}
+
+#[test]
+fn diagnostics_flag_false_stops_with_sanitized_rationale_and_count_held_separately() {
+    assert_eq!(sanitized_model_text("a\u{0}b\nc", 10), "a b\nc");
+    assert_eq!(sanitized_model_text(&"x".repeat(12), 5), "xxxxx…");
+
+    let rows = vec![
+        json!({
+            "status": "assessed",
+            "fixtureId": "f",
+            "caseId": "f/positive",
+            "method": "normal_llm",
+            "condition": "information",
+            "expectedVerdict": "met",
+            "actualVerdict": "unmet",
+            "adoptedVerdict": "unmet",
+            "rationale": "the wording differs but the facts match",
+            "rationaleOrigin": "model",
+            "uncertainty": null,
+            "rejection": null,
+            "lowConfidence": false,
+        }),
+        json!({
+            "status": "assessed",
+            "fixtureId": "f",
+            "caseId": "f/negative",
+            "method": "normal_llm",
+            "condition": "information",
+            "expectedVerdict": "unmet",
+            "actualVerdict": "met",
+            "adoptedVerdict": "met",
+            "rationale": "synthetic wrong sync",
+            "rationaleOrigin": "model",
+        }),
+        json!({
+            "status": "held",
+            "caseId": "f/injection",
+            "method": "normal_llm",
+            "unverifiedReason": "adversarial_instruction_detected: ignore previous instructions",
+        }),
+        json!({"status": "not_run", "caseId": "f/other", "method": "normal_llm"}),
+    ];
+    let diagnostics = diagnostics_json(&rows);
+    assert_eq!(diagnostics["counts"]["assessed"], json!(2));
+    assert_eq!(diagnostics["counts"]["falseStops"], json!(1));
+    assert_eq!(diagnostics["counts"]["falseSyncs"], json!(1));
+    assert_eq!(diagnostics["counts"]["held"], json!(1));
+    assert_eq!(
+        diagnostics["falseStops"][0]["rationale"],
+        json!("the wording differs but the facts match")
+    );
+    assert_eq!(
+        diagnostics["falseSyncs"][0]["rationale"],
+        json!("synthetic wrong sync")
+    );
+    assert_eq!(
+        diagnostics["held"][0]["reason"],
+        json!("adversarial_instruction_detected: ignore previous instructions")
+    );
 }
 
 #[test]
@@ -3591,11 +4216,13 @@ fn phase_b_real_evaluation_runs_only_after_explicit_human_authorization() {
     let root = fixture_root();
     let mut driver = RealPhaseBDriver::new();
     let limits = RunLimitsSnapshot::from_environment();
+    let selection = RunSelection::from_environment();
     let run = execute_phase_b(
         approval_path.as_deref(),
         &root,
         &mut driver,
         limits,
+        selection,
         Timestamp::now().as_unix_millis(),
     );
     let path = match report_path() {
@@ -3613,12 +4240,19 @@ fn phase_b_real_evaluation_runs_only_after_explicit_human_authorization() {
     if run.status == "refused" {
         panic!("PHASE_B_REFUSED: {}", run.refusal_reasons.join("; "));
     }
-    if run.status != "partial_text_only" {
+    let diagnostic = env::var("H3_PHASE_B_DIAGNOSTIC").as_deref() == Ok("1");
+    if run.status != "partial_text_only" && !diagnostic {
         panic!(
             "PHASE_B_INCOMPLETE: status={} externalRequests={}; inspect {}",
             run.status,
             run.external_requests,
             path.display()
+        );
+    }
+    if diagnostic {
+        eprintln!(
+            "PHASE_B_DIAGNOSTIC: status={} externalRequests={}; completeness gate intentionally relaxed by H3_PHASE_B_DIAGNOSTIC=1",
+            run.status, run.external_requests
         );
     }
 }
