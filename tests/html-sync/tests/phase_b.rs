@@ -2137,6 +2137,20 @@ fn assessed_row(call: &PlannedCall, observation: &CallObservation, latency_ms: u
     row
 }
 
+fn adversarial_hold_row(call: &PlannedCall, marker: &str) -> Value {
+    let mut row = base_row(call);
+    row["status"] = json!("held");
+    row["actualVerdict"] = json!("insufficient");
+    row["adoptedVerdict"] = Value::Null;
+    row["outcome"] = Value::Null;
+    row["agreement"] = json!(call.expected_verdict == ConditionVerdict::Insufficient);
+    row["unverifiedReason"] = json!(format!("adversarial_instruction_detected: {marker}"));
+    row["requestCount"] = json!(0);
+    row["attempts"] = json!(0);
+    row["latencyMs"] = json!(0);
+    row
+}
+
 fn failed_row(call: &PlannedCall, failure: &SendFailure, latency_ms: u64) -> Value {
     let mut row = base_row(call);
     let reason = match failure.status {
@@ -2458,6 +2472,20 @@ fn execute_phase_b(
                 .map(str::trim)
                 .any(|method| method == call.method.id())
         {
+            continue;
+        }
+        if let Some(marker) = herness_html_sync::adversarial_instruction(&call.evidence.source_text)
+            .or_else(|| herness_html_sync::adversarial_instruction(&call.evidence.candidate_text))
+        {
+            rows.push((
+                (
+                    call.fixture_index,
+                    call.case_index,
+                    call.method,
+                    call.condition,
+                ),
+                adversarial_hold_row(call, marker),
+            ));
             continue;
         }
         let fixture_attempts = *per_fixture_attempts.get(&call.fixture_id).unwrap_or(&0);
@@ -3363,9 +3391,11 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
         &fixture_root(),
         RunLimitsSnapshot::default(),
     );
-    assert_eq!(run.status, "partial_text_only");
+    assert_eq!(run.status, "partial");
     assert_eq!(driver.prepare_calls, 1);
-    assert_eq!(driver.sends.len(), 54, "27 cases x 2 text methods");
+    // Two injection cases are held by the deterministic adversarial gate and
+    // are never sent, for either method.
+    assert_eq!(driver.sends.len(), 50, "25 sendable cases x 2 text methods");
     let unique_sends = driver
         .sends
         .iter()
@@ -3373,10 +3403,24 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
         .collect::<BTreeSet<_>>();
     assert_eq!(
         unique_sends.len(),
-        54,
-        "every fixture/case/method pair is sent exactly once"
+        50,
+        "every sendable fixture/case/method pair is sent exactly once"
     );
-    assert_eq!(run.external_requests, 55, "one call used two attempts");
+    assert_eq!(run.external_requests, 51, "one call used two attempts");
+    let held = run.report["results"]
+        .as_array()
+        .expect("result rows")
+        .iter()
+        .filter(|row| row["status"] == "held")
+        .count();
+    assert_eq!(held, 4, "two injection cases x two methods are held");
+    assert!(
+        driver
+            .sends
+            .iter()
+            .all(|send| !send.case_id.ends_with("/injection")),
+        "injection cases are never sent"
+    );
     assert!(
         driver
             .sends
@@ -3408,7 +3452,11 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
         .iter()
         .filter(|send| send.method == Method::Jev)
         .count();
-    assert_eq!((normal, jev), (27, 27));
+    assert_eq!(
+        (normal, jev),
+        (25, 25),
+        "two injection cases are held per method"
+    );
     let report = run.report.to_string();
     assert!(!report.contains("Bearer "));
     assert!(!report.contains("COMMANDCODE_API_KEY"));
@@ -3437,7 +3485,15 @@ fn a_complete_text_only_approval_runs_a_scripted_recording_dry_run_without_a_pro
     assert!(
         information
             .iter()
-            .all(|row| row["status"] == json!("assessed"))
+            .all(|row| row["status"] == json!("assessed") || row["status"] == json!("held"))
+    );
+    assert_eq!(
+        information
+            .iter()
+            .filter(|row| row["status"] == json!("held"))
+            .count(),
+        4,
+        "two injection cases x two methods are held"
     );
     let not_run = rows
         .iter()

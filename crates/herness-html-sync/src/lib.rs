@@ -128,7 +128,8 @@ pub use request::{
     H3RequestFingerprint, RequestCommit, StoredRequestResult, decode_stored_request_result,
 };
 pub use rubric::{
-    ConditionRubric, H3_RUBRIC_SCHEMA, H3_RUBRIC_VERSION, RubricSet, condition_rubric,
+    ADVERSARIAL_INSTRUCTION_MARKERS, ConditionRubric, H3_RUBRIC_SCHEMA, H3_RUBRIC_VERSION,
+    RubricSet, adversarial_instruction, condition_rubric,
 };
 pub use state::{
     Applicability, ApplicabilityReason, ArchivedVersionRef, CandidateRecord, CandidateStorageRef,

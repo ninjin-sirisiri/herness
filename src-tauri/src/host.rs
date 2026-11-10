@@ -746,6 +746,21 @@ impl DesktopHost {
             document,
         )
         .map_err(|error| error.to_string())?;
+        let source_text = String::from_utf8_lossy(&prepared.source);
+        if let Some(marker) = herness_html_sync::adversarial_instruction(&source_text)
+            .or_else(|| herness_html_sync::adversarial_instruction(&prepared.html))
+        {
+            let cause = herness_html_sync::HumanWaitCause::UndecidableAssessment;
+            let detail = format!("adversarial instruction marker in candidate evidence: {marker}");
+            let _ = pipeline::mark_waiting(
+                &mut store,
+                &prepared,
+                cause,
+                vec![herness_html_sync::RequiredAction::ReassessCandidate],
+                now,
+            );
+            return Ok(PostCandidateOutcome::WaitingHuman { cause, detail });
+        }
         let capture = HostFingerprints::capture(
             &settings,
             approval.versions().policy_fingerprint(),
@@ -1109,6 +1124,15 @@ impl DesktopHost {
             css,
             resources,
         };
+        let source_text = String::from_utf8_lossy(&prepared.source);
+        if let Some(marker) = herness_html_sync::adversarial_instruction(&source_text)
+            .or_else(|| herness_html_sync::adversarial_instruction(&prepared.html))
+        {
+            return Ok(herness_html_sync::AdoptionOutcome::WaitingHuman {
+                cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                detail: format!("adversarial instruction marker in candidate evidence: {marker}"),
+            });
+        }
         let capture = HostFingerprints::capture(
             &settings,
             approval.versions().policy_fingerprint(),
