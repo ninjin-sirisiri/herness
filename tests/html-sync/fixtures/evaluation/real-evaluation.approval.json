@@ -1,0 +1,29 @@
+{
+  "schema": "h3-real-evaluation-approval-v1",
+  "status": "not_run",
+  "externalRequests": 0,
+  "approvedBy": "",
+  "approvedAt": "",
+  "connection": {
+    "provider": "",
+    "connectionId": "",
+    "endpointClass": "",
+    "model": ""
+  },
+  "fixtures": [],
+  "dataKinds": [],
+  "requestBudget": {
+    "maxRequests": 0,
+    "perFixtureMax": 0
+  },
+  "retryPolicy": {
+    "maxAttempts": 0,
+    "sameConnectionOnly": true,
+    "retryOn": []
+  },
+  "costApproval": {
+    "feeCapUsd": null,
+    "quotaLabel": "",
+    "quotaConfirmed": false
+  }
+}

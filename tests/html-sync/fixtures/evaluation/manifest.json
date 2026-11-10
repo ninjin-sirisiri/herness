@@ -1,0 +1,1045 @@
+{
+  "schema": "h3-evaluation-set-v1",
+  "version": 1,
+  "description": "Hand-authored evaluation baselines and reconstructed positives for glossary, ADR, spec and plan documents. The scripted judge is an answer-key contract, not model accuracy or human understanding.",
+  "judge": {
+    "mode": "scripted-answer-key",
+    "methods": [
+      {
+        "id": "normal_llm",
+        "label": "Normal LLM",
+        "providerKind": "normal_llm",
+        "scriptedConfidence": null
+      },
+      {
+        "id": "jev",
+        "label": "Jev",
+        "providerKind": "jev",
+        "scriptedConfidence": 0.99
+      },
+      {
+        "id": "decisions",
+        "label": "Decisions",
+        "providerKind": "decisions",
+        "scriptedConfidence": 0.99
+      }
+    ],
+    "limitations": [
+      "No provider, credential, Keychain item, network request or real model is used.",
+      "The answer key checks exact source facts and known contradictions; it does not evaluate paraphrase quality or human understanding.",
+      "All three method rows are scripted and must not be reported as real-model accuracy."
+    ]
+  },
+  "fixtures": [
+    {
+      "id": "eval-glossary-001",
+      "documentKind": "glossary",
+      "dataKinds": [
+        "text"
+      ],
+      "sourcePath": "docs/glossary/CONTEXT.md",
+      "packPath": "CONTEXT.md",
+      "positivePath": "positive/glossary-CONTEXT.html",
+      "alternatePositivePath": null,
+      "sourceDigest": "sha256:0e38268df0a8c10dd1372cc47be783d681d71a86499d9173c63aa3970f6d5c69",
+      "sourceByteLength": 391,
+      "units": [
+        {
+          "id": "heading-000000",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Ordering",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000012",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Tracks customer orders.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000037",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Terms",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_term-000047",
+          "kind": "glossary_term",
+          "answers": [
+            {
+              "text": "A customer's request for goods.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_avoid-000091",
+          "kind": "glossary_avoid",
+          "answers": [
+            {
+              "text": "Purchase, transaction",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_term-000123",
+          "kind": "glossary_term",
+          "answers": [
+            {
+              "text": "Do not accept a backorder without the owner's approval.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_avoid-000241",
+          "kind": "glossary_avoid",
+          "answers": [
+            {
+              "text": "Waitlist",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_term-000260",
+          "kind": "glossary_term",
+          "answers": [
+            {
+              "text": "only the owner may approve a return",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "glossary_avoid-000375",
+          "kind": "glossary_avoid",
+          "answers": [
+            {
+              "text": "Refund",
+              "scope": "visible"
+            }
+          ]
+        }
+      ],
+      "readingTasks": [
+        {
+          "id": "eval-glossary-001-task-1",
+          "question": "What must happen before a backorder is accepted?",
+          "unit": "glossary_term-000123",
+          "answer": "the owner's approval"
+        },
+        {
+          "id": "eval-glossary-001-task-2",
+          "question": "Which words should be avoided for Order?",
+          "unit": "glossary_avoid-000091",
+          "answer": "Purchase, transaction"
+        }
+      ],
+      "cases": [
+        {
+          "id": "eval-glossary-001/positive",
+          "path": "positive/glossary-CONTEXT.html",
+          "expected": "sync",
+          "kind": "positive",
+          "hazard": null,
+          "note": "Correct reconstruction; all source units and conditions are represented.",
+          "packExpectation": "allow"
+        },
+        {
+          "id": "eval-glossary-001/avoid-term",
+          "path": "negative/glossary-CONTEXT-avoid-term.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "glossary-canonical-avoid",
+          "forbiddenVisible": [
+            "request for goods or transactions"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-glossary-001/permission",
+          "path": "negative/glossary-CONTEXT-permission.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "permission",
+          "forbiddenVisible": [
+            "Anyone may accept a backorder without approval."
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-glossary-001/hidden",
+          "path": "negative/glossary-CONTEXT-hidden.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "hidden-information",
+          "forbiddenVisible": [
+            "Anyone may accept a backorder without approval."
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-glossary-001/injection",
+          "path": "negative/glossary-CONTEXT-injection.html",
+          "expected": "hold",
+          "kind": "negative",
+          "hazard": "injection",
+          "injection": true,
+          "packExpectation": "either"
+        }
+      ]
+    },
+    {
+      "id": "eval-adr-001",
+      "documentKind": "adr",
+      "dataKinds": [
+        "text"
+      ],
+      "sourcePath": "docs/adr/0001-queue-choice.md",
+      "packPath": "docs/adr/0001-queue-choice.md",
+      "positivePath": "positive/adr-0001-queue-choice.html",
+      "alternatePositivePath": null,
+      "sourceDigest": "sha256:73373a1ee03a371f987133ca11d7cf23d97598b103b4c7d3220638b857e3288a",
+      "sourceByteLength": 191,
+      "units": [
+        {
+          "id": "heading-000000",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Queue choice",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000016",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "750 ms",
+              "scope": "visible"
+            },
+            {
+              "text": "at most 2 MiB",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "inline_code-000020",
+          "kind": "inline_code",
+          "answers": [
+            {
+              "text": "FIFO",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000068",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Do not use",
+              "scope": "visible"
+            },
+            {
+              "text": "unless the owner approves a migration",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "inline_code-000079",
+          "kind": "inline_code",
+          "answers": [
+            {
+              "text": "LIFO",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000126",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Adopt the queue.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "link-000147",
+          "kind": "link",
+          "answers": [
+            {
+              "text": "href=\"../plans/2026-11-01-example.md\"",
+              "scope": "html"
+            }
+          ]
+        }
+      ],
+      "readingTasks": [
+        {
+          "id": "eval-adr-001-task-1",
+          "question": "What window does FIFO use?",
+          "unit": "paragraph-000016",
+          "answer": "750 ms"
+        },
+        {
+          "id": "eval-adr-001-task-2",
+          "question": "When may LIFO be used?",
+          "unit": "paragraph-000068",
+          "answer": "unless the owner approves a migration"
+        }
+      ],
+      "cases": [
+        {
+          "id": "eval-adr-001/positive",
+          "path": "positive/adr-0001-queue-choice.html",
+          "expected": "sync",
+          "kind": "positive",
+          "hazard": null,
+          "note": "Correct reconstruction; the negation, caveat, code, link and thresholds are preserved.",
+          "packExpectation": "allow"
+        },
+        {
+          "id": "eval-adr-001/negation",
+          "path": "negative/adr-0001-queue-choice-negation.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "negation",
+          "forbiddenVisible": [
+            "Use LIFO even if the owner rejects a migration."
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-adr-001/caveat",
+          "path": "negative/adr-0001-queue-choice-caveat.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "caveat",
+          "note": "The owner-approval exception was removed.",
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-adr-001/threshold",
+          "path": "negative/adr-0001-queue-choice-threshold.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "threshold",
+          "forbiddenVisible": [
+            "750 s"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-adr-001/code",
+          "path": "negative/adr-0001-queue-choice-code.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "code",
+          "forbiddenHtml": [
+            "<code id=\"fifo\">LIFO</code>"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-adr-001/link",
+          "path": "negative/adr-0001-queue-choice-link.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "link",
+          "forbiddenHtml": [
+            "href=\"../plans/2026-11-01-other.md\""
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-adr-001/fake-edge",
+          "path": "negative/adr-0001-queue-choice-fake-edge.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "fake-edge-value",
+          "forbiddenVisible": [
+            "12 ms"
+          ],
+          "supportUnmet": true,
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-adr-001/stale",
+          "path": "negative/adr-0001-queue-choice-stale.html",
+          "expected": "hold",
+          "kind": "negative",
+          "hazard": "stale-evidence",
+          "stale": true,
+          "note": "The candidate matches the previous source revision (sha256:021ce9554ebc9ee597f31a70e4fdce169cdcceb0fb132290e40a31f1e1ee4fea), not the current source digest sha256:73373a1ee03a371f987133ca11d7cf23d97598b103b4c7d3220638b857e3288a.",
+          "staleSourceDigest": "sha256:021ce9554ebc9ee597f31a70e4fdce169cdcceb0fb132290e40a31f1e1ee4fea",
+          "packExpectation": "deny"
+        }
+      ]
+    },
+    {
+      "id": "eval-spec-001",
+      "documentKind": "spec",
+      "dataKinds": [
+        "text"
+      ],
+      "sourcePath": "docs/sdd/specs/2026-11-01-example-design.md",
+      "packPath": "docs/sdd/specs/2026-11-01-example-design.md",
+      "positivePath": "positive/spec-2026-11-01-example-design.html",
+      "alternatePositivePath": null,
+      "sourceDigest": "sha256:eba57386adfdec2da7eb7c4139ee020c6acd9c5b0af6799ad4c9d15c55793b5c",
+      "sourceByteLength": 457,
+      "units": [
+        {
+          "id": "heading-000000",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Example design",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000018",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "href=\"../plans/2026-11-01-example.md\"",
+              "scope": "html"
+            }
+          ]
+        },
+        {
+          "id": "link-000026",
+          "kind": "link",
+          "answers": [
+            {
+              "text": "href=\"../plans/2026-11-01-example.md\"",
+              "scope": "html"
+            }
+          ]
+        },
+        {
+          "id": "heading-000067",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Goals",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "list-000077",
+          "kind": "list",
+          "answers": [
+            {
+              "text": "Keep Markdown canonical.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "list_item-000077",
+          "kind": "list_item",
+          "answers": [
+            {
+              "text": "Keep Markdown canonical.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000105",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Rules",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000115",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "must not contain external network requests",
+              "scope": "visible"
+            },
+            {
+              "text": "Only a human owner may approve a new Target.",
+              "scope": "visible"
+            },
+            {
+              "text": "1,280×800",
+              "scope": "visible"
+            },
+            {
+              "text": "390×844",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000286",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Detail",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000298",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "semantic HTML",
+              "scope": "visible"
+            },
+            {
+              "text": "href=\"https://example.com/docs\"",
+              "scope": "html"
+            }
+          ]
+        },
+        {
+          "id": "inline_code-000302",
+          "kind": "inline_code",
+          "answers": [
+            {
+              "text": "semantic HTML",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "link-000326",
+          "kind": "link",
+          "answers": [
+            {
+              "text": "href=\"https://example.com/docs\"",
+              "scope": "html"
+            }
+          ]
+        },
+        {
+          "id": "table-000375",
+          "kind": "table",
+          "answers": [
+            {
+              "text": "Source",
+              "scope": "visible"
+            },
+            {
+              "text": "Companion",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_header-000377",
+          "kind": "table_header",
+          "answers": [
+            {
+              "text": "Area",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_header-000384",
+          "kind": "table_header",
+          "answers": [
+            {
+              "text": "Rule",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_cell-000407",
+          "kind": "table_cell",
+          "answers": [
+            {
+              "text": "Source",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_cell-000416",
+          "kind": "table_cell",
+          "answers": [
+            {
+              "text": "Markdown",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_cell-000429",
+          "kind": "table_cell",
+          "answers": [
+            {
+              "text": "Companion",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "table_cell-000441",
+          "kind": "table_cell",
+          "answers": [
+            {
+              "text": "Authored HTML",
+              "scope": "visible"
+            }
+          ]
+        }
+      ],
+      "readingTasks": [
+        {
+          "id": "eval-spec-001-task-1",
+          "question": "Which viewports must the render checks cover?",
+          "unit": "paragraph-000115",
+          "answer": "1,280×800"
+        },
+        {
+          "id": "eval-spec-001-task-2",
+          "question": "What must the HTML companion not contain?",
+          "unit": "paragraph-000115",
+          "answer": "external network requests"
+        }
+      ],
+      "cases": [
+        {
+          "id": "eval-spec-001/positive",
+          "path": "positive/spec-2026-11-01-example-design.html",
+          "expected": "sync",
+          "kind": "positive",
+          "hazard": null,
+          "note": "Correct reconstruction; the prohibition, permission, viewports, code, links and table are preserved.",
+          "packExpectation": "allow"
+        },
+        {
+          "id": "eval-spec-001/negation",
+          "path": "negative/spec-2026-11-01-example-design-negation.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "negation",
+          "forbiddenVisible": [
+            "may contain external network requests"
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-spec-001/permission",
+          "path": "negative/spec-2026-11-01-example-design-permission.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "permission",
+          "forbiddenVisible": [
+            "Anyone may approve a new Target."
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-spec-001/viewport",
+          "path": "negative/spec-2026-11-01-example-design-viewport.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "threshold-viewport",
+          "forbiddenVisible": [
+            "1,024×768"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-spec-001/code",
+          "path": "negative/spec-2026-11-01-example-design-code.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "code",
+          "forbiddenHtml": [
+            "<code id=\"semantic-html\">div soup</code>"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-spec-001/link",
+          "path": "negative/spec-2026-11-01-example-design-link.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "link",
+          "forbiddenHtml": [
+            "href=\"https://example.com/other\""
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-spec-001/table",
+          "path": "negative/spec-2026-11-01-example-design-table.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "table-value",
+          "forbiddenVisible": [
+            "Generated HTML"
+          ],
+          "packExpectation": "either"
+        }
+      ]
+    },
+    {
+      "id": "eval-plan-001",
+      "documentKind": "plan",
+      "dataKinds": [
+        "text"
+      ],
+      "sourcePath": "docs/sdd/plans/2026-11-01-example.md",
+      "packPath": "docs/sdd/plans/2026-11-01-example.md",
+      "positivePath": "positive/plan-2026-11-01-example.html",
+      "alternatePositivePath": "positive/plan-2026-11-01-example-alt.html",
+      "sourceDigest": "sha256:eb305936e83609f3abb6b07c1b0b75632d97704882bb211c69983fca67df0614",
+      "sourceByteLength": 488,
+      "units": [
+        {
+          "id": "heading-000000",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Example Implementation Plan",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000031",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Build the example.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000061",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Two sequential tasks that share one branch.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000124",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "pytest",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000148",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "docs/sdd/specs/2026-11-01-example-design.md",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000203",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Global Constraints",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000226",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "Do not run Task 2 before Task 1 completes.",
+              "scope": "visible"
+            },
+            {
+              "text": "Keep the global constraint inside every task brief.",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000322",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Task 1: First thing",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000346",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "UNIQUE_TASK_ONE",
+              "scope": "visible"
+            },
+            {
+              "text": "750 ms",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "heading-000407",
+          "kind": "heading",
+          "answers": [
+            {
+              "text": "Task 2: Second thing",
+              "scope": "visible"
+            }
+          ]
+        },
+        {
+          "id": "paragraph-000432",
+          "kind": "paragraph",
+          "answers": [
+            {
+              "text": "UNIQUE_TASK_TWO",
+              "scope": "visible"
+            },
+            {
+              "text": "2 MiB",
+              "scope": "visible"
+            }
+          ]
+        }
+      ],
+      "readingTasks": [
+        {
+          "id": "eval-plan-001-task-1",
+          "question": "May Task 2 run before Task 1 completes?",
+          "unit": "paragraph-000226",
+          "answer": "Do not run Task 2 before Task 1 completes."
+        },
+        {
+          "id": "eval-plan-001-task-2",
+          "question": "What is the migration window?",
+          "unit": "paragraph-000346",
+          "answer": "750 ms"
+        }
+      ],
+      "cases": [
+        {
+          "id": "eval-plan-001/positive",
+          "path": "positive/plan-2026-11-01-example.html",
+          "expected": "sync",
+          "kind": "positive",
+          "hazard": null,
+          "note": "Correct reconstruction; execution order, global constraint and thresholds are preserved.",
+          "packExpectation": "allow"
+        },
+        {
+          "id": "eval-plan-001/order",
+          "path": "negative/plan-2026-11-01-example-order.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "execution-order",
+          "forbiddenVisible": [
+            "Run Task 2 before Task 1 completes."
+          ],
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-plan-001/hidden",
+          "path": "negative/plan-2026-11-01-example-hidden.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "hidden-information",
+          "note": "The execution-order constraint is present only inside a hidden span.",
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-plan-001/threshold",
+          "path": "negative/plan-2026-11-01-example-threshold.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "threshold",
+          "forbiddenVisible": [
+            "750 s"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-plan-001/fake-value",
+          "path": "negative/plan-2026-11-01-example-fake-value.html",
+          "expected": "reject",
+          "kind": "negative",
+          "hazard": "fake-edge-value",
+          "forbiddenVisible": [
+            "12 ms"
+          ],
+          "packExpectation": "deny"
+        },
+        {
+          "id": "eval-plan-001/injection",
+          "path": "negative/plan-2026-11-01-example-injection.html",
+          "expected": "hold",
+          "kind": "negative",
+          "hazard": "injection",
+          "injection": true,
+          "packExpectation": "either"
+        },
+        {
+          "id": "eval-plan-001/false-stop-probe",
+          "path": "positive/plan-2026-11-01-example-alt.html",
+          "expected": "sync",
+          "kind": "false-stop-probe",
+          "hazard": "over-strict-scripted-judge",
+          "scriptedOverStrict": true,
+          "note": "Diagnostic probe only: a correct alternative reconstruction is stopped by a scripted over-strict judge, so the aggregator must report a false stop rather than a pass. This is not a model-quality result.",
+          "packExpectation": "allow"
+        }
+      ]
+    }
+  ],
+  "humanObservation": {
+    "schema": "h3-human-observation-record-v1",
+    "status": "not_run",
+    "reason": "Task 24 supplies the record and reading tasks only; no human observation was performed.",
+    "fields": [
+      "fixtureId",
+      "documentKind",
+      "documentVersion.sourceDigest",
+      "documentVersion.fixtureVersion",
+      "observer.name",
+      "observer.role",
+      "observer.independent",
+      "method.provider",
+      "method.profileId",
+      "method.model",
+      "environment.appVersion",
+      "environment.os",
+      "environment.display",
+      "startedAt",
+      "durationSeconds",
+      "readingTasks[].taskId",
+      "readingTasks[].correct",
+      "readingTasks[].answer",
+      "readingTasks[].wrongAnswer",
+      "wrongAnswers",
+      "difficultyNotes",
+      "assistance",
+      "result"
+    ],
+    "record": {
+      "schema": "h3-human-observation-record-v1",
+      "status": "not_run",
+      "fixtureId": "",
+      "documentKind": "",
+      "documentVersion": {
+        "sourceDigest": "",
+        "fixtureVersion": 1
+      },
+      "observer": {
+        "name": "",
+        "role": "",
+        "independent": null
+      },
+      "method": {
+        "provider": "",
+        "profileId": "",
+        "model": ""
+      },
+      "environment": {
+        "appVersion": "",
+        "os": "",
+        "display": ""
+      },
+      "startedAt": "",
+      "durationSeconds": null,
+      "readingTasks": [],
+      "wrongAnswers": [],
+      "difficultyNotes": "",
+      "assistance": "none",
+      "result": "not_run"
+    }
+  },
+  "realEvaluation": {
+    "schema": "h3-real-evaluation-approval-v1",
+    "status": "not_run",
+    "externalRequests": 0,
+    "reason": "No real model, provider, credential, Keychain item or external request was used in Task 24.",
+    "approvalTemplate": {
+      "schema": "h3-real-evaluation-approval-v1",
+      "status": "not_run",
+      "externalRequests": 0,
+      "approvedBy": "",
+      "approvedAt": "",
+      "connection": {
+        "provider": "",
+        "connectionId": "",
+        "endpointClass": "",
+        "model": ""
+      },
+      "fixtures": [],
+      "dataKinds": [],
+      "requestBudget": {
+        "maxRequests": 0,
+        "perFixtureMax": 0
+      },
+      "retryPolicy": {
+        "maxAttempts": 0,
+        "sameConnectionOnly": true,
+        "retryOn": []
+      },
+      "costApproval": {
+        "feeCapUsd": null,
+        "quotaLabel": "",
+        "quotaConfirmed": false
+      }
+    },
+    "requiredBeforeSend": [
+      "exact connection provider, connection id, endpoint class and model",
+      "exact fixture ids and data kinds",
+      "finite request budget (maxRequests and perFixtureMax > 0)",
+      "finite retry policy bound to the same connection",
+      "fee cap and quota approval",
+      "human approver and approval time"
+    ]
+  }
+}

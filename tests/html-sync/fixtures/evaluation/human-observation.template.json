@@ -1,0 +1,32 @@
+{
+  "schema": "h3-human-observation-record-v1",
+  "status": "not_run",
+  "fixtureId": "",
+  "documentKind": "",
+  "documentVersion": {
+    "sourceDigest": "",
+    "fixtureVersion": 1
+  },
+  "observer": {
+    "name": "",
+    "role": "",
+    "independent": null
+  },
+  "method": {
+    "provider": "",
+    "profileId": "",
+    "model": ""
+  },
+  "environment": {
+    "appVersion": "",
+    "os": "",
+    "display": ""
+  },
+  "startedAt": "",
+  "durationSeconds": null,
+  "readingTasks": [],
+  "wrongAnswers": [],
+  "difficultyNotes": "",
+  "assistance": "none",
+  "result": "not_run"
+}

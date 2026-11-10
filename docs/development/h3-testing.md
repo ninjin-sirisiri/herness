@@ -1,6 +1,6 @@
 # H3 HTML sync: 実adapter結合と受入テスト手順
 
-H3の正本仕様は [H3 design](../sdd/specs/2026-11-09-h3-html-sync-design.md)、H1/H2の追加契約は [H1 design](../sdd/specs/2026-11-07-h1-runtime-design.md) と [H2 design](../sdd/specs/2026-11-08-h2-supervision-design.md)。この文書はTask 23で追加した実adapter受入の再現手順、実測/scriptedの区別、fixture、既知の未確認範囲を記録する。
+H3の正本仕様は [H3 design](../sdd/specs/2026-11-09-h3-html-sync-design.md)、H1/H2の追加契約は [H1 design](../sdd/specs/2026-11-07-h1-runtime-design.md) と [H2 design](../sdd/specs/2026-11-08-h2-supervision-design.md)。この文書はTask 23で追加した実adapter受入の再現手順、Task 24で追加した意味・視覚品質の評価セット、実測/scriptedの区別、fixture、既知の未確認範囲を記録する。
 
 ## revision
 
@@ -134,3 +134,154 @@ uvx --from pytest pytest -q
 | pack `uvx --from pytest pytest -q` | 372 passed in 23.73s |
 | `cargo check --workspace --locked` | success、warningなし |
 | `cargo build -p herness-desktop --locked` | success（real render child用） |
+
+## 意味・視覚品質の評価セット（Task 24）
+
+Task 24は、用語集・ADR・spec・planの4種について、手著作baseline（Markdown）、再構成正例（semantic-v1 HTML）、source unit別の正解、読解課題、負例、人間観測record、opt-in実評価のapproval gateを追加した。fixtureは評価用のテスト入力であり、Target setのMarkdownや`.html` companionではない。したがって`html-docs validate`/`check`の対象にはならない。
+
+正本manifestは `tests/html-sync/fixtures/evaluation/manifest.json`。評価testは `tests/html-sync/tests/evaluation.rs`。
+
+### fixture ID
+
+| fixture ID | 文書種別 | baseline | 再構成正例 | real packのtarget path |
+| --- | --- | --- | --- | --- |
+| `eval-glossary-001` | glossary | `docs/glossary/CONTEXT.md` | `positive/glossary-CONTEXT.html` | `CONTEXT.md` |
+| `eval-adr-001` | ADR | `docs/adr/0001-queue-choice.md` | `positive/adr-0001-queue-choice.html` | `docs/adr/0001-queue-choice.md` |
+| `eval-spec-001` | spec | `docs/sdd/specs/2026-11-01-example-design.md` | `positive/spec-2026-11-01-example-design.html` | `docs/sdd/specs/2026-11-01-example-design.md` |
+| `eval-plan-001` | plan | `docs/sdd/plans/2026-11-01-example.md` | `positive/plan-2026-11-01-example.html` | `docs/sdd/plans/2026-11-01-example.md` |
+
+`eval-plan-001` には、同じ情報を別layoutで再構成した `positive/plan-2026-11-01-example-alt.html` もある。これはfalse-stop検出用の正例であり、品質の実測値ではない。
+
+4 fixtureはいずれも `dataKinds: ["text"]` のsemantic評価入力で、承認済み画像bytesや実render画像は含まない。scripted judgeのsupport/usability/render rowはcontract分類用であり、実画像条件の評価ではない。
+
+### source unit別の正解と読解課題
+
+manifestの `fixtures[].units[]` は `source-units` のunit id/kindと一致し、各unitに `answers[]`（`scope: visible` または `scope: html`）を持つ。scripted judgeはvisible text（template/script/style/hiddenを除外）とraw HTMLの両方から、正解の存在と既知の矛盾を検査する。
+
+主な正解:
+
+- glossary: `Backorder` の「Do not accept ... without the owner's approval」、`Order` のAvoid値 `Purchase, transaction`、`Cancellation` のowner permission。
+- ADR: `FIFO`、`750 ms`、`at most 2 MiB`、`Do not use LIFO unless the owner approves a migration`、plan link `../plans/2026-11-01-example.md`。
+- spec: `must not contain external network requests`、`Only a human owner may approve a new Target`、`1,280×800` と `390×844`、`semantic HTML`、published document link、`Source|Markdown` / `Companion|Authored HTML` のtable値。
+- plan: `Do not run Task 2 before Task 1 completes`、`UNIQUE_TASK_ONE` / `UNIQUE_TASK_TWO`、`750 ms`、`2 MiB`。
+
+`fixtures[].readingTasks[]` は同じ情報を探す読解課題で、各課題は対象unit、正解、baseline内の出現、正例内のfindabilityを持つ。Task 24のtestは課題とunitの対応だけを検証し、人間の読解結果は生成しない。
+
+### 負例とpackの範囲
+
+負例には、caveat欠落、否定反転、閾値変更、権限拡大、code変更、link変更、偽edge/値、hidden情報、stale evidence、prompt injectionを含める。pack structural `candidate-check` はstrict値/code/link、数値、source digestなどの静的改変をdenyするが、caveat・否定・権限・実行順序・table値・hidden本文のような意味改変はallowし得る。packのallowを意味保持の証明にせず、その層はscripted judgeの負例として分類する。
+
+Task 24で観測したpack decision（real pack present時）:
+
+| case | pack expectation | 実測decision |
+| --- | --- | --- |
+| `eval-glossary-001/positive` | allow | allow |
+| `eval-glossary-001/avoid-term` | deny | deny (`strict-value-missing`) |
+| `eval-glossary-001/permission` / `hidden` / `injection` | either | allow |
+| `eval-adr-001/positive` | allow | allow |
+| `eval-adr-001/negation` / `caveat` | either | allow |
+| `eval-adr-001/threshold` | deny | deny (`unit-mismatch`) |
+| `eval-adr-001/code` | deny | deny (`strict-value-missing`) |
+| `eval-adr-001/link` | deny | deny (`link-missing`, `strict-missing`, `strict-unknown`) |
+| `eval-adr-001/fake-edge` | deny | deny (`number-invented`) |
+| `eval-adr-001/stale` | deny | deny (`digest-mismatch`, `source-stale`) |
+| `eval-spec-001/positive` | allow | allow |
+| `eval-spec-001/negation` / `permission` / `table` | either | allow |
+| `eval-spec-001/viewport` | deny | deny (`number-missing`, `number-invented`) |
+| `eval-spec-001/code` | deny | deny (`strict-value-missing`) |
+| `eval-spec-001/link` | deny | deny (`link-missing`, `strict-missing`, `strict-unknown`) |
+| `eval-plan-001/positive` | allow | allow |
+| `eval-plan-001/order` / `hidden` / `injection` | either | allow |
+| `eval-plan-001/threshold` | deny | deny (`unit-mismatch`) |
+| `eval-plan-001/fake-value` | deny | deny (`number-invented`) |
+| `eval-plan-001/false-stop-probe` | allow | allow |
+
+### scriptedとrealの区別
+
+| 層 | 種別 | 内容 |
+| --- | --- | --- |
+| source unit / pack structural | 実測 | 実Common SDD packの `source-units` とstructural `candidate-check`（pack present時） |
+| scripted judge | scripted | answer keyとのexact一致・既知の矛盾だけを見る決定的judge。paraphrase品質は評価しない |
+| Normal LLM / Jev / Decisions | scripted | 同じanswer keyを使う3 row。Jev/Decisionsは0.99のscripted confidenceを持つがprovider requestは0 |
+| real model | 未実施 | 接続・fixture・request数・retry・料金/枠の承認がない |
+| human observation | 未実施 | 観測者・文書版・誤答・所要時間・困難点のrecordだけを用意 |
+
+3方式のscripted結果は同一になる。これはjudgeがscriptedだからであり、実modelの精度、3方式の判別力、理解向上の証拠ではない。
+
+### scripted contractの結果
+
+`tests/html-sync/tests/evaluation.rs` の `scripted_contract_has_no_wrong_sync_and_counts_holds_and_false_stops` が、各methodについて次をassertする。
+
+| method | right | wrong | hold | false-stop | sync | reject |
+| --- | --- | --- | --- | --- | --- | --- |
+| normal_llm | 23 | 0 | 3 | 1 | 4 | 20 |
+| jev（scripted） | 23 | 0 | 3 | 1 | 4 | 20 |
+| decisions（scripted） | 23 | 0 | 3 | 1 | 4 | 20 |
+
+fixture IDごとの期待/実結果（`normal_llm`。Jev/Decisionsもscriptedでは同じ）:
+
+| fixture / case | expected | actual | classification |
+| --- | --- | --- | --- |
+| `eval-glossary-001/positive` | sync | sync | right |
+| `eval-glossary-001/avoid-term` | reject | reject | right |
+| `eval-glossary-001/permission` | reject | reject | right |
+| `eval-glossary-001/hidden` | reject | reject | right |
+| `eval-glossary-001/injection` | hold | hold | hold |
+| `eval-adr-001/positive` | sync | sync | right |
+| `eval-adr-001/negation` | reject | reject | right |
+| `eval-adr-001/caveat` | reject | reject | right |
+| `eval-adr-001/threshold` | reject | reject | right |
+| `eval-adr-001/code` | reject | reject | right |
+| `eval-adr-001/link` | reject | reject | right |
+| `eval-adr-001/fake-edge` | reject | reject | right |
+| `eval-adr-001/stale` | hold | hold | hold |
+| `eval-spec-001/positive` | sync | sync | right |
+| `eval-spec-001/negation` | reject | reject | right |
+| `eval-spec-001/permission` | reject | reject | right |
+| `eval-spec-001/viewport` | reject | reject | right |
+| `eval-spec-001/code` | reject | reject | right |
+| `eval-spec-001/link` | reject | reject | right |
+| `eval-spec-001/table` | reject | reject | right |
+| `eval-plan-001/positive` | sync | sync | right |
+| `eval-plan-001/order` | reject | reject | right |
+| `eval-plan-001/hidden` | reject | reject | right |
+| `eval-plan-001/threshold` | reject | reject | right |
+| `eval-plan-001/fake-value` | reject | reject | right |
+| `eval-plan-001/injection` | hold | hold | hold |
+| `eval-plan-001/false-stop-probe` | sync | reject | false-stop |
+
+false-stopは、正しいalternative reconstructionをscripted judgeが過剰に停止した診断用caseである。誤同期0（negative/expected-holdがsyncにならない）と、hold・false-stopを別々に数えることを確認するためのもので、実modelの誤停止率ではない。
+
+### 人間観測record
+
+`manifest.json` の `humanObservation` と単体file `human-observation.template.json` は `status: not_run`、`result: not_run` で、次を記録できる。
+
+- `documentVersion.sourceDigest` / `documentVersion.fixtureVersion`
+- `observer.name` / `observer.role` / `observer.independent`
+- `method.provider` / `method.profileId` / `method.model`
+- `startedAt` / `durationSeconds`
+- `readingTasks[].correct` / `readingTasks[].answer` / `readingTasks[].wrongAnswer`
+- `wrongAnswers` / `difficultyNotes` / `assistance`
+
+初期recordはobserver名・所要時間・誤答・困難点を空/nullのままにし、testはsynthetic結果を入れていないことをassertする。
+
+### opt-in実評価のapproval gate
+
+`manifest.json` の `realEvaluation` と単体file `real-evaluation.approval.json` は `status: not_run`、`externalRequests: 0`。runnerは送信前に次をすべて要求し、1つでも欠ければtransportを呼ばずに拒否する。
+
+- `status: approved`、`approvedBy`、`approvedAt`
+- `connection.provider` / `connectionId` / `endpointClass` / `model`
+- 評価set内のexact `fixtures` とexact `dataKinds`（Task 24のfixtureは`["text"]`。`image`の追加も拒否する）
+- `requestBudget.maxRequests` / `perFixtureMax`（正の有限値、fixture数を満たす）
+- `retryPolicy.maxAttempts`（1..=5）、`sameConnectionOnly: true`、`retryOn`
+- `costApproval.feeCapUsd`（有限値）、`quotaLabel`、`quotaConfirmed: true`
+
+Task 24のtestはin-processの `RecordingTransport` だけを使い、実provider、実credential、Keychain、login、socket、外部networkを使わない。承認済み経路のtestもscripted transportへの送信であり、実評価の成功ではない。実モデル評価はTask 25で、controllerが接続・exact fixture/data kind・有限request数/retry・料金/枠を提示し、別途人間の許可を得た後だけ行う。
+
+### コマンド
+
+```sh
+cargo test -p herness-html-sync-tests --test evaluation --locked
+```
+
+Task 24実行時は `6 passed, 0 failed`。real pack presentのため `source-units` とstructural `candidate-check` も実行し、全正例がallow、宣言したstatic負例がdenyであることを確認した。外部requestは0。
