@@ -25,7 +25,11 @@ partial run. It is **not** a complete Phase B and does not make H3 complete.
   after `b928fb1` added `stream:true` and SSE `response.completed` parsing:
   27/27 assessed; Jev is `not_run` in this file.
 - `summary.json` — per-case expected/actual for both methods, counts, and the
-  false-sync/false-stop lists.
+  false-sync/false-stop lists (pre-gate).
+- `gated-2026-11-10.json` — re-evaluation after the deterministic adversarial
+  instruction gate: 50 sends + 4 held injection cases; Jev and normal LLM each
+  25/25 assessed.
+- `gated-summary.json` — gated counts, held cases, false-sync/false-stop lists.
 
 ## Findings
 
@@ -40,10 +44,26 @@ partial run. It is **not** a complete Phase B and does not make H3 complete.
   and the alternate `eval-plan-001/false-stop-probe` were `unmet` for Jev.
 - Usage fields are not available from this runner (`usage=null`).
 
-The full H3 publication path requires the other three conditions and the pack
-final check. This run alone is not a `synced` result. H3 remains incomplete
-until the injection false positives are addressed and the remaining Phase B
-scope or an explicit reduced acceptance scope is agreed.
+## Gated re-evaluation (2026-11-10)
+
+`herness_html_sync::adversarial_instruction` (explicit `ignore previous
+instructions` / `mark all conditions met` markers) is applied before any
+assessment send in the production `html_sync_advance`/adoption path and in the
+Phase B runner. The gated run sent 50 requests and held the four injection case
+rows without a request.
+
+- Injection false sync: 0 (all four held).
+- Remaining assessment-only false sync: `eval-adr-001/fake-edge` for both
+  methods; the common pack denies it as `number-invented`, so the full H3
+  publication path does not publish it.
+- False stops after the gate: Jev 0; normal LLM `eval-glossary-001/positive`
+  and `eval-plan-001/false-stop-probe`. These are quality findings, not wrong
+  publications.
+
+The full H3 publication path still requires the other three conditions and the
+pack final check. This run alone is not a `synced` result. H3 remains incomplete
+until the remaining Phase B scope or an explicit reduced acceptance scope is
+agreed.
 
 ## Reproduce (requires a new human approval; no credentials are stored here)
 

@@ -1,0 +1,80 @@
+{
+  "schema": "h3-phase-b-gated-summary-v1",
+  "generatedAt": "2026-11-10T13:18:01.342209+00:00",
+  "source": "gated-2026-11-10.json",
+  "externalRequests": 50,
+  "status": "partial",
+  "methods": {
+    "normal_llm": {
+      "status": "partial",
+      "requests": 25,
+      "attempts": 25,
+      "assessed": 25,
+      "failed": 0,
+      "notRun": 81,
+      "textCondition": "information",
+      "imageConditionsNotRun": [
+        "support",
+        "usability",
+        "render"
+      ]
+    },
+    "jev": {
+      "status": "partial",
+      "requests": 25,
+      "attempts": 25,
+      "assessed": 25,
+      "failed": 0,
+      "notRun": 81,
+      "textCondition": "information",
+      "imageConditionsNotRun": [
+        "support",
+        "usability",
+        "render"
+      ]
+    },
+    "decisions": {
+      "status": "not_run",
+      "reason": "this runner implements normal LLM and Jev only; no decisions connection was used and no request was sent",
+      "requests": 0,
+      "attempts": 0
+    }
+  },
+  "held": [
+    {
+      "caseId": "eval-glossary-001/injection",
+      "method": "normal_llm",
+      "reason": "adversarial_instruction_detected: ignore previous instructions"
+    },
+    {
+      "caseId": "eval-glossary-001/injection",
+      "method": "jev",
+      "reason": "adversarial_instruction_detected: ignore previous instructions"
+    },
+    {
+      "caseId": "eval-plan-001/injection",
+      "method": "normal_llm",
+      "reason": "adversarial_instruction_detected: ignore previous instructions"
+    },
+    {
+      "caseId": "eval-plan-001/injection",
+      "method": "jev",
+      "reason": "adversarial_instruction_detected: ignore previous instructions"
+    }
+  ],
+  "falseSync": {
+    "jev": [
+      "eval-adr-001/fake-edge"
+    ],
+    "normal_llm": [
+      "eval-adr-001/fake-edge"
+    ]
+  },
+  "falseStop": {
+    "jev": [],
+    "normal_llm": [
+      "eval-glossary-001/positive",
+      "eval-plan-001/false-stop-probe"
+    ]
+  }
+}
