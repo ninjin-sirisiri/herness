@@ -76,7 +76,7 @@ cargo test -p herness-runtime-tests --locked
 cargo test -p herness-supervision-tests --locked
 ```
 
-`herness-html-sync-tests` のacceptance/renderは `target/debug/herness-desktop` をchild processとして起動するため、先にdesktop binaryをbuildする。CIでbinaryがない場合はrender/acceptanceが明示的に失敗する（fake captureへfallbackしない）。
+`herness-html-sync-tests` のacceptance/renderは `target/debug/herness-desktop` をchild processとして起動するため、先にdesktop binaryをbuildする。CIでbinaryがない場合はrender/acceptanceが明示的に失敗する（fake captureへfallbackしない）。acceptance testはreal WKWebView childを1本ずつ実行する（test内のstatic mutex）。並列負荷によるchild captureのflakyを避けるためで、test内容は変えない。
 
 pack testは `/Users/h-uma/Documents/sdd` で実行する。
 
@@ -104,7 +104,12 @@ uvx --from pytest pytest -q
 | reassess same candidate | `acceptance::reassess_reuses_the_saved_candidate_through_verification_and_assessment` | 保存済みcandidateを再検証・再assessmentし、requeueではない。receiptなしを維持 |
 | multi-project 1 / dirty order | `cross_phase::dirty_documents_keep_notification_order_under_one_app_wide_slot` | B,A通知順を保持しduplicateは位置を変えない。`APP_WIDE_AUTHORING_CONCURRENCY=1`、`DOCUMENT_PUBLICATION_CONCURRENCY=1` |
 | quit/restore | `cross_phase::restart_reconciles_without_sending_and_preserves_the_saved_document`、Task 21 `recovery::request_unknown_and_unconfirmed_stop_preserve_budget...` | startup request 0、side effects zero、active workは `waiting_human` latch。budgetはTask 21でexact 12s/31 runsを保持 |
+| reassess same candidate | `acceptance::reassess_reuses_the_saved_candidate_through_verification_and_assessment` | 保存済みcandidateを再検証・再assessmentし、requeueではない。receiptなしを維持 |
 | dependency reconciliation | `acceptance::discovered_dependencies_include_css_and_referenced_resources` | CSSと `docs/adr/assets/logo.svg`（Resource）を登録 |
+| external HTML adoption (positive) | `acceptance::adopt_current_external_html_reaches_synced_with_a_valid_receipt` | external HTML edit → guarded `AdoptCurrent` → real pack validation + real render + 4条件再評価 → `synced`。new receiptのhtml digestがexternal bytesと一致し、全condition `met` |
+| external HTML adoption (negative) | `acceptance::an_adoption_with_a_failing_evaluation_keeps_waiting_without_overwriting` | strict値を壊したexternal HTMLは `WaitingHuman`。external bytesも既存receiptも上書きしない |
+| continuous source change → synced | `acceptance::continuous_source_change_supersedes_reissues_consent_and_reaches_synced` | 著作中の原文変更で旧世代 `Superseded`、H1 stop確認、Completion/Html consent再発行、same target/cycleで新世代を著作・検証・評価・公開し `synced`。generation 2件、history 2件、予算消費は非リセット、reissue recordあり |
+| consent expansion refusal | `acceptance::consent_reissue_refuses_a_target_expansion_and_never_starts_the_new_generation` | H2 consentのTarget setを追加した状態で原文変更 → reissue前に拒否、新世代/新receiptなし、旧HTML保持 |
 
 「誤同期0」は各負例がreceiptを作らないこと、またはexternal conflict/waiting/failedで止まることで確認する。負例がformal HTMLを書いたテストはない。
 
@@ -113,8 +118,8 @@ uvx --from pytest pytest -q
 - 実provider、実Keychain、実login、実ChatGPT accountは使っていない。scripted judgeの品質・実modelのmet/unmet精度は未確認。
 - productionのin-process `NativeRenderPort` は `AppHandle` へ配線したが、GUI windowを起動する自動testはない。受入のreal captureはTask 17のchild process経由。
 - Jevの実画像上限（Task 18 report）は受入で再確認していない。Jevでimage-required条件を実運用する場合は、実PNGが上限内か別途確認し、不足ならwaiting-humanにする。
-- `resolve_conflict` の `adopt_current` は、外部HTMLを新generationとして候補storeへ保存し、real検証・評価・adoption payloadを組み立てる経路が未配線。現状は「validated adoption payloadが必要」という明示エラーで、構造だけのadoptionを受理しない。`replace_with_candidate` は保存済みcandidateのreal再検証・assessment・explicit publicationを通す。
-- 原文変更中のautomatic supersede + consent reissueは実装したが、受入testでsource editを競合させて `synced` まで通す連続変更シナリオは未追加。Task 16のscripted host supersession testとTask 23の同意再発行実装が別々の証拠。
+- external HTML adoptionは、外部bytesを新generation/candidateとしてprivate storeへ保存し、real structural/semantic/SVG validation、real render、4条件の再評価、Task 20 `CurrentHtmlAdoption`、Task 19 explicit publicationを通す。構造だけ・stale・fakeの結果はwaiting-humanのまま。
+- 連続原文変更は、scripted modelのdelayで旧runをin-flightに保ち、test seamは観測の到着時刻だけを制御する。H1 stop、H2 supersession、consent再発行、owner authority、publicationは実経路。judgeは引き続きscripted loopback。
 - unknown publication resultの受入はfault injectionを使うTask 19/21 testに依存し、Task 23の受入testでは再現していない。
 - 複数processの実crashはTask 21のchild exit code 70で境界を再現する。SIGKILL/power lossではない。
 - `cargo fmt`/clippyはTask 25のgateではない。`cargo check --workspace --locked` はwarning-free。
@@ -123,7 +128,7 @@ uvx --from pytest pytest -q
 
 | command | result |
 | --- | --- |
-| `cargo test -p herness-html-sync-tests --locked` | 172 passed, 0 failed（acceptance 9、assessment 15、conflicts 11、contracts 13、coordinator 10、cross_phase 2、desktop 12、evidence 10、observer 19、policy_bridge 15、publish 18、recovery 20、render 3、store 12、worker 3） |
+| `cargo test -p herness-html-sync-tests --locked` | 177 passed, 0 failed（acceptance 14、assessment 15、conflicts 11、contracts 13、coordinator 10、cross_phase 2、desktop 12、evidence 10、observer 19、policy_bridge 15、publish 18、recovery 20、render 3、store 12、worker 3） |
 | `cargo test -p herness-runtime-tests --locked` | 280 passed, 0 failed, 1 ignored（既存manual RSS） |
 | `cargo test -p herness-supervision-tests --locked` | 213 passed, 0 failed, 3 ignored（real connection） |
 | pack `uvx --from pytest pytest -q` | 372 passed in 23.73s |

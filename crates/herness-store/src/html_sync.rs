@@ -1019,6 +1019,10 @@ impl H3StorePort for Store {
         Store::html_sync_generations(self, project, document).map_err(H3Error::from)
     }
 
+    fn load_html_sync_host_state(&self, key: &str) -> Result<Option<Vec<u8>>, H3Error> {
+        Store::load_host_state(self, key).map_err(H3Error::from)
+    }
+
     fn load_html_sync_candidate(
         &self,
         project: ProjectId,

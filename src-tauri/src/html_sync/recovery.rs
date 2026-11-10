@@ -154,6 +154,7 @@ pub struct HtmlSyncRecoveryHost {
     accepting: bool,
     last_startup: Option<HtmlSyncStartupReport>,
     pending_companions: Vec<herness_html_sync::observer::CompanionObservation>,
+    pending_source_changes: Vec<SourceObservation>,
 }
 
 impl HtmlSyncRecoveryHost {
@@ -184,6 +185,7 @@ impl HtmlSyncRecoveryHost {
             accepting: true,
             last_startup: None,
             pending_companions: Vec::new(),
+            pending_source_changes: Vec::new(),
         })
     }
 
@@ -405,8 +407,13 @@ impl HtmlSyncRecoveryHost {
         // Generated HTML and receipts are companion observations. They never
         // become Markdown authoring work.
         for observation in &tick.sources {
-            if observation.is_authoring_candidate() {
-                self.worker.observe(observation);
+            if observation.is_authoring_candidate()
+                && matches!(
+                    self.worker.observe(observation),
+                    OfferOutcome::ChangedDuringAuthoring
+                )
+            {
+                self.pending_source_changes.push(observation.clone());
             }
         }
         self.pending_companions.extend(tick.companions.iter().cloned());
@@ -436,8 +443,13 @@ impl HtmlSyncRecoveryHost {
             companions.extend(tick.companions);
         }
         for observation in &sources {
-            if observation.is_authoring_candidate() {
-                self.worker.observe(observation);
+            if observation.is_authoring_candidate()
+                && matches!(
+                    self.worker.observe(observation),
+                    OfferOutcome::ChangedDuringAuthoring
+                )
+            {
+                self.pending_source_changes.push(observation.clone());
             }
         }
         self.pending_companions.extend(companions);
@@ -766,6 +778,14 @@ impl HtmlSyncRecoveryHost {
         self.poll_observers();
         let registry_store = self.store.clone();
         let registry = StoreBackedOwnerApprovalRegistry::new(&registry_store);
+        // A stable source change detected while the same document is being
+        // authored is superseded through the real H1 stop/H2 supersession path.
+        // The scripted test seam only controls when the observation arrives;
+        // the stop, consent reissue, and replacement remain the production path.
+        for observation in std::mem::take(&mut self.pending_source_changes) {
+            self.worker
+                .source_changed(runtime, supervision, &registry, &observation)?;
+        }
         self.worker.pump(runtime, supervision, &registry).map(Some)
     }
 

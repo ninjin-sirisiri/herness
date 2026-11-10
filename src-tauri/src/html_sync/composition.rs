@@ -1810,11 +1810,58 @@ fn resolve_conflict(
             .map_err(|error| error.to_string())?;
             reject_with_reason(host, request, record, reason, now)
         }
-        ConflictResolution::AdoptCurrent => Err(
-            "adopting the current HTML requires an explicit validated adoption payload; no \
-             structural-only result is accepted"
-                .to_owned(),
-        ),
+        ConflictResolution::AdoptCurrent => {
+            let document = record.state().document_key().clone();
+            let outcome = host.html_sync_adopt_current(&document)?;
+            let current = host
+                .store_handle()
+                .load_html_sync_document(record.state().project_id(), &document)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the document state disappeared during adoption".to_owned())?;
+            let operation_outcome = match &outcome {
+                herness_html_sync::AdoptionOutcome::Adopted(
+                    herness_html_sync::PublicationOutcome::Synced { .. },
+                ) => H3OperationOutcome::Accepted {
+                    state: H3State::Synced,
+                    revision: current.revision(),
+                },
+                herness_html_sync::AdoptionOutcome::WaitingHuman { cause, .. } => {
+                    H3OperationOutcome::Rejected {
+                        reason: H3Reason::new(
+                            H3StateReasonKind::WaitingHuman { cause: *cause },
+                            vec![RequiredAction::ReassessCandidate],
+                        )
+                        .map_err(|error| error.to_string())?,
+                    }
+                }
+                herness_html_sync::AdoptionOutcome::Conflict { .. } => H3OperationOutcome::Rejected {
+                    reason: H3Reason::new(
+                        H3StateReasonKind::WaitingHuman {
+                            cause: herness_html_sync::HumanWaitCause::ExternalHtmlConflict,
+                        },
+                        vec![RequiredAction::ResolveHtmlConflict {
+                            target: record.state().document_key().companion_path(),
+                        }],
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
+                _ => H3OperationOutcome::Rejected {
+                    reason: H3Reason::new(
+                        H3StateReasonKind::WaitingHuman {
+                            cause: herness_html_sync::HumanWaitCause::ExternalHtmlConflict,
+                        },
+                        vec![RequiredAction::ResolveHtmlConflict {
+                            target: record.state().document_key().companion_path(),
+                        }],
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
+            };
+            let result = H3OperationResult::new(request, operation_outcome, 0, now)
+                .map_err(|error| error.to_string())?;
+            commit_request_with_current_state(host, request, result, now)?;
+            operation_view(host, request)
+        }
         ConflictResolution::ReplaceWithCandidate => {
             let document = record.state().document_key().clone();
             let generation = record

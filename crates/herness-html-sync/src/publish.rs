@@ -19,8 +19,8 @@ use std::collections::BTreeSet;
 use herness_core::ports::publish::PublicationArchivePort;
 use herness_core::{
     ArchivedVersion, ExpectedTargetVersion, FileVersion, NonEmptyText, OldVersionArchive,
-    PublicationFailure, PublicationRequest, PublicationRequestId, PublicationResult, RunControl,
-    Timestamp, hash_bytes,
+    ProjectId, PublicationFailure, PublicationRequest, PublicationRequestId, PublicationResult,
+    RunControl, Timestamp, hash_bytes,
 };
 use herness_supervision::ContentDigest;
 use herness_supervision::evidence::TargetVersion;
@@ -644,12 +644,12 @@ impl PublicationOrchestrator<'_> {
             None => None,
         };
 
-        let receipt = match build_publication_receipt(&attempt, settings, previous_receipt) {
+        let receipt = match build_publication_receipt(self.store, &attempt, settings, previous_receipt) {
             Ok(receipt) => receipt,
             Err(_error) if attempt.explicit_resolution => {
                 // An explicit human resolution may replace invalid metadata. The
                 // old receipt is still archived byte-exactly before replacement.
-                match build_publication_receipt(&attempt, settings, None) {
+                match build_publication_receipt(self.store, &attempt, settings, None) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         let refusal = Refusal::conflict(
@@ -1443,7 +1443,12 @@ impl PublicationOrchestrator<'_> {
         if applied.profile() != approval.assessment().profile()
             || applied.condition_version() != approval.owner_binding().condition_version()
             || applied.condition_digest() != approval.owner_binding().conditions_digest()
-            || applied.target_version() != approval.assessment().consent().target_scope_version()
+            || !target_version_matches_range_consent(
+                self.store,
+                project,
+                applied.target_version(),
+                approval,
+            )
         {
             return Ok(Some(Refusal::waiting(
                 HumanWaitCause::PermissionDenied,
@@ -2261,6 +2266,7 @@ fn published_file_digest(result: &PublicationResult) -> Result<ContentDigest, H3
 /// contains only paths, digests, version identities, decisions, and evidence
 /// references; no secret, credential, prompt, or raw provider error is copied.
 pub fn build_publication_receipt(
+    store: &dyn H3StorePort,
     attempt: &CandidatePublication,
     settings: &H3Settings,
     previous_receipt: Option<&str>,
@@ -2319,7 +2325,12 @@ pub fn build_publication_receipt(
     if applied.profile() != approval.assessment().profile()
         || applied.condition_version() != approval.owner_binding().condition_version()
         || applied.condition_digest() != approval.owner_binding().conditions_digest()
-        || applied.target_version() != approval.assessment().consent().target_scope_version()
+        || !target_version_matches_range_consent(
+            store,
+            attempt.document().project_id(),
+            applied.target_version(),
+            approval,
+        )
     {
         return Err(H3Error::invalid(
             "versions",
@@ -2677,4 +2688,68 @@ fn parse_previous_receipt(text: &str) -> Result<PreviousReceipt, H3Error> {
         }
     }
     Ok(receipt)
+}
+
+/// Whether one evaluation target version matches the approved Html consent or
+/// one recorded host-only reissue inside the exact human-approved Target set.
+fn target_version_matches_range_consent(
+    store: &dyn H3StorePort,
+    project: ProjectId,
+    version: TargetVersion,
+    approval: &crate::config::H3ConfigurationApproval,
+) -> bool {
+    let assessment = approval.assessment();
+    if assessment.consent().target_scope_version() == version {
+        return true;
+    }
+    let key = format!(
+        "h3.consent.reissue:{}:html:{}",
+        project,
+        version.get()
+    );
+    let Ok(Some(bytes)) = store.load_html_sync_host_state(&key) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    record.get("schema").and_then(serde_json::Value::as_str)
+        == Some("h3-range-consent-reissue-v1")
+        && record
+            .get("purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some("html")
+        && record
+            .get("targetVersion")
+            .and_then(serde_json::Value::as_u64)
+            == Some(version.get())
+        && record
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .eq(assessment.disclosure().targets().iter().map(String::as_str))
+            })
+        && record
+            .get("dataKinds")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| {
+                let recorded = kinds
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<BTreeSet<_>>();
+                recorded
+                    == assessment
+                        .disclosure()
+                        .data_kinds()
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<BTreeSet<_>>()
+            })
+        && record
+            .get("origin")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|origin| origin == assessment.origin().to_string())
 }

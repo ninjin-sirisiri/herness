@@ -10,13 +10,13 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use herness_assessment::AssessmentEndpoints;
@@ -42,7 +42,7 @@ use herness_desktop::html_sync::pipeline::{
 };
 use herness_html_sync::observer::{ChangeSignal, ChangeSource, DependencyKind};
 use herness_html_sync::{
-    DocumentKey, H3ApprovalLimits, H3Approver, H3Condition, H3ConfigurationApproval,
+    ConflictResolution, DocumentKey, H3ApprovalLimits, H3Approver, H3Condition, H3ConfigurationApproval,
     H3ConfigurationDraft, H3ConnectionApproval, H3OwnerBinding, H3Settings, H3State, H3StorePort,
     H3Operation, H3OperationRequest, H3RequestId, H3VersionBinding, HtmlSyncCommit,
     ObservationEligibility, ObservationTrigger, PublicationFileInput, SettingsCommit,
@@ -54,9 +54,9 @@ use herness_supervision::profiles::{
     ProfileVersion, ProviderKind, RubricVersion,
 };
 use herness_supervision::{
-    BudgetLedger, ConditionDigest, ConditionVersion, ContentDigest,
-    DisclosureDataKind, DisclosureScope, OwnerKind, OwnerRef, ProfileId, ProviderOrigin,
-    SupervisionId, TargetVersion,
+    ApprovalActor, BudgetLedger, ConditionDigest, ConditionVersion, ConsentId, ContentDigest,
+    DisclosureConsent, DisclosureDataKind, DisclosureScope, OwnerKind, OwnerRef, ProfileId,
+    ProviderOrigin, SupervisionId, TargetVersion,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -87,13 +87,18 @@ impl MockServer {
     where
         F: Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync + 'static,
     {
+        Self::start_arc(Arc::new(handler))
+    }
+
+    fn start_arc(
+        handler: Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let address = listener.local_addr().expect("address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
         let recorded = Arc::clone(&requests);
         let counter = Arc::clone(&calls);
-        let handler = Arc::new(handler);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -571,7 +576,12 @@ impl CredentialPort for FakeCredentials {
 // Acceptance harness.
 // ---------------------------------------------------------------------------
 
+/// One real WKWebView child at a time keeps the acceptance evidence stable on
+/// a loaded machine; the H3 package tests this target sequentially.
+static ACCEPTANCE_SERIAL: Mutex<()> = Mutex::new(());
+
 struct Acceptance {
+    _serial: MutexGuard<'static, ()>,
     _temp: TempDir,
     root: PathBuf,
     project: ProjectId,
@@ -591,6 +601,24 @@ impl Acceptance {
     }
 
     fn new_with_assessment(images: bool, auto_publish: bool) -> Self {
+        Self::new_inner(images, auto_publish, None)
+    }
+
+    fn new_with_handler(
+        auto_publish: bool,
+        handler: Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>,
+    ) -> Self {
+        Self::new_inner(true, auto_publish, Some(handler))
+    }
+
+    fn new_inner(
+        images: bool,
+        auto_publish: bool,
+        handler: Option<Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>>,
+    ) -> Self {
+        let serial = ACCEPTANCE_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new().expect("temp");
         let root = temp.path().join("project");
         std::fs::create_dir_all(root.join("docs/adr")).expect("adr");
@@ -608,7 +636,10 @@ impl Acceptance {
         std::fs::write(root.join(COMPANION), &candidate_html).expect("write companion");
         std::fs::write(root.join(CSS), &css).expect("write css");
 
-        let authoring = MockServer::start(authoring_model(candidate_html.clone()));
+        let authoring = match handler {
+            Some(handler) => MockServer::start_arc(handler),
+            None => MockServer::start(authoring_model(candidate_html.clone())),
+        };
         let assessment = MockServer::start(|_, request| scripted_met(request));
         let provider_endpoints = ProviderEndpoints::for_loopback(
             format!("{}/v1", authoring.url()),
@@ -847,6 +878,7 @@ impl Acceptance {
             .set_render_port(Arc::new(ChildRenderPort));
 
         Self {
+            _serial: serial,
             _temp: temp,
             root,
             project,
@@ -1479,4 +1511,586 @@ fn reassess_reuses_the_saved_candidate_through_verification_and_assessment() {
     );
     assert_eq!(h.state(), H3State::WaitingHuman);
     assert!(!h.files_exist().1, "no receipt may be written");
+}
+
+fn wait_for_external_conflict(h: &mut Acceptance) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        h.host.pump().expect("pump");
+        if h.state() == H3State::WaitingHuman {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the external HTML edit did not become waiting_human");
+}
+
+#[test]
+fn adopt_current_external_html_reaches_synced_with_a_valid_receipt() {
+    let mut h = Acceptance::new(true);
+    assert!(
+        h.pump_until(|h| h.state() == H3State::Synced, Duration::from_secs(120)),
+        "baseline must sync"
+    );
+    let baseline_receipt = std::fs::read(
+        h.root
+            .join(herness_html_sync::html_evidence_path(&h.document)),
+    )
+    .expect("baseline receipt");
+    let external = h
+        .candidate_html
+        .replace("Choosing a queue", "Choosing the queue");
+    std::fs::write(h.root.join(COMPANION), &external).expect("external edit");
+    let signal = ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher)
+        .expect("companion signal");
+    assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
+    wait_for_external_conflict(&mut h);
+
+    let record = h.record();
+    let request = H3OperationRequest::new(
+        H3RequestId::new(h.project),
+        h.project,
+        Some(h.document.clone()),
+        Some(record.revision()),
+        Some(record.state().source().digest().clone()),
+        H3Operation::ResolveConflict {
+            resolution: ConflictResolution::AdoptCurrent,
+        },
+        Timestamp::now(),
+    )
+    .expect("adoption request");
+    let view = composition::apply_document_operation(&mut h.host, request)
+        .expect("adoption operation");
+    assert!(
+        matches!(
+            view.result.outcome(),
+            herness_html_sync::H3OperationOutcome::Accepted { .. }
+        ),
+        "adoption must be accepted: {:?}",
+        view.result.outcome()
+    );
+    assert_eq!(h.state(), H3State::Synced);
+    assert_eq!(
+        std::fs::read(h.root.join(COMPANION)).expect("companion"),
+        external.as_bytes(),
+        "the adopted external bytes are the current formal HTML"
+    );
+    let receipt = std::fs::read(
+        h.root
+            .join(herness_html_sync::html_evidence_path(&h.document)),
+    )
+    .expect("adoption receipt");
+    assert_ne!(receipt, baseline_receipt, "a new receipt was written");
+    let receipt_json: Value = serde_json::from_slice(&receipt).expect("receipt json");
+    assert_eq!(receipt_json["schema"], "sdd-html-receipt");
+    assert_eq!(
+        receipt_json["html"]["digest"],
+        format!(
+            "sha256:{}",
+            ContentDigest::sha256(external.as_bytes()).as_str()
+        )
+    );
+    assert!(
+        receipt_json["conditions"]
+            .as_array()
+            .is_some_and(|conditions| conditions.iter().all(|entry| entry["decision"] == "met"))
+    );
+}
+
+#[test]
+fn an_adoption_with_a_failing_evaluation_keeps_waiting_without_overwriting() {
+    let mut h = Acceptance::new(true);
+    assert!(
+        h.pump_until(|h| h.state() == H3State::Synced, Duration::from_secs(120)),
+        "baseline must sync"
+    );
+    let receipt_path = h
+        .root
+        .join(herness_html_sync::html_evidence_path(&h.document));
+    let baseline_receipt = std::fs::read(&receipt_path).expect("baseline receipt");
+    let external = h.candidate_html.replace(
+        "<code id=\"fifo\">FIFO</code>",
+        "<code id=\"fifo\">LIFO</code>",
+    );
+    assert_ne!(external, h.candidate_html);
+    std::fs::write(h.root.join(COMPANION), &external).expect("external edit");
+    let signal = ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher)
+        .expect("companion signal");
+    assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
+    wait_for_external_conflict(&mut h);
+
+    let record = h.record();
+    let request = H3OperationRequest::new(
+        H3RequestId::new(h.project),
+        h.project,
+        Some(h.document.clone()),
+        Some(record.revision()),
+        Some(record.state().source().digest().clone()),
+        H3Operation::ResolveConflict {
+            resolution: ConflictResolution::AdoptCurrent,
+        },
+        Timestamp::now(),
+    )
+    .expect("adoption request");
+    let view = composition::apply_document_operation(&mut h.host, request)
+        .expect("adoption operation");
+    assert!(
+        matches!(
+            view.result.outcome(),
+            herness_html_sync::H3OperationOutcome::Rejected { .. }
+        ),
+        "a failing adoption must be rejected: {:?}",
+        view.result.outcome()
+    );
+    assert_eq!(h.state(), H3State::WaitingHuman);
+    assert_eq!(
+        std::fs::read(h.root.join(COMPANION)).expect("companion"),
+        external.as_bytes(),
+        "the external bytes are not overwritten"
+    );
+    assert_eq!(
+        std::fs::read(&receipt_path).expect("receipt"),
+        baseline_receipt,
+        "the receipt is not overwritten"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Continuous source-change fixture.
+// ---------------------------------------------------------------------------
+
+const V2_SOURCE: &[u8] =
+    b"# Queue choice v2\n\nUse the durable queue with a 500 ms window.\n";
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Builds a complete semantic-v1 candidate for the v2 source from the real
+/// pack's `source-units` result. The provenance ranges/digests are the pack's
+/// own values; nothing is fabricated.
+fn build_v2_candidate() -> String {
+    let temp = TempDir::new().expect("v2 temp");
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(root.join("docs/adr")).expect("adr");
+    std::fs::create_dir_all(root.join("docs/sdd/assets")).expect("assets");
+    std::fs::write(root.join(TARGET), V2_SOURCE).expect("v2 source");
+    std::fs::write(root.join(CSS), "body { color: #111; }\n").expect("css");
+    let bridge = herness_desktop::html_sync::policy::HtmlPolicyBridge::detect(
+        &root,
+        support::REAL_PACK_ROOT,
+        support::toolchain(),
+    )
+    .expect("detect")
+    .probe()
+    .approval_binding()
+    .expect("binding");
+    let bridge = herness_desktop::html_sync::policy::HtmlPolicyBridge::detect(
+        &root,
+        support::REAL_PACK_ROOT,
+        support::toolchain(),
+    )
+    .expect("detect")
+    .connect(&bridge)
+    .expect("connect");
+    let inputs = BTreeMap::from([(TARGET.to_owned(), V2_SOURCE.to_vec())]);
+    let units = bridge
+        .source_units(TARGET, &inputs)
+        .expect("source units")
+        .get("units")
+        .and_then(Value::as_array)
+        .expect("units")
+        .iter()
+        .map(|unit| {
+            json!({
+                "id": unit.get("id").cloned().unwrap_or(Value::Null),
+                "kind": unit.get("kind").cloned().unwrap_or(Value::Null),
+                "source_digest": unit.get("source_digest").cloned().unwrap_or(Value::Null),
+                "range": unit.get("range").cloned().unwrap_or(Value::Null),
+                "parent": unit.get("parent").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    let digest = ContentDigest::sha256(V2_SOURCE);
+    let mut mappings = Vec::new();
+    let mut elements = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        let id = unit.get("id").and_then(Value::as_str).expect("unit id");
+        let kind = unit.get("kind").and_then(Value::as_str).expect("unit kind");
+        let target = if kind == "heading" {
+            "queue-choice-v2".to_owned()
+        } else {
+            format!("u{index}")
+        };
+        mappings.push(json!({
+            "unit": id,
+            "representation": "paraphrase",
+            "targets": [target.clone()]
+        }));
+        let text = match kind {
+            "heading" => "Queue choice v2",
+            _ => "Use the durable queue with a 500 ms window.",
+        };
+        let element = match kind {
+            "heading" => format!("<h1 id=\"{target}\">{}</h1>", escape_html(text)),
+            _ => format!("<p id=\"{target}\">{}</p>", escape_html(text)),
+        };
+        elements.push(element);
+    }
+    let provenance = json!({
+        "schema": "sdd-provenance",
+        "version": 1,
+        "contract": "semantic-v1",
+        "source": {"path": TARGET, "digest": format!("sha256:{}", digest.as_str())},
+        "units": units,
+        "mappings": mappings,
+        "strict": [],
+        "supplementary": [],
+        "calculations": [],
+    });
+    format!(
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src &#x27;none&#x27;; img-src &#x27;self&#x27; data:; style-src &#x27;self&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;; frame-ancestors &#x27;none&#x27;\">\n\
+<meta name=\"sdd-source-digest\" content=\"{}\">\n\
+<meta name=\"sdd-html-contract\" content=\"semantic-v1\">\n\
+<title>Queue choice v2</title>\n\
+<link rel=\"stylesheet\" href=\"../sdd/assets/sdd.css\">\n</head>\n<body>\n\
+<a class=\"skip-link\" href=\"#content\">Skip to content</a>\n\
+<header class=\"document-header\"><p class=\"document-kind\">ADR</p></header>\n\
+<main id=\"content\" tabindex=\"-1\"><article class=\"decision-article\">\n\
+{}\n</article></main>\n\
+<template id=\"sdd-provenance\">{}</template>\n\
+</body>\n</html>\n",
+        format!("sha256:{}", digest.as_str()),
+        elements.join("\n"),
+        provenance
+    )
+}
+
+#[test]
+fn the_v2_fixture_passes_the_real_pack() {
+    let html = build_v2_candidate();
+    let temp = TempDir::new().expect("temp");
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(root.join("docs/adr")).expect("adr");
+    std::fs::create_dir_all(root.join("docs/sdd/assets")).expect("assets");
+    std::fs::write(root.join(TARGET), V2_SOURCE).expect("source");
+    std::fs::write(root.join(CSS), "body { color: #111; }\n").expect("css");
+    let bridge = herness_desktop::html_sync::policy::HtmlPolicyBridge::detect(
+        &root,
+        support::REAL_PACK_ROOT,
+        support::toolchain(),
+    )
+    .expect("detect")
+    .probe()
+    .approval_binding()
+    .expect("binding");
+    let bridge = herness_desktop::html_sync::policy::HtmlPolicyBridge::detect(
+        &root,
+        support::REAL_PACK_ROOT,
+        support::toolchain(),
+    )
+    .expect("detect")
+    .connect(&bridge)
+    .expect("connect");
+    let inputs = BTreeMap::from([
+        (TARGET.to_owned(), V2_SOURCE.to_vec()),
+        (COMPANION.to_owned(), html.into_bytes()),
+    ]);
+    let check = bridge
+        .candidate_check(
+            TARGET,
+            herness_desktop::html_sync::policy::CandidateStage::Structural,
+            None,
+            &inputs,
+        )
+        .expect("check");
+    assert_eq!(
+        check.decision(),
+        CandidateDecision::Allow,
+        "violations={:?} contract={} stage={}",
+        check.violations(),
+        check.contract(),
+        check.stage()
+    );
+}
+
+fn continuous_model(
+    v1_html: String,
+    v2_html: String,
+) -> Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync> {
+    let v1_provenance = provenance_payload(&v1_html);
+    let v2_provenance = provenance_payload(&v2_html);
+    Arc::new(move |_index, request| {
+        let handle = extract_handle(&request.body);
+        let value: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+        let last = value
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| items.last())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let last_type = last.get("type").and_then(Value::as_str).unwrap_or("message");
+        let call_id = last.get("call_id").and_then(Value::as_str).unwrap_or("");
+        let output = last.get("output").and_then(Value::as_str).unwrap_or("");
+        if last_type != "function_call_output" {
+            return responses_tool_call(
+                "call_read",
+                "candidate_read",
+                json!({"handle": handle, "artifact": "source_markdown"}),
+            );
+        }
+        match call_id {
+            "call_read" => {
+                let v2_source = output.contains("500 ms");
+                if !v2_source {
+                    // Keep the old generation in flight long enough for the
+                    // test to change the Markdown; the real H1 stop must cancel it.
+                    std::thread::sleep(Duration::from_millis(2_500));
+                }
+                let html = if v2_source { &v2_html } else { &v1_html };
+                responses_tool_call(
+                    "call_html",
+                    "candidate_write",
+                    json!({
+                        "handle": handle,
+                        "artifact": "candidate_html",
+                        "content": html,
+                        "rationale": "author the candidate for the current exact source"
+                    }),
+                )
+            }
+            "call_html" => {
+                let v2_source = output.contains("500 ms");
+                let provenance = if v2_source {
+                    &v2_provenance
+                } else {
+                    &v1_provenance
+                };
+                responses_tool_call(
+                    "call_prov",
+                    "candidate_write",
+                    json!({
+                        "handle": handle,
+                        "artifact": "candidate_provenance",
+                        "content": provenance,
+                        "rationale": "record the visible-source mapping"
+                    }),
+                )
+            }
+            _ => responses_text("candidate authored"),
+        }
+    })
+}
+
+fn start_first_authoring_run(h: &mut Acceptance) {
+    h.host.pump().expect("first pump");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if h.host.html_sync().active_project() == Some(h.project)
+            && h.authoring.count() >= 1
+        {
+            return;
+        }
+        h.host.pump().expect("pump");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the first authoring run did not start");
+}
+
+fn notify_source_changed(h: &mut Acceptance) {
+    let signal = ChangeSignal::new(TARGET, ChangeSource::FilesystemWatcher)
+        .expect("source signal");
+    assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
+}
+
+#[test]
+fn continuous_source_change_supersedes_reissues_consent_and_reaches_synced() {
+    let v1_html = std::fs::read_to_string(
+        Path::new(support::REAL_PACK_ROOT).join("tests/fixtures/adr/0001-queue-choice.html"),
+    )
+    .expect("v1 candidate");
+    let v2_html = build_v2_candidate();
+    let handler = continuous_model(v1_html.clone(), v2_html.clone());
+    let mut h = Acceptance::new_with_handler(true, handler);
+    start_first_authoring_run(&mut h);
+    let budget_before = h
+        .host
+        .store_handle()
+        .lock()
+        .load_budget_record(h.project, h.supervision)
+        .expect("budget")
+        .expect("budget record")
+        .record()
+        .usage()
+        .clone();
+    assert!(budget_before.runs_started() >= 1);
+
+    std::fs::write(h.root.join(TARGET), V2_SOURCE).expect("v2 source");
+    notify_source_changed(&mut h);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        h.host.pump().expect("pump");
+        if h.state() == H3State::Synced {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(h.state(), H3State::Synced, "the new source must reach synced; reason={:?} generations={:?}", h.record().state().reason(), h.host.store_handle().html_sync_generations(h.project, &h.document).map(|generations| generations.into_iter().map(|generation| (generation.generation(), format!("{:?}", generation.status()))).collect::<Vec<_>>()));
+    assert_eq!(
+        std::fs::read(h.root.join(COMPANION)).expect("companion"),
+        v2_html.as_bytes(),
+        "the new source's candidate is the current companion"
+    );
+    let generations = h
+        .host
+        .store_handle()
+        .html_sync_generations(h.project, &h.document)
+        .expect("generations");
+    assert_eq!(generations.len(), 2, "old and new generations are retained");
+    assert!(generations.iter().any(|generation| {
+        matches!(
+            generation.status(),
+            herness_html_sync::GenerationStatus::Superseded
+        )
+    }));
+    assert!(generations.iter().any(|generation| {
+        matches!(
+            generation.status(),
+            herness_html_sync::GenerationStatus::Active
+                | herness_html_sync::GenerationStatus::Completed
+        )
+    }));
+    let history = composition::history_view(&h.host, h.project, &h.document, 10)
+        .expect("history");
+    assert_eq!(history.generations.len(), 2);
+    assert_ne!(
+        history.generations[0].candidate_html_digest,
+        history.generations[1].candidate_html_digest,
+        "the two versions have different candidate bytes"
+    );
+    let budget_after = h
+        .host
+        .store_handle()
+        .lock()
+        .load_budget_record(h.project, h.supervision)
+        .expect("budget")
+        .expect("budget record")
+        .record()
+        .usage()
+        .clone();
+    assert!(
+        budget_after.runs_started() >= budget_before.runs_started(),
+        "the run budget is not reset"
+    );
+    assert!(
+        budget_after.active_seconds_consumed() >= budget_before.active_seconds_consumed(),
+        "active seconds are not reset"
+    );
+    let target_version = h
+        .host
+        .supervision_get(h.project, h.supervision)
+        .expect("target")
+        .target_version;
+    assert!(target_version >= 2, "the H2 target version advanced");
+    let store = h.host.store_handle();
+    for purpose in ["completion", "html"] {
+        let key = format!(
+            "h3.consent.reissue:{}:{}:{}",
+            h.project, purpose, target_version
+        );
+        let bytes = store
+            .lock()
+            .load_host_state(&key)
+            .expect("host state")
+            .unwrap_or_else(|| panic!("the {purpose} consent reissue record is missing"));
+        let record: Value = serde_json::from_slice(&bytes).expect("reissue json");
+        assert_eq!(record["schema"], "h3-range-consent-reissue-v1");
+        assert_eq!(record["targetVersion"], target_version);
+        assert_eq!(record["targets"], json!([TARGET]));
+    }
+    let source = std::fs::read(h.root.join(TARGET)).expect("source");
+    let receipt = std::fs::read_to_string(
+        h.root
+            .join(herness_html_sync::html_evidence_path(&h.document)),
+    )
+    .expect("receipt");
+    let receipt: Value = serde_json::from_str(&receipt).expect("receipt json");
+    assert_eq!(
+        receipt["source"]["digest"],
+        format!("sha256:{}", ContentDigest::sha256(&source).as_str())
+    );
+}
+
+#[test]
+fn consent_reissue_refuses_a_target_expansion_and_never_starts_the_new_generation() {
+    let v1_html = std::fs::read_to_string(
+        Path::new(support::REAL_PACK_ROOT).join("tests/fixtures/adr/0001-queue-choice.html"),
+    )
+    .expect("v1 candidate");
+    let v2_html = build_v2_candidate();
+    let handler = continuous_model(v1_html.clone(), v2_html.clone());
+    let mut h = Acceptance::new_with_handler(true, handler);
+    start_first_authoring_run(&mut h);
+    {
+        let mut config = h.host.supervision().config().get(h.project);
+        let consent = config.consent(ProfilePurpose::Html).cloned().expect("consent");
+        let scope = DisclosureScope::new(
+            ProfilePurpose::Html,
+            consent.scope().data_kinds().clone(),
+            vec![TARGET.to_owned(), "docs/adr/extra.md".to_owned()],
+            TargetVersion::new(1).expect("target"),
+        )
+        .expect("expanded scope");
+        let expanded = DisclosureConsent::grant(
+            ApprovalActor::Human,
+            ConsentId::new(h.project),
+            consent.origin().clone(),
+            scope,
+            Timestamp::now(),
+        )
+        .expect("expanded consent");
+        config.set_consent(expanded);
+        h.host.supervision().config().set(h.project, config);
+    }
+    std::fs::write(h.root.join(TARGET), V2_SOURCE).expect("v2 source");
+    notify_source_changed(&mut h);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        h.host.pump().expect("pump");
+        if matches!(h.state(), H3State::Failed | H3State::WaitingHuman) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(h.state(), H3State::Synced);
+    assert_eq!(
+        std::fs::read(h.root.join(COMPANION)).expect("companion"),
+        v1_html.as_bytes(),
+        "the old formal HTML is not replaced by an expanded-scope generation"
+    );
+    let target_version = h
+        .host
+        .supervision_get(h.project, h.supervision)
+        .expect("target")
+        .target_version;
+    for purpose in ["completion", "html"] {
+        let key = format!(
+            "h3.consent.reissue:{}:{}:{}",
+            h.project, purpose, target_version
+        );
+        assert!(
+            h.host
+                .store_handle()
+                .lock()
+                .load_host_state(&key)
+                .expect("host state")
+                .is_none(),
+            "an expanded scope must not be reissued"
+        );
+    }
 }

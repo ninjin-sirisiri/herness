@@ -541,6 +541,13 @@ pub trait H3StorePort {
         document: &DocumentKey,
     ) -> Result<Vec<PublicationJournal>, H3Error>;
 
+    /// Loads one narrow host-state record used for a recorded, host-only
+    /// consent reissue inside the exact human-approved Target set. The default
+    /// is explicit absence; concrete stores that support the record override it.
+    fn load_html_sync_host_state(&self, _key: &str) -> Result<Option<Vec<u8>>, H3Error> {
+        Ok(None)
+    }
+
     /// Returns a stored idempotent request result.
     fn html_sync_request_result(
         &self,

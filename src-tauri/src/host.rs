@@ -31,7 +31,7 @@ use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::composition::HtmlSyncServices;
 use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
 use herness_html_sync::observer::{DependencyKind, DependencyPath};
-use herness_html_sync::H3StorePort;
+use herness_html_sync::{H3StorePort, PublicationFileReadPort};
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -505,14 +505,7 @@ impl DesktopHost {
                     // exact candidate bytes are durably stored. A failure is
                     // reported by the saved state, never by a fake synced flag.
                     match self.html_sync_advance(&candidate.document) {
-                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::Publication(
-                            outcome,
-                        )) => {
-                            eprintln!(
-                                "HTML_SYNC_PIPELINE: document={} publication={outcome:?}",
-                                candidate.document.target_path()
-                            );
-                        }
+                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::Publication(_)) => {}
                         Ok(
                             crate::html_sync::pipeline::PostCandidateOutcome::VerificationRejected {
                                 detail,
@@ -938,7 +931,359 @@ impl DesktopHost {
         }
     }
 
+
+    /// Builds and runs the real human adoption payload for the exact current
+    /// external HTML.
+    ///
+    /// The external bytes are validated by the real Common SDD pack and the
+    /// real WKWebView, then the four Html conditions are re-evaluated against
+    /// the current source/HTML through the existing assessment gate. Only a
+    /// completion-ready, non-fake evaluation reaches
+    /// `DesktopHtmlSyncOperations::adopt_current_html`; a structural-only,
+    /// stale, or fake result remains waiting for a human.
+    pub fn html_sync_adopt_current(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+    ) -> Result<herness_html_sync::AdoptionOutcome, String> {
+        use crate::html_sync::pipeline::{
+            self, AssessmentContext, HostFingerprints, PreparedCandidate,
+        };
+
+        let project = document.project_id();
+        let now = Timestamp::now();
+        let root = self
+            .html_sync
+            .project_root(project)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "the project is not registered with the H3 composition".to_owned())?;
+        let settings_record = self
+            .store_handle()
+            .load_html_sync_settings(project)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the project has no stored H3 settings".to_owned())?;
+        let settings = settings_record.settings().clone();
+        let approval = settings
+            .approval()
+            .cloned()
+            .ok_or_else(|| "the stored settings carry no human approval".to_owned())?;
+        let supervision_id = self
+            .html_sync_supervision_id(project)
+            .ok_or_else(|| "the project has no approved H2 target".to_owned())?;
+        let plan = crate::supervision::plan::load_plan(
+            &self.store_handle(),
+            project,
+            supervision_id,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
+        let context = AssessmentContext::from_plan(
+            project,
+            &plan,
+            approval.assessment().profile(),
+        )
+        .map_err(|error| error.to_string())?;
+        let files = crate::html_sync::publish::ProjectPublicationFiles::new(&root)
+            .map_err(|error| error.to_string())?;
+        let record = self
+            .store_handle()
+            .load_html_sync_document(project, document)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the document has no saved H3 state".to_owned())?;
+        let source = files
+            .read(document.target_path())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the Markdown source is missing".to_owned())?;
+        let html_bytes = files
+            .read(&document.companion_path())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the external HTML is missing".to_owned())?;
+        let html = String::from_utf8(html_bytes).map_err(|_| {
+            "the external HTML is not UTF-8 and cannot be adopted".to_owned()
+        })?;
+        let provenance = pipeline::extract_provenance(&html)
+            .map_err(|error| error.to_string())?;
+        let dependencies = self.html_sync.dependencies(project);
+        let mut css = Vec::new();
+        let mut resources = Vec::new();
+        for dependency in &dependencies {
+            let Some(bytes) = files
+                .read(dependency.path())
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let input = herness_html_sync::PublicationFileInput::new(
+                dependency.path(),
+                bytes,
+            )
+            .map_err(|error| error.to_string())?;
+            match dependency.kind() {
+                herness_html_sync::observer::DependencyKind::Css => css.push(input),
+                herness_html_sync::observer::DependencyKind::Resource => resources.push(input),
+            }
+        }
+        let css_text = css
+            .first()
+            .map(|input| {
+                String::from_utf8(input.bytes().to_vec())
+                    .map_err(|_| "the shared CSS is not UTF-8".to_owned())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let source_text = String::from_utf8(source.clone())
+            .map_err(|_| "the Markdown source is not UTF-8".to_owned())?;
+
+        let candidates = self.html_sync.candidate_store();
+        let generation_id = herness_html_sync::GenerationId::new(project);
+        let cycle_id = record
+            .state()
+            .cycle_id()
+            .unwrap_or_else(|| herness_html_sync::CycleId::new(project));
+        let job_id = record
+            .state()
+            .job_id()
+            .unwrap_or_else(|| herness_html_sync::JobId::new(project));
+        let generation_number = self
+            .store_handle()
+            .html_sync_generations(project, document)
+            .map_err(|error| error.to_string())?
+            .len() as u64
+            + 1;
+        let opened = candidates
+            .open_generation(
+                herness_html_sync::CandidateGenerationRequest::new(
+                    document.clone(),
+                    approval.owner_binding().job_id(),
+                    generation_number,
+                    Some(uuid::Uuid::new_v4().to_string()),
+                    source_text,
+                    Some(html.clone()),
+                    if css_text.is_empty() {
+                        None
+                    } else {
+                        Some(css_text)
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        let mut candidate_writer = candidates.clone();
+        use herness_core::ArtifactPort;
+        candidate_writer
+            .write_artifact(
+                opened.handle(),
+                herness_core::ArtifactSlot::CandidateHtml,
+                &html,
+                None,
+            )
+            .map_err(|error| format!("candidate html: {error:?}"))?;
+        candidate_writer
+            .write_artifact(
+                opened.handle(),
+                herness_core::ArtifactSlot::CandidateProvenance,
+                &provenance,
+                None,
+            )
+            .map_err(|error| format!("candidate provenance: {error:?}"))?;
+        let candidate = herness_html_sync::CandidateRecord::new(
+            herness_html_sync::CandidateId::new(project),
+            document.clone(),
+            generation_id,
+            opened.storage().clone(),
+            herness_supervision::ContentDigest::sha256(html.as_bytes()),
+            herness_supervision::ContentDigest::sha256(provenance.as_bytes()),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        let placeholder_fingerprints = herness_html_sync::FingerprintSet::new(
+            settings.fingerprint().clone(),
+            approval.versions().policy_fingerprint().clone(),
+            herness_supervision::ContentDigest::sha256(
+                css.first()
+                    .map(|input| input.bytes())
+                    .unwrap_or_default(),
+            ),
+            herness_supervision::ContentDigest::sha256(b"adoption-resources"),
+            Some(herness_supervision::ContentDigest::sha256(html.as_bytes())),
+            Some(herness_supervision::ContentDigest::sha256(
+                provenance.as_bytes(),
+            )),
+            None,
+        );
+        let placeholder_generation = herness_html_sync::GenerationRecord::new(
+            generation_id,
+            document.clone(),
+            generation_number,
+            cycle_id,
+            job_id,
+            record.state().source().clone(),
+            placeholder_fingerprints,
+            herness_html_sync::GenerationStatus::Active,
+            false,
+            now,
+        )
+        .map_err(|error| error.to_string())?
+        .with_candidate(candidate.clone())
+        .map_err(|error| error.to_string())?;
+        let mut prepared = PreparedCandidate {
+            document: document.clone(),
+            record: record.clone(),
+            generation: placeholder_generation,
+            candidate,
+            html,
+            provenance,
+            source,
+            css,
+            resources,
+        };
+        let capture = HostFingerprints::capture(
+            &settings,
+            approval.versions().policy_fingerprint(),
+            approval.versions().pack_fingerprint(),
+            &prepared,
+            &context,
+        )
+        .map_err(|error| error.to_string())?;
+        let bridge = self
+            .html_sync_services
+            .policy_bridge(project, &root, &settings)?;
+        let render = self
+            .html_sync_services
+            .render_port()
+            .ok_or_else(|| "no real render port is installed".to_owned())?;
+        let verification = match pipeline::verify(
+            bridge.as_ref(),
+            render.as_ref(),
+            &prepared,
+            &context,
+            &capture,
+            now,
+        ) {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Ok(herness_html_sync::AdoptionOutcome::WaitingHuman {
+                    cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                    detail: error.to_string(),
+                });
+            }
+        };
+        if !verification.is_usable() {
+            let (detail, _) = pipeline::verification_detail(&verification);
+            return Ok(herness_html_sync::AdoptionOutcome::WaitingHuman {
+                cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                detail,
+            });
+        }
+        let pack = verification
+            .pack
+            .clone()
+            .ok_or_else(|| "the adoption verification produced no evidence pack".to_owned())?;
+        let assessment = self
+            .html_sync_services
+            .assessment_mut()
+            .ok_or_else(|| "the Html assessment host is not composed".to_owned())?;
+        let evaluation = match pipeline::assess(
+            assessment,
+            &pack,
+            &context,
+            supervision_id,
+            &verification,
+            &capture,
+            now,
+        ) {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                return Ok(herness_html_sync::AdoptionOutcome::WaitingHuman {
+                    cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                    detail: error.to_string(),
+                });
+            }
+        };
+        if !evaluation.completion_ready() || evaluation.test_only() {
+            return Ok(herness_html_sync::AdoptionOutcome::WaitingHuman {
+                cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                detail: "the adoption evaluation is not completion-ready or is fake".to_owned(),
+            });
+        }
+        let post = evaluation.binding().post_verification();
+        let derived = herness_html_sync::FingerprintSet::new(
+            post.settings().clone(),
+            post.policy().clone(),
+            post.css().clone(),
+            post.resources().clone(),
+            Some(post.candidate().clone()),
+            Some(post.provenance().clone()),
+            Some(post.digest()),
+        );
+        let h2 = record
+            .state()
+            .h2()
+            .cloned()
+            .ok_or_else(|| "the document has no H2 reference for adoption".to_owned())?;
+        let generation = herness_html_sync::GenerationRecord::new(
+            generation_id,
+            document.clone(),
+            generation_number,
+            cycle_id,
+            job_id,
+            record.state().source().clone(),
+            derived,
+            herness_html_sync::GenerationStatus::Active,
+            false,
+            now,
+        )
+        .map_err(|error| error.to_string())?
+        .with_candidate(
+            prepared
+                .candidate
+                .clone(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_h2(h2);
+        prepared.generation = generation.clone();
+        let policy = pipeline::policy_identity(&settings).map_err(|error| error.to_string())?;
+        let receipt_path = herness_html_sync::html_evidence_path(document);
+        let services = &mut self.html_sync_services;
+        let recovery = &mut self.html_sync;
+        let operations = services.ensure_operations(project, &root)?;
+        let validation = operations
+            .validate_current_html(
+                document,
+                &prepared.source,
+                prepared.html.as_bytes(),
+                &prepared.css,
+                &prepared.resources,
+            )
+            .map_err(|error| error.to_string())?;
+        let adoption = herness_html_sync::CurrentHtmlAdoption::new(
+            record.revision(),
+            herness_html_sync::PublicationId::new(project),
+            generation,
+            prepared.html.clone(),
+            prepared.provenance.clone(),
+            prepared.source.clone(),
+            prepared.css.clone(),
+            prepared.resources.clone(),
+            policy,
+            evaluation,
+            validation,
+            pipeline::current_expected(&files, &document.companion_path())
+                .map_err(|error| error.to_string())?,
+            pipeline::current_expected(&files, &receipt_path)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        recovery
+            .with_publication_expectations(project, |expectations| {
+                operations
+                    .adopt_current_html(adoption, expectations, now)
+                    .map_err(|error| error.to_string())
+            })
+            .ok_or_else(|| "the project has no observer for adoption expectations".to_owned())?
+    }
+
     /// Requests a cooperative stop for one project's active H3 authoring run.
+
     pub fn html_sync_stop_active(
         &mut self,
         document: &herness_html_sync::DocumentKey,

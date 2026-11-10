@@ -26,10 +26,10 @@ use herness_html_sync::{
     SourceObservation, StopOutcome, SupersessionOutcome, SyncCoordinator, WorkspaceReader,
 };
 use herness_supervision::owner_launch::{OwnerApprovalRegistryPort, authorize_owner_launch};
+use herness_supervision::owner_launch::OwnerApproval;
 use herness_supervision::{
-    ApprovalActor, ConsentId, DisclosureConsent, DisclosureScope,
-    ProfilePurpose, StopCause, SupervisionId, SupervisionRequestId, SupervisionState,
-    TargetVersion,
+    ApprovalActor, ConsentBinding, ConsentId, DisclosureConsent, DisclosureScope, ProfilePurpose,
+    StopCause, SupervisionId, SupervisionRequestId, SupervisionState, TargetVersion,
 };
 
 use crate::host::DesktopRuntime;
@@ -896,12 +896,163 @@ impl AuthoringControlPort for SupervisionAuthoringControl<'_> {
         let plans = self.supervision.plans();
         let mut adapter = DesktopH1::new(self.runtime, self.store.clone(), plans);
         adapter.set_candidate_artifact(Some(handle.clone()));
+        let range_registry = RangeConsentApprovalRegistry {
+            inner: self.registry,
+            store: self.store.clone(),
+            config: self.supervision.config(),
+            project,
+            target_version: request.target_version(),
+            now: self.now,
+        };
         self.supervision.supersede_approved_owner(
             &mut adapter,
-            self.registry,
+            &range_registry,
             old_authority,
             supersede,
         )?;
         self.started(request.generation(), handle, storage, project, supervision)
+    }
+}
+
+
+/// Owner-approval registry that adopts one recorded range-consent reissue for
+/// the exact approved Target set.
+///
+/// The human H3 approval is never rewritten. For the supersession target
+/// version only, the authoring consent binding is replaced by the current
+/// reissued consent after the record, the approval's disclosure scope, and the
+/// configured consent are re-checked. Any mismatch falls back to the original
+/// registry value, which makes `authorize_owner_launch` reject the launch.
+struct RangeConsentApprovalRegistry<'a> {
+    inner: &'a dyn OwnerApprovalRegistryPort,
+    store: StoreHandle,
+    config: crate::supervision::plan::ConfigStore,
+    project: ProjectId,
+    target_version: TargetVersion,
+    now: Timestamp,
+}
+
+impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
+    fn current_owner_approval(
+        &self,
+        project_id: ProjectId,
+        owner: &herness_supervision::OwnerRef,
+        now: Timestamp,
+    ) -> Result<Option<OwnerApproval>, herness_supervision::SupervisionError> {
+        let Some(approval) = self
+            .inner
+            .current_owner_approval(project_id, owner, now)?
+        else {
+            return Ok(None);
+        };
+        if project_id != self.project {
+            return Ok(Some(approval));
+        }
+        let key = format!(
+            "h3.consent.reissue:{}:completion:{}",
+            self.project,
+            self.target_version.get()
+        );
+        let Some(bytes) = self
+            .store
+            .lock()
+            .load_host_state(&key)
+            .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
+                detail: error.to_string(),
+            })?
+        else {
+            return Ok(Some(approval));
+        };
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(Some(approval));
+        };
+        let Some(settings) = self
+            .store
+            .lock()
+            .load_html_sync_settings(self.project)
+            .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
+                detail: error.to_string(),
+            })?
+        else {
+            return Ok(Some(approval));
+        };
+        let Some(human) = settings.settings().approval() else {
+            return Ok(Some(approval));
+        };
+        let disclosure = human.authoring().disclosure();
+        let record_matches = record
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            == Some("h3-range-consent-reissue-v1")
+            && record
+                .get("purpose")
+                .and_then(serde_json::Value::as_str)
+                == Some("completion")
+            && record
+                .get("targetVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(self.target_version.get())
+            && record
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .eq(disclosure.targets().iter().map(String::as_str))
+                })
+            && record
+                .get("dataKinds")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|kinds| {
+                    let recorded = kinds
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    recorded
+                        == disclosure
+                            .data_kinds()
+                            .iter()
+                            .map(|kind| kind.as_str())
+                            .collect::<std::collections::BTreeSet<_>>()
+                })
+            && record
+                .get("origin")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|origin| origin == human.authoring().origin().to_string());
+        if !record_matches {
+            return Ok(Some(approval));
+        }
+        let Some(current) = self.config.get(self.project).consent(ProfilePurpose::Completion).cloned()
+        else {
+            return Ok(Some(approval));
+        };
+        if current.target_scope_version() != self.target_version
+            || current.scope().targets() != disclosure.targets()
+            || current.scope().data_kinds() != disclosure.data_kinds()
+            || current.origin() != human.authoring().origin()
+        {
+            return Ok(Some(approval));
+        }
+        let consent: ConsentBinding = current.binding();
+        let rebuilt = OwnerApproval::new(
+            project_id,
+            approval.owner().clone(),
+            approval.source(),
+            approval.settings_version(),
+            approval.job_id(),
+            approval.condition_version(),
+            approval.conditions_digest().clone(),
+            approval.execution_scope().clone(),
+            approval.profile(),
+            consent,
+            approval.budget_policy_version(),
+            approval.budget().clone(),
+        )
+        .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
+            detail: error.to_string(),
+        })?;
+        let _ = self.now;
+        Ok(Some(rebuilt))
     }
 }

@@ -53,6 +53,10 @@ impl H3StorePort for StoreHandle {
             .map_err(H3Error::from)
     }
 
+    fn load_html_sync_host_state(&self, key: &str) -> Result<Option<Vec<u8>>, H3Error> {
+        self.lock().load_host_state(key).map_err(H3Error::from)
+    }
+
     fn load_html_sync_candidate(
         &self,
         project: ProjectId,

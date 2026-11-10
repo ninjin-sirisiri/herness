@@ -573,7 +573,8 @@ pub fn assess(
     )
 }
 
-fn current_expected(
+/// Reads the current exact version or explicit absence of one formal file.
+pub fn current_expected(
     files: &ProjectPublicationFiles,
     path: &str,
 ) -> Result<ExpectedTargetVersion, H3Error> {
@@ -821,4 +822,24 @@ pub fn cycle_is_open(store: &mut StoreHandle, record: &H3DocumentRecord) -> Resu
     Ok(store
         .load_html_sync_cycle(record.state().project_id(), cycle_id)?
         .is_some_and(|cycle| cycle.state() == CycleState::Open))
+}
+
+/// Extracts the exact non-executed `#sdd-provenance` template payload from a
+/// semantic-v1 HTML document. A missing template is an explicit error.
+pub fn extract_provenance(html: &str) -> Result<String, H3Error> {
+    let lower = html.to_ascii_lowercase();
+    let marker = "id=\"sdd-provenance\"";
+    let id_position = lower.find(marker).ok_or_else(|| H3Error::invalid(
+        "provenance",
+        "the current HTML has no sdd-provenance template",
+    ))?;
+    let open_end = lower[id_position..]
+        .find('>')
+        .map(|offset| id_position + offset + 1)
+        .ok_or_else(|| H3Error::invalid("provenance", "the provenance tag is not closed"))?;
+    let close = lower[open_end..]
+        .find("</template>")
+        .map(|offset| open_end + offset)
+        .ok_or_else(|| H3Error::invalid("provenance", "the provenance template is not closed"))?;
+    Ok(html[open_end..close].to_owned())
 }
