@@ -10,6 +10,7 @@ pub mod assessment;
 pub mod composition;
 pub mod observer;
 pub mod operations;
+pub mod pipeline;
 pub mod policy;
 pub mod publish;
 pub mod recovery;

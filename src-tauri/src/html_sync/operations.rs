@@ -414,6 +414,16 @@ impl DesktopHtmlSyncOperations {
         }
     }
 
+    /// Publishes one evaluated candidate through the Task 19 orchestrator.
+    pub fn publish(
+        &mut self,
+        attempt: CandidatePublication,
+        expectations: &mut dyn PublicationWriteExpectationPort,
+        now: Timestamp,
+    ) -> Result<herness_html_sync::PublicationOutcome, H3Error> {
+        self.publisher.publish(attempt, expectations, now)
+    }
+
     /// Publishes one explicit regenerated replacement through Task 19.
     pub fn replace_with_regenerated(
         &mut self,

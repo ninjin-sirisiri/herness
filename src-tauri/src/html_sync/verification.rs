@@ -103,8 +103,12 @@ pub struct CandidateVerificationRequest<'a> {
     pub candidate_digest: ContentDigest,
     /// Exact provenance digest.
     pub provenance_digest: ContentDigest,
-    /// Exact shared CSS digest.
+    /// Exact shared CSS dependency fingerprint used by the H3 evidence pack.
     pub css_digest: ContentDigest,
+    /// Exact shared CSS byte digest bound by the real render manifest. The H3
+    /// dependency fingerprint covers the path and kind, while the render binds
+    /// the exact CSS bytes; they are not interchangeable.
+    pub render_css_digest: ContentDigest,
     /// Exact resource-set digest.
     pub resources_digest: ContentDigest,
     /// Exact settings digest.
@@ -470,7 +474,7 @@ pub fn render_facts(
         });
     }
     if manifest.candidate.html_sha256 != request.candidate_digest
-        || manifest.candidate.css_sha256 != request.css_digest
+        || manifest.candidate.css_sha256 != request.render_css_digest
         || manifest.candidate.resources_sha256 != request.resources_digest
     {
         return Err(EvidenceValidationError::RenderFingerprintMismatch { field: "candidate" });
@@ -550,9 +554,9 @@ pub fn render_facts(
         manifest.isolation.is_isolated(),
         manifest.browser.tauri_ipc_injected,
         RenderCandidateFingerprints::new(
-            manifest.candidate.html_sha256.clone(),
-            manifest.candidate.css_sha256.clone(),
-            manifest.candidate.resources_sha256.clone(),
+            request.candidate_digest.clone(),
+            request.css_digest.clone(),
+            request.resources_digest.clone(),
             manifest.candidate.candidate_sha256.clone(),
         ),
         pngs,

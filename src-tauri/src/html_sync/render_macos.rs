@@ -1512,8 +1512,14 @@ fn verify_protocol(probe: &str, _payload: &RenderPayload) -> Result<(), RenderEr
             }
         })
     };
+    // A real semantic-v1 candidate must carry a restrictive CSP
+    // (`default-src 'none'`), so its page-world fetch of the custom scheme may
+    // be refused before the router answers. In that case the probe records no
+    // status. The authoritative rejection proof is the native router self-probe
+    // (`missing_resource_status == 404`), checked by
+    // `verify_protocol_evidence`; a status that *was* observed must still be 404.
     let missing = status("/missing.png");
-    if missing != Some(404) {
+    if missing.is_some_and(|status| status != 404) {
         return Err(RenderError::IncompleteCapture {
             detail: format!("missing resource probe returned {missing:?}, expected 404"),
         });
@@ -1535,12 +1541,23 @@ fn verify_protocol_evidence(evidence: &ProtocolEvidence) -> Result<(), RenderErr
             detail: format!("router self-probe failed: {probe:?}"),
         });
     }
-    if !evidence.unknown_job_rejected
-        || !evidence.missing_resource_rejected
-        || !evidence.non_candidate_rejected
-    {
+    // A restrictive candidate CSP can stop the page-world fetch before it
+    // reaches the router. The native in-memory router self-probe above is the
+    // authoritative rejection evidence; page-level records are an additional
+    // proof when the candidate CSP allows them to arrive.
+    if !evidence.unknown_job_rejected && probe.unknown_job_status != 403 {
         return Err(RenderError::IncompleteCapture {
-            detail: "job protocol did not observe every required rejection".to_owned(),
+            detail: "the unknown-job rejection was not observed".to_owned(),
+        });
+    }
+    if !evidence.missing_resource_rejected && probe.missing_resource_status != 404 {
+        return Err(RenderError::IncompleteCapture {
+            detail: "the missing-resource rejection was not observed".to_owned(),
+        });
+    }
+    if !evidence.non_candidate_rejected && probe.non_candidate_status != 404 {
+        return Err(RenderError::IncompleteCapture {
+            detail: "the non-candidate rejection was not observed".to_owned(),
         });
     }
     Ok(())

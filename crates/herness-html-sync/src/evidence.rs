@@ -2691,6 +2691,178 @@ impl EvidenceContentStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Every stored document in evidence-id order.
+    pub fn documents(&self) -> Vec<EvidenceDocumentContent> {
+        self.documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Adds every document from a rehydrated store.
+    pub fn merge(&self, documents: &Self) -> Result<(), EvidenceValidationError> {
+        for document in documents.documents() {
+            self.insert(document)?;
+        }
+        Ok(())
+    }
+
+    /// Persists the exact content documents as one versioned JSON file.
+    ///
+    /// This is the minimum durable surface for H3 evidence content: the H2
+    /// metadata record lives in SQLite, while the full text/image bytes are
+    /// stored here inside the private application area. Image bytes are hex
+    /// encoded because the transport model never serializes them directly.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), EvidenceValidationError> {
+        let wire = PersistedEvidenceContent {
+            format_version: H3_FORMAT_VERSION,
+            schema: H3_EVIDENCE_CONTENT_SCHEMA.to_owned(),
+            documents: self
+                .documents()
+                .into_iter()
+                .map(PersistedDocument::from_document)
+                .collect(),
+        };
+        let bytes =
+            serde_json::to_vec(&wire).map_err(|error| EvidenceValidationError::Storage {
+                detail: format!("evidence content could not be encoded: {error}"),
+            })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| EvidenceValidationError::Storage {
+                detail: format!("evidence content directory: {error}"),
+            })?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes).map_err(|error| EvidenceValidationError::Storage {
+            detail: format!("evidence content could not be written: {error}"),
+        })?;
+        std::fs::rename(&temporary, path).map_err(|error| EvidenceValidationError::Storage {
+            detail: format!("evidence content could not be committed: {error}"),
+        })?;
+        Ok(())
+    }
+
+    /// Loads one previously persisted content file. A missing file is an empty
+    /// store; a corrupt or unsupported file is an explicit error.
+    pub fn load(path: &std::path::Path) -> Result<Self, EvidenceValidationError> {
+        let store = Self::new();
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(error) => {
+                return Err(EvidenceValidationError::Storage {
+                    detail: format!("evidence content could not be read: {error}"),
+                });
+            }
+        };
+        let wire: PersistedEvidenceContent =
+            serde_json::from_slice(&bytes).map_err(|error| EvidenceValidationError::Storage {
+                detail: format!("evidence content could not be decoded: {error}"),
+            })?;
+        if wire.format_version != H3_FORMAT_VERSION || wire.schema != H3_EVIDENCE_CONTENT_SCHEMA {
+            return Err(EvidenceValidationError::UnsupportedSchema {
+                found: format!("{}/{}", wire.format_version, wire.schema),
+            });
+        }
+        for document in wire.documents {
+            store.insert(document.into_document()?)?;
+        }
+        Ok(store)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedEvidenceContent {
+    format_version: u32,
+    schema: String,
+    documents: Vec<PersistedDocument>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedDocument {
+    evidence_id: EvidenceId,
+    kind: EvidenceContentKind,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    media_type: Option<String>,
+    #[serde(default)]
+    bytes_hex: Option<String>,
+    truncated: bool,
+    secret_excluded: bool,
+}
+
+impl PersistedDocument {
+    fn from_document(document: EvidenceDocumentContent) -> Self {
+        Self {
+            evidence_id: document.evidence_id,
+            kind: document.kind,
+            text: document.text,
+            media_type: document.media_type,
+            bytes_hex: document.bytes.map(|bytes| encode_hex(&bytes)),
+            truncated: document.truncated,
+            secret_excluded: document.secret_excluded,
+        }
+    }
+
+    fn into_document(self) -> Result<EvidenceDocumentContent, EvidenceValidationError> {
+        let bytes = match self.bytes_hex {
+            Some(hex) => Some(decode_hex(&hex)?),
+            None => None,
+        };
+        Ok(EvidenceDocumentContent {
+            format_version: H3_FORMAT_VERSION,
+            schema: H3_EVIDENCE_CONTENT_SCHEMA.to_owned(),
+            evidence_id: self.evidence_id,
+            kind: self.kind,
+            text: self.text,
+            media_type: self.media_type,
+            bytes,
+            truncated: self.truncated,
+            secret_excluded: self.secret_excluded,
+        })
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>, EvidenceValidationError> {
+    if hex.len() % 2 != 0 {
+        return Err(EvidenceValidationError::InvalidValue {
+            field: "evidenceContent.bytesHex".to_owned(),
+            detail: "odd-length hex payload".to_owned(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    let digit = |value: u8| -> Result<u8, EvidenceValidationError> {
+        match value {
+            b'0'..=b'9' => Ok(value - b'0'),
+            b'a'..=b'f' => Ok(value - b'a' + 10),
+            b'A'..=b'F' => Ok(value - b'A' + 10),
+            _ => Err(EvidenceValidationError::InvalidValue {
+                field: "evidenceContent.bytesHex".to_owned(),
+                detail: "invalid hex digit".to_owned(),
+            }),
+        }
+    };
+    for pair in raw.chunks(2) {
+        bytes.push((digit(pair[0])? << 4) | digit(pair[1])?);
+    }
+    Ok(bytes)
 }
 
 impl EvidenceContentSource for EvidenceContentStore {
@@ -4499,6 +4671,8 @@ pub enum EvidenceValidationError {
     UnsupportedSchema { found: String },
     /// A value failed validation.
     InvalidValue { field: String, detail: String },
+    /// Durable evidence content could not be read or written.
+    Storage { detail: String },
 }
 
 impl fmt::Display for EvidenceValidationError {
@@ -4577,6 +4751,7 @@ impl fmt::Display for EvidenceValidationError {
             Self::SplitCoverage { detail } => write!(formatter, "split coverage: {detail}"),
             Self::UnsupportedSchema { found } => write!(formatter, "unsupported schema {found}"),
             Self::InvalidValue { field, detail } => write!(formatter, "{field}: {detail}"),
+            Self::Storage { detail } => write!(formatter, "evidence storage: {detail}"),
         }
     }
 }

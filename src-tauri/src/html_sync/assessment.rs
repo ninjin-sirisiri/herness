@@ -35,6 +35,7 @@ static ASSESSMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Desktop Html assessment host with an exact content-carrying evidence store.
 pub struct HtmlAssessmentHost {
     store: StoreHandle,
+    config: ConfigStore,
     port: HostAssessmentPort,
     content: EvidenceContentStore,
 }
@@ -44,13 +45,46 @@ impl HtmlAssessmentHost {
     /// registry.
     pub fn new(store: StoreHandle, config: ConfigStore, host: AssessmentHost) -> Self {
         let content = EvidenceContentStore::new();
-        let port = HostAssessmentPort::new(store.clone(), config, host)
+        let port = HostAssessmentPort::new(store.clone(), config.clone(), host)
             .with_evidence_content(Arc::new(content.clone()));
         Self {
             store,
+            config,
             port,
             content,
         }
+    }
+
+    /// Resolves the exact input capabilities approved for one fixed profile.
+    ///
+    /// The H3 plan uses this so a text-only connection is never planned as
+    /// image-bearing evidence. A missing or changed profile is explicit.
+    pub fn profile_inputs(&self, profile: ProfileBinding) -> Result<ProfileInputs, H3Error> {
+        let project = profile.profile_id().project_id();
+        let config = self.config.get(project);
+        let configured = config
+            .profile(profile.purpose())
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.assessment.profile".to_owned(),
+                detail: format!("no {} profile is configured", profile.purpose().as_str()),
+            })?;
+        if configured.profile.binding() != profile {
+            return Err(H3Error::Unavailable {
+                capability: "h3.assessment.profile".to_owned(),
+                detail: "the configured profile differs from the approved profile".to_owned(),
+            });
+        }
+        let inputs = configured.profile.required_inputs();
+        Ok(if inputs.supports_image() {
+            ProfileInputs::text_with_optional_image()
+        } else {
+            ProfileInputs::text_only()
+        })
+    }
+
+    /// Rehydrates persisted evidence content before a post-restart assessment.
+    pub fn rehydrate_content(&self, store: &EvidenceContentStore) -> Result<(), H3Error> {
+        self.content.merge(store).map_err(H3Error::from)
     }
 
     /// Exact content store shared with the H2 port.

@@ -181,7 +181,7 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 }
             };
-            let (host, reconciliation) = DesktopHost::open_with_html_sync_pack(
+            let (mut host, reconciliation) = DesktopHost::open_with_html_sync_pack(
                 &root,
                 connections,
                 credentials,
@@ -190,6 +190,10 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                     .map(PathBuf::from)
                     .filter(|path| path.is_absolute()),
             )?;
+            // The production render port uses the same application handle and
+            // the real hidden WKWebView. It grants no candidate access.
+            host.html_sync_services_mut()
+                .install_native_render(app.handle().clone());
 
             app.manage(AppState {
                 host: Mutex::new(host),

@@ -244,10 +244,54 @@ impl PublicationSafetyPort for H3PublicationSafety {
                 .approval()
                 .is_some_and(|approval| approval.is_current_at(request.now));
         let consent_current = settings.approval().is_some_and(|approval| {
-            let consent = approval.assessment().consent();
-            consent.purpose() == herness_supervision::ProfilePurpose::Html
-                && consent.target_scope_version() == request.target_version
-                && approval.assessment().profile() == request.profile
+            let assessment = approval.assessment();
+            let consent = assessment.consent();
+            let profile_matches = assessment.profile() == request.profile;
+            if !profile_matches || consent.purpose() != herness_supervision::ProfilePurpose::Html
+            {
+                return false;
+            }
+            if consent.target_scope_version() == request.target_version {
+                return true;
+            }
+            // A source change advances the H2 target version. The host records
+            // one narrow reissue for the exact human-approved Target set, data
+            // kinds, origin, and purpose. No expansion is accepted here.
+            let key = format!(
+                "h3.consent.reissue:{}:html:{}",
+                project,
+                request.target_version.get()
+            );
+            let Ok(Some(bytes)) = self.store.lock().load_host_state(&key) else {
+                return false;
+            };
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return false;
+            };
+            let disclosure = assessment.disclosure();
+            record.get("schema").and_then(serde_json::Value::as_str)
+                == Some("h3-range-consent-reissue-v1")
+                && record
+                    .get("purpose")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("html")
+                && record
+                    .get("targetVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(request.target_version.get())
+                && record
+                    .get("targets")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|targets| {
+                        targets
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .eq(disclosure.targets().iter().map(String::as_str))
+                    })
+                && record
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|origin| origin == assessment.origin().to_string())
         });
         let budget_remaining = match request.generation.h2() {
             Some(h2) => {

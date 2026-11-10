@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::host::DesktopHost;
 use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::operations::DesktopHtmlSyncOperations;
+use crate::html_sync::pipeline::{CandidateRenderPort, NativeRenderPort};
 use crate::html_sync::policy::{ConnectedPolicyBridge, HtmlPolicyBridge, PolicyBridgeError};
 use crate::html_sync::publish::ProjectPublicationFiles;
 use crate::supervision::store::StoreHandle;
@@ -492,6 +493,8 @@ pub struct HtmlSyncServices {
     barrier: DesktopH4Barrier,
     render_available: bool,
     candidate_tooling_available: bool,
+    render: Option<Arc<dyn CandidateRenderPort>>,
+    evidence_root: PathBuf,
 }
 
 impl HtmlSyncServices {
@@ -522,6 +525,8 @@ impl HtmlSyncServices {
             barrier: DesktopH4Barrier::new(store_for_barrier),
             render_available: cfg!(target_os = "macos"),
             candidate_tooling_available: true,
+            render: None,
+            evidence_root: app_data_root.join("html-sync-evidence"),
         })
     }
 
@@ -550,6 +555,53 @@ impl HtmlSyncServices {
     /// Private history archive root.
     pub fn archive_root(&self) -> &Path {
         &self.archive_root
+    }
+
+    /// Private root for durable assessment content.
+    pub fn evidence_root(&self) -> &Path {
+        &self.evidence_root
+    }
+
+    /// Replaces the toolchain used for the verified Common SDD host-API
+    /// connection. Production reads it from the host environment; acceptance
+    /// tests pass the repository's explicit validator path.
+    pub fn set_toolchain(&mut self, toolchain: herness_core::ToolchainConfig) {
+        self.toolchain = toolchain;
+    }
+
+    /// Installs the production hidden-window render port once the desktop
+    /// application handle exists. It is not an approval and grants no access.
+    pub fn install_native_render(&mut self, app: tauri::AppHandle) {
+        self.render = Some(Arc::new(NativeRenderPort::new(app)));
+        self.render_available = true;
+    }
+
+    /// Installs an explicit render port. Used by the real child-capture
+    /// acceptance tests; the production path uses the native port.
+    pub fn set_render_port(&mut self, render: Arc<dyn CandidateRenderPort>) {
+        self.render = Some(render);
+        self.render_available = true;
+    }
+
+    /// The installed render port, when present.
+    pub fn render_port(&self) -> Option<Arc<dyn CandidateRenderPort>> {
+        self.render.clone()
+    }
+
+    /// Mutable Html assessment host.
+    pub fn assessment_mut(&mut self) -> Option<&mut HtmlAssessmentHost> {
+        self.assessment.as_mut()
+    }
+
+    /// The verified policy connection for one approved project, connecting it
+    /// once when needed. It never sends a model request.
+    pub fn policy_bridge(
+        &mut self,
+        project: ProjectId,
+        root: &Path,
+        settings: &H3Settings,
+    ) -> Result<Arc<ConnectedPolicyBridge>, String> {
+        self.prepare_policy_bridge(project, root, settings)
     }
 
     fn prepare_policy_bridge(
@@ -596,7 +648,7 @@ impl HtmlSyncServices {
         Ok(connected)
     }
 
-    fn ensure_operations(
+    pub(crate) fn ensure_operations(
         &mut self,
         project: ProjectId,
         root: &Path,
@@ -1263,7 +1315,9 @@ pub fn enable(host: &mut DesktopHost, project: ProjectId) -> Result<HtmlSyncEnab
     if report.available()
         && let Some(supervision_id) = supervision_id
     {
-        let dependencies = host.html_sync().dependencies(project);
+        let dependencies = crate::host::discovered_dependencies(&root, &settings);
+        host.html_sync_mut()
+            .register_project(project, &root, dependencies.clone());
         worker_bound = host
             .html_sync_mut()
             .activate_project(
@@ -1562,6 +1616,28 @@ fn reassess_document(
         return reject(host, request, record, now, RequiredAction::ApproveSettings);
     }
     let document = state.document_key().clone();
+    // A saved active generation with an exact candidate is reassessed in place:
+    // the current source/dependencies are re-verified, the real render and the
+    // three Html assessment methods run again, and only a completion-ready
+    // evaluation reaches publication. A document with no stored candidate is
+    // requeued from the source as before.
+    if let Some(generation_id) = state.generation()
+        && host
+            .store_handle()
+            .html_sync_generations(state.project_id(), &document)
+            .ok()
+            .and_then(|generations| {
+                generations
+                    .into_iter()
+                    .find(|generation| generation.generation_id() == generation_id)
+            })
+            .is_some_and(|generation| {
+                generation.status() == herness_html_sync::GenerationStatus::Active
+                    && generation.candidate().is_some()
+            })
+    {
+        return reassess_saved_candidate(host, request, now);
+    }
     let (cycle, new_cycle) = resumable_cycle(host, state, settings.settings().version(), now)?;
     let reason = H3Reason::new(
         H3StateReasonKind::Pending {
@@ -1612,6 +1688,104 @@ fn reassess_document(
     operation_view(host, request)
 }
 
+fn reassess_saved_candidate(
+    host: &mut DesktopHost,
+    request: &H3OperationRequest,
+    now: Timestamp,
+) -> Result<HtmlSyncOperationView, String> {
+    let document = request
+        .document()
+        .cloned()
+        .ok_or_else(|| "reassess requires one document".to_owned())?;
+    host.html_sync_mut().clear_latch(&document);
+    let advanced = host.html_sync_advance(&document);
+    let record = host
+        .store_handle()
+        .load_html_sync_document(request.project_id(), &document)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the document state disappeared during reassessment".to_owned())?;
+    let outcome = match &advanced {
+        Ok(crate::html_sync::pipeline::PostCandidateOutcome::Publication(
+            herness_html_sync::PublicationOutcome::Synced { .. },
+        )) => H3OperationOutcome::Accepted {
+            state: H3State::Synced,
+            revision: record.revision(),
+        },
+        Ok(crate::html_sync::pipeline::PostCandidateOutcome::WaitingHuman {
+            cause,
+            detail: _,
+        }) => H3OperationOutcome::Rejected {
+            reason: H3Reason::new(
+                H3StateReasonKind::WaitingHuman { cause: *cause },
+                vec![RequiredAction::ReassessCandidate],
+            )
+            .map_err(|error| error.to_string())?,
+        },
+        Ok(crate::html_sync::pipeline::PostCandidateOutcome::FixableUnmet { .. })
+        | Ok(crate::html_sync::pipeline::PostCandidateOutcome::VerificationRejected {
+            ..
+        }) => H3OperationOutcome::Rejected {
+            reason: H3Reason::new(
+                H3StateReasonKind::Failed {
+                    cause: herness_html_sync::H3FailureCause::CandidateRejected,
+                },
+                vec![RequiredAction::ReviewFailure],
+            )
+            .map_err(|error| error.to_string())?,
+        },
+        Ok(_) => H3OperationOutcome::Accepted {
+            state: record.state().state(),
+            revision: record.revision(),
+        },
+        Err(_detail) => H3OperationOutcome::Rejected {
+            reason: H3Reason::new(
+                H3StateReasonKind::WaitingHuman {
+                    cause: herness_html_sync::HumanWaitCause::RecoveryReconciliation,
+                },
+                vec![RequiredAction::ReconcileRecovery],
+            )
+            .map_err(|error| error.to_string())?,
+        },
+    };
+    let result = H3OperationResult::new(request, outcome, 0, now)
+        .map_err(|error| error.to_string())?;
+    commit_request_with_current_state(host, request, result, now)?;
+    operation_view(host, request)
+}
+
+fn commit_request_with_current_state(
+    host: &mut DesktopHost,
+    request: &H3OperationRequest,
+    result: H3OperationResult,
+    now: Timestamp,
+) -> Result<(), String> {
+    let document = request
+        .document()
+        .cloned()
+        .ok_or_else(|| "the operation requires one document".to_owned())?;
+    let record = host
+        .store_handle()
+        .load_html_sync_document(request.project_id(), &document)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the document state disappeared".to_owned())?;
+    let state = record.state().clone();
+    let event = document_state_event(&document, Some(state.state()), &state, now)
+        .map_err(|error| error.to_string())?;
+    commit_operation(
+        host,
+        request,
+        HtmlSyncCommit::new()
+            .with_document(
+                DocumentCommit::new(Some(record.revision()), state)
+                    .map_err(|error| error.to_string())?,
+            )
+            .with_request(
+                RequestCommit::new(request.clone(), result).map_err(|error| error.to_string())?,
+            )
+            .with_events(vec![event]),
+    )
+}
+
 fn resolve_conflict(
     host: &mut DesktopHost,
     request: &H3OperationRequest,
@@ -1641,11 +1815,67 @@ fn resolve_conflict(
              structural-only result is accepted"
                 .to_owned(),
         ),
-        ConflictResolution::ReplaceWithCandidate => Err(
-            "replacing the current HTML requires an explicit evaluated candidate publication; \
-             the saved generation alone is not accepted"
-                .to_owned(),
-        ),
+        ConflictResolution::ReplaceWithCandidate => {
+            let document = record.state().document_key().clone();
+            let generation = record
+                .state()
+                .generation()
+                .ok_or_else(|| {
+                    "replacing the current HTML requires a saved scanned candidate".to_owned()
+                })?;
+            let candidate_exists = host
+                .store_handle()
+                .html_sync_generations(record.state().project_id(), &document)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|entry| entry.generation_id() == generation)
+                .is_some_and(|entry| entry.candidate().is_some());
+            if !candidate_exists {
+                return Err(
+                    "replacing the current HTML requires a saved scanned candidate".to_owned(),
+                );
+            }
+            host.html_sync_mut().clear_latch(&document);
+            let advanced = host.html_sync_replace_with_candidate(&document);
+            let current = host
+                .store_handle()
+                .load_html_sync_document(record.state().project_id(), &document)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the document state disappeared during replacement".to_owned())?;
+            let outcome = match &advanced {
+                Ok(crate::html_sync::pipeline::PostCandidateOutcome::Publication(
+                    herness_html_sync::PublicationOutcome::Synced { .. },
+                )) => H3OperationOutcome::Accepted {
+                    state: H3State::Synced,
+                    revision: current.revision(),
+                },
+                Ok(crate::html_sync::pipeline::PostCandidateOutcome::WaitingHuman {
+                    cause,
+                    ..
+                }) => H3OperationOutcome::Rejected {
+                    reason: H3Reason::new(
+                        H3StateReasonKind::WaitingHuman { cause: *cause },
+                        vec![RequiredAction::ReassessCandidate],
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
+                Ok(_) | Err(_) => H3OperationOutcome::Rejected {
+                    reason: H3Reason::new(
+                        H3StateReasonKind::WaitingHuman {
+                            cause: herness_html_sync::HumanWaitCause::ExternalHtmlConflict,
+                        },
+                        vec![RequiredAction::ResolveHtmlConflict {
+                            target: record.state().document_key().companion_path(),
+                        }],
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
+            };
+            let result = H3OperationResult::new(request, outcome, 0, now)
+                .map_err(|error| error.to_string())?;
+            commit_request_with_current_state(host, request, result, now)?;
+            operation_view(host, request)
+        }
     }
 }
 

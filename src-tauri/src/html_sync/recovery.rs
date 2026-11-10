@@ -42,6 +42,7 @@ use serde::Serialize;
 use crate::host::DesktopRuntime;
 use crate::html_sync::composition::HtmlSyncCapabilityReport;
 use crate::html_sync::observer::{ProjectFilesystemWatcher, WatchNotice};
+use crate::html_sync::publish::ObserverWriteExpectations;
 use crate::html_sync::worker::HtmlSyncWorker;
 use crate::supervision::SupervisionHost;
 use crate::supervision::runtime::DesktopH1;
@@ -152,6 +153,7 @@ pub struct HtmlSyncRecoveryHost {
     watch_rx: Receiver<WatchNotice>,
     accepting: bool,
     last_startup: Option<HtmlSyncStartupReport>,
+    pending_companions: Vec<herness_html_sync::observer::CompanionObservation>,
 }
 
 impl HtmlSyncRecoveryHost {
@@ -181,6 +183,7 @@ impl HtmlSyncRecoveryHost {
             watch_rx,
             accepting: true,
             last_startup: None,
+            pending_companions: Vec::new(),
         })
     }
 
@@ -198,6 +201,49 @@ impl HtmlSyncRecoveryHost {
     /// by the desktop composition test.
     pub const fn worker_count(&self) -> usize {
         1
+    }
+
+    /// The one app-lifetime worker.
+    pub const fn worker(&self) -> &HtmlSyncWorker {
+        &self.worker
+    }
+
+    /// Mutable worker for the post-candidate pipeline and explicit human
+    /// operations. This is host-only and has no IPC surface.
+    pub fn worker_mut(&mut self) -> &mut HtmlSyncWorker {
+        &mut self.worker
+    }
+
+    /// Private candidate store used by the worker.
+    pub fn candidate_store(&self) -> CandidateArtifactStore {
+        self.candidates.clone()
+    }
+
+    /// Runs one host publication attempt with the real observer expectation
+    /// registered for the exact two files.
+    ///
+    /// The observer is borrowed only for the duration of the closure. Source
+    /// observations produced while retiring the expectation are offered to the
+    /// one worker; companions and uncertainties are never authoring work.
+    pub fn with_publication_expectations<R>(
+        &mut self,
+        project: ProjectId,
+        run: impl FnOnce(
+            &mut dyn herness_html_sync::PublicationWriteExpectationPort,
+        ) -> Result<R, String>,
+    ) -> Option<Result<R, String>> {
+        let observer = self.observers.get_mut(&project)?;
+        let mut expectations = ObserverWriteExpectations::new(observer);
+        let result = run(&mut expectations);
+        let sources = expectations.take_sources();
+        let _ = expectations.take_companions();
+        let _ = expectations.take_uncertainties();
+        for observation in &sources {
+            if observation.is_authoring_candidate() {
+                self.worker.observe(observation);
+            }
+        }
+        Some(result)
     }
 
     /// Registered project root.
@@ -363,6 +409,7 @@ impl HtmlSyncRecoveryHost {
                 self.worker.observe(observation);
             }
         }
+        self.pending_companions.extend(tick.companions.iter().cloned());
     }
 
     fn drain_watch_notices(&mut self) {
@@ -382,14 +429,26 @@ impl HtmlSyncRecoveryHost {
 
     fn poll_observers(&mut self) {
         let mut sources = Vec::new();
+        let mut companions = Vec::new();
         for observer in self.observers.values_mut() {
-            sources.extend(observer.poll().sources);
+            let tick = observer.poll();
+            sources.extend(tick.sources);
+            companions.extend(tick.companions);
         }
         for observation in &sources {
             if observation.is_authoring_candidate() {
                 self.worker.observe(observation);
             }
         }
+        self.pending_companions.extend(companions);
+    }
+
+    /// Companion/receipt observations detected since the last host pump.
+    ///
+    /// The host records an external HTML edit as `waiting_human`; generated
+    /// HTML itself never becomes Markdown authoring work.
+    pub fn take_companions(&mut self) -> Vec<herness_html_sync::observer::CompanionObservation> {
+        std::mem::take(&mut self.pending_companions)
     }
 
     /// Registers one open project without starting anything.

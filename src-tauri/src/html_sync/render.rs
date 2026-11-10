@@ -795,6 +795,48 @@ impl RenderEvidence {
         self.validate()?;
         write_evidence(directory, &self.manifest, &self.pngs)
     }
+
+    /// Reads complete evidence written by the hidden render child.
+    ///
+    /// Every PNG is read from the canonical evidence directory only; a missing
+    /// file, digest mismatch, or unsafe file name is an explicit error. The
+    /// returned evidence still has to pass [`Self::validate`] before use.
+    pub fn read_from(directory: &Path) -> Result<Self, RenderError> {
+        let manifest_path = directory.join("manifest.json");
+        let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| RenderError::Io {
+            detail: format!("read {}: {error}", manifest_path.display()),
+        })?;
+        let manifest: RenderManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| RenderError::Io {
+                detail: format!("parse manifest: {error}"),
+            })?;
+        let mut pngs = Vec::with_capacity(manifest.configurations.len());
+        for configuration in &manifest.configurations {
+            let name = &configuration.png.path;
+            if name.is_empty()
+                || name.contains('/')
+                || name.contains('\\')
+                || name.contains("..")
+                || Path::new(name).is_absolute()
+            {
+                return Err(RenderError::IncompleteCapture {
+                    detail: format!("unsafe PNG file name `{name}`"),
+                });
+            }
+            let bytes = std::fs::read(directory.join(name)).map_err(|error| RenderError::Io {
+                detail: format!("read PNG {name}: {error}"),
+            })?;
+            pngs.push(RenderPng::new(
+                name.clone(),
+                bytes,
+                configuration.png.pixel_width,
+                configuration.png.pixel_height,
+            ));
+        }
+        let evidence = Self { manifest, pngs };
+        evidence.validate()?;
+        Ok(evidence)
+    }
 }
 
 /// One captured PNG snapshot.

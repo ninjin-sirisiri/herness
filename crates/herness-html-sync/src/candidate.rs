@@ -363,6 +363,61 @@ impl CandidateArtifactStore {
         }
     }
 
+    /// Reads the exact authored candidate and provenance bytes for one stored
+    /// candidate record.
+    ///
+    /// This is the post-restart verification/publication read. It checks the
+    /// manifest identity and token digest and returns only bytes whose digests
+    /// match the record. A missing or mismatched entry is an explicit error, not
+    /// an empty success.
+    pub fn read_candidate_record(
+        &self,
+        candidate: &crate::state::CandidateRecord,
+    ) -> Result<(String, String), H3Error> {
+        let verification = self.verify_candidate_record(candidate)?;
+        match verification {
+            CandidateVerification::Present => {}
+            CandidateVerification::Missing => {
+                return Err(H3Error::NotFound {
+                    record: "candidate bytes",
+                    id: candidate.storage().namespace().to_owned(),
+                });
+            }
+            CandidateVerification::Mismatch { html, provenance } => {
+                return Err(H3Error::Corrupt {
+                    record: "candidate bytes",
+                    detail: format!("htmlMismatch={html} provenanceMismatch={provenance}"),
+                });
+            }
+        }
+        let directory = self.generation_directory(candidate.storage().namespace());
+        let html = read_optional_slot(&directory, ArtifactSlot::CandidateHtml)
+            .map_err(|error| H3Error::Storage {
+                detail: format!("candidate html read: {error}"),
+            })?
+            .ok_or_else(|| H3Error::NotFound {
+                record: "candidate_html",
+                id: candidate.storage().namespace().to_owned(),
+            })?;
+        let provenance = read_optional_slot(&directory, ArtifactSlot::CandidateProvenance)
+            .map_err(|error| H3Error::Storage {
+                detail: format!("candidate provenance read: {error}"),
+            })?
+            .ok_or_else(|| H3Error::NotFound {
+                record: "candidate_provenance",
+                id: candidate.storage().namespace().to_owned(),
+            })?;
+        let html = String::from_utf8(html).map_err(|_| H3Error::Corrupt {
+            record: "candidate_html",
+            detail: "the candidate HTML is not UTF-8".to_owned(),
+        })?;
+        let provenance = String::from_utf8(provenance).map_err(|_| H3Error::Corrupt {
+            record: "candidate_provenance",
+            detail: "the candidate provenance is not UTF-8".to_owned(),
+        })?;
+        Ok((html, provenance))
+    }
+
     fn generation_directory(&self, namespace: &str) -> PathBuf {
         self.root.join(namespace)
     }

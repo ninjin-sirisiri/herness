@@ -281,6 +281,7 @@ fn desktop_verification_calls_the_real_pack_bridge_and_records_an_unavailable_re
             provenance_payload(fixture.candidate_html()).as_bytes(),
         ),
         css_digest: fingerprints.css().clone(),
+        render_css_digest: herness_supervision::ContentDigest::sha256(b"fixture-css"),
         resources_digest: fingerprints.resources().clone(),
         settings_digest: fingerprints.settings().clone(),
         policy_digest: fingerprints.policy().clone(),

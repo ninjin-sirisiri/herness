@@ -111,6 +111,33 @@ impl DesktopHost {
         )
     }
 
+    /// Test composition seam combining the real pack root with loopback
+    /// assessment bases.
+    ///
+    /// This is never selected by the desktop shell. It lets the cross-phase
+    /// acceptance test run the real pack, real render child, and the existing
+    /// Html assessment gate against a scripted loopback judge.
+    #[doc(hidden)]
+    pub fn open_with_html_sync_test_boundaries(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        pack_root: Option<PathBuf>,
+        assessment_endpoints: AssessmentEndpoints,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            assessment_endpoints,
+            None,
+            None,
+            pack_root,
+        )
+    }
+
     /// Test composition seam with explicit assessment provider bases.
     ///
     /// Production uses [`Self::open`] with official bases. Tests pass loopback
@@ -256,10 +283,13 @@ impl DesktopHost {
         let mut html_sync = HtmlSyncRecoveryHost::new(recovery_store, candidate_root)
             .map_err(|error| error.to_string())?;
         for view in &project_views {
+            let dependencies = stored_settings(&store, view.project_id())
+                .map(|settings| discovered_dependencies(view.path().as_path(), &settings))
+                .unwrap_or_else(|| default_dependencies(view.path().as_path()));
             html_sync.register_project(
                 view.project_id(),
                 view.path().as_path(),
-                default_dependencies(view.path().as_path()),
+                dependencies,
             );
         }
         let mut html_sync_services = HtmlSyncServices::new(
@@ -465,11 +495,97 @@ impl DesktopHost {
         }
         // The app-lifetime H3 worker keeps ticking with no window and no
         // selected project. A restart latch prevents it from starting authoring.
-        if let Err(error) = self
+        match self
             .html_sync
             .pump(&mut self.runtime, &mut self.supervision)
         {
-            eprintln!("HTML_SYNC_PUMP_ERROR: {error}");
+            Ok(Some(tick)) => {
+                if let Some(candidate) = tick.candidate {
+                    // Verification/assessment/publication run only after the
+                    // exact candidate bytes are durably stored. A failure is
+                    // reported by the saved state, never by a fake synced flag.
+                    match self.html_sync_advance(&candidate.document) {
+                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::Publication(
+                            outcome,
+                        )) => {
+                            eprintln!(
+                                "HTML_SYNC_PIPELINE: document={} publication={outcome:?}",
+                                candidate.document.target_path()
+                            );
+                        }
+                        Ok(
+                            crate::html_sync::pipeline::PostCandidateOutcome::VerificationRejected {
+                                detail,
+                                fixable,
+                            },
+                        ) => {
+                            eprintln!(
+                                "HTML_SYNC_VERIFICATION_REJECTED: document={} fixable={fixable} detail={detail}",
+                                candidate.document.target_path()
+                            );
+                        }
+                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::FixableUnmet {
+                            conditions,
+                        }) => {
+                            eprintln!(
+                                "HTML_SYNC_FIXABLE_UNMET: document={} conditions={conditions:?}",
+                                candidate.document.target_path()
+                            );
+                        }
+                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::WaitingHuman {
+                            cause,
+                            detail,
+                        }) => {
+                            eprintln!(
+                                "HTML_SYNC_WAITING_HUMAN: document={} cause={cause:?} detail={detail}",
+                                candidate.document.target_path()
+                            );
+                        }
+                        Ok(crate::html_sync::pipeline::PostCandidateOutcome::Stale) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "HTML_SYNC_PIPELINE_ERROR: document={} detail={error}",
+                                candidate.document.target_path()
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("HTML_SYNC_PUMP_ERROR: {error}"),
+        }
+        // A companion edit that is not one of our own publication writes is an
+        // external conflict. It becomes waiting_human and is never overwritten.
+        for companion in self.html_sync.take_companions() {
+            if companion.file != herness_html_sync::observer::CompanionFileKind::Html
+                || companion.change != herness_html_sync::observer::CompanionChange::External
+            {
+                continue;
+            }
+            let project = companion.document.project_id();
+            let mut store = self.store_handle();
+            let Ok(Some(record)) = store.load_html_sync_document(project, &companion.document)
+            else {
+                continue;
+            };
+            if let Err(error) = herness_html_sync::record_external_html_conflict(
+                &mut store,
+                &record,
+                companion.digest.as_ref(),
+                Timestamp::now(),
+            ) {
+                eprintln!(
+                    "HTML_SYNC_CONFLICT_ERROR: document={} detail={error}",
+                    companion.document.target_path()
+                );
+            } else {
+                self.html_sync_mut()
+                    .seed_latch(
+                        companion.document.clone(),
+                        Some(herness_html_sync::CycleLatch::WaitingHuman),
+                        "the formal HTML changed outside H3",
+                    );
+            }
         }
         Ok(report)
     }
@@ -561,6 +677,265 @@ impl DesktopHost {
     /// Mutable H3 service composition for explicit trusted operations.
     pub fn html_sync_services_mut(&mut self) -> &mut HtmlSyncServices {
         &mut self.html_sync_services
+    }
+
+    /// Runs the real post-candidate verification, assessment and publication
+    /// path for one stored candidate.
+    ///
+    /// Every input is read from the exact private candidate store and current
+    /// project bytes. A missing render, pack, assessment host, or approval is an
+    /// explicit error. Only a completion-ready evaluation with a native render
+    /// reaches the Task 19 publication orchestrator.
+    pub fn html_sync_advance(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+    ) -> Result<crate::html_sync::pipeline::PostCandidateOutcome, String> {
+        self.html_sync_advance_attempt(document, false)
+    }
+
+    /// Runs the same verification/assessment path as an explicit human
+    /// regenerated replacement. The candidate must already be stored; the
+    /// publication path records the explicit-resolution journal marker.
+    pub fn html_sync_replace_with_candidate(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+    ) -> Result<crate::html_sync::pipeline::PostCandidateOutcome, String> {
+        self.html_sync_advance_attempt(document, true)
+    }
+
+    fn html_sync_advance_attempt(
+        &mut self,
+        document: &herness_html_sync::DocumentKey,
+        explicit: bool,
+    ) -> Result<crate::html_sync::pipeline::PostCandidateOutcome, String> {
+        use crate::html_sync::pipeline::{
+            self, AssessmentContext, HostFingerprints, PostCandidateOutcome,
+        };
+
+        let project = document.project_id();
+        let now = Timestamp::now();
+        if let Ok(Some(record)) = self.store_handle().load_html_sync_document(project, document)
+            && record.state().state() == herness_html_sync::H3State::Synced
+        {
+            return Err("the document is already synced; it is not re-verified or rewritten".to_owned());
+        }
+        let root = self
+            .html_sync
+            .project_root(project)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "the project is not registered with the H3 composition".to_owned())?;
+        let settings_record = self
+            .store_handle()
+            .load_html_sync_settings(project)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the project has no stored H3 settings".to_owned())?;
+        let settings = settings_record.settings().clone();
+        let approval = settings
+            .approval()
+            .cloned()
+            .ok_or_else(|| "the stored settings carry no human approval".to_owned())?;
+        let supervision_id = self
+            .html_sync_supervision_id(project)
+            .ok_or_else(|| "the project has no approved H2 target".to_owned())?;
+        let plan = crate::supervision::plan::load_plan(
+            &self.store_handle(),
+            project,
+            supervision_id,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
+        let context = AssessmentContext::from_plan(
+            project,
+            &plan,
+            approval.assessment().profile(),
+        )
+        .map_err(|error| error.to_string())?;
+        let files = crate::html_sync::publish::ProjectPublicationFiles::new(&root)
+            .map_err(|error| error.to_string())?;
+        let candidates = self.html_sync.candidate_store();
+        let dependencies = self.html_sync.dependencies(project);
+        let mut store = self.store_handle();
+        let mut prepared = pipeline::load_prepared(
+            &mut store,
+            &files,
+            &candidates,
+            &dependencies,
+            project,
+            document,
+        )
+        .map_err(|error| error.to_string())?;
+        let capture = HostFingerprints::capture(
+            &settings,
+            approval.versions().policy_fingerprint(),
+            approval.versions().pack_fingerprint(),
+            &prepared,
+            &context,
+        )
+        .map_err(|error| error.to_string())?;
+        let bridge = self
+            .html_sync_services
+            .policy_bridge(project, &root, &settings)?;
+        let render = self
+            .html_sync_services
+            .render_port()
+            .ok_or_else(|| "no real render port is installed".to_owned())?;
+        let verification = match pipeline::verify(
+            bridge.as_ref(),
+            render.as_ref(),
+            &prepared,
+            &context,
+            &capture,
+            now,
+        ) {
+            Ok(verification) => verification,
+            Err(error) => {
+                let _ = pipeline::mark_rejected(
+                    &mut store,
+                    &prepared,
+                    herness_html_sync::H3FailureCause::VerificationUnavailable,
+                    now,
+                );
+                return Ok(PostCandidateOutcome::VerificationRejected {
+                    detail: error.to_string(),
+                    fixable: false,
+                });
+            }
+        };
+        if !verification.is_usable() {
+            let (detail, fixable) = pipeline::verification_detail(&verification);
+            let _ = pipeline::mark_rejected(
+                &mut store,
+                &prepared,
+                herness_html_sync::H3FailureCause::CandidateRejected,
+                now,
+            );
+            return Ok(PostCandidateOutcome::VerificationRejected { detail, fixable });
+        }
+        let pack = verification
+            .pack
+            .clone()
+            .ok_or_else(|| "the verification produced no evidence pack".to_owned())?;
+        let record = pipeline::mark_assessing(&mut store, &prepared, now)
+            .map_err(|error| error.to_string())?;
+        prepared.record = record;
+
+        let persisted = pipeline::load_evidence(
+            self.html_sync_services.evidence_root(),
+            document,
+            prepared.generation.generation_id(),
+        )
+        .map_err(|error| error.to_string())?;
+        let assessment = self
+            .html_sync_services
+            .assessment_mut()
+            .ok_or_else(|| "the Html assessment host is not composed".to_owned())?;
+        assessment
+            .rehydrate_content(&persisted)
+            .map_err(|error| error.to_string())?;
+        let evaluation = match pipeline::assess(
+            assessment,
+            &pack,
+            &context,
+            supervision_id,
+            &verification,
+            &capture,
+            now,
+        ) {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let detail = error.to_string();
+                let lower = detail.to_ascii_lowercase();
+                let cause = if lower.contains("consent")
+                    || lower.contains("permission")
+                    || lower.contains("approval")
+                {
+                    herness_html_sync::HumanWaitCause::PermissionDenied
+                } else {
+                    herness_html_sync::HumanWaitCause::UndecidableAssessment
+                };
+                let _ = pipeline::mark_waiting(
+                    &mut store,
+                    &prepared,
+                    cause,
+                    vec![herness_html_sync::RequiredAction::ReassessCandidate],
+                    now,
+                );
+                return Ok(PostCandidateOutcome::WaitingHuman { cause, detail });
+            }
+        };
+        let content = assessment.content().clone();
+        pipeline::persist_evidence(
+            self.html_sync_services.evidence_root(),
+            document,
+            prepared.generation.generation_id(),
+            &content,
+        )
+        .map_err(|error| error.to_string())?;
+
+        use herness_html_sync::EvaluationDispositionState;
+        match evaluation.disposition().state() {
+            EvaluationDispositionState::CompletionReady => {
+                let policy = pipeline::policy_identity(&settings)
+                    .map_err(|error| error.to_string())?;
+                let attempt =
+                    pipeline::publication_attempt(&files, &prepared, &evaluation, &policy, now)
+                        .map_err(|error| error.to_string())?;
+                let attempt = if explicit {
+                    attempt.with_explicit_resolution()
+                } else {
+                    attempt
+                };
+                let services = &mut self.html_sync_services;
+                let recovery = &mut self.html_sync;
+                let operations = services
+                    .ensure_operations(project, &root)?;
+                let published = recovery
+                    .with_publication_expectations(project, |expectations| {
+                        if explicit {
+                            operations
+                                .replace_with_regenerated(attempt, expectations, now)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            operations
+                                .publish(attempt, expectations, now)
+                                .map_err(|error| error.to_string())
+                        }
+                    })
+                    .ok_or_else(|| {
+                        "the project has no observer for publication expectations".to_owned()
+                    })??;
+                Ok(PostCandidateOutcome::Publication(published))
+            }
+            EvaluationDispositionState::FixableUnmet => {
+                let conditions = evaluation.disposition().fixable_conditions().to_vec();
+                let _ = pipeline::mark_rejected(
+                    &mut store,
+                    &prepared,
+                    herness_html_sync::H3FailureCause::CandidateRejected,
+                    now,
+                );
+                Ok(PostCandidateOutcome::FixableUnmet { conditions })
+            }
+            EvaluationDispositionState::WaitingHuman => {
+                let detail = evaluation
+                    .disposition()
+                    .waiting_human_reasons()
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "the Html assessment needs a human".to_owned());
+                let _ = pipeline::mark_waiting(
+                    &mut store,
+                    &prepared,
+                    herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                    vec![herness_html_sync::RequiredAction::ReassessCandidate],
+                    now,
+                );
+                Ok(PostCandidateOutcome::WaitingHuman {
+                    cause: herness_html_sync::HumanWaitCause::UndecidableAssessment,
+                    detail,
+                })
+            }
+        }
     }
 
     /// Requests a cooperative stop for one project's active H3 authoring run.
@@ -906,16 +1281,23 @@ impl DesktopHost {
         }
         let Self {
             runtime,
+            store,
             html_sync,
             ..
         } = self;
         let view = runtime
             .open_project(&project)
             .map_err(|error| error.to_string())?;
+        let dependencies = StoreHandle::new(Arc::clone(store))
+            .load_html_sync_settings(view.project_id())
+            .ok()
+            .flatten()
+            .map(|record| discovered_dependencies(project.as_path(), record.settings()))
+            .unwrap_or_else(|| default_dependencies(project.as_path()));
         html_sync.register_project(
             view.project_id(),
             project.as_path(),
-            default_dependencies(project.as_path()),
+            dependencies,
         );
         Ok(view)
     }
@@ -1030,6 +1412,127 @@ fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
         dependencies.push(dependency);
     }
     dependencies
+}
+
+fn stored_settings(
+    store: &Arc<std::sync::Mutex<herness_store::Store>>,
+    project: ProjectId,
+) -> Option<herness_html_sync::H3Settings> {
+    store
+        .lock()
+        .ok()?
+        .load_html_sync_settings(project)
+        .ok()
+        .flatten()
+        .map(|record| record.settings().clone())
+}
+
+/// Discovers the shared CSS plus every local `src`/`href` resource referenced
+/// by each approved Target's current HTML companion.
+///
+/// Paths are canonical project-relative values; absolute URLs, fragments, and
+/// data URLs are ignored. A referenced path that escapes the project or does
+/// not exist is not registered and is therefore never treated as a dependency
+/// change. This makes recovery/dependency reconciliation cover real resources
+/// rather than only the shared stylesheet.
+pub fn discovered_dependencies(
+    root: &Path,
+    settings: &herness_html_sync::H3Settings,
+) -> Vec<DependencyPath> {
+    let mut dependencies = default_dependencies(root);
+    let mut seen = dependencies
+        .iter()
+        .map(|dependency| dependency.path().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for target in settings.target_paths() {
+        let Ok(document) = herness_html_sync::DocumentKey::new(settings.project_id(), target.clone())
+        else {
+            continue;
+        };
+        let companion = document.companion_path();
+        let Ok(text) = std::fs::read_to_string(root.join(&companion)) else {
+            continue;
+        };
+        for reference in local_references(&text) {
+            if dependencies.len() >= 64 {
+                break;
+            }
+            if reference.ends_with(".css") || reference.ends_with(".md") || reference.ends_with(".html")
+            {
+                continue;
+            }
+            let Some(relative) = resolve_reference(&companion, &reference) else {
+                continue;
+            };
+            if !seen.insert(relative.clone()) {
+                continue;
+            }
+            let path = canonical_root.join(&relative);
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(canonical) = std::fs::canonicalize(&path)
+                && !canonical.starts_with(&canonical_root)
+            {
+                continue;
+            }
+            if let Ok(dependency) =
+                DependencyPath::new(relative, DependencyKind::Resource)
+            {
+                dependencies.push(dependency);
+            }
+        }
+    }
+    dependencies
+}
+
+fn local_references(html: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for (marker, attribute) in [("src=\"", "\""), ("href=\"", "\"")] {
+        let mut rest = html;
+        while let Some(position) = rest.find(marker) {
+            rest = &rest[position + marker.len()..];
+            let Some(end) = rest.find(attribute) else {
+                break;
+            };
+            let value = &rest[..end];
+            if !value.starts_with("http:")
+                && !value.starts_with("https:")
+                && !value.starts_with("data:")
+                && !value.starts_with('#')
+                && !value.starts_with("mailto:")
+                && !value.starts_with('/')
+            {
+                references.push(value.to_owned());
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn resolve_reference(companion: &str, reference: &str) -> Option<String> {
+    let parent = Path::new(companion).parent()?;
+    let mut components = Vec::new();
+    for component in parent.components() {
+        if let std::path::Component::Normal(part) = component {
+            components.push(part.to_string_lossy().into_owned());
+        }
+    }
+    for part in reference.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            part if part.contains('\\') => return None,
+            part => components.push(part.to_owned()),
+        }
+    }
+    Some(components.join("/"))
 }
 
 /// Finds the H2 target whose plan owner matches the human H3 owner binding.

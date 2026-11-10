@@ -27,7 +27,9 @@ use herness_html_sync::{
 };
 use herness_supervision::owner_launch::{OwnerApprovalRegistryPort, authorize_owner_launch};
 use herness_supervision::{
+    ApprovalActor, ConsentId, DisclosureConsent, DisclosureScope,
     ProfilePurpose, StopCause, SupervisionId, SupervisionRequestId, SupervisionState,
+    TargetVersion,
 };
 
 use crate::host::DesktopRuntime;
@@ -464,6 +466,131 @@ impl SupervisionAuthoringControl<'_> {
         Ok(authorize_owner_launch(self.registry, &binding, self.now)?)
     }
 
+    /// Reissues the completion and Html consents for one exact approved
+    /// Target set at the new H2 target version.
+    ///
+    /// This is host-only. It never widens the Target set, data kinds, origin,
+    /// or purpose, and it records the previous/new version and the exact set in
+    /// host state. A missing human H3 approval or any expanded scope is an
+    /// explicit error before the supersession starts.
+    fn reissue_range_consent(
+        &mut self,
+        project: ProjectId,
+        supervision: SupervisionId,
+        target_version: TargetVersion,
+    ) -> Result<(), H3Error> {
+        let settings = self
+            .store
+            .lock()
+            .load_html_sync_settings(project)?
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.consent.settings".to_owned(),
+                detail: "the project has no stored H3 settings".to_owned(),
+            })?
+            .settings()
+            .clone();
+        if !settings.verify_fingerprint() || !settings.enabled() {
+            return Err(H3Error::Unavailable {
+                capability: "h3.consent.approval".to_owned(),
+                detail: "the stored H3 settings are disabled or tampered".to_owned(),
+            });
+        }
+        let approval = settings.approval().cloned().ok_or_else(|| H3Error::Unavailable {
+            capability: "h3.consent.approval".to_owned(),
+            detail: "the stored settings carry no human range approval".to_owned(),
+        })?;
+        if !approval.is_current_at(self.now) {
+            return Err(H3Error::Unavailable {
+                capability: "h3.consent.approval".to_owned(),
+                detail: "the human range approval is revoked, superseded, or expired".to_owned(),
+            });
+        }
+        let mut config = self.supervision.config().get(project);
+        for (purpose, approved) in [
+            (ProfilePurpose::Completion, approval.authoring()),
+            (ProfilePurpose::Html, approval.assessment()),
+        ] {
+            let Some(current) = config.consent(purpose).cloned() else {
+                return Err(H3Error::Unavailable {
+                    capability: "h3.consent".to_owned(),
+                    detail: format!("no {} consent is configured", purpose.as_str()),
+                });
+            };
+            if !matches!(
+                current.state(),
+                herness_supervision::ConsentState::Granted { .. }
+            ) {
+                return Err(H3Error::Unavailable {
+                    capability: "h3.consent".to_owned(),
+                    detail: format!("the {} consent is revoked", purpose.as_str()),
+                });
+            }
+            let disclosure = approved.disclosure();
+            if current.scope().targets() != disclosure.targets()
+                || current.scope().data_kinds() != disclosure.data_kinds()
+                || current.origin() != approved.origin()
+            {
+                return Err(H3Error::Unavailable {
+                    capability: "h3.consent.scope".to_owned(),
+                    detail: format!(
+                        "reissuing {} consent would expand the human-approved Target set, data kinds, or origin",
+                        purpose.as_str()
+                    ),
+                });
+            }
+            let scope = DisclosureScope::new(
+                purpose,
+                current.scope().data_kinds().clone(),
+                current.scope().targets().to_vec(),
+                target_version,
+            )
+            .map_err(H3Error::from)?;
+            let consent = DisclosureConsent::grant(
+                ApprovalActor::Human,
+                ConsentId::new(project),
+                current.origin().clone(),
+                scope,
+                self.now,
+            )
+            .map_err(H3Error::from)?;
+            config.set_consent(consent);
+            let record = serde_json::json!({
+                "schema": "h3-range-consent-reissue-v1",
+                "projectId": project,
+                "supervisionId": supervision,
+                "purpose": purpose.as_str(),
+                "previousTargetVersion": current.target_scope_version().get(),
+                "targetVersion": target_version.get(),
+                "targets": current.scope().targets(),
+                "dataKinds": current.scope().data_kinds(),
+                "origin": current.origin().to_string(),
+                "approvalId": approval.approval_id(),
+                "reissuedAt": self.now,
+            });
+            let bytes = serde_json::to_vec(&record).map_err(|error| H3Error::Storage {
+                detail: format!("consent reissue record: {error}"),
+            })?;
+            let key = format!(
+                "h3.consent.reissue:{}:{}:{}",
+                project,
+                purpose.as_str(),
+                target_version.get()
+            );
+            self.store
+                .lock()
+                .save_host_state(&key, &bytes)
+                .map_err(|error| H3Error::Storage {
+                    detail: format!("consent reissue record: {error}"),
+                })?;
+        }
+        self.supervision.config().set(project, config);
+        self.supervision
+            .config()
+            .persist(&self.store, project)
+            .map_err(H3Error::from)?;
+        Ok(())
+    }
+
     fn read_candidate(&self, active: &ActiveOwner) -> Result<CandidateAuthored, H3Error> {
         let mut store = self.candidate_store.clone();
         let html = store
@@ -738,6 +865,11 @@ impl AuthoringControlPort for SupervisionAuthoringControl<'_> {
     fn supersede(&mut self, request: &OwnerSupersedeRequest) -> Result<OwnerStarted, H3Error> {
         let project = request.job().project_id();
         let supervision = request.job().supervision_id();
+        // A source change advances the H2 target version. The human H3 range
+        // approval already covers the exact Target set; reissue the purpose
+        // consents for that same set at the new target version and record it.
+        // Any target/kind/origin expansion is refused before the supersession.
+        self.reissue_range_consent(project, supervision, request.target_version())?;
         let (handle, storage) = self.open_candidate_for(
             request.document(),
             request.job(),
