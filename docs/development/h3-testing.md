@@ -285,3 +285,59 @@ cargo test -p herness-html-sync-tests --test evaluation --locked
 ```
 
 Task 24実行時は `6 passed, 0 failed`。real pack presentのため `source-units` とstructural `candidate-check` も実行し、全正例がallow、宣言したstatic負例がdenyであることを確認した。外部requestは0。
+
+## H3受入（Task 25、Phase A）
+
+受入の詳細な証跡は [H3 acceptance](../research/2026-11-09-h3-acceptance.md) に保存する。この節は再現コマンドと現在の状態だけを記録する。
+
+### revision
+
+- herness: `127f1b1bdb0dbd2224098d669f4ad78a55894e47`（code tree。機能変更は`cc612f6`、formatのみの`127f1b1`）
+- Common SDD pack: `/Users/h-uma/Documents/sdd` HEAD `601ebed9c02828373d9851cc01ea45b8c097ac7b`（read-only、clean）
+- 環境: macOS 27.2（26B123）、Mac17,3（Apple M5）、arm64、16 GiB、`rustc/cargo 1.97.1`、debug build
+
+### 実行コマンドと結果
+
+worktree rootで実行する。Cargoはすべて`--locked`。
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build -p herness-desktop --locked
+cargo test -p herness-html-sync-tests --test native_lifecycle --locked -- --nocapture
+```
+
+| command | result |
+| --- | --- |
+| `cargo fmt --all -- --check` | 0。既存66ファイルのformat差分を`127f1b1`で別commitにした後は差分なし |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0。warningなし |
+| `cargo test --workspace --locked` | **875 passed, 0 failed, 4 ignored**（54 test target + 10 doc-test target）。ignoredはmanual RSS 1件と実接続3件 |
+| `cargo test -p herness-html-sync-tests --locked` | **184 passed, 0 failed**。native_lifecycle 1件を含む |
+| `cargo build -p herness-desktop --locked` | 0。`Finished dev profile` |
+| pack `uvx --from pytest pytest -q` | **372 passed in 24.58s**。`python3 -m pytest -q`はsystem Pythonにpytestがないため同じsuiteを`uvx`で実行 |
+| `python3 /Users/h-uma/Documents/sdd/scripts/html-docs validate ...` | H3 spec/planとpack ADR 0002が`decision=allow`。Target Markdown/`.html`は両repoとも未変更のため`check --paths`の対象なし |
+
+### H3 native lifecycle fixture
+
+`tests/html-sync/tests/native_lifecycle.rs` は、実SQLiteへpending H3 cycleをseedし、実`target/debug/herness-desktop`を新しい絶対`HERNESS_APP_DATA_ROOT`で起動する。`--h3-lifecycle-test`はmain windowを作らずprojectも選択しない。startup restoreとhost pumpだけを実行し、`H3_LIFECYCLE_OK: ... projects=1 bound=... failures=0 request_count=0 window=absent selected_project=none`を要求する。同じrootで2回目の起動（restore）と`--quit-test`（実quit hook）も行い、`WaitingHuman`/`RecoveryReconciliation` latchとrequest 0をstoreで確認する。fixtureはprocess/lifecycleの証拠であり、provider接続や人間のGUI操作の証拠ではない。
+
+実Tauriのsmoke/close-reopen/quitは、fresh absolute rootで次を確認した。
+
+```sh
+HERNESS_APP_DATA_ROOT=<fresh>/smoke target/debug/herness-desktop --smoke-test
+HERNESS_APP_DATA_ROOT=<fresh>/close-reopen target/debug/herness-desktop --close-reopen-test
+HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
+```
+
+結果は`SMOKE_OK`、`CLOSE_REOPEN_OK`、`QUIT_OK save=confirmed stop=confirmed`。いずれもexit 0、stderr空。H3 stateを含むrootでは`--h3-lifecycle-test`と`--quit-test`をfixtureが実行する。
+
+### 既知のflake
+
+最終workspaceはgreenだが、途中でH2のloopback/parallel-load flakeを2件観測した。`production_permission_profile_runs_the_real_evaluator_and_charges_the_shared_ledger`の`EvaluatorFailure::Unavailable`と、`permission_evaluator_failures_are_sanitized_and_never_allow`のrequest数不足である。どちらも単独再実行と最終workspaceで合格し、assertは変更していない。H3起因ではない。
+
+### Phase B gate（`not_run`）
+
+通常LLM・Jev・Decisionsの実文書評価と人間の読解観測は**未許可・未実行**である。実行前にcontrollerが接続（provider/endpoint/model/auth/origin/connection ID）、exact fixtureと`dataKinds`（text/image）、送信bytes分類、有限要求数と同一接続retry、60秒timeout、料金上限/`PriceVersion`または課金なしの保証、quota、許可範囲・期限、sanitized evidence、人間観測のobserver/文書版/課題を提示し、別途の人間許可を得る。許可がない限り実Keychain・login・providerへ接続しない。Phase Bの結果をscripted judgeやnative lifecycleで代用しない。Jevの画像上限は未確認で、不足・超過は`WaitingHuman`/`insufficient`にする。
+
+H1/H2の未確認（OpenAI/Anthropic APIキー経路、通常LLM/Decisions実接続、Jev標準permission auto-allow、実Tauri GUI手動操作、閾値の実model妥当性）はH3でも未確認のままである。Phase Aは合格だが、Phase Bまたは受入範囲の再合意がない限り**H3全体を完了にしない**。
