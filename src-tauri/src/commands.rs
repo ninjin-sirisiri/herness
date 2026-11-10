@@ -459,7 +459,11 @@ pub fn chatgpt_login_status(
 }
 
 /// Lists the selected ChatGPT account's model catalog.
-#[tauri::command(async)]
+///
+/// The probe creates and drives its own Tokio runtime. Running it on Tauri's
+/// async worker would panic with a nested-runtime error, so this command is
+/// intentionally synchronous and blocks only the trusted catalog request.
+#[tauri::command]
 pub fn chatgpt_models(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,

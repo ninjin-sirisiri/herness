@@ -1060,11 +1060,21 @@ impl TransportInner {
                     return Err(AssessmentError::new(AssessmentErrorKind::RequestRejected)
                         .with_status(status));
                 }
+                let is_event_stream = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("text/event-stream"));
                 let body = read_body(response).await?;
                 if body.is_empty() {
                     return Err(AssessmentError::new(AssessmentErrorKind::InvalidResponse)
                         .with_status(status));
                 }
+                let body = if is_event_stream || looks_like_sse(&body) {
+                    collapse_openai_responses_stream(&body)?
+                } else {
+                    body
+                };
                 Ok(AssessmentResponse {
                     status,
                     attempts: 0,
@@ -1156,6 +1166,60 @@ fn response_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     let seconds = value.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+fn looks_like_sse(body: &[u8]) -> bool {
+    body.starts_with(b"event:") || body.starts_with(b"data:")
+}
+
+/// Collapses an OpenAI Responses SSE stream into its final response object.
+///
+/// ChatGPT-login connections require `stream: true`. Only a terminal
+/// `response.completed` event is success; a failed/incomplete stream or a
+/// stream that ends without completion is an invalid response.
+fn collapse_openai_responses_stream(body: &[u8]) -> Result<Vec<u8>, AssessmentError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?;
+    let mut event_name: Option<&str> = None;
+    let mut completed: Option<Value> = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(name) = line.strip_prefix("event:") {
+            event_name = Some(name.trim());
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .or(event_name)
+            .unwrap_or_default();
+        match kind {
+            "response.completed" => {
+                let response = value
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| value.clone());
+                completed = Some(response);
+            }
+            "response.failed" | "response.incomplete" => {
+                return Err(AssessmentError::new(AssessmentErrorKind::InvalidResponse));
+            }
+            _ => {}
+        }
+    }
+    let response =
+        completed.ok_or_else(|| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?;
+    serde_json::to_vec(&response).map_err(|_| AssessmentError::new(AssessmentErrorKind::Internal))
 }
 
 async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, AssessmentError> {
@@ -1331,6 +1395,40 @@ mod tests {
             )
             .is_err(),
             "credential-bearing URL must be rejected"
+        );
+    }
+
+    #[test]
+    fn openai_responses_sse_uses_the_completed_response_only() {
+        let body = br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp-1","output":[],"output_text":"{}"}}
+
+"#;
+        let collapsed = collapse_openai_responses_stream(body).expect("completed stream");
+        let value: Value = serde_json::from_slice(&collapsed).expect("response JSON");
+        assert_eq!(value["id"].as_str(), Some("resp-1"));
+
+        let failed = br#"event: response.failed
+data: {"type":"response.failed","response":{"id":"resp-2"}}
+
+"#;
+        assert_eq!(
+            collapse_openai_responses_stream(failed).unwrap_err().kind(),
+            AssessmentErrorKind::InvalidResponse
+        );
+
+        let missing = br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+"#;
+        assert_eq!(
+            collapse_openai_responses_stream(missing)
+                .unwrap_err()
+                .kind(),
+            AssessmentErrorKind::InvalidResponse
         );
     }
 }

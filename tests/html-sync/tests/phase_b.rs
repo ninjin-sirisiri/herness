@@ -1734,7 +1734,8 @@ impl RealPhaseBDriver {
         .map_err(assessment_refusal)?
         .with_retry_policy(RetryPolicy::h2_default());
         Ok(NormalLlmRuntime {
-            adapter: LlmAssessmentAdapter::new(transport, Arc::new(SystemClock)),
+            adapter: LlmAssessmentAdapter::new(transport, Arc::new(SystemClock))
+                .with_streaming(true),
             entry,
             thresholds: ProfileThresholds::normal_llm(),
             _login: login,
@@ -2449,7 +2450,16 @@ fn execute_phase_b(
     let mut rows = Vec::new();
     let mut stopped_calls = BTreeMap::<(usize, usize, Method), String>::new();
 
+    let method_filter = env::var("H3_PHASE_B_METHODS").ok();
     for call in &plan.calls {
+        if let Some(filter) = &method_filter
+            && !filter
+                .split(',')
+                .map(str::trim)
+                .any(|method| method == call.method.id())
+        {
+            continue;
+        }
         let fixture_attempts = *per_fixture_attempts.get(&call.fixture_id).unwrap_or(&0);
         if stop_reason.is_none() {
             if Instant::now() >= deadline {

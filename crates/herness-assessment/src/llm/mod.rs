@@ -274,13 +274,27 @@ impl LlmAssessment {
 pub struct LlmAssessmentAdapter {
     transport: AssessmentTransport,
     clock: Arc<dyn ClockPort + Send + Sync>,
+    streaming: bool,
 }
 
 impl LlmAssessmentAdapter {
     /// Creates an adapter that uses the exact connection selected by the
     /// profile and the injected host clock.
     pub fn new(transport: AssessmentTransport, clock: Arc<dyn ClockPort + Send + Sync>) -> Self {
-        Self { transport, clock }
+        Self {
+            transport,
+            clock,
+            streaming: false,
+        }
+    }
+
+    /// Enables the OpenAI Responses streaming transport required by
+    /// ChatGPT-login connections. The final `response.completed` event is
+    /// collapsed back into the ordinary response shape before parsing.
+    #[must_use]
+    pub const fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
     }
 
     /// Assesses exactly one condition using exactly the supplied evidence.
@@ -310,6 +324,7 @@ impl LlmAssessmentAdapter {
             request,
             evidence,
             preflight.native_structured_output,
+            self.streaming,
         )?;
         let mut transport_request = TransportRequest::new(
             entry.profile().connection(),

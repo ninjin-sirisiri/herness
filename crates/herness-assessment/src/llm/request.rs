@@ -74,6 +74,7 @@ pub(crate) fn build(
     request: &AssessmentRequest,
     evidence: &[EvidenceDocument],
     native_structured_output: bool,
+    streaming: bool,
 ) -> Result<Value, AssessmentError> {
     let payload = serde_json::to_string(&user_payload(request, evidence))
         .map_err(|_| AssessmentError::new(AssessmentErrorKind::Internal))?;
@@ -83,6 +84,7 @@ pub(crate) fn build(
             &payload,
             evidence,
             native_structured_output,
+            streaming,
         )),
         Route::AnthropicMessages => Ok(anthropic_messages(profile, &payload, evidence)),
         Route::OpenAiCompletions => Ok(openai_completions(
@@ -125,6 +127,7 @@ fn openai_responses(
     payload: &str,
     evidence: &[EvidenceDocument],
     native_structured_output: bool,
+    streaming: bool,
 ) -> Value {
     let mut content = vec![json!({"type": "input_text", "text": payload})];
     for document in evidence {
@@ -151,6 +154,9 @@ fn openai_responses(
                 "strict": true,
             }
         });
+    }
+    if streaming {
+        body["stream"] = json!(true);
     }
     body
 }

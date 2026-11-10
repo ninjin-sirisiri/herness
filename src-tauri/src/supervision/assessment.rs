@@ -81,6 +81,17 @@ impl AssessmentHost {
             == Some(AssessmentGateway::CommandCode)
     }
 
+    /// Whether this connection's Responses route requires SSE streaming.
+    ///
+    /// ChatGPT-login connections reject a non-streaming Responses request with
+    /// HTTP 400 (`Stream must be set to true`). API-key connections keep the
+    /// ordinary non-streaming request.
+    pub fn requires_streaming(&self, connection: herness_core::ConnectionId) -> bool {
+        self.directory
+            .get(connection)
+            .is_ok_and(|settings| settings.auth_method() == herness_core::AuthMethod::ChatGptLogin)
+    }
+
     /// Assessment provider bases for one connection.
     ///
     /// Direct providers use the host's official/loopback endpoints; a Command
@@ -624,7 +635,16 @@ impl ConditionAssessmentPort for HostAssessmentPort {
         let clock: Arc<dyn herness_supervision::ClockPort + Send + Sync> = Arc::new(HostClock);
         let result = match configured.profile.provider() {
             herness_supervision::ProviderKind::NormalLlm => {
-                LlmAssessmentAdapter::new(transport, clock)
+                let adapter = LlmAssessmentAdapter::new(transport, clock);
+                let adapter = if self
+                    .host
+                    .requires_streaming(configured.profile.connection())
+                {
+                    adapter.with_streaming(true)
+                } else {
+                    adapter
+                };
+                adapter
                     .assess(request, &entry, &documents, control)
                     .map_err(assessment_error)
                     .map(|assessment| assessment.into_result())
