@@ -336,8 +336,54 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 最終workspaceはgreenだが、途中でH2のloopback/parallel-load flakeを2件観測した。`production_permission_profile_runs_the_real_evaluator_and_charges_the_shared_ledger`の`EvaluatorFailure::Unavailable`と、`permission_evaluator_failures_are_sanitized_and_never_allow`のrequest数不足である。どちらも単独再実行と最終workspaceで合格し、assertは変更していない。H3起因ではない。
 
-### Phase B gate（`not_run`）
+### Phase B gate（`not_run`、実行runbook）
 
-通常LLM・Jev・Decisionsの実文書評価と人間の読解観測は**未許可・未実行**である。実行前にcontrollerが接続（provider/endpoint/model/auth/origin/connection ID）、exact fixtureと`dataKinds`（text/image）、送信bytes分類、有限要求数と同一接続retry、60秒timeout、料金上限/`PriceVersion`または課金なしの保証、quota、許可範囲・期限、sanitized evidence、人間観測のobserver/文書版/課題を提示し、別途の人間許可を得る。許可がない限り実Keychain・login・providerへ接続しない。Phase Bの結果をscripted judgeやnative lifecycleで代用しない。Jevの画像上限は未確認で、不足・超過は`WaitingHuman`/`insufficient`にする。
+通常LLM・Jev・Decisionsの実文書評価と人間の読解観測は**未許可・未実行**である。記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
+
+**接続（人間が別々に選択、現在verifiedのものだけ）**
+
+| role | provider/endpoint | model | auth |
+| --- | --- | --- | --- |
+| normal LLM | OpenAI Responses / Anthropic Messages / OpenAI-compatibleのうち1つ | 選択model（version固定） | API key |
+| Jev | TypeSafe System One直接、または固定Command Code gatewayのうち1つ | `jev-1.14.0` / `typesafe/jev-1.14.0` | TypeSafe key / Command Code key |
+| Decisions | OpenAI `/v1/decisions` | `gpt-6-luna` | OpenAI API key |
+
+各接続は`connectionId`、`endpointClass`、origin、model、`verified=true`、`consentGranted=true`、purpose=assessmentを要求する。fallback・自動切替・ChatGPT loginのDecisions流用を禁止する。
+
+**fixtureとbytes**
+
+- 4文書（glossary / ADR / spec / plan）、5 positives（4 primary + 1 alternate false-stop probe）、22 negatives、27 cases。
+- source 1,527 bytes、candidate HTML 151,484 bytes。`dataKinds`は全case `["text"]`。image/PNG bytesは0。
+- fixture IDとsource digestは`eval-glossary-001` `sha256:0e3826...`、`eval-adr-001` `sha256:73373a...`、`eval-spec-001` `sha256:eba573...`、`eval-plan-001` `sha256:eb3059...`。caseごとのcandidate bytes/digestはtemplateに固定。
+- `fixtureVersion=1`、`targetVersion=1`（評価用fixtureの版。H2の実Targetではない）。評価fixtureはrepository Targetを変更しない。
+
+**request plan**
+
+- 4条件（information/support/usability/render）×27 cases = **108 requests/method**。
+- normal LLM 108 + Jev 108 + Decisions 108 = **324 first attempts**。warm-up/authoring 0。
+- retryは同一接続で最大2回（attempts=3）、1秒→2秒+jitter。429/5xx/connection resetだけ。timeout/send unknown/low confidence/auth/invalid responseはretryしない。60秒timeout。worst case 972 attempts、推奨`maxRequests=972` / `perFixtureMax=36`。
+- 7,200秒累積active、追加run 30回、3回連続停滞の上限を維持し、fixture追加・世代交代・再起動でリセットしない。
+
+**費用・gate**
+
+- `feeCapUsd`/`priceVersion`または承認済みquota path、`quotaLabel`、`quotaConfirmed`が必要。現在のdesktop compositionは`NoPriceEstimator`のため、money cap付き送信はestimateなしで**送信前に拒否**される。ダミーestimateを追加しない。money cap付きで実行するには別途承認されたprice estimatorが必要である。
+- 送信前gateはconnection（3 role）、exact fixtures/dataKinds、finite request budget、retry policy、fee/quota、approver/time、scope/期限のすべてを要求し、欠落時は不足fieldを列挙して送信0で拒否する。
+- 既存の`tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval`が、provider/connectionId/endpointClass/model、fixtures、dataKinds、maxRequests/perFixtureMax、retry、fee/quota、approvedBy/approvedAtの欠落を拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runnerはこのgateを3接続へ拡張して再利用する。production runnerはまだ実装していない。
+
+**人間観測**
+
+`human-observation.template.json`を使い、4 fixture×1 record（8 reading tasks）を作る。observer/role/independent、documentVersion.sourceDigest/fixtureVersion、method/provider/profile/model、startedAt/durationSeconds、readingTasksのcorrect/answer/wrongAnswer、wrongAnswers、difficultyNotes、assistance、resultをrun後にだけ記入する。合成結果を入れない。
+
+**実行順序（許可後）**
+
+1. 3接続を選択しverified/consent/origin/modelを確認する。
+2. templateをコピーし、exact fixtures/dataKinds/bytes、budget、retry、fee/quota、approver/time、期限、観測計画を記入する。
+3. preflightが全field・要求数・bytes・費用/枠を表示し、欠落時は送信0で停止する。
+4. 承認範囲内で3方式を実行し、retryは同一接続・上限内だけ。
+5. 要求数/usage/model/判定/保留/誤停止/失敗/revisionをsanitized evidenceへ保存する。
+6. 人間が4文書を読み、4 recordsを記入する。
+7. 未完了・失敗・未確認を成功として丸めない。
+
+許可がない限り実Keychain・login・providerへ接続しない。Phase Bの結果をscripted judgeやnative lifecycleで代用しない。Jevの画像上限は未確認で、不足・超過は`WaitingHuman`/`insufficient`にする。
 
 H1/H2の未確認（OpenAI/Anthropic APIキー経路、通常LLM/Decisions実接続、Jev標準permission auto-allow、実Tauri GUI手動操作、閾値の実model妥当性）はH3でも未確認のままである。Phase Aは合格だが、Phase Bまたは受入範囲の再合意がない限り**H3全体を完了にしない**。

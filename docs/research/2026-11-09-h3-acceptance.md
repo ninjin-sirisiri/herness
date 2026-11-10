@@ -92,17 +92,108 @@
 
 「誤同期0」は各負例がreceiptを作らないこと、またはexternal conflict/waiting/failedで止まることで確認する。負例がformal HTMLを書いたtestはない。
 
-## Phase B: `not_run`（未許可）
+## Phase B: `not_run`（未許可・実行runbook）
 
-Phase Bは、controllerが次の情報を人間へ提示し、対象・データ・上限・費用について**別途の明示許可**を得た場合だけ実行できる。今回は許可がないため、実provider・実Keychain・実login・実accountへ一切接続せず、`not_run`のまま残す。
+Phase Bは、controllerが次の情報を人間へ提示し、対象・データ・上限・費用について**別途の明示許可**を得た場合だけ実行する。今回は許可がないため、実provider・実Keychain・実login・実accountへ一切接続せず、`not_run`のまま残す。
 
-1. **接続:** provider、endpoint class、connection ID、model ID/version、認証方式、origin、接続の由来。許可された接続だけを列挙し、fallbackを禁止する。
-2. **fixtureと送信bytes:** Task 24のexact fixture IDとexact `dataKinds`（text/image）。送信本文の分類、target scope、repository外fixtureであること。imageを追加する場合は実bytesとサイズ上限も提示する。
-3. **有限要求:** fixture別・経路別の要求数、attempt上限、同一接続だけのretry、60秒timeout、全体の停止条件。無制限再試行と自動再評価をしない。
-4. **費用・枠:** 金額上限（USD）と`PriceVersion`、または課金なしを保証する隔離手段、quota label/確認。見積不能な経路は人間の明示許可がない限り使わない。
-5. **許可範囲・期限:** 許可された接続・fixture・要求数・費用・期間を記録し、範囲外は拒否する。secretを含めない。
-6. **証拠:** 要求数、usage、返却model ID、閾値結果、失敗理由、対象revision、未確認範囲をsanitized evidenceとして保存する。provider本文・credential・Authorization・生URL・secretを保存しない。
-7. **人間観測:** 観測者、独立性、文書版、読解課題、正誤、誤答、所要時間、困難点、assistanceを`human-observation.template.json`へ記録する。観測結果を合成しない。
+Phase Bの記入用テンプレートは `tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`（`status: not_run`、`externalRequests: 0`、credentialなし）。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残し、Phase Bのexact fixture/case/bytes/request planは新しいテンプレートに固定する。テンプレートは**承認ではない**。`approvedBy`/`approvedAt`/接続/予算/費用/枠を人間が埋め、別途の許可を記録するまで送信しない。
+
+### B.1 必須接続（人間が選択・現在verifiedのものだけ）
+
+| role | provider / endpoint | model | auth | 要件 |
+| --- | --- | --- | --- | --- |
+| normal LLM | OpenAI Responses、Anthropic Messages、またはOpenAI-compatible。人間が1つを選択 | 選択したmodel ID（version固定） | API key | `connectionId`、`endpointClass`、origin、model、`verified=true`、`consentGranted=true`、purpose=assessment。fallback禁止 |
+| Jev | TypeSafe System One（直接）または固定Command Code gateway。人間が1つを選択 | 直接は`jev-1.14.0`、gatewayは`typesafe/jev-1.14.0`固定 | API key（直接はTypeSafe key、gatewayはCommand Code key） | `verified=true`、`consentGranted=true`、purpose=assessment。direct/gatewayの自動切替禁止 |
+| Decisions | OpenAI `POST /v1/decisions`（API key） | `gpt-6-luna` | OpenAI API key | `verified=true`、`consentGranted=true`、purpose=assessment。ChatGPT loginを流用しない |
+
+- 3接続はいずれも**人間が別々に選択**し、現在のprofile/consentがverified/grantedであることをpreflightで再確認する。未verified・consentなし・origin不一致・model不一致は送信前に拒否する。
+- 同じ接続を複数roleへ使い回さない。許可された接続以外へのfallback、自動再選択、別modelへの切替をしない。
+- 接続ID・model・originは承認記録へ保存するが、API key/Authorization/Keychain値は保存しない。
+
+### B.2 固定評価セット（4文書・5正例・22負例・27ケース）
+
+| fixture | 種別 | source path | source digest | source bytes | cases | candidate HTML bytes |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| `eval-glossary-001` | glossary | `docs/glossary/CONTEXT.md` | `sha256:0e38268df0a8c10dd1372cc47be783d681d71a86499d9173c63aa3970f6d5c69` | 391 | 5 | 27,572 |
+| `eval-adr-001` | ADR | `docs/adr/0001-queue-choice.md` | `sha256:73373a1ee03a371f987133ca11d7cf23d97598b103b4c7d3220638b857e3288a` | 191 | 8 | 29,355 |
+| `eval-spec-001` | spec | `docs/sdd/specs/2026-11-01-example-design.md` | `sha256:eba57386adfdec2da7eb7c4139ee020c6acd9c5b0af6799ad4c9d15c55793b5c` | 457 | 7 | 56,555 |
+| `eval-plan-001` | plan | `docs/sdd/plans/2026-11-01-example.md` | `sha256:eb305936e83609f3abb6b07c1b0b75632d97704882bb211c69983fca67df0614` | 488 | 7 | 38,002 |
+
+- 合計: 4文書、5 positives（4 primary + 1 alternate false-stop probe）、22 negatives、27 cases、source 1,527 bytes、candidate HTML 151,484 bytes。
+- `dataKinds`は全27ケースで**`["text"]`のみ**。image/PNG bytesは0。画像を追加する場合は、新しいexact byte list・能力確認・人間許可を別途必要とし、このrunbookの範囲外とする。
+- `fixtureVersion=1`、`targetVersion=1`（評価用fixtureの版。H2の実Targetではない）。source digestは上表、各caseのcandidate HTML digestとbyte lengthは`phase-b.approval.template.json`の`fixtures[].cases[]`にexact値で固定する。評価fixtureはrepositoryのTargetを変更しない。
+- case IDは次の27件。
+
+| fixture | case IDs |
+| --- | --- |
+| glossary | `positive`, `avoid-term`, `permission`, `hidden`, `injection`（すべて`eval-glossary-001/...`） |
+| ADR | `positive`, `negation`, `caveat`, `threshold`, `code`, `link`, `fake-edge`, `stale`（すべて`eval-adr-001/...`） |
+| spec | `positive`, `negation`, `permission`, `viewport`, `code`, `link`, `table`（すべて`eval-spec-001/...`） |
+| plan | `positive`, `order`, `hidden`, `threshold`, `fake-value`, `injection`, `false-stop-probe`（すべて`eval-plan-001/...`） |
+
+### B.3 有限request plan
+
+| method | cases | conditions/case | first attempts | max retries/request | worst-case attempts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| normal LLM | 27 | 4 | 108 | 2 | 324 |
+| Jev | 27 | 4 | 108 | 2 | 324 |
+| Decisions | 27 | 4 | 108 | 2 | 324 |
+| **total** | 27 | 4 | **324** | 2 | **972** |
+
+- 条件は`information`、`support`、`usability`、`render`の4つ。1 caseにつき1条件1request、1方式108 requests。warm-up/authoring requestは0。
+- retryは**同一接続だけ**で最大2回（attempts=3）、backoff 1秒→2秒+jitter。retry対象は429、5xx、connection resetだけ。**timeout、send result unknown、low confidence、auth failure、invalid responseはretryしない**。60秒timeout。
+- `requestBudget.maxRequests` / `perFixtureMax`は人間が有限値を入れる。推奨上限は`972` / `36`（4条件×3 attempts×3方式）。324を超える送信は、retry予約の範囲内だけ許可し、上限に達したら新規requestを開始しない。
+- 7,200秒のH2累積active時間、追加run 30回、3回連続停滞の上限はPhase Bでも維持する。fixture追加・世代交代・再起動で予算をリセットしない。Phase Bの評価も同じ累積に算入する。
+- 実要求数・usage・返却model ID・閾値・失敗理由・対象revisionをsanitized evidenceへ保存する。要求数が324/972を超えたら停止し、成功として集計しない。
+
+### B.4 送信evidenceとorigin
+
+各方式のoriginへ送るのは、その方式のrequestに必要な次のtext evidenceだけである。
+
+- exact source Markdown bytes（上表のdigest/bytes）とcandidate HTML bytes（templateのdigest/bytes）。
+- candidate provenance、4条件のrubric、source-unit mapping、structured render facts。
+- 画像/PNGは送らない（今回の`dataKinds`はtextのみ）。Jev/Decisions/LLMへ画像を追加する場合は、別のimage-capable profile・exact bytes・サイズ上限・人間許可が必要。
+- repositoryの他file、credential、Authorization、Keychain値、login material、他方式の出力、人間観測noteを送らない。
+- normal LLMは選択した1 originだけ、Jevは選択したTypeSafeまたはCommand Code originだけ、DecisionsはOpenAI originだけに送る。1方式の結果を別方式のoriginへ送らない。
+
+### B.5 費用・枠・money cap
+
+- `feeCapUsd`、`priceVersion`、`quotaLabel`、`quotaConfirmed`を人間が記入する。見積不能のまま「上限内」と主張しない。
+- 現在のdesktop compositionは`NoPriceEstimator`を使う。money capが設定されたrequestはestimateなしで**送信前に`BudgetUnavailable`として拒否**される。ダミーestimateを追加しない。Phase Bをmoney cap付きで実行するには、別途承認されたprice estimator/price versionが必要である。これがない限り、money cap付きPhase Bは実行できない。
+- quota/credit pathを使う場合も、人間がquota labelと上限を確認し、USDの上限を主張しない。どちらのpathでも、preflightは費用承認が欠けたら送信しない。
+
+### B.6 人間観測
+
+`human-observation.template.json`を使い、4 fixtureそれぞれ1 record（合計4 records、8 reading tasks）を作る。run後にだけ記入する。
+
+- `observer.name` / `role` / `independent`、`documentVersion.sourceDigest` / `fixtureVersion`。
+- `method.provider` / `profileId` / `model`、`startedAt` / `durationSeconds`。
+- `readingTasks[].taskId` / `correct` / `answer` / `wrongAnswer`、`wrongAnswers`、`difficultyNotes`、`assistance`、`result`。
+- 観測者名・時間・誤答・困難点を合成しない。実run前は`status: not_run` / `result: not_run`のままにする。
+
+### B.7 送信前gate
+
+Phase B runnerは、次のすべてが揃うまでtransportを呼ばない。1つでも欠ければ不足fieldを列挙して拒否し、`externalRequests`は0のままにする。
+
+1. `status=approved`、`approvedBy`、`approvedAt`、`expiresAt`、scope。
+2. normal LLM / Jev / Decisionsのprovider、connectionId、endpointClass、model、origin、`verified=true`、`consentGranted=true`、purpose。
+3. exact `fixtures`（4 fixture IDs）とexact `dataKinds`（`["text"]`）。余分なfixture/data kindを拒否する。
+4. finite `requestBudget.maxRequests` / `perFixtureMax`（0より大きい）。
+5. `retryPolicy.maxAttempts`（1..=5）、`sameConnectionOnly=true`、`retryOn`非空、no-retry条件。
+6. `feeCapUsd`/`priceVersion`または承認済みquota path、`quotaLabel`、`quotaConfirmed`。
+7. human observation plan（observer/文書版/課題）と証拠保存先。
+
+既存のTask 24 gate `tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval` が、connection provider/id/endpoint/model、fixtures、dataKinds、request budget、retry、fee/quota、approver/timeの欠落をすべて拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runnerはこのgateを3接続へ拡張して再利用し、欠落fieldを列挙する。新しいschemaのproduction runnerはまだ実装していないため、Phase Bは実行できない。
+
+### B.8 実行順序（許可後）
+
+1. 人間が3接続を選択し、verified/consent/origin/modelを確認する。
+2. テンプレートをコピーし、exact fixtures/dataKinds/bytes、request budget、retry、fee/quota、approver/time、期限、観測計画を記入する。
+3. preflightが全fieldを検証し、要求数・送信bytes・費用/枠を表示する。欠落があれば送信0で停止する。
+4. 承認範囲内でnormal LLM 108、Jev 108、Decisions 108を実行する。retryは同一接続・上限内だけ。
+5. 要求数、usage、model、判定、保留/誤停止、失敗理由、revisionをsanitized evidenceへ保存する。
+6. 人間が4文書の読解課題を実施し、4 recordsを記入する。
+7. Phase B reportを作成する。未完了・失敗・未確認を成功として丸めない。
 
 Phase Bの実要求数・usage・判定・人間観測は**0件/未取得**である。Task 24のscripted transport、Task 23のloopback judge、Task 25のnative lifecycleを実model評価の代替にしない。
 

@@ -1,0 +1,530 @@
+{
+  "schema": "h3-phase-b-approval-v1",
+  "status": "not_run",
+  "externalRequests": 0,
+  "note": "Template only. No human approval, no credential, no provider connection and no real send. Fill every placeholder and obtain a separate human approval before use.",
+  "approval": {
+    "approvedBy": "",
+    "approvedAt": "",
+    "scope": "Phase B: real normal-LLM, Jev and Decisions evaluation of the exact text-only evaluation set, plus human reading observation",
+    "expiresAt": ""
+  },
+  "evaluationSet": {
+    "manifest": "tests/html-sync/fixtures/evaluation/manifest.json",
+    "fixtureVersion": 1,
+    "documents": 4,
+    "positives": 5,
+    "negatives": 22,
+    "cases": 27,
+    "dataKinds": [
+      "text"
+    ],
+    "sourceBytes": 1527,
+    "candidateHtmlBytes": 151484,
+    "images": {
+      "approved": false,
+      "files": [],
+      "totalBytes": 0,
+      "note": "No image/PNG bytes are part of the Task 24 set. Adding image data requires a new exact byte list and human approval."
+    }
+  },
+  "connections": {
+    "normalLlm": {
+      "required": true,
+      "selected": false,
+      "provider": "",
+      "connectionId": "",
+      "endpointClass": "",
+      "model": "",
+      "auth": "api_key",
+      "origin": "",
+      "verified": false,
+      "consentGranted": false,
+      "purpose": "assessment",
+      "allowedProviders": [
+        "OpenAI Responses",
+        "Anthropic Messages",
+        "OpenAI-compatible"
+      ],
+      "fallback": false,
+      "note": "Human-selected, currently verified, exact origin and model. No fallback. The same connection must not be reused for another provider role."
+    },
+    "jev": {
+      "required": true,
+      "selected": false,
+      "mode": "direct_typesafe",
+      "allowedModes": [
+        "direct_typesafe",
+        "commandcode_gateway"
+      ],
+      "provider": "TypeSafe",
+      "connectionId": "",
+      "endpointClass": "type_safe_system_one",
+      "model": "jev-1.14.0",
+      "wireModel": "jev-1.14.0",
+      "auth": "api_key",
+      "origin": "docs.typesafe.ai / selected Command Code gateway origin",
+      "verified": false,
+      "consentGranted": false,
+      "purpose": "assessment",
+      "fallback": false,
+      "note": "Direct TypeSafe requires the real TypeSafe key. The fixed Command Code gateway uses typesafe/jev-1.14.0 and the human-approved GOAT quota; never auto-switch between them."
+    },
+    "decisions": {
+      "required": true,
+      "selected": false,
+      "provider": "OpenAI",
+      "connectionId": "",
+      "endpointClass": "openai_decisions",
+      "model": "gpt-6-luna",
+      "auth": "api_key",
+      "origin": "https://api.openai.com",
+      "verified": false,
+      "consentGranted": false,
+      "purpose": "assessment",
+      "fallback": false,
+      "note": "OpenAI API key only; ChatGPT login is not a Decisions credential."
+    }
+  },
+  "evidenceSent": {
+    "common": [
+      "exact source Markdown bytes per fixture (sourceDigest)",
+      "exact candidate HTML bytes per case (digest)",
+      "candidate provenance text",
+      "the four condition rubrics and source-unit mapping",
+      "structured render facts (no image/PNG unless separately approved)"
+    ],
+    "normalLlm": [
+      "common evidence only to the selected normal-LLM origin"
+    ],
+    "jev": [
+      "common evidence only to the selected TypeSafe or fixed Command Code Jev origin"
+    ],
+    "decisions": [
+      "common evidence only to the selected OpenAI Decisions origin"
+    ],
+    "never": [
+      "repository files outside the exact fixture bytes",
+      "credentials, Authorization headers, Keychain values, login material",
+      "other providers' outputs or human observation notes",
+      "image/PNG files not listed with exact bytes and human approval"
+    ]
+  },
+  "fixtures": [
+    {
+      "id": "eval-glossary-001",
+      "documentKind": "glossary",
+      "sourcePath": "docs/glossary/CONTEXT.md",
+      "sourceDigest": "sha256:0e38268df0a8c10dd1372cc47be783d681d71a86499d9173c63aa3970f6d5c69",
+      "sourceByteLength": 391,
+      "fixtureVersion": 1,
+      "targetVersion": 1,
+      "dataKinds": [
+        "text"
+      ],
+      "imageBytes": 0,
+      "caseCount": 5,
+      "cases": [
+        {
+          "id": "eval-glossary-001/positive",
+          "kind": "positive",
+          "expected": "sync",
+          "hazard": null,
+          "path": "positive/glossary-CONTEXT.html",
+          "byteLength": 5482,
+          "digest": "sha256:343a94bbe8a46e941e9865ab802cec2b818551917620f602f3bedc4f0eb6acf0"
+        },
+        {
+          "id": "eval-glossary-001/avoid-term",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "glossary-canonical-avoid",
+          "path": "negative/glossary-CONTEXT-avoid-term.html",
+          "byteLength": 5501,
+          "digest": "sha256:3974c1bb8fbb6a604f6351f353018f0153fbbd403f3718574a9ee7f45d54847c"
+        },
+        {
+          "id": "eval-glossary-001/permission",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "permission",
+          "path": "negative/glossary-CONTEXT-permission.html",
+          "byteLength": 5474,
+          "digest": "sha256:c8caa03fc50c4b5f4aa81be45aa86bda996edd9103bf72b87f31fe1c11b7bb03"
+        },
+        {
+          "id": "eval-glossary-001/hidden",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "hidden-information",
+          "path": "negative/glossary-CONTEXT-hidden.html",
+          "byteLength": 5550,
+          "digest": "sha256:797c196746bbac441b0aae6deb5b12d38481cbc5dbbc0edd60f514c39102ca46"
+        },
+        {
+          "id": "eval-glossary-001/injection",
+          "kind": "negative",
+          "expected": "hold",
+          "hazard": "injection",
+          "path": "negative/glossary-CONTEXT-injection.html",
+          "byteLength": 5565,
+          "digest": "sha256:bff10fcc90b57619f4d79385bdda365e96642f7a5ab914065050595713db427b"
+        }
+      ]
+    },
+    {
+      "id": "eval-adr-001",
+      "documentKind": "adr",
+      "sourcePath": "docs/adr/0001-queue-choice.md",
+      "sourceDigest": "sha256:73373a1ee03a371f987133ca11d7cf23d97598b103b4c7d3220638b857e3288a",
+      "sourceByteLength": 191,
+      "fixtureVersion": 1,
+      "targetVersion": 1,
+      "dataKinds": [
+        "text"
+      ],
+      "imageBytes": 0,
+      "caseCount": 8,
+      "cases": [
+        {
+          "id": "eval-adr-001/positive",
+          "kind": "positive",
+          "expected": "sync",
+          "hazard": null,
+          "path": "positive/adr-0001-queue-choice.html",
+          "byteLength": 3635,
+          "digest": "sha256:8bc3c044e90dd3676b77be9792f4053896c8da50526624c7a5f0f24c5f23ddef"
+        },
+        {
+          "id": "eval-adr-001/negation",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "negation",
+          "path": "negative/adr-0001-queue-choice-negation.html",
+          "byteLength": 3628,
+          "digest": "sha256:4328b61b08c8b139d0e369cc0eb29ee8c99a9bf15eb969358a2d48079cc1a4d2"
+        },
+        {
+          "id": "eval-adr-001/caveat",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "caveat",
+          "path": "negative/adr-0001-queue-choice-caveat.html",
+          "byteLength": 3597,
+          "digest": "sha256:542cbfbd3cb2caef6da16d8ee881037ca396f5450b9e20d024802831d203aec8"
+        },
+        {
+          "id": "eval-adr-001/threshold",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "threshold",
+          "path": "negative/adr-0001-queue-choice-threshold.html",
+          "byteLength": 3634,
+          "digest": "sha256:e01aa8e122ce12d267fe530784bb4961460ae155a232f5be10e94c22a6042862"
+        },
+        {
+          "id": "eval-adr-001/code",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "code",
+          "path": "negative/adr-0001-queue-choice-code.html",
+          "byteLength": 3635,
+          "digest": "sha256:c3377d5a29bb09e05406a590fe9b3bfbc95eee3abd4e9941e2fd1a09461e1da5"
+        },
+        {
+          "id": "eval-adr-001/link",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "link",
+          "path": "negative/adr-0001-queue-choice-link.html",
+          "byteLength": 3631,
+          "digest": "sha256:f97692719a6f95ccdddc8b5a487e5ec472c0cddff214434295a9d58dfe4eca5d"
+        },
+        {
+          "id": "eval-adr-001/fake-edge",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "fake-edge-value",
+          "path": "negative/adr-0001-queue-choice-fake-edge.html",
+          "byteLength": 3960,
+          "digest": "sha256:948f72ee84be08d1399dad40ae03c29cab173132413e0a34d6ea8128d2a82dfc"
+        },
+        {
+          "id": "eval-adr-001/stale",
+          "kind": "negative",
+          "expected": "hold",
+          "hazard": "stale-evidence",
+          "path": "negative/adr-0001-queue-choice-stale.html",
+          "byteLength": 3635,
+          "digest": "sha256:5432871ca64d3ebb14449299a245408842507811a91d870270d5c76a8a8e429e"
+        }
+      ]
+    },
+    {
+      "id": "eval-spec-001",
+      "documentKind": "spec",
+      "sourcePath": "docs/sdd/specs/2026-11-01-example-design.md",
+      "sourceDigest": "sha256:eba57386adfdec2da7eb7c4139ee020c6acd9c5b0af6799ad4c9d15c55793b5c",
+      "sourceByteLength": 457,
+      "fixtureVersion": 1,
+      "targetVersion": 1,
+      "dataKinds": [
+        "text"
+      ],
+      "imageBytes": 0,
+      "caseCount": 7,
+      "cases": [
+        {
+          "id": "eval-spec-001/positive",
+          "kind": "positive",
+          "expected": "sync",
+          "hazard": null,
+          "path": "positive/spec-2026-11-01-example-design.html",
+          "byteLength": 8082,
+          "digest": "sha256:e711c3f5d2cd3308d9137b6c9b97342eeb65996b7686a6aec0b1e351b5751119"
+        },
+        {
+          "id": "eval-spec-001/negation",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "negation",
+          "path": "negative/spec-2026-11-01-example-design-negation.html",
+          "byteLength": 8077,
+          "digest": "sha256:d64597d5086ddfd64fc8a41f9719752b7d894dd68010c4c8b5b8cacdea2082fb"
+        },
+        {
+          "id": "eval-spec-001/permission",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "permission",
+          "path": "negative/spec-2026-11-01-example-design-permission.html",
+          "byteLength": 8070,
+          "digest": "sha256:79a7151bb98fe157ff6eaa40420e434363ad654beeb4e960f9c404bd1306a350"
+        },
+        {
+          "id": "eval-spec-001/viewport",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "threshold-viewport",
+          "path": "negative/spec-2026-11-01-example-design-viewport.html",
+          "byteLength": 8082,
+          "digest": "sha256:ddd728d9f702201b72691961693877ecdcf3f67f6d8908dfb732e11d4e2220cc"
+        },
+        {
+          "id": "eval-spec-001/code",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "code",
+          "path": "negative/spec-2026-11-01-example-design-code.html",
+          "byteLength": 8077,
+          "digest": "sha256:baa58b466add2fc05c6affaaa26efd97c44b10d9bf81dadf218be022538a60c0"
+        },
+        {
+          "id": "eval-spec-001/link",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "link",
+          "path": "negative/spec-2026-11-01-example-design-link.html",
+          "byteLength": 8084,
+          "digest": "sha256:2ef6810eed727760dc4feb884d44cb2ec51cd1cd21e92cf55a085c4bc3c317f6"
+        },
+        {
+          "id": "eval-spec-001/table",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "table-value",
+          "path": "negative/spec-2026-11-01-example-design-table.html",
+          "byteLength": 8083,
+          "digest": "sha256:90f6e49c6f69ca043b9aa7949d76ee7f3858b761f7495151e42d6db41eb16b12"
+        }
+      ]
+    },
+    {
+      "id": "eval-plan-001",
+      "documentKind": "plan",
+      "sourcePath": "docs/sdd/plans/2026-11-01-example.md",
+      "sourceDigest": "sha256:eb305936e83609f3abb6b07c1b0b75632d97704882bb211c69983fca67df0614",
+      "sourceByteLength": 488,
+      "fixtureVersion": 1,
+      "targetVersion": 1,
+      "dataKinds": [
+        "text"
+      ],
+      "imageBytes": 0,
+      "caseCount": 7,
+      "cases": [
+        {
+          "id": "eval-plan-001/positive",
+          "kind": "positive",
+          "expected": "sync",
+          "hazard": null,
+          "path": "positive/plan-2026-11-01-example.html",
+          "byteLength": 5398,
+          "digest": "sha256:9fc143b3d84dab88029d642a39fbf8af43a7a6e86b7ee1f12720035813f6ed87"
+        },
+        {
+          "id": "eval-plan-001/order",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "execution-order",
+          "path": "negative/plan-2026-11-01-example-order.html",
+          "byteLength": 5391,
+          "digest": "sha256:6861445621256a8c5a4d96b29a54bc3a9eb28fc33a4bee8499932a3c1558ffa9"
+        },
+        {
+          "id": "eval-plan-001/hidden",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "hidden-information",
+          "path": "negative/plan-2026-11-01-example-hidden.html",
+          "byteLength": 5401,
+          "digest": "sha256:b0d91100493ebc56d9b1d5e31dd3e815d5055778771eedf5e10cf37c19743b27"
+        },
+        {
+          "id": "eval-plan-001/threshold",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "threshold",
+          "path": "negative/plan-2026-11-01-example-threshold.html",
+          "byteLength": 5397,
+          "digest": "sha256:564ff9cd3c5df5a02770ff0b728f3f8daa56849310059155f28652d11a2c10cc"
+        },
+        {
+          "id": "eval-plan-001/fake-value",
+          "kind": "negative",
+          "expected": "reject",
+          "hazard": "fake-edge-value",
+          "path": "negative/plan-2026-11-01-example-fake-value.html",
+          "byteLength": 5459,
+          "digest": "sha256:11018e3542e493c00a688517683b61ad9724b38c8224f2ae14669ac8c2a91834"
+        },
+        {
+          "id": "eval-plan-001/injection",
+          "kind": "negative",
+          "expected": "hold",
+          "hazard": "injection",
+          "path": "negative/plan-2026-11-01-example-injection.html",
+          "byteLength": 5475,
+          "digest": "sha256:74b7fef3e0f74c40b8179fd223e92f281bee1bd4839830ccf19bf0c5a5d14143"
+        },
+        {
+          "id": "eval-plan-001/false-stop-probe",
+          "kind": "false-stop-probe",
+          "expected": "sync",
+          "hazard": "over-strict-scripted-judge",
+          "path": "positive/plan-2026-11-01-example-alt.html",
+          "byteLength": 5481,
+          "digest": "sha256:117a3812017870f03882866a7aa378988932cfc5b545448b3660bb9d051098bd"
+        }
+      ]
+    }
+  ],
+  "requestPlan": {
+    "conditionsPerCase": 4,
+    "conditionKinds": [
+      "information",
+      "support",
+      "usability",
+      "render"
+    ],
+    "cases": 27,
+    "methods": 3,
+    "firstAttemptRequestsPerMethod": 108,
+    "firstAttemptRequestsTotal": 324,
+    "warmupRequests": 0,
+    "authoringRequests": 0,
+    "retry": {
+      "maxRetriesPerRequest": 2,
+      "maxAttemptsPerRequest": 3,
+      "sameConnectionOnly": true,
+      "backoffSeconds": [
+        1,
+        2
+      ],
+      "jitter": true,
+      "timeoutSeconds": 60,
+      "retryOn": [
+        "http_429",
+        "http_5xx",
+        "connection_reset"
+      ],
+      "noRetryOn": [
+        "timeout",
+        "send_result_unknown",
+        "low_confidence",
+        "auth_failure",
+        "invalid_response"
+      ]
+    },
+    "worstCaseAttempts": 972,
+    "requestBudget": {
+      "maxRequests": 0,
+      "perFixtureMax": 0,
+      "suggestedMaxRequests": 972,
+      "suggestedPerFixtureMax": 36,
+      "note": "The human sets finite values. 972/36 covers 324 first attempts plus at most two retries; no request may start after the cap."
+    },
+    "note": "One assessment request per condition per case per method. No authoring model and no warm-up request. The agent runner must not send a partial set and call it a method result."
+  },
+  "money": {
+    "feeCapUsd": null,
+    "priceVersion": "",
+    "quotaLabel": "",
+    "quotaConfirmed": false,
+    "priceEstimator": "NoPriceEstimator",
+    "price_estimator_available": false,
+    "behavior": "With the current desktop composition, a money-capped send is refused before any network request because NoPriceEstimator returns no estimate. Do not add a fake estimate. Either approve a real estimator/price version with the fee cap or run only under a separately approved quota path that does not claim a USD cap."
+  },
+  "limits": {
+    "activeSeconds": 7200,
+    "additionalRuns": 30,
+    "stagnationRuns": 3,
+    "resetOnGenerationChange": false,
+    "note": "The H2 cumulative limits are not reset by Phase B, a new fixture, generation change, or restart."
+  },
+  "humanObservation": {
+    "template": "tests/html-sync/fixtures/evaluation/human-observation.template.json",
+    "status": "not_run",
+    "recordsRequired": 4,
+    "readingTasksPerFixture": 2,
+    "fields": [
+      "fixtureId",
+      "documentVersion.sourceDigest",
+      "documentVersion.fixtureVersion",
+      "observer.name",
+      "observer.role",
+      "observer.independent",
+      "method.provider",
+      "method.profileId",
+      "method.model",
+      "startedAt",
+      "durationSeconds",
+      "readingTasks[].taskId",
+      "readingTasks[].correct",
+      "readingTasks[].answer",
+      "readingTasks[].wrongAnswer",
+      "wrongAnswers",
+      "difficultyNotes",
+      "assistance",
+      "result"
+    ],
+    "note": "Fill only after the real run. Do not synthesize observer names, times, answers or difficulty notes."
+  },
+  "gate": {
+    "refuseBeforeSendUnless": [
+      "approvedBy",
+      "approvedAt",
+      "status=approved",
+      "normalLlm connection provider/connectionId/endpointClass/model/verified/consent",
+      "jev mode/provider/connectionId/endpointClass/model/verified/consent",
+      "decisions provider/connectionId/endpointClass/model/verified/consent",
+      "exact fixtures and exact dataKinds",
+      "finite requestBudget.maxRequests and perFixtureMax",
+      "retryPolicy.maxAttempts in 1..=5, sameConnectionOnly=true, retryOn non-empty",
+      "finite feeCapUsd or an explicitly approved quota path with no USD claim",
+      "quotaLabel and quotaConfirmed"
+    ],
+    "defaultExternalRequests": 0,
+    "existingTest": "tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval"
+  }
+}
