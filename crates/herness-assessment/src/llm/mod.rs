@@ -241,6 +241,7 @@ impl InconclusiveReason {
 pub struct LlmAssessment {
     result: AssessmentResult,
     rejection: Option<InconclusiveReason>,
+    attempts: u8,
 }
 
 impl LlmAssessment {
@@ -252,6 +253,15 @@ impl LlmAssessment {
     /// Schema/refusal/truncation reason, when the answer was unusable.
     pub const fn rejection(&self) -> Option<InconclusiveReason> {
         self.rejection
+    }
+
+    /// Number of HTTP attempts used for this assessment.
+    ///
+    /// The transport retries only the same connection and only for its
+    /// bounded retryable failures. This value is the actual count, not the
+    /// configured maximum.
+    pub const fn attempts(&self) -> u8 {
+        self.attempts
     }
 
     /// Consumes the wrapper and returns the result.
@@ -354,7 +364,11 @@ impl LlmAssessmentAdapter {
         )
         .map_err(|_| AssessmentError::new(AssessmentErrorKind::InvalidResponse))?
         .with_rationale_origin(rationale_origin);
-        Ok(LlmAssessment { result, rejection })
+        Ok(LlmAssessment {
+            result,
+            rejection,
+            attempts: response.attempts(),
+        })
     }
 }
 

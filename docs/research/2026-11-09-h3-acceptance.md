@@ -107,6 +107,7 @@ Phase Bの記入用テンプレートは `tests/html-sync/fixtures/evaluation/ph
 | Decisions | OpenAI `POST /v1/decisions`（API key） | `gpt-6-luna` | OpenAI API key | `verified=true`、`consentGranted=true`、purpose=assessment。ChatGPT loginを流用しない |
 
 - 3接続はいずれも**人間が別々に選択**し、現在のprofile/consentがverified/grantedであることをpreflightで再確認する。未verified・consentなし・origin不一致・model不一致は送信前に拒否する。
+- 実装済みの`tests/html-sync/tests/phase_b.rs`は、normal LLMをChatGPT loginのOpenAI Responsesに限定し、Jevを固定Command Code gatewayに限定する。Decisionsとimage-required条件は`not_run`であり、このpartial runnerをfull Phase Bの成功として扱わない。
 - 同じ接続を複数roleへ使い回さない。許可された接続以外へのfallback、自動再選択、別modelへの切替をしない。
 - 接続ID・model・originは承認記録へ保存するが、API key/Authorization/Keychain値は保存しない。
 
@@ -183,7 +184,7 @@ Phase B runnerは、次のすべてが揃うまでtransportを呼ばない。1�
 6. `feeCapUsd`/`priceVersion`または承認済みquota path、`quotaLabel`、`quotaConfirmed`。
 7. human observation plan（observer/文書版/課題）と証拠保存先。
 
-既存のTask 24 gate `tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval` が、connection provider/id/endpoint/model、fixtures、dataKinds、request budget、retry、fee/quota、approver/timeの欠落をすべて拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runnerはこのgateを3接続へ拡張して再利用し、欠落fieldを列挙する。新しいschemaのproduction runnerはまだ実装していないため、Phase Bは実行できない。
+既存のTask 24 gate `tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval` が、connection provider/id/endpoint/model、fixtures、dataKinds、request budget、retry、fee/quota、approver/timeの欠落をすべて拒否し、`RecordingTransport.calls.len() == 0`をassertしている。Phase B runner `tests/html-sync/tests/phase_b.rs` は、承認gateをnormal LLMとJevのexact接続へ拡張し、欠落fieldを列挙する。実装済みの範囲はtext-onlyの`information`条件だけで、Decisionsと`support` / `usability` / `render`は`not_run`である。承認ファイルが完全で`H3_PHASE_B_REAL=1`が設定されるまで送信しない。
 
 ### B.8 実行順序（許可後）
 

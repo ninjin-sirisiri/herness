@@ -6,7 +6,7 @@
   "approval": {
     "approvedBy": "",
     "approvedAt": "",
-    "scope": "Phase B: real normal-LLM, Jev and Decisions evaluation of the exact text-only evaluation set, plus human reading observation",
+    "scope": "Phase B (partial text-only runner): exact normal-LLM and Jev evaluation of the exact text-only evaluation set; Decisions, support, usability and render are not run",
     "expiresAt": ""
   },
   "evaluationSet": {
@@ -36,42 +36,39 @@
       "connectionId": "",
       "endpointClass": "",
       "model": "",
-      "auth": "api_key",
+      "auth": "chatgpt_login",
       "origin": "",
       "verified": false,
       "consentGranted": false,
       "purpose": "assessment",
       "allowedProviders": [
-        "OpenAI Responses",
-        "Anthropic Messages",
-        "OpenAI-compatible"
+        "openai_responses"
       ],
       "fallback": false,
-      "note": "Human-selected, currently verified, exact origin and model. No fallback. The same connection must not be reused for another provider role."
+      "note": "Human-selected, currently verified ChatGPT-login OpenAI Responses connection. Fill provider=openai, endpointClass=openai_responses, origin=https://api.openai.com, and the exact model. No API-key substitution, provider fallback, or connection reuse."
     },
     "jev": {
       "required": true,
       "selected": false,
-      "mode": "direct_typesafe",
+      "mode": "commandcode_gateway",
       "allowedModes": [
-        "direct_typesafe",
         "commandcode_gateway"
       ],
-      "provider": "TypeSafe",
+      "provider": "typesafe",
       "connectionId": "",
-      "endpointClass": "type_safe_system_one",
-      "model": "jev-1.14.0",
-      "wireModel": "jev-1.14.0",
+      "endpointClass": "typesafe_system_one",
+      "model": "typesafe/jev-1.14.0",
+      "wireModel": "typesafe/jev-1.14.0",
       "auth": "api_key",
-      "origin": "docs.typesafe.ai / selected Command Code gateway origin",
+      "origin": "",
       "verified": false,
       "consentGranted": false,
       "purpose": "assessment",
       "fallback": false,
-      "note": "Direct TypeSafe requires the real TypeSafe key. The fixed Command Code gateway uses typesafe/jev-1.14.0 and the human-approved GOAT quota; never auto-switch between them."
+      "note": "This runner uses the fixed Command Code gateway only: fill origin=https://api.commandcode.ai and use COMMANDCODE_API_KEY. Never auto-switch to direct TypeSafe or another provider."
     },
     "decisions": {
-      "required": true,
+      "required": false,
       "selected": false,
       "provider": "OpenAI",
       "connectionId": "",
@@ -83,7 +80,7 @@
       "consentGranted": false,
       "purpose": "assessment",
       "fallback": false,
-      "note": "OpenAI API key only; ChatGPT login is not a Decisions credential."
+      "note": "Not run by the current text-only runner. Selecting Decisions requires a separate authorization and an OpenAI API key; ChatGPT login is not a Decisions credential."
     }
   },
   "evidenceSent": {
@@ -91,8 +88,8 @@
       "exact source Markdown bytes per fixture (sourceDigest)",
       "exact candidate HTML bytes per case (digest)",
       "candidate provenance text",
-      "the four condition rubrics and source-unit mapping",
-      "structured render facts (no image/PNG unless separately approved)"
+      "the H3 information-condition rubric and source-unit mapping (support, usability and render remain not_run)",
+      "no render facts are invented; structured render facts are sent only when separately approved"
     ],
     "normalLlm": [
       "common evidence only to the selected normal-LLM origin"
@@ -460,11 +457,11 @@
     "requestBudget": {
       "maxRequests": 0,
       "perFixtureMax": 0,
-      "suggestedMaxRequests": 972,
-      "suggestedPerFixtureMax": 36,
-      "note": "The human sets finite values. 972/36 covers 324 first attempts plus at most two retries; no request may start after the cap."
+      "suggestedMaxRequests": 162,
+      "suggestedPerFixtureMax": 48,
+      "note": "The human sets finite values. This runner sends 54 first attempts (27 cases x normal LLM + Jev, information condition only), so 162 total and 48 per fixture cover at most two same-connection retries. The full three-method/four-condition hard upper bound remains 972. No request may start after the cap."
     },
-    "note": "One assessment request per condition per case per method. No authoring model and no warm-up request. The agent runner must not send a partial set and call it a method result."
+    "note": "The implemented text-only runner sends one assessment request for the information condition per case per method (normal LLM and Jev only). It records support, usability and render as not_run and does not call the result a complete three-method Phase B. No authoring model and no warm-up request."
   },
   "money": {
     "feeCapUsd": null,
@@ -473,7 +470,8 @@
     "quotaConfirmed": false,
     "priceEstimator": "NoPriceEstimator",
     "price_estimator_available": false,
-    "behavior": "With the current desktop composition, a money-capped send is refused before any network request because NoPriceEstimator returns no estimate. Do not add a fake estimate. Either approve a real estimator/price version with the fee cap or run only under a separately approved quota path that does not claim a USD cap."
+    "behavior": "With the current desktop composition, a money-capped send is refused before any network request because NoPriceEstimator returns no estimate. Do not add a fake estimate. Either approve a real estimator/price version with the fee cap or run only under a separately approved quota path that does not claim a USD cap.",
+    "phaseBRunner": "The phase_b runner accepts only the approved quota path with feeCapUsd null and quotaConfirmed=true. Any numeric feeCapUsd is refused before send because this runner composes no price estimator."
   },
   "limits": {
     "activeSeconds": 7200,
@@ -515,16 +513,34 @@
       "approvedBy",
       "approvedAt",
       "status=approved",
-      "normalLlm connection provider/connectionId/endpointClass/model/verified/consent",
-      "jev mode/provider/connectionId/endpointClass/model/verified/consent",
-      "decisions provider/connectionId/endpointClass/model/verified/consent",
-      "exact fixtures and exact dataKinds",
-      "finite requestBudget.maxRequests and perFixtureMax",
-      "retryPolicy.maxAttempts in 1..=5, sameConnectionOnly=true, retryOn non-empty",
-      "finite feeCapUsd or an explicitly approved quota path with no USD claim",
-      "quotaLabel and quotaConfirmed"
+      "expiresAt in the future",
+      "approved text-only exact-evaluation-set scope",
+      "normalLlm ChatGPT-login connection provider/connectionId/endpointClass/model/origin/verified/consent",
+      "jev commandcode_gateway provider/connectionId/endpointClass/model/wireModel/origin/verified/consent",
+      "exact fixtures and exact dataKinds=[\"text\"]",
+      "no approved image/PNG bytes",
+      "finite requestBudget.maxRequests and perFixtureMax covering the text-only two-method plan and retries",
+      "retryPolicy.maxAttemptsPerRequest=3, sameConnectionOnly=true, backoff [1,2], jitter, timeout 60, retryOn/noRetryOn",
+      "approved quotaLabel and quotaConfirmed with no unsupported USD cap",
+      "approval and run limits not exhausted"
+    ],
+    "methodsImplemented": [
+      "normal_llm",
+      "jev"
+    ],
+    "methodsNotRun": [
+      "decisions"
+    ],
+    "conditionsSent": [
+      "information"
+    ],
+    "conditionsNotRunWithoutImages": [
+      "support",
+      "usability",
+      "render"
     ],
     "defaultExternalRequests": 0,
-    "existingTest": "tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval"
+    "existingTest": "tests/html-sync/tests/evaluation.rs::real_evaluation_gate_refuses_before_sending_without_every_approval",
+    "phaseBTest": "tests/html-sync/tests/phase_b.rs"
   }
 }

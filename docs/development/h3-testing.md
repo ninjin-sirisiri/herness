@@ -340,15 +340,30 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 通常LLM・Jev・Decisionsの実文書評価と人間の読解観測は**未許可・未実行**である。記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
 
+opt-in runnerは`tests/html-sync/tests/phase_b.rs`。normal LLM（ChatGPT login）とJev（Command Code固定gateway）の`information`条件だけを実装し、`support` / `usability` / `render`とDecisionsは`not_run`として記録する。通常のtest runではignoredで、`H3_PHASE_B_REAL=1`と完全な承認ファイルが揃うまで送信しない。実runは別途の人間許可後だけ行う。
+
+```bash
+cargo test -p herness-html-sync-tests --test phase_b --locked
+```
+
+承認後の実run（このworktreeでは未実行。`COMMANDCODE_API_KEY`は事前に環境へ設定し、command line・approval・reportへ書かない）:
+
+```bash
+H3_PHASE_B_REAL=1 \
+H3_PHASE_B_APPROVAL=/absolute/path/to/filled-phase-b.approval.json \
+H3_PHASE_B_REPORT=/absolute/path/to/phase-b-report.json \
+cargo test -p herness-html-sync-tests --test phase_b --locked -- --ignored --nocapture
+```
+
 **接続（人間が別々に選択、現在verifiedのものだけ）**
 
 | role | provider/endpoint | model | auth |
 | --- | --- | --- | --- |
-| normal LLM | OpenAI Responses / Anthropic Messages / OpenAI-compatibleのうち1つ | 選択model（version固定） | API key |
-| Jev | TypeSafe System One直接、または固定Command Code gatewayのうち1つ | `jev-1.14.0` / `typesafe/jev-1.14.0` | TypeSafe key / Command Code key |
-| Decisions | OpenAI `/v1/decisions` | `gpt-6-luna` | OpenAI API key |
+| normal LLM | OpenAI Responses（実装済みrunnerはChatGPT loginのみ） | 選択model（version固定） | ChatGPT login（Keychain） |
+| Jev | 固定Command Code gateway（実装済みrunnerは直接TypeSafeを自動選択しない） | `typesafe/jev-1.14.0` | Command Code API key |
+| Decisions | OpenAI `/v1/decisions` | `gpt-6-luna` | 実装済みrunnerでは`not_run` |
 
-各接続は`connectionId`、`endpointClass`、origin、model、`verified=true`、`consentGranted=true`、purpose=assessmentを要求する。fallback・自動切替・ChatGPT loginのDecisions流用を禁止する。
+各接続は`connectionId`、`endpointClass`、origin、model、`verified=true`、`consentGranted=true`、purpose=assessmentを要求する。fallback・自動切替・API-key substitution・ChatGPT loginのDecisions流用を禁止する。
 
 **fixtureとbytes**
 
@@ -361,7 +376,7 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 - 4条件（information/support/usability/render）×27 cases = **108 requests/method**。
 - normal LLM 108 + Jev 108 + Decisions 108 = **324 first attempts**。warm-up/authoring 0。
-- retryは同一接続で最大2回（attempts=3）、1秒→2秒+jitter。429/5xx/connection resetだけ。timeout/send unknown/low confidence/auth/invalid responseはretryしない。60秒timeout。worst case 972 attempts、推奨`maxRequests=972` / `perFixtureMax=36`。
+- retryは同一接続で最大2回（attempts=3）、1秒→2秒+jitter。429/5xx/connection resetだけ。timeout/send unknown/low confidence/auth/invalid responseはretryしない。60秒timeout。実装済みtext-only runner（information条件×normal LLM+Jev）はfirst attempts 54、worst case 162なので、推奨`maxRequests=162` / `perFixtureMax=48`。full 3-method/4-conditionのhard upper boundは972のまま。
 - 7,200秒累積active、追加run 30回、3回連続停滞の上限を維持し、fixture追加・世代交代・再起動でリセットしない。
 
 **費用・gate**
