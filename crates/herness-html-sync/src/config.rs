@@ -511,6 +511,7 @@ pub struct H3OwnerBinding {
 
 impl H3OwnerBinding {
     /// Creates a validated owner binding.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project: ProjectId,
         owner: OwnerRef,

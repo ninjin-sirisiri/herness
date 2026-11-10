@@ -1839,6 +1839,7 @@ impl OwnerHarness {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn owner_supersession_refuses_every_human_stop_wait_stagnation_limit_recovery_cancel_and_failure_latch()
 {
     let cases: Vec<(

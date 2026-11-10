@@ -357,6 +357,7 @@ impl HtmlAssessmentHost {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evidence_id(
     project: herness_core::ProjectId,
     generation: herness_html_sync::GenerationId,

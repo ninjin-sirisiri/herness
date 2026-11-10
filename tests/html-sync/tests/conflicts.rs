@@ -432,6 +432,7 @@ impl Env {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn document_state(
         &self,
         reason: H3Reason,
@@ -475,18 +476,18 @@ impl Env {
 
     fn set_companion(&self, bytes: &[u8]) {
         fs::write(
-            self.fixture.root.join(&self.document.companion_path()),
+            self.fixture.root.join(self.document.companion_path()),
             bytes,
         )
         .expect("write companion");
     }
 
     fn companion(&self) -> Option<Vec<u8>> {
-        fs::read(self.fixture.root.join(&self.document.companion_path())).ok()
+        fs::read(self.fixture.root.join(self.document.companion_path())).ok()
     }
 
     fn source_bytes(&self) -> Vec<u8> {
-        fs::read(self.fixture.root.join(&self.document.target_path())).expect("source")
+        fs::read(self.fixture.root.join(self.document.target_path())).expect("source")
     }
 
     fn set_receipt(&self, bytes: &[u8]) {
@@ -1129,7 +1130,7 @@ fn desktop_operations_validate_the_current_html_and_use_the_publication_writer()
             &env.document,
             &env.source,
             env.candidate_html.as_bytes(),
-            &[env.css.clone()],
+            std::slice::from_ref(&env.css),
             &[],
         )
         .expect("host validation");
@@ -1767,7 +1768,7 @@ fn source_deletion_and_rename_keep_old_artifacts_and_report_remaining_paths() {
         &mut env.store.clone(),
         &mut controls,
         &request,
-        &env.settings.target_paths().to_vec(),
+        env.settings.target_paths(),
         now(),
     )
     .expect("source deletion");
@@ -1797,7 +1798,7 @@ fn source_deletion_and_rename_keep_old_artifacts_and_report_remaining_paths() {
         &mut env.store.clone(),
         &mut controls,
         &request,
-        &env.settings.target_paths().to_vec(),
+        env.settings.target_paths(),
         now(),
     )
     .expect("duplicate deletion");
@@ -1833,7 +1834,7 @@ fn source_deletion_and_rename_keep_old_artifacts_and_report_remaining_paths() {
         &mut env.store.clone(),
         &mut controls,
         &request,
-        &env.settings.target_paths().to_vec(),
+        env.settings.target_paths(),
         now(),
     )
     .expect("source move");
@@ -1875,7 +1876,7 @@ fn a_source_removal_does_not_orphan_when_the_job_stop_is_unconfirmed() {
         &mut env.store.clone(),
         &mut controls,
         &request,
-        &env.settings.target_paths().to_vec(),
+        env.settings.target_paths(),
         now(),
     )
     .expect_err("unconfirmed stop is not orphaned");
@@ -1896,7 +1897,7 @@ fn a_source_removal_does_not_orphan_when_the_job_stop_is_unconfirmed() {
         &mut env.store.clone(),
         &mut controls,
         &request,
-        &env.settings.target_paths().to_vec(),
+        env.settings.target_paths(),
         now(),
     )
     .expect_err("a stored unconfirmed stop is replayed as the same failure");
@@ -2027,9 +2028,7 @@ fn store_synced_document(
     );
     let record = env.store_new_document(state.clone());
     let mut record = record;
-    for journal in [journal] {
-        record = commit_publication(env, &record, journal);
-    }
+    record = commit_publication(env, &record, journal);
     (record, generation)
 }
 
@@ -2240,12 +2239,10 @@ fn collect_tree(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>
         };
         if metadata.is_dir() {
             collect_tree(root, &path, files);
-        } else if metadata.is_file() {
-            if let Ok(bytes) = fs::read(&path) {
-                if let Ok(relative) = path.strip_prefix(root) {
+        } else if metadata.is_file()
+            && let Ok(bytes) = fs::read(&path)
+                && let Ok(relative) = path.strip_prefix(root) {
                     files.push((relative.to_path_buf(), bytes));
                 }
-            }
-        }
     }
 }

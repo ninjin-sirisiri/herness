@@ -1187,13 +1187,13 @@ impl SyncCoordinator {
         }
         let document = observation.document.clone();
         let project = document.project_id();
-        if let Some(active) = &self.active {
-            if active.owner.document() == &document {
-                if active.snapshot.digest() == observation.snapshot.digest() {
-                    return OfferOutcome::ActiveUnchanged;
-                }
-                return OfferOutcome::ChangedDuringAuthoring;
+        if let Some(active) = &self.active
+            && active.owner.document() == &document
+        {
+            if active.snapshot.digest() == observation.snapshot.digest() {
+                return OfferOutcome::ActiveUnchanged;
             }
+            return OfferOutcome::ChangedDuringAuthoring;
         }
         if let Some(held) = self.latches.get(&(project, document.clone())) {
             // A new notification is not a human resume.
@@ -2331,6 +2331,7 @@ impl SyncCoordinator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_failure(
         &self,
         store: &mut dyn H3StorePort,

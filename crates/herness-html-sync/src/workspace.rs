@@ -623,7 +623,7 @@ fn read_exact<R: SourceReadPort>(
             ),
         });
     }
-    Ok(captured(path, read)?)
+    captured(path, read)
 }
 
 fn read_optional<R: SourceReadPort>(

@@ -76,6 +76,8 @@ struct RecordedRequest {
     body: String,
 }
 
+type MockHandler = Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>;
+
 struct MockServer {
     address: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -90,9 +92,7 @@ impl MockServer {
         Self::start_arc(Arc::new(handler))
     }
 
-    fn start_arc(
-        handler: Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>,
-    ) -> Self {
+    fn start_arc(handler: MockHandler) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let address = listener.local_addr().expect("address");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -604,18 +604,11 @@ impl Acceptance {
         Self::new_inner(images, auto_publish, None)
     }
 
-    fn new_with_handler(
-        auto_publish: bool,
-        handler: Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>,
-    ) -> Self {
+    fn new_with_handler(auto_publish: bool, handler: MockHandler) -> Self {
         Self::new_inner(true, auto_publish, Some(handler))
     }
 
-    fn new_inner(
-        images: bool,
-        auto_publish: bool,
-        handler: Option<Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync>>,
-    ) -> Self {
+    fn new_inner(images: bool, auto_publish: bool, handler: Option<MockHandler>) -> Self {
         let serial = ACCEPTANCE_SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1751,6 +1744,7 @@ fn build_v2_candidate() -> String {
         "supplementary": [],
         "calculations": [],
     });
+    let source_digest = format!("sha256:{}", digest.as_str());
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -1765,7 +1759,7 @@ fn build_v2_candidate() -> String {
 {}\n</article></main>\n\
 <template id=\"sdd-provenance\">{}</template>\n\
 </body>\n</html>\n",
-        format!("sha256:{}", digest.as_str()),
+        source_digest,
         elements.join("\n"),
         provenance
     )
@@ -1819,10 +1813,7 @@ fn the_v2_fixture_passes_the_real_pack() {
     );
 }
 
-fn continuous_model(
-    v1_html: String,
-    v2_html: String,
-) -> Arc<dyn Fn(usize, &RecordedRequest) -> MockResponse + Send + Sync> {
+fn continuous_model(v1_html: String, v2_html: String) -> MockHandler {
     let v1_provenance = provenance_payload(&v1_html);
     let v2_provenance = provenance_payload(&v2_html);
     Arc::new(move |_index, request| {
@@ -1926,8 +1917,7 @@ fn continuous_source_change_supersedes_reissues_consent_and_reaches_synced() {
         .expect("budget")
         .expect("budget record")
         .record()
-        .usage()
-        .clone();
+        .usage();
     assert!(budget_before.runs_started() >= 1);
 
     std::fs::write(h.root.join(TARGET), V2_SOURCE).expect("v2 source");
@@ -1981,8 +1971,7 @@ fn continuous_source_change_supersedes_reissues_consent_and_reaches_synced() {
         .expect("budget")
         .expect("budget record")
         .record()
-        .usage()
-        .clone();
+        .usage();
     assert!(
         budget_after.runs_started() >= budget_before.runs_started(),
         "the run budget is not reset"

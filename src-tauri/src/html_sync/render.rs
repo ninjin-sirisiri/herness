@@ -1478,6 +1478,7 @@ impl RenderError {
 /// AppKit main thread. Call it from a background thread, never from the
 /// AppKit main thread.
 #[cfg(target_os = "macos")]
+#[allow(clippy::result_large_err)]
 pub fn render_candidate(
     app: &tauri::AppHandle,
     job: &RenderJob,

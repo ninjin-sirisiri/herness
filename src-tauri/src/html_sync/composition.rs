@@ -951,15 +951,13 @@ fn purposes_display(
                 .iter()
                 .find(|entry| entry.purpose == purpose.as_str())
         });
-        let approved = settings
-            .and_then(H3Settings::approval)
-            .and_then(|approval| {
-                if purpose == ProfilePurpose::Completion {
-                    Some(approval.authoring())
-                } else {
-                    Some(approval.assessment())
-                }
-            });
+        let approved = settings.and_then(H3Settings::approval).map(|approval| {
+            if purpose == ProfilePurpose::Completion {
+                approval.authoring()
+            } else {
+                approval.assessment()
+            }
+        });
         let configured = status.is_some_and(|status| status.configured) || approved.is_some();
         let verified = status.is_some_and(|status| status.verified);
         let consent_state = status
@@ -1169,7 +1167,7 @@ pub fn budget_view(host: &DesktopHost, project: ProjectId) -> Result<HtmlSyncBud
     Ok(HtmlSyncBudgetView {
         project_id: project,
         supervision_id,
-        usage: budget.as_ref().map(|budget| budget.usage.clone()),
+        usage: budget.as_ref().map(|budget| budget.usage),
         budget,
         multi_cycle_cost_warning: MULTI_CYCLE_COST_WARNING,
     })
@@ -2040,6 +2038,7 @@ fn resumable_cycle(
     Ok((cycle, true))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_state(
     host: &mut DesktopHost,
     request: &H3OperationRequest,

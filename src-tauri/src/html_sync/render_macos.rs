@@ -118,9 +118,11 @@ const CONTROL_READ_SCRIPT: &str = r#"JSON.stringify({main: (() => { try { return
 const RENDER_READ_SCRIPT: &str = r#"JSON.stringify({main: (() => { try { return localStorage.getItem("h3-main-canary"); } catch (e) { return "error:" + e.name; } })(), render: (() => { try { return localStorage.getItem("h3-render-canary"); } catch (e) { return "error:" + e.name; } })()})"#;
 
 thread_local! {
-    static RULE_LIST: RefCell<Option<Retained<WKContentRuleList>>> = RefCell::new(None);
-    static SESSIONS: RefCell<BTreeMap<String, RenderSession>> = RefCell::new(BTreeMap::new());
-    static AUX_SESSIONS: RefCell<BTreeMap<AuxKind, AuxSession>> = RefCell::new(BTreeMap::new());
+    static RULE_LIST: RefCell<Option<Retained<WKContentRuleList>>> = const { RefCell::new(None) };
+    static SESSIONS: RefCell<BTreeMap<String, RenderSession>> =
+        const { RefCell::new(BTreeMap::new()) };
+    static AUX_SESSIONS: RefCell<BTreeMap<AuxKind, AuxSession>> =
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -614,6 +616,7 @@ impl AuxDelegate {
 }
 
 /// Renders one candidate. Called from a background thread only.
+#[allow(clippy::result_large_err)]
 pub(super) fn render(
     app: &AppHandle,
     job: &RenderJob,
@@ -1340,6 +1343,7 @@ fn as_any(object: &NSString) -> &AnyObject {
     unsafe { &*(object as *const NSString).cast::<AnyObject>() }
 }
 
+#[allow(clippy::type_complexity)]
 fn start_snapshot_on_main(
     mtm: MainThreadMarker,
     job_id: &str,

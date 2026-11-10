@@ -570,15 +570,14 @@ impl HtmlSyncRecoveryHost {
                             binding.dependencies.clone(),
                         ) {
                             Ok(true) => {
-                                if let Some(job_id) = self.durable_job_id(project) {
-                                    if let Err(error) =
+                                if let Some(job_id) = self.durable_job_id(project)
+                                    && let Err(error) =
                                         self.worker.restore_job_id(project, job_id)
-                                    {
-                                        failures.push(HtmlSyncRecoveryFailure {
-                                            project_id: project,
-                                            detail: error.to_string(),
-                                        });
-                                    }
+                                {
+                                    failures.push(HtmlSyncRecoveryFailure {
+                                        project_id: project,
+                                        detail: error.to_string(),
+                                    });
                                 }
                                 self.bound.insert(project);
                                 bound.push(project);

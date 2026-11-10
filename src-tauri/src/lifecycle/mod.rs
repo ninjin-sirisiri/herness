@@ -38,6 +38,58 @@ pub fn ui_ready_generation() -> usize {
     UI_READY_GENERATION.load(Ordering::SeqCst)
 }
 
+/// Runs the windowless H3 lifecycle launcher.
+///
+/// The app data root must be pre-seeded by the acceptance fixture. This mode
+/// creates no main window and selects no project: it only restores the app,
+/// pumps the host, and reports the saved H3 startup result. It is a test
+/// launcher, not a production IPC surface or a claim of GUI operation.
+pub fn start_h3_lifecycle_test(app: &tauri::App) {
+    let handle = app.handle().clone();
+    std::thread::spawn(move || {
+        // Allow the app-lifetime pump to run one or more windowless ticks.
+        std::thread::sleep(Duration::from_millis(250));
+        let state = handle.state::<crate::app::AppState>();
+        let Ok(mut host) = state.host.lock() else {
+            eprintln!("H3_LIFECYCLE_FAILED: the host lock was poisoned");
+            handle.exit(2);
+            return;
+        };
+        for _ in 0..5 {
+            if let Err(error) = host.pump() {
+                eprintln!("H3_LIFECYCLE_FAILED: host pump failed: {error}");
+                handle.exit(2);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let Some(startup) = host.html_sync_startup().cloned() else {
+            eprintln!("H3_LIFECYCLE_FAILED: no H3 startup report was saved");
+            handle.exit(2);
+            return;
+        };
+        let window_absent = handle.get_webview_window(guard::MAIN_LABEL).is_none();
+        let projects = startup.projects().len();
+        let bound = startup.bound_projects().len();
+        let failures = startup.failures().len();
+        let requests = startup.request_count();
+        if failures != 0 || requests != 0 || !window_absent {
+            eprintln!(
+                "H3_LIFECYCLE_FAILED: pid={} projects={projects} bound={bound} failures={failures} request_count={requests} window_absent={window_absent}",
+                std::process::id()
+            );
+            handle.exit(2);
+            return;
+        }
+        println!(
+            "H3_LIFECYCLE_OK: pid={} projects={projects} bound={bound} failures={failures} request_count={requests} window=absent selected_project=none",
+            std::process::id()
+        );
+        drop(host);
+        handle.exit(0);
+    });
+}
+
 /// Starts the host-owned monitoring pump.
 ///
 /// The pump runs for the application lifetime and drives every project's

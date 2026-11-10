@@ -2840,7 +2840,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>, EvidenceValidationError> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(EvidenceValidationError::InvalidValue {
             field: "evidenceContent.bytesHex".to_owned(),
             detail: "odd-length hex payload".to_owned(),
@@ -3758,12 +3758,7 @@ impl AssessmentPlan {
         max_text_bytes: usize,
     ) -> Result<Self, EvidenceValidationError> {
         pack.validate()?;
-        let expected = pack
-            .coverage
-            .expected_units()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let expected = pack.coverage.expected_units().to_vec();
         let split = EvaluationSplit::contiguous(&expected, max_units_per_part.max(1))?;
         let mut slices = Vec::new();
         let mut truncated = Vec::new();
@@ -4857,20 +4852,20 @@ fn related_context(unit: &SourceUnitDefinition, units: &[SourceUnitDefinition]) 
         .position(|candidate| candidate.id == unit.id)
         .unwrap_or(0);
     let mut context = Vec::new();
-    if let Some(parent) = unit.parent() {
-        if let Some(parent_unit) = units.iter().find(|candidate| candidate.id() == parent) {
-            context.push(format!(
-                "parent {}: {}",
-                parent_unit.kind(),
-                truncate(parent_unit.text(), 240)
-            ));
-        }
+    if let Some(parent) = unit.parent()
+        && let Some(parent_unit) = units.iter().find(|candidate| candidate.id() == parent)
+    {
+        context.push(format!(
+            "parent {}: {}",
+            parent_unit.kind(),
+            truncate(parent_unit.text(), 240)
+        ));
     }
-    for index in position.saturating_sub(2)..position {
+    for previous in units.iter().take(position).skip(position.saturating_sub(2)) {
         context.push(format!(
             "previous {}: {}",
-            units[index].kind(),
-            truncate(units[index].text(), 240)
+            previous.kind(),
+            truncate(previous.text(), 240)
         ));
     }
     if let Some(next) = units.get(position + 1) {
@@ -5324,19 +5319,20 @@ fn scan_html(html: &str) -> ScannedHtml {
                     if element.main {
                         main_depth = main_depth.saturating_sub(1);
                     }
-                    if let Some(level) = element.heading_level {
-                        if let Some(capture) = heading_captures.pop() {
-                            headings.push(HeadingFact {
-                                level,
-                                text: normalize_space(&capture.text),
-                                id: element.id.clone(),
-                            });
-                        }
+                    if let Some(level) = element.heading_level
+                        && let Some(capture) = heading_captures.pop()
+                    {
+                        headings.push(HeadingFact {
+                            level,
+                            text: normalize_space(&capture.text),
+                            id: element.id.clone(),
+                        });
                     }
-                    if let Some(id) = element.id {
-                        if element.targetable && element.start < tag.end {
-                            targets.insert(id, html[element.start..tag.end].to_owned());
-                        }
+                    if let Some(id) = element.id
+                        && element.targetable
+                        && element.start < tag.end
+                    {
+                        targets.insert(id, html[element.start..tag.end].to_owned());
                     }
                 }
             }
@@ -5373,18 +5369,20 @@ fn scan_html(html: &str) -> ScannedHtml {
         let is_visible =
             is_visible_context && !hidden && !is_template && !is_head && !is_nav && !is_aside;
 
-        if !is_visible && let Some(id) = &id {
-            if !matches!(name, "html" | "body" | "main" | "head") {
-                hidden_targets.insert(id.clone());
-            }
+        if !is_visible
+            && let Some(id) = &id
+            && !matches!(name, "html" | "body" | "main" | "head")
+        {
+            hidden_targets.insert(id.clone());
         }
 
         // Navigation links live inside <nav>, which is intentionally not a
         // mapping target, but its targets are still usability facts.
-        if nav_depth > 0 && name == "a" {
-            if let Some(href) = attr(&tag.attrs, "href") {
-                navigation_targets.push(href.to_owned());
-            }
+        if nav_depth > 0
+            && name == "a"
+            && let Some(href) = attr(&tag.attrs, "href")
+        {
+            navigation_targets.push(href.to_owned());
         }
         if template_depth == 0
             && head_depth == 0
@@ -5510,10 +5508,11 @@ fn scan_html(html: &str) -> ScannedHtml {
         } else {
             // Self-closing and void elements with an id are visible targets on
             // their own.
-            if is_visible && let Some(id) = id {
-                if !matches!(name, "html" | "body" | "main" | "head") {
-                    targets.insert(id, html[start..tag.end].to_owned());
-                }
+            if is_visible
+                && let Some(id) = id
+                && !matches!(name, "html" | "body" | "main" | "head")
+            {
+                targets.insert(id, html[start..tag.end].to_owned());
             }
         }
 

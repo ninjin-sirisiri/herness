@@ -461,6 +461,7 @@ impl H3DocumentRecord {
 
 /// Result of one atomic H3 commit.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum HtmlSyncCommitOutcome {
     /// State was written and events are visible after the commit.
     Applied {

@@ -862,6 +862,7 @@ impl FinalCandidateCheckPort for RejectingFinal<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_direct(
     env: &Env,
     mut store: FaultyH3Store,

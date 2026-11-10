@@ -1186,7 +1186,7 @@ fn validate_capabilities(
             .and_then(Value::as_str)
             .ok_or_else(invalid_capabilities)?,
     )?;
-    if &policy_digest != &probe.policy_fingerprint {
+    if policy_digest != probe.policy_fingerprint {
         return Err(PolicyBridgeError::PolicyFingerprintMismatch {
             approved: probe.policy_fingerprint.as_str().to_owned(),
             found: policy_digest.as_str().to_owned(),
@@ -1338,7 +1338,6 @@ fn pack_fingerprint(
     component(policy_fingerprint.as_str());
     component(&definition.capability.requires.policy_bridge.protocol);
     component(&definition.capability.requires.policy_bridge.version.to_string());
-    drop(component);
     Ok(finish_digest(hasher))
 }
 

@@ -844,18 +844,16 @@ fn replacement_actor(
 fn supersession_recovery_rejection(
     report: &RecoveryReport,
 ) -> Option<OwnerSupersessionRejection> {
-    for reason in report.block_reasons() {
-        match reason {
-            RecoveryBlockReason::BudgetExhausted { limit } => {
-                return Some(OwnerSupersessionRejection::BudgetExhausted { limit: *limit });
-            }
-            RecoveryBlockReason::StopUnconfirmed { .. } => {
-                return Some(OwnerSupersessionRejection::StopUnconfirmed);
-            }
-            _ => return Some(OwnerSupersessionRejection::RecoveryPending),
+    match report.block_reasons().first() {
+        Some(RecoveryBlockReason::BudgetExhausted { limit }) => {
+            Some(OwnerSupersessionRejection::BudgetExhausted { limit: *limit })
         }
+        Some(RecoveryBlockReason::StopUnconfirmed { .. }) => {
+            Some(OwnerSupersessionRejection::StopUnconfirmed)
+        }
+        Some(_) => Some(OwnerSupersessionRejection::RecoveryPending),
+        None => None,
     }
-    None
 }
 
 fn generation_label(record: &SupervisionRecord) -> String {

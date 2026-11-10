@@ -758,7 +758,7 @@ impl PublicationOrchestrator<'_> {
         let ready_document = if attempt.explicit_resolution {
             rebuild_explicit_ready_document(&attempt, ready_reason, now)?
         } else {
-            rebuild_document(&document_record.state(), ready_reason, now)?
+            rebuild_document(document_record.state(), ready_reason, now)?
         };
         let prepared_event = crate::events::publication_event(&journal, now)?;
         let ready_event = crate::events::document_state_event(
@@ -851,7 +851,7 @@ impl PublicationOrchestrator<'_> {
         let old_saved = journal.old_versions_saved(old_html, old_receipt, now)?;
         let old_saved_event = crate::events::publication_event(&old_saved, now)?;
         let old_saved_document = rebuild_document(
-            &current_document.state(),
+            current_document.state(),
             H3Reason::new(
                 H3StateReasonKind::ReadyToPublish {
                     generation: attempt.generation.generation_id(),
@@ -904,7 +904,7 @@ impl PublicationOrchestrator<'_> {
             Vec::new(),
         )?;
         let publishing_document =
-            rebuild_document(&current_document.state(), publishing_reason, now)?;
+            rebuild_document(current_document.state(), publishing_reason, now)?;
         let publishing_event = crate::events::publication_event(&replacing, now)?;
         let publishing_state_event = crate::events::document_state_event(
             attempt.document(),
@@ -1102,7 +1102,7 @@ impl PublicationOrchestrator<'_> {
             Vec::new(),
         )?;
         let synced_document = rebuild_synced_document(
-            &current_document.state(),
+            current_document.state(),
             synced_reason,
             Applicability::current_synced(),
             now,
@@ -1605,7 +1605,7 @@ impl PublicationOrchestrator<'_> {
                 .failed(PublicationStatus::NotPublished, refusal.detail.clone(), now)?,
         };
         let reason = refusal.reason(document)?;
-        let next = rebuild_document(&document.state(), reason, now)?;
+        let next = rebuild_document(document.state(), reason, now)?;
         let document_event = crate::events::document_state_event(
             attempt.document(),
             Some(document.state().state()),

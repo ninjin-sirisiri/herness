@@ -611,14 +611,13 @@ fn duplicate_request_returns_the_stored_result_without_another_write_or_event() 
         .expect("load")
         .expect("document");
     assert_eq!(after_duplicate.revision(), 2);
-    assert_eq!(
+    assert!(
         store
             .html_sync_request_result(project, ids.request_one)
             .expect("request result")
             .expect("stored")
             .replay()
-            .duplicate(),
-        true
+            .duplicate()
     );
 
     let conflicting = herness_html_sync_tests::fixtures::pause_request(ids.request_one, 2);

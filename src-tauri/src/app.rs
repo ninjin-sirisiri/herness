@@ -33,6 +33,8 @@ pub enum LaunchMode {
         quit_test: bool,
         /// Run the close/reopen launcher.
         close_reopen_test: bool,
+        /// Run the windowless H3 lifecycle launcher.
+        h3_lifecycle_test: bool,
     },
     /// Desktop child-process render evidence launcher.
     RenderTest(RenderTestLaunch),
@@ -44,6 +46,7 @@ impl Default for LaunchMode {
             smoke_test: false,
             quit_test: false,
             close_reopen_test: false,
+            h3_lifecycle_test: false,
         }
     }
 }
@@ -60,6 +63,7 @@ where
     let mut smoke_test = false;
     let mut quit_test = false;
     let mut close_reopen_test = false;
+    let mut h3_lifecycle_test = false;
     let mut render: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
     let mut budget_ms = 30_000u64;
     let mut cancel_after_ms = None;
@@ -69,6 +73,7 @@ where
             "--smoke-test" => smoke_test = true,
             "--quit-test" => quit_test = true,
             "--close-reopen-test" => close_reopen_test = true,
+            "--h3-lifecycle-test" => h3_lifecycle_test = true,
             "--h3-render-test" => {
                 let fixture = arguments
                     .next()
@@ -103,8 +108,11 @@ where
         }
     }
 
+    if h3_lifecycle_test && (smoke_test || quit_test || close_reopen_test) {
+        return Err("--h3-lifecycle-test cannot be combined with the window launchers".to_owned());
+    }
     if let Some((fixture_dir, output_dir)) = render {
-        if smoke_test || quit_test || close_reopen_test {
+        if smoke_test || quit_test || close_reopen_test || h3_lifecycle_test {
             return Err("--h3-render-test cannot be combined with the window launchers".to_owned());
         }
         return Ok(LaunchMode::RenderTest(RenderTestLaunch {
@@ -118,6 +126,7 @@ where
         smoke_test,
         quit_test,
         close_reopen_test,
+        h3_lifecycle_test,
     })
 }
 
@@ -148,12 +157,13 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                 start_render_test(app, launch.clone());
                 return Ok(());
             }
-            let (smoke_test, quit_test, close_reopen_test) = match &mode {
+            let (smoke_test, quit_test, close_reopen_test, h3_lifecycle_test) = match &mode {
                 LaunchMode::Normal {
                     smoke_test,
                     quit_test,
                     close_reopen_test,
-                } => (*smoke_test, *quit_test, *close_reopen_test),
+                    h3_lifecycle_test,
+                } => (*smoke_test, *quit_test, *close_reopen_test, *h3_lifecycle_test),
                 LaunchMode::RenderTest(_) => unreachable!("render mode returned above"),
             };
 
@@ -207,6 +217,10 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
             // events and applies run deadlines even with no window and no
             // non-selected project poll.
             lifecycle::start_host_pump(app);
+            if h3_lifecycle_test {
+                lifecycle::start_h3_lifecycle_test(app);
+                return Ok(());
+            }
             lifecycle::create_main_window(app)?;
             if smoke_test {
                 lifecycle::start_smoke_test(app, started);
@@ -365,7 +379,21 @@ mod tests {
                 smoke_test: true,
                 quit_test: false,
                 close_reopen_test: false,
+                h3_lifecycle_test: false,
             }
+        );
+        assert_eq!(
+            parse_launch_mode(args(&["--h3-lifecycle-test"])).expect("h3 lifecycle"),
+            LaunchMode::Normal {
+                smoke_test: false,
+                quit_test: false,
+                close_reopen_test: false,
+                h3_lifecycle_test: true,
+            }
+        );
+        assert!(
+            parse_launch_mode(args(&["--h3-lifecycle-test", "--smoke-test"])).is_err(),
+            "the windowless lifecycle launcher cannot also create a window"
         );
     }
 }

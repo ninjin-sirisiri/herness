@@ -379,6 +379,7 @@ impl H3Record for H3OperationRequest {
     rename_all = "snake_case",
     rename_all_fields = "camelCase"
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum H3OperationOutcome {
     /// Settings were approved or enabled.
     SettingsEnabled {

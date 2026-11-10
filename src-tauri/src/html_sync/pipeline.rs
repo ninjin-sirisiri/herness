@@ -650,10 +650,8 @@ pub fn commit_state(
         state.evidence().to_vec(),
         state.applicability().clone(),
         now,
-    )
-    .map_err(H3Error::from)?;
-    let event = document_state_event(state.document_key(), Some(state.state()), &next, now)
-        .map_err(H3Error::from)?;
+    )?;
+    let event = document_state_event(state.document_key(), Some(state.state()), &next, now)?;
     let mut commit = herness_html_sync::HtmlSyncCommit::new()
         .with_document(DocumentCommit::new(Some(record.revision()), next)?)
         .with_events(vec![event]);
@@ -688,8 +686,7 @@ pub fn mark_assessing(
             generation: prepared.generation.generation_id(),
         },
         Vec::new(),
-    )
-    .map_err(H3Error::from)?;
+    )?;
     commit_state(store, &prepared.record, reason, None, now)
 }
 
@@ -703,8 +700,7 @@ pub fn mark_rejected(
     let reason = H3Reason::new(
         H3StateReasonKind::Failed { cause },
         vec![RequiredAction::ReviewFailure],
-    )
-    .map_err(H3Error::from)?;
+    )?;
     commit_state(store, &prepared.record, reason, None, now)
 }
 
@@ -716,8 +712,7 @@ pub fn mark_waiting(
     actions: Vec<RequiredAction>,
     now: Timestamp,
 ) -> Result<H3DocumentRecord, H3Error> {
-    let reason = H3Reason::new(H3StateReasonKind::WaitingHuman { cause }, actions)
-        .map_err(H3Error::from)?;
+    let reason = H3Reason::new(H3StateReasonKind::WaitingHuman { cause }, actions)?;
     commit_state(
         store,
         &prepared.record,
@@ -779,11 +774,11 @@ pub fn verification_detail(
         );
         (failure.to_string(), fixable)
     } else if !verification.is_usable() {
-        let mut detail = verification
-            .checks
-            .all_pass()
-            .then(|| "the evidence pack was not built from the available checks".to_owned())
-            .unwrap_or_else(|| "a mandatory check did not pass".to_owned());
+        let mut detail = if verification.checks.all_pass() {
+            "the evidence pack was not built from the available checks".to_owned()
+        } else {
+            "a mandatory check did not pass".to_owned()
+        };
         if let Some(check) = &verification.policy_check {
             detail.push_str(&format!(
                 "; structural decision={:?} stage={} contract={} final={} violations={:?}",

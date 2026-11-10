@@ -1221,12 +1221,12 @@ impl<'a> RecoveryService<'a> {
                 )?
             };
             let next = rebuild_document(
-                &state,
+                state,
                 reason,
                 Applicability::not_applicable(ApplicabilityReason::NeverPublished),
                 now,
             )?;
-            let cycle = self.load_cycle(project, &state)?;
+            let cycle = self.load_cycle(project, state)?;
             self.commit_document(
                 &record,
                 &next,
@@ -1278,8 +1278,8 @@ impl<'a> RecoveryService<'a> {
             let recovery = self.analyze_document(project, &record, deps)?;
             if persist && recovery.state_changed {
                 let state = record.state();
-                let next = next_document_state(&state, &recovery, now)?;
-                let cycle = self.load_cycle(project, &state)?;
+                let next = next_document_state(state, &recovery, now)?;
+                let cycle = self.load_cycle(project, state)?;
                 self.commit_document(&record, &next, cycle, recovery.latch, now)?;
                 committed = true;
             }
@@ -1312,7 +1312,7 @@ impl<'a> RecoveryService<'a> {
                 .find(|generation| generation.generation_id() == id)
         });
         let publications = self.store.list_html_sync_publications(project, &document)?;
-        let cycle = self.load_cycle(project, &state)?;
+        let cycle = self.load_cycle(project, state)?;
         let h2 = self
             .runtime
             .h2_facts(&document, state.h2(), cycle.as_ref())?;
@@ -1553,7 +1553,7 @@ impl<'a> RecoveryService<'a> {
             boundaries.dedup();
             boundaries
         };
-        let plan = recovery_plan(&state, &findings, &publication_recoveries);
+        let plan = recovery_plan(state, &findings, &publication_recoveries);
         let next_state = plan.next_state;
         let latch_changed = plan.latch.is_some_and(|latch| {
             cycle.as_ref().is_some_and(|cycle| {

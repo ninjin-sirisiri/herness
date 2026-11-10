@@ -194,6 +194,7 @@ impl DesktopHost {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         app_data_root: impl AsRef<Path>,
         connections: ConnectionAdmin,
@@ -1283,7 +1284,6 @@ impl DesktopHost {
     }
 
     /// Requests a cooperative stop for one project's active H3 authoring run.
-
     pub fn html_sync_stop_active(
         &mut self,
         document: &herness_html_sync::DocumentKey,

@@ -365,7 +365,7 @@ impl SupervisionAuthoringControl<'_> {
     }
 
     fn h2(record: &herness_supervision::SupervisionRecord) -> Result<H2Reference, H3Error> {
-        Ok(H2Reference::new(
+        H2Reference::new(
             record.project_id(),
             record.supervision_id(),
             Some(record.run_group().id()),
@@ -373,7 +373,7 @@ impl SupervisionAuthoringControl<'_> {
             Some(record.target_version()),
             Some(record.revision()),
             Some(record.state()),
-        )?)
+        )
     }
 
     fn started(

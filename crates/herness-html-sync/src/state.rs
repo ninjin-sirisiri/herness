@@ -492,11 +492,9 @@ impl H2Reference {
         revision: Option<u64>,
         state: Option<SupervisionState>,
     ) -> Result<Self, H3Error> {
-        supervision_id.validate_in(project).map_err(|error| H3Error::from(error))?;
+        supervision_id.validate_in(project).map_err(H3Error::from)?;
         if let Some(run_group) = run_group {
-            run_group
-                .validate_in(project)
-                .map_err(|error| H3Error::from(error))?;
+            run_group.validate_in(project).map_err(H3Error::from)?;
         }
         if revision == Some(0) {
             return Err(H3Error::must_be_positive("h2Revision"));
@@ -582,9 +580,7 @@ impl EvidenceRef {
         kind: EvidenceKind,
         digest: ContentDigest,
     ) -> Result<Self, H3Error> {
-        evidence_id
-            .validate_in(project)
-            .map_err(|error| H3Error::from(error))?;
+        evidence_id.validate_in(project).map_err(H3Error::from)?;
         Ok(Self {
             format_version: H3_FORMAT_VERSION,
             evidence_id,
@@ -1066,6 +1062,7 @@ impl H3DocumentState {
     ///
     /// A `synced` document must be currently applicable, and only a synced
     /// document may be currently applicable.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         document_key: DocumentKey,
         settings_version: u64,
