@@ -338,7 +338,7 @@ HERNESS_APP_DATA_ROOT=<fresh>/quit target/debug/herness-desktop --quit-test
 
 ### Phase B gate and 2026-11-10 partial execution
 
-Phase Bは2026-11-10に**限定実行**した。利用可能な接続はChatGPT login（normal LLM、`gpt-6-luna` → continued runでは`gpt-6.1-sol`）とCommandCode GOAT Jev（`typesafe/jev-1.14.0`）だけで、実行したのはtext-onlyの`information`条件のみ。Decisions、`support`/`usability`/`render`、画像、人間の読解観測は`not_run`である。injectionのfalse positiveとfalse stopが出たためgateを追加し、continued improvementではnormal LLMのfalse stopを0/5にした。Jev再評価・残条件・人間観測は未実行のため、**H3全体は未完了**である。詳細は[受入証跡](../research/2026-11-09-h3-acceptance.md)のB.9と`docs/research/2026-11-09-h3-phase-b/`。
+Phase Bは2026-11-10に**限定実行**した。利用可能な接続はChatGPT login（normal LLM、`gpt-6-luna` → continued runでは`gpt-6.1-sol`）とCommandCode GOAT Jev（`typesafe/jev-1.14.0`）だけで、実行したのはtext-onlyの`information`条件のみ。Decisions、`support`/`usability`/`render`、画像、人間の読解観測は`not_run`である。injectionのfalse positiveとfalse stopが出たためgateを追加し、continued improvementではnormal LLMのfalse stopを0/5にした。2026-11-10に利用者が **text-only reduced scope** を明示的に受入れ、H3は **accepted-with-exceptions** として確定した。Decisions・画像・残条件・人間観測は未確認であり、full H3 completeではない。詳細は[受入証跡](../research/2026-11-09-h3-acceptance.md)のB.9と`docs/research/2026-11-09-h3-phase-b/`。
 
 記入用のexact templateは`tests/html-sync/fixtures/evaluation/phase-b.approval.template.json`。`status: not_run`、`externalRequests: 0`で、credential・承認・実接続を含まない。既存の`real-evaluation.approval.json`はTask 24の汎用not-run gateテンプレートとして残す。
 
@@ -429,7 +429,7 @@ normal LLMのfalse stop 2件（`eval-glossary-001/positive`、`eval-plan-001/fal
 - 残るassessment-only false sync 2件は、どちらもCommon SDD pack structural `candidate-check`が`number-invented`で拒否する。full pipelineのfalse syncにはならない。
 - reports: `docs/research/2026-11-09-h3-phase-b/continued-summary-2026-11-10.json`、`continued-positives-gpt-6.1-sol-2026-11-10.json`、`continued-normal-llm-gpt-6.1-sol-2026-11-10.json`。
 - no-send verification: `cargo test -p herness-html-sync-tests --test phase_b --locked`（12 passed / 1 ignored real run）、`cargo test -p herness-html-sync --locked`、`cargo test -p herness-assessment --locked`（24 passed）、`cargo fmt --all -- --check`、`cargo check --workspace --locked`。`herness-supervision-tests`のfull suiteはparallel-loadの既知flakeを2件観測し、各testの単独再実行はgreen。real runは引き続き`H3_PHASE_B_REAL=1`と完全なapprovalがない限り実行されない。
-- Jev再評価・Decisions・`support`/`usability`/`render`・画像・人間観測は未実行。**H3全体は未完了**。
+- Jev再評価・Decisions・`support`/`usability`/`render`・画像・人間観測は未実行。H3はtext-only reduced scopeで**accepted-with-exceptions**であり、full H3 completeではない。
 
 - `eval-adr-001/fake-edge`は共通packの`number-invented`で正式反映前に拒否されるが、injectionは決定論的gateがなく、semanticなfalse positiveとして残る。
 - normal LLMの初回27件はChatGPT ResponsesのHTTP 400 `Stream must be set to true`で失敗した。`b928fb1`で`stream:true`とSSE `response.completed`解析を追加して再実行し、27/27 assessed。`chatgpt_models`のnested runtime panicも同期コマンド化で修正した。
@@ -451,4 +451,4 @@ normal LLMのfalse stop 2件（`eval-glossary-001/positive`、`eval-plan-001/fal
 
 許可がない限り実Keychain・login・providerへ接続しない。Phase Bの結果をscripted judgeやnative lifecycleで代用しない。Jevの画像上限は未確認で、不足・超過は`WaitingHuman`/`insufficient`にする。
 
-H1/H2の未確認（OpenAI/Anthropic APIキー経路、通常LLM/Decisions実接続、Jev標準permission auto-allow、実Tauri GUI手動操作、閾値の実model妥当性）はH3でも未確認のままである。Phase Aは合格だが、Phase Bまたは受入範囲の再合意がない限り**H3全体を完了にしない**。
+H1/H2の未確認（OpenAI/Anthropic APIキー経路、通常LLM/Decisions実接続、Jev標準permission auto-allow、実Tauri GUI手動操作、閾値の実model妥当性）はH3でも未確認のままである。Phase Aは合格し、Phase Bはtext-only reduced scopeとして人間が明示的に受入れた。full Phase Bと上記未確認は残るため、**H3全体が完全検証済みとは表示しない**。

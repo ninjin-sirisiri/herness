@@ -1,6 +1,6 @@
 # H3 HTML同期の受入証跡（Phase A実行、2026-11-09）
 
-**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase Bは2026-11-10に**限定実行**した（ChatGPT loginのnormal LLM + CommandCode Jev、text-onlyの`information`条件のみ）。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は`not_run`である。実評価では負例のinformation条件にfalse positive（injection）と正例のfalse stopが出た。その後、明示的なinstruction overrideを送信前に止める決定論的gateを追加して再評価し、injectionのfalse syncは0になった（fake-edgeはpack structuralで拒否、false stopは残存）。2026-11-10のcontinued improvementでは、通常LLMのadapter promptにverdict semanticsを明記し、`gpt-6.1-sol`で再評価してnormal LLMのfalse stopを0/5にした。Jev・Decisions・画像・残条件・人間観測は未実行のため、full Phase Bではなく、**H3全体は未完了**であり、完了扱いにしない。
+**Status:** Phase A（自動検証・loopback・実Tauri/WebKitのwindowなし/非選択project/quit/restore）は全gateを実行して合格した。Phase Bは2026-11-10に**限定実行**した（ChatGPT loginのnormal LLM + CommandCode Jev、text-onlyの`information`条件のみ）。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は`not_run`である。実評価では負例のinformation条件にfalse positive（injection）と正例のfalse stopが出た。その後、明示的なinstruction overrideを送信前に止める決定論的gateを追加して再評価し、injectionのfalse syncは0になった（fake-edgeはpack structuralで拒否、false stopは残存）。2026-11-10のcontinued improvementでは、通常LLMのadapter promptにverdict semanticsを明記し、`gpt-6.1-sol`で再評価してnormal LLMのfalse stopを0/5にした。2026-11-10に利用者が **text-only reduced scope** を明示的に受入れ、H3は **accepted-with-exceptions** として確定した。Decisions、画像、`support`/`usability`/`render`、人間の読解観測は未確認であり、full H3 completeではない。
 
 - **herness revision（Phase Aの検証code tree）:** `127f1b1bdb0dbd2224098d669f4ad78a55894e47`（`style: apply rustfmt across the workspace`）。Phase B runnerは`15c85bf`、ChatGPT streaming修正は`b928fb1`。この受入記録のcommitはcode treeを変更しない。
 - **Common SDD pack:** `/Users/h-uma/Documents/sdd` HEAD `601ebed9c02828373d9851cc01ea45b8c097ac7b`（read-only、clean）。
@@ -299,6 +299,29 @@ Phase Aの範囲では、H3の実adapter・実pack・実render・実Tauri lifecy
 - 予備のsmoke実行1回を`HERNESS_APP_DATA_ROOT`未設定で行った。これは既定の`~/Library/Application Support/dev.herness.desktop/herness`を使い、provider・Keychain・login・外部networkには触れていない。記録用evidenceには含めず、最終binaryの記録は上記のfresh root実行だけである。既定rootの既存DBにschema/migrationの副作用があり得るため、隠さずここに記す。
 - `git show --check`と`git diff --check`はclean。最終workspace testは875 passed / 0 failed / 4 ignored、packは372 passed。
 
+## 受入決定（2026-11-10、text-only reduced scope）
+
+利用者`h-uma`は、Phase Aと、Phase Bのtext-only `information`条件（normal LLM `gpt-6.1-sol` + CommandCode Jev、injection gate、false stop 0、injection false sync 0）を **text-only reduced scope** として明示的に受入れた。これは計画の「未確認を残す場合は人間の受入範囲再合意を要する」に対する合意である。
+
+受入範囲外・未確認として残すもの:
+
+- Decisions（OpenAI API keyなし）、画像/PNG、`support`/`usability`/`render`、人間の読解観測。
+- Jevの画像上限、実providerの継続的な料金/枠保証、production in-process `NativeRenderPort`のGUI手動描画。
+- H1/H2から継承した未確認（OpenAI/Anthropic APIキー経路、実Tauri GUI操作、実modelのthreshold妥当性など）。
+- assessment-onlyのfalse sync 2件（`fake-edge`/`fake-value`）。どちらも共通packが`number-invented`で拒否するため、full H3 pipelineの正式反映ではない。
+- normal LLMのrun間ばらつき（false stopの再現性は限定的）。今回の受入は特定の記録runに対するもので、将来のmodel更新を自動承認しない。
+
+最終gate（code tree `fa0299c` + この受入記録）:
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — pass
+- `cargo test --workspace --locked` — 初回に既知の並列flake（`adapter_authority_prevents_a_second_executor_for_allowed_tools`）が1件出たが、対象target単独20/20とworkspace rerunはpass
+- `cargo build -p herness-desktop --locked` — pass
+- pack `uvx --from pytest pytest -q` — **372 passed**
+- Phase Aのnative lifecycle / smoke / close-reopen / quitは上記のとおりpass
+
+**結論:** H3は **text-only reduced scopeでaccepted-with-exceptions**。full Phase B（Decisions・画像・残条件・人間観測）は未完了であり、H3全体が完全検証済みという表示はしない。作業treeのcommitは`fa0299c`まで（この受入記録のdocs commitを除く）。
+
 ## Phase A判定
 
-**Phase A PASS。** fmt、clippy `-D warnings`、workspace test、desktop build、pack test、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateがすべて成功した。Phase Bは限定実行（normal LLM + Jev、text-only information）で、injection gate後の再評価ではinjectionのfalse syncは0、fake-edgeはpack structuralで拒否、normal LLMのfalse stopは`gpt-6.1-sol`とprompt semanticsのcontinued runで0/5になった。Jev再評価・Decisions・画像・残条件・人間観測は未実行である。**H3全体は未完了である。**
+**Phase A PASS。** fmt、clippy `-D warnings`、workspace test（初回flake後rerun）、desktop build、pack 372 passed、実Tauri smoke/close-reopen/quit、H3 native lifecycle fixture、H3 package test、html-docs validateが成功した。Phase Bはtext-only reduced scopeでaccepted-with-exceptions（normal LLM `gpt-6.1-sol` + Jev、injection gate、false stop 0、injection false sync 0）。Jev再評価・Decisions・画像・残条件・人間観測は未実行であり、H3全体が完全検証済みという表示はしない。
