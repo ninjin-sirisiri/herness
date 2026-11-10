@@ -596,12 +596,8 @@ fn html_is_a_distinct_condition_purpose_with_no_completion_fallback() {
         ProfileInputs::text_only(),
     );
     assert_eq!(html.purpose(), ProfilePurpose::Html);
-    let html_entry = ProfileEntry::new(
-        html.clone(),
-        connection,
-        ConnectionStatus::Available,
-        false,
-    );
+    let html_entry =
+        ProfileEntry::new(html.clone(), connection, ConnectionStatus::Available, false);
 
     let mut catalog = ProfileCatalog::for_project(project);
     catalog.insert(html_entry).expect("insert html profile");
@@ -613,11 +609,8 @@ fn html_is_a_distinct_condition_purpose_with_no_completion_fallback() {
         }))
     );
 
-    let completion_binding = ProfileBinding::new(
-        html.id(),
-        html.version(),
-        ProfilePurpose::Completion,
-    );
+    let completion_binding =
+        ProfileBinding::new(html.id(), html.version(), ProfilePurpose::Completion);
     assert!(!completion_binding.matches(&html));
     assert!(matches!(
         catalog.resolve_bound(completion_binding),
@@ -668,10 +661,7 @@ fn html_assessment_results_record_their_purpose_and_never_support_completion() {
 
     assert_eq!(result.purpose(), ProfilePurpose::Html);
     assert_eq!(result.profile().purpose(), ProfilePurpose::Html);
-    assert_eq!(
-        result.provenance().purpose(),
-        Some(ProfilePurpose::Html)
-    );
+    assert_eq!(result.provenance().purpose(), Some(ProfilePurpose::Html));
 
     let completion_binding =
         ProfileBinding::new(profile.id(), profile.version(), ProfilePurpose::Completion);

@@ -25,6 +25,7 @@ use herness_core::{
 };
 use herness_store::test_support::CommitFault;
 use herness_store::{Store, StoreConfig};
+use herness_supervision::OwnerSupersessionRejection;
 use herness_supervision::approval::{ApprovalActor, OwnerApprovalSource};
 use herness_supervision::budget::ledger::{
     BudgetClockPort, BudgetLedger, ClockReading, MoneySettlement,
@@ -64,11 +65,10 @@ use herness_supervision::state::{
 use herness_supervision::supervisor::{
     OwnerNotificationPort, StopDisposition, SupervisorNotification,
 };
-use herness_supervision::OwnerSupersessionRejection;
 use herness_supervision_tests::{
-    ScriptedOwnerApprovalRegistry, approved_condition_set_at, assessment_request, assessment_result,
-    completion_profile, completion_snapshot, consent_for_origin, contract, ids, now, other_origin,
-    owner_contract_at, owner_contract_succeeding, project, target_scope,
+    ScriptedOwnerApprovalRegistry, approved_condition_set_at, assessment_request,
+    assessment_result, completion_profile, completion_snapshot, consent_for_origin, contract, ids,
+    now, other_origin, owner_contract_at, owner_contract_succeeding, project, target_scope,
 };
 use tempfile::TempDir;
 
@@ -1740,8 +1740,7 @@ impl OwnerHarness {
     fn new(prepare: impl FnOnce(&mut SupervisionRecord)) -> Self {
         let web = Harness::new();
         let project_id = project();
-        let owner =
-            OwnerRef::new(OwnerKind::H3HtmlJob, "generation-job").expect("owner reference");
+        let owner = OwnerRef::new(OwnerKind::H3HtmlJob, "generation-job").expect("owner reference");
         let current = owner_contract_at(
             project_id,
             owner,
@@ -1841,7 +1840,7 @@ impl OwnerHarness {
 #[test]
 #[allow(clippy::type_complexity)]
 fn owner_supersession_refuses_every_human_stop_wait_stagnation_limit_recovery_cancel_and_failure_latch()
-{
+ {
     let cases: Vec<(
         &str,
         Box<dyn FnOnce(&mut SupervisionRecord)>,
@@ -1939,9 +1938,7 @@ fn owner_supersession_refuses_every_human_stop_wait_stagnation_limit_recovery_ca
         let result = harness.execute(&mut runtime, &current, &replacement, before.revision());
         assert_eq!(
             result.expect_err(name),
-            herness_supervision::SupervisionError::OwnerSupersessionRejected {
-                reason: expected
-            },
+            herness_supervision::SupervisionError::OwnerSupersessionRejected { reason: expected },
             "{name}"
         );
         let after = harness.record();
@@ -2056,10 +2053,7 @@ fn duplicate_and_crashed_owner_supersession_do_not_double_supersede() {
     let after_first = harness.record();
     assert_eq!(after_first.target_version().get(), 2);
     assert_eq!(after_first.change_log().len(), 1);
-    assert_eq!(
-        after_first.revision(),
-        before.revision().saturating_add(1)
-    );
+    assert_eq!(after_first.revision(), before.revision().saturating_add(1));
 
     // A duplicate id returns the recorded result and performs no load, stop,
     // budget mutation, or second state change.
@@ -2091,12 +2085,8 @@ fn duplicate_and_crashed_owner_supersession_do_not_double_supersede() {
 
     // A new request whose atomic commit fails leaves no result. Retrying the
     // same id succeeds exactly once.
-    let replacement_three = owner_contract_succeeding(
-        &replacement,
-        3,
-        1,
-        replacement.budget().clone(),
-    );
+    let replacement_three =
+        owner_contract_succeeding(&replacement, 3, 1, replacement.budget().clone());
     let request_three_id = SupervisionRequestId::new(project_id);
     let request_three = OwnerSupersessionRequest::new(
         request_three_id,
@@ -2123,11 +2113,13 @@ fn duplicate_and_crashed_owner_supersession_do_not_double_supersede() {
     );
     assert!(failed.is_err(), "the injected commit fault must surface");
     harness.store.set_commit_fault(None);
-    assert!(harness
-        .store
-        .command_result(request_three_id)
-        .expect("command lookup")
-        .is_none());
+    assert!(
+        harness
+            .store
+            .command_result(request_three_id)
+            .expect("command lookup")
+            .is_none()
+    );
     let after_crash = harness.record();
     assert_eq!(after_crash.revision(), after_first.revision());
     assert_eq!(after_crash.target_version().get(), 2);
@@ -2156,7 +2148,10 @@ fn duplicate_and_crashed_owner_supersession_do_not_double_supersede() {
     .expect("retry");
     assert!(!retried.duplicate());
     let after_retry = harness.record();
-    assert_eq!(after_retry.revision(), after_first.revision().saturating_add(1));
+    assert_eq!(
+        after_retry.revision(),
+        after_first.revision().saturating_add(1)
+    );
     assert_eq!(after_retry.target_version().get(), 3);
     assert_eq!(after_retry.change_log().len(), 2);
     assert_eq!(runtime.stop_calls, 1);

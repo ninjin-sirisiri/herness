@@ -511,7 +511,9 @@ impl SupervisionContract {
             });
         }
         conditions.require_approval(now)?;
-        self.work_packet = self.work_packet.revised_conditions(conditions.condition_version())?;
+        self.work_packet = self
+            .work_packet
+            .revised_conditions(conditions.condition_version())?;
         self.conditions = conditions;
         self.bump_revision();
         Ok(())

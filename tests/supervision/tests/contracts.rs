@@ -30,10 +30,10 @@ use herness_supervision::evidence::{
 use herness_supervision::owner_launch::{
     OwnerApproval, OwnerLaunchBinding, authorize_owner_launch,
 };
+use herness_supervision::packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 use herness_supervision::profiles::{
     ProfileBinding, ProfilePurpose, ProfileThresholds, ProfileVersion,
 };
-use herness_supervision::packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 use herness_supervision::state::{
     CompletionBlocker, HumanAction, StopCause, SupervisionFailure, SupervisionRecord,
     SupervisionState,
@@ -1045,7 +1045,11 @@ fn immutable_work_packet_is_versioned_fingerprinted_and_bound_to_the_contract() 
         "owner instruction for the approved target"
     );
     assert_eq!(packet.execution_scope(), &execution);
-    assert!(!packet.prompt().contains("Work toward the approved completion conditions."));
+    assert!(
+        !packet
+            .prompt()
+            .contains("Work toward the approved completion conditions.")
+    );
 
     let json = serde_json::to_value(&packet).expect("packet json");
     let decoded: WorkPacket = serde_json::from_value(json.clone()).expect("packet decode");
@@ -1198,15 +1202,13 @@ impl IntoConditionIds for Ids {
 #[test]
 fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
     let (project, fixture_ids) = project_set();
-    let h3_owner =
-        OwnerRef::new(OwnerKind::H3HtmlJob, "h3-job-1").expect("H3 owner");
+    let h3_owner = OwnerRef::new(OwnerKind::H3HtmlJob, "h3-job-1").expect("H3 owner");
     let contract = owner_contract(
         project,
         h3_owner.clone(),
         OwnerApprovalSource::H3ApprovedSettings,
     );
-    let binding =
-        OwnerLaunchBinding::from_contract(&contract, 1, 7, "job-1").expect("binding");
+    let binding = OwnerLaunchBinding::from_contract(&contract, 1, 7, "job-1").expect("binding");
     assert_eq!(binding.project_id(), project);
     assert_eq!(binding.supervision_id(), fixture_ids.supervision);
     assert_eq!(binding.approval().owner(), &h3_owner);
@@ -1290,13 +1292,8 @@ fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
                 &base,
                 ApprovalChange {
                     execution_scope: Some(
-                        ExecutionScope::new(
-                            project,
-                            vec!["src".to_owned()],
-                            Vec::new(),
-                            false,
-                        )
-                        .expect("scope"),
+                        ExecutionScope::new(project, vec!["src".to_owned()], Vec::new(), false)
+                            .expect("scope"),
                     ),
                     ..ApprovalChange::default()
                 },
@@ -1349,9 +1346,7 @@ fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
             changed_approval(
                 &base,
                 ApprovalChange {
-                    budget: Some(
-                        BudgetPolicy::new(3_600, 1, None).expect("finite budget"),
-                    ),
+                    budget: Some(BudgetPolicy::new(3_600, 1, None).expect("finite budget")),
                     ..ApprovalChange::default()
                 },
             ),
@@ -1385,13 +1380,8 @@ fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
         })
     ));
 
-    let h4_owner =
-        OwnerRef::new(OwnerKind::H4SddTask, "task-6-fixture").expect("H4 owner");
-    let h4_contract = owner_contract(
-        project,
-        h4_owner,
-        OwnerApprovalSource::H4ApprovedPlan,
-    );
+    let h4_owner = OwnerRef::new(OwnerKind::H4SddTask, "task-6-fixture").expect("H4 owner");
+    let h4_contract = owner_contract(project, h4_owner, OwnerApprovalSource::H4ApprovedPlan);
     let h4_binding =
         OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("binding");
     assert_eq!(

@@ -230,7 +230,11 @@ pub enum H3CancelCause {
 
 /// Structured reason for the current H3 state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum H3StateReasonKind {
     /// Settings are absent or disabled.
     Disabled,
@@ -843,7 +847,9 @@ impl GenerationRecord {
         if completed
             && !matches!(
                 status,
-                GenerationStatus::Completed | GenerationStatus::Superseded | GenerationStatus::Orphaned
+                GenerationStatus::Completed
+                    | GenerationStatus::Superseded
+                    | GenerationStatus::Orphaned
             )
         {
             return Err(H3Error::invalid(
@@ -1363,10 +1369,7 @@ impl SyncCycle {
     /// Ends the cycle in `state`.
     pub fn end(mut self, state: CycleState, at: Timestamp) -> Result<Self, H3Error> {
         if self.state != CycleState::Open {
-            return Err(H3Error::invalid(
-                "cycleState",
-                "only an open cycle can end",
-            ));
+            return Err(H3Error::invalid("cycleState", "only an open cycle can end"));
         }
         if state == CycleState::Open {
             return Err(H3Error::invalid(
@@ -1434,7 +1437,13 @@ impl H3Settings {
         }
         target_paths.sort();
         target_paths.dedup();
-        let fingerprint = settings_fingerprint(project_id, version, &target_paths, auto_publish, retain_history);
+        let fingerprint = settings_fingerprint(
+            project_id,
+            version,
+            &target_paths,
+            auto_publish,
+            retain_history,
+        );
         Ok(Self {
             format_version: H3_FORMAT_VERSION,
             project_id,
@@ -1455,10 +1464,7 @@ impl H3Settings {
     /// come from the approval. The fingerprint binds both the stored scope and
     /// the approval fingerprint, so removing, adding, or altering a Target
     /// without a new approval is detected.
-    pub fn approved(
-        approval: H3ConfigurationApproval,
-        enabled: bool,
-    ) -> Result<Self, H3Error> {
+    pub fn approved(approval: H3ConfigurationApproval, enabled: bool) -> Result<Self, H3Error> {
         let project_id = approval.project_id();
         let version = approval.settings_version();
         let targets = approval.targets().to_vec();
@@ -1831,7 +1837,10 @@ impl ArchivedVersionRef {
     /// host-supplied, must be relative, and must not escape its private root.
     pub fn new(reference: impl Into<String>, digest: ContentDigest) -> Result<Self, H3Error> {
         let reference = reference.into();
-        if reference.is_empty() || reference.contains('\0') || reference.chars().any(char::is_control) {
+        if reference.is_empty()
+            || reference.contains('\0')
+            || reference.chars().any(char::is_control)
+        {
             return Err(H3Error::empty("archiveReference"));
         }
         if reference.starts_with('/') || reference.split('/').any(|part| part == "..") {
@@ -2137,7 +2146,11 @@ impl PublicationJournal {
 
     /// Adds or replaces one file entry after an observation.
     pub fn with_file(mut self, file: PublicationFileJournal) -> Result<Self, H3Error> {
-        if let Some(index) = self.files.iter().position(|entry| entry.role() == file.role()) {
+        if let Some(index) = self
+            .files
+            .iter()
+            .position(|entry| entry.role() == file.role())
+        {
             self.files[index] = file;
         } else {
             self.files.push(file);
@@ -2248,7 +2261,11 @@ impl PublicationJournal {
     }
 
     /// Marks the publication successful with the observed HTML digest.
-    pub fn published(mut self, observed_html: ContentDigest, at: Timestamp) -> Result<Self, H3Error> {
+    pub fn published(
+        mut self,
+        observed_html: ContentDigest,
+        at: Timestamp,
+    ) -> Result<Self, H3Error> {
         if self.status != PublicationStatus::Replacing {
             return Err(H3Error::invalid(
                 "publicationStatus",
@@ -2270,7 +2287,9 @@ impl PublicationJournal {
     ) -> Result<Self, H3Error> {
         if matches!(
             status,
-            PublicationStatus::Published | PublicationStatus::Replacing | PublicationStatus::Prepared
+            PublicationStatus::Published
+                | PublicationStatus::Replacing
+                | PublicationStatus::Prepared
         ) {
             return Err(H3Error::invalid(
                 "publicationStatus",

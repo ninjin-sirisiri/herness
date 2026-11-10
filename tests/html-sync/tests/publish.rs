@@ -15,16 +15,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use herness_core::ports::publish::{PublicationGatePort, PublicationRecordPort};
+use herness_core::runtime::PublicationWriter;
 use herness_core::{
     ConnectionId, ExpectedTargetVersion, ProjectId, PublicationRequest, RunControl, StorePort,
 };
-use herness_core::ports::publish::{PublicationGatePort, PublicationRecordPort};
-use herness_core::runtime::PublicationWriter;
+use herness_desktop::html_sync::policy::{CandidateStage, HtmlPolicyBridge};
 use herness_desktop::html_sync::publish::{
     H3PublicationRecords, ObserverWriteExpectations, PolicyFinalCheck, ProjectPublicationFiles,
     SharedHistoryArchive,
 };
-use herness_desktop::html_sync::policy::{CandidateStage, HtmlPolicyBridge};
 use herness_desktop::supervision::store::StoreHandle;
 use herness_html_sync::ids::GenerationId;
 use herness_html_sync::{
@@ -240,26 +240,24 @@ impl Env {
             .expect("seed budget");
         handle
             .commit_html_sync(
-                HtmlSyncCommit::new()
-                    .with_settings(
-                        herness_html_sync::SettingsCommit::new(None, settings.clone())
-                            .expect("settings commit"),
-                    ),
+                HtmlSyncCommit::new().with_settings(
+                    herness_html_sync::SettingsCommit::new(None, settings.clone())
+                        .expect("settings commit"),
+                ),
             )
             .expect("store settings");
 
         let source = fs::read(fixture.root.join(TARGET_PATH)).expect("source");
-        let css_bytes =
-            fs::read(fixture.root.join("docs/sdd/assets/sdd.css")).expect("shared css");
+        let css_bytes = fs::read(fixture.root.join("docs/sdd/assets/sdd.css")).expect("shared css");
         let css = PublicationFileInput::new("docs/sdd/assets/sdd.css", css_bytes.clone())
             .expect("css input");
-        let css_fp =
-            dependency_fingerprint(herness_html_sync::DependencyKind::Css, [(css.path(), css.digest())]);
-        let resources_fp =
-            dependency_fingerprint(herness_html_sync::DependencyKind::Resource, []);
+        let css_fp = dependency_fingerprint(
+            herness_html_sync::DependencyKind::Css,
+            [(css.path(), css.digest())],
+        );
+        let resources_fp = dependency_fingerprint(herness_html_sync::DependencyKind::Resource, []);
         let candidate_html = fixture.candidate_html().to_owned();
-        let provenance =
-            support::provenance_payload(&candidate_html);
+        let provenance = support::provenance_payload(&candidate_html);
         let candidate_digest = ContentDigest::sha256(candidate_html.as_bytes());
         let provenance_digest = ContentDigest::sha256(provenance.as_bytes());
         let source_digest = ContentDigest::sha256(&source);
@@ -312,11 +310,9 @@ impl Env {
             SourceRevision::new(1).expect("source revision"),
             source_digest,
         );
-        let storage = CandidateStorageRef::new(
-            "a".repeat(64),
-            ContentDigest::sha256(b"candidate-token"),
-        )
-        .expect("storage ref");
+        let storage =
+            CandidateStorageRef::new("a".repeat(64), ContentDigest::sha256(b"candidate-token"))
+                .expect("storage ref");
         let candidate = CandidateRecord::new(
             candidate_id(),
             document_key(),
@@ -380,9 +376,7 @@ impl Env {
         let outcome = handle
             .commit_html_sync(
                 HtmlSyncCommit::new()
-                    .with_document(
-                        DocumentCommit::new(None, state).expect("document commit"),
-                    )
+                    .with_document(DocumentCommit::new(None, state).expect("document commit"))
                     .with_generation(generation.clone()),
             )
             .expect("store document");
@@ -677,10 +671,7 @@ impl H3StorePort for FaultyH3Store {
         self.inner.commit_html_sync(commit)
     }
 
-    fn update_html_sync_publication(
-        &mut self,
-        journal: PublicationJournal,
-    ) -> Result<(), H3Error> {
+    fn update_html_sync_publication(&mut self, journal: PublicationJournal) -> Result<(), H3Error> {
         self.inner.update_html_sync_publication(journal)
     }
 }
@@ -809,23 +800,19 @@ impl FinalCandidateCheckPort for StructuralOnly<'_> {
         let result = self
             .inner
             .bridge()
-            .candidate_check(
-                request.html_path,
-                CandidateStage::Structural,
-                None,
-                &{
-                    let mut inputs = std::collections::BTreeMap::new();
-                    inputs.insert(request.source_path.to_owned(), request.source.to_vec());
-                    inputs.insert(request.html_path.to_owned(), request.html.to_vec());
-                    inputs
-                },
-            )
+            .candidate_check(request.html_path, CandidateStage::Structural, None, &{
+                let mut inputs = std::collections::BTreeMap::new();
+                inputs.insert(request.source_path.to_owned(), request.source.to_vec());
+                inputs.insert(request.html_path.to_owned(), request.html.to_vec());
+                inputs
+            })
             .map_err(|error| H3Error::Unavailable {
                 capability: "test.structural".to_owned(),
                 detail: error.to_string(),
             })?;
         Ok(FinalCandidateCheck {
-            allowed: result.decision() == herness_desktop::html_sync::policy::CandidateDecision::Allow,
+            allowed: result.decision()
+                == herness_desktop::html_sync::policy::CandidateDecision::Allow,
             final_pass: result.final_pass(),
             final_binding: result.final_binding(),
             contract: result.contract().to_owned(),
@@ -843,10 +830,8 @@ impl FinalCandidateCheckPort for RejectingFinal<'_> {
         &self,
         request: &FinalCandidateCheckRequest<'_>,
     ) -> Result<FinalCandidateCheck, H3Error> {
-        let mut receipt: Value =
-            serde_json::from_str(request.receipt).expect("receipt JSON");
-        receipt["inputs"]["policy"]["digest"] =
-            Value::String(format!("sha256:{}", "0".repeat(64)));
+        let mut receipt: Value = serde_json::from_str(request.receipt).expect("receipt JSON");
+        receipt["inputs"]["policy"]["digest"] = Value::String(format!("sha256:{}", "0".repeat(64)));
         let mutated = serde_json::to_string_pretty(&receipt).expect("mutated receipt");
         let mutated = FinalCandidateCheckRequest {
             source_path: request.source_path,
@@ -950,7 +935,10 @@ fn publication_writes_the_exact_html_and_receipt_and_commits_synced_with_the_seq
     );
     assert_eq!(
         receipt_json["html"]["digest"],
-        format!("sha256:{}", ContentDigest::sha256(env.candidate_html.as_bytes()).as_str())
+        format!(
+            "sha256:{}",
+            ContentDigest::sha256(env.candidate_html.as_bytes()).as_str()
+        )
     );
     assert_eq!(
         receipt_json["inputs"]["css"][0]["path"],
@@ -960,9 +948,15 @@ fn publication_writes_the_exact_html_and_receipt_and_commits_synced_with_the_seq
         receipt_json["inputs"]["policy"]["digest"],
         format!("sha256:{}", env.policy.digest().as_str())
     );
-    assert_eq!(receipt_json["inputs"]["policy"]["version"], PACK_POLICY_VERSION);
+    assert_eq!(
+        receipt_json["inputs"]["policy"]["version"],
+        PACK_POLICY_VERSION
+    );
     assert_eq!(receipt_json["versions"]["settings"], "settings:1");
-    assert_eq!(receipt_json["generation"]["id"], generation_id().to_string());
+    assert_eq!(
+        receipt_json["generation"]["id"],
+        generation_id().to_string()
+    );
     assert_eq!(receipt_json["generation"]["revision"], 1);
     assert_eq!(receipt_json["generation"]["parent"], Value::Null);
     assert_eq!(receipt_json["h2"]["purpose"], "Html");
@@ -975,7 +969,12 @@ fn publication_writes_the_exact_html_and_receipt_and_commits_synced_with_the_seq
     }
     for condition in receipt_json["conditions"].as_array().expect("conditions") {
         assert_eq!(condition["decision"], "met");
-        assert!(!condition["evidence"].as_array().expect("evidence").is_empty());
+        assert!(
+            !condition["evidence"]
+                .as_array()
+                .expect("evidence")
+                .is_empty()
+        );
     }
     let text = String::from_utf8(receipt).expect("utf8");
     for secret in ["api_key", "Bearer", "provider error", "raw response"] {
@@ -984,11 +983,17 @@ fn publication_writes_the_exact_html_and_receipt_and_commits_synced_with_the_seq
 
     let journal = env.journal().expect("journal");
     assert_eq!(journal.status(), PublicationStatus::Published);
-    assert_eq!(journal.final_project_sequence(), Some(final_project_sequence));
+    assert_eq!(
+        journal.final_project_sequence(),
+        Some(final_project_sequence)
+    );
     assert_eq!(journal.observed_after_html(), Some(&html_digest));
     assert_eq!(journal.observed_after_receipt(), Some(&receipt_digest));
     assert_eq!(
-        journal.file(PublicationFileRole::Html).expect("html file").status(),
+        journal
+            .file(PublicationFileRole::Html)
+            .expect("html file")
+            .status(),
         PublicationFileStatus::Published
     );
     assert_eq!(
@@ -1027,15 +1032,24 @@ fn publication_writes_the_exact_html_and_receipt_and_commits_synced_with_the_seq
     assert_eq!(state_event.kind().as_str(), "html_sync.state");
     assert_eq!(state_event.payload().as_value()["state"], "synced");
     assert_eq!(
-        journal.file(PublicationFileRole::Html).expect("html").h1_request_id(),
-        Some(&herness_core::PublicationRequestId::new(format!("{}:html", publication_id())).expect("id"))
+        journal
+            .file(PublicationFileRole::Html)
+            .expect("html")
+            .h1_request_id(),
+        Some(
+            &herness_core::PublicationRequestId::new(format!("{}:html", publication_id()))
+                .expect("id")
+        )
     );
     assert_eq!(
         journal
             .file(PublicationFileRole::Receipt)
             .expect("receipt")
             .h1_request_id(),
-        Some(&herness_core::PublicationRequestId::new(format!("{}:receipt", publication_id())).expect("id"))
+        Some(
+            &herness_core::PublicationRequestId::new(format!("{}:receipt", publication_id()))
+                .expect("id")
+        )
     );
 }
 
@@ -1143,7 +1157,10 @@ fn old_html_and_receipt_are_retained_with_exact_bytes_and_the_generation_chains(
     )
     .expect("publication");
     assert!(matches!(outcome, PublicationOutcome::Synced { .. }));
-    assert_eq!(env.companion().expect("html"), env.candidate_html.as_bytes());
+    assert_eq!(
+        env.companion().expect("html"),
+        env.candidate_html.as_bytes()
+    );
     let journal = env.journal().expect("journal");
     assert_eq!(journal.status(), PublicationStatus::Published);
     let old_html_ref = journal.old_html().expect("old html ref");
@@ -1151,7 +1168,10 @@ fn old_html_and_receipt_are_retained_with_exact_bytes_and_the_generation_chains(
     assert_eq!(old_html_ref.digest(), &old_html_digest);
     assert_eq!(old_receipt_ref.digest(), &old_receipt_digest);
     let archived_html = archive_entry(&env, old_html_ref.reference());
-    assert_eq!(archived_html["content"].as_str().expect("content"), std::str::from_utf8(&old_html).expect("utf8"));
+    assert_eq!(
+        archived_html["content"].as_str().expect("content"),
+        std::str::from_utf8(&old_html).expect("utf8")
+    );
     assert_eq!(archived_html["target"], "docs/adr/0001-queue-choice.html");
     let archived_receipt = archive_entry(&env, old_receipt_ref.reference());
     assert_eq!(
@@ -1161,7 +1181,10 @@ fn old_html_and_receipt_are_retained_with_exact_bytes_and_the_generation_chains(
     let published_receipt: Value =
         serde_json::from_slice(&env.receipt().expect("receipt")).expect("receipt JSON");
     assert_eq!(published_receipt["generation"]["revision"], 1);
-    assert_eq!(published_receipt["generation"]["parent"], "previous-generation");
+    assert_eq!(
+        published_receipt["generation"]["parent"],
+        "previous-generation"
+    );
 }
 
 #[test]
@@ -1524,7 +1547,12 @@ fn final_validation_denial_blocks_publication_and_structural_only_is_not_final()
     assert!(matches!(outcome, PublicationOutcome::NotPublished { .. }));
     assert!(env2.companion().is_none());
     assert!(env2.receipt().is_none());
-    assert!(env2.archive_root.read_dir().map(|mut entries| entries.next().is_none()).unwrap_or(true));
+    assert!(
+        env2.archive_root
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    );
 }
 
 #[test]
@@ -1622,7 +1650,8 @@ fn stop_consent_budget_and_approval_rechecks_refuse_before_writing() {
     let env = Env::new();
     env.remove_companion();
     env.remove_receipt();
-    env.control.request_stop(herness_core::StopReason::UserRequest);
+    env.control
+        .request_stop(herness_core::StopReason::UserRequest);
     let mut expectations = RecordingExpectations::default();
     let outcome = publish_allow(
         &env,
@@ -1707,9 +1736,11 @@ fn settings_policy_and_css_mismatches_are_refused_without_writing() {
     let env2 = Env::new();
     env2.remove_companion();
     env2.remove_receipt();
-    let changed_css =
-        PublicationFileInput::new("docs/sdd/assets/sdd.css", b"body { color: red; }\n".to_vec())
-            .expect("css input");
+    let changed_css = PublicationFileInput::new(
+        "docs/sdd/assets/sdd.css",
+        b"body { color: red; }\n".to_vec(),
+    )
+    .expect("css input");
     let attempt = CandidatePublication::new(
         publication_id(),
         env2.document.clone(),
@@ -1807,16 +1838,12 @@ fn archive_save_faults_never_replace_any_formal_file() {
         env.set_companion(&old_html);
         env.set_receipt(&old_receipt);
         let expected_html = ExpectedTargetVersion::Present {
-            version: herness_core::FileVersion::new(
-                ContentDigest::sha256(&old_html).as_str(),
-            )
-            .expect("file version"),
+            version: herness_core::FileVersion::new(ContentDigest::sha256(&old_html).as_str())
+                .expect("file version"),
         };
         let expected_receipt = ExpectedTargetVersion::Present {
-            version: herness_core::FileVersion::new(
-                ContentDigest::sha256(&old_receipt).as_str(),
-            )
-            .expect("file version"),
+            version: herness_core::FileVersion::new(ContentDigest::sha256(&old_receipt).as_str())
+                .expect("file version"),
         };
         let mut expectations = RecordingExpectations::default();
         let outcome = publish_allow(
@@ -1944,7 +1971,10 @@ fn a_fault_after_both_writes_is_reconciliation_required_not_synced() {
         outcome,
         PublicationOutcome::ReconciliationRequired { .. }
     ));
-    assert_eq!(env.companion().expect("html"), env.candidate_html.as_bytes());
+    assert_eq!(
+        env.companion().expect("html"),
+        env.candidate_html.as_bytes()
+    );
     assert!(env.receipt().is_some());
     let journal = env.journal().expect("journal");
     assert_eq!(journal.status(), PublicationStatus::Replacing);
@@ -1988,10 +2018,8 @@ fn a_h1_intent_or_rename_failure_never_replaces_the_target() {
         &env,
         env.attempt(
             ExpectedTargetVersion::Present {
-                version: herness_core::FileVersion::new(
-                    ContentDigest::sha256(existing).as_str(),
-                )
-                .expect("version"),
+                version: herness_core::FileVersion::new(ContentDigest::sha256(existing).as_str())
+                    .expect("version"),
             },
             ExpectedTargetVersion::Absent,
         ),
@@ -2099,7 +2127,10 @@ fn a_h1_result_fault_after_the_rename_is_unverifiable_and_never_retried_as_succe
         outcome,
         PublicationOutcome::ReconciliationRequired { .. }
     ));
-    assert_eq!(env.companion().expect("html"), env.candidate_html.as_bytes());
+    assert_eq!(
+        env.companion().expect("html"),
+        env.candidate_html.as_bytes()
+    );
     assert!(env.receipt().is_none());
     let journal = env.journal().expect("journal");
     assert_eq!(journal.status(), PublicationStatus::Unverifiable);
@@ -2157,7 +2188,10 @@ fn a_receipt_failure_after_the_html_is_published_is_reconciliation_required() {
         outcome,
         PublicationOutcome::ReconciliationRequired { .. }
     ));
-    assert_eq!(env.companion().expect("html"), env.candidate_html.as_bytes());
+    assert_eq!(
+        env.companion().expect("html"),
+        env.candidate_html.as_bytes()
+    );
     assert!(env.receipt().is_none());
     let journal = env.journal().expect("journal");
     assert_eq!(journal.status(), PublicationStatus::Unverifiable);
@@ -2276,20 +2310,17 @@ fn the_observer_absorbs_the_self_publication_notification_by_id_and_bytes() {
     if skip_without_pack() {
         return;
     }
-    use herness_html_sync::{
-        CompanionChange, DependencyPath, DependencyKind, ObservationTargets,
-    };
+    use herness_html_sync::{CompanionChange, DependencyKind, DependencyPath, ObservationTargets};
     let env = Env::new();
     env.remove_companion();
     env.remove_receipt();
     let targets = ObservationTargets::new(
         project(),
         vec![env.document.clone()],
-        vec![DependencyPath::new(
-            "docs/sdd/assets/sdd.css",
-            DependencyKind::Css,
-        )
-        .expect("dependency")],
+        vec![
+            DependencyPath::new("docs/sdd/assets/sdd.css", DependencyKind::Css)
+                .expect("dependency"),
+        ],
     )
     .expect("targets");
     let mut observer = ProjectObserver::new(
@@ -2354,18 +2385,18 @@ fn the_observer_absorbs_the_self_publication_notification_by_id_and_bytes() {
         changed.as_bytes(),
     )
     .expect("external edit");
-    assert!(observer.notify(
-        ChangeSignal::new(
-            env.document.companion_path(),
-            ChangeSource::ExternalEditor,
+    assert!(
+        observer.notify(
+            ChangeSignal::new(env.document.companion_path(), ChangeSource::ExternalEditor,)
+                .expect("signal")
         )
-        .expect("signal")
-    ));
+    );
     let tick = observer.poll();
-    assert!(tick.companions.iter().any(|companion| matches!(
-        companion.change,
-        CompanionChange::External
-    )));
+    assert!(
+        tick.companions
+            .iter()
+            .any(|companion| matches!(companion.change, CompanionChange::External))
+    );
 }
 
 #[test]
@@ -2403,7 +2434,10 @@ fn the_desktop_publisher_composes_the_real_writer_archive_and_safety_port() {
         matches!(outcome, PublicationOutcome::Synced { .. }),
         "{outcome:?}"
     );
-    assert_eq!(env.companion().expect("html"), env.candidate_html.as_bytes());
+    assert_eq!(
+        env.companion().expect("html"),
+        env.candidate_html.as_bytes()
+    );
     assert!(env.receipt().is_some());
     assert_eq!(expectations.retired, vec![publication_id()]);
 }
@@ -2440,8 +2474,7 @@ fn the_desktop_safety_port_rechecks_the_real_approval_and_consent() {
         .expect("approval")
         .clone()
         .revoke(now());
-    let revoked_settings =
-        H3Settings::approved(revoked, true).expect("revoked settings");
+    let revoked_settings = H3Settings::approved(revoked, true).expect("revoked settings");
     env.store
         .lock()
         .commit_html_sync(

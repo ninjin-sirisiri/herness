@@ -6927,10 +6927,7 @@ fn llm_adapter_rejects_a_permission_request_before_sending() {
             TransportControl::default(),
         )
         .expect("completion assessment");
-    assert_eq!(
-        assessment.result().purpose(),
-        ProfilePurpose::Completion
-    );
+    assert_eq!(assessment.result().purpose(), ProfilePurpose::Completion);
     assert_eq!(
         assessment.result().reported_verdict(),
         ConditionVerdict::Met

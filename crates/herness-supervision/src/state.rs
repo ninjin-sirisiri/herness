@@ -1318,8 +1318,7 @@ impl SupervisionRecord {
             });
         }
         if condition_version == self.condition_version
-            && (condition_ids != self.condition_ids
-                || required_checks != self.required_checks)
+            && (condition_ids != self.condition_ids || required_checks != self.required_checks)
         {
             return Err(SupervisionError::OwnerSupersessionRejected {
                 reason: crate::error::OwnerSupersessionRejection::ConditionsMismatch,
@@ -1331,9 +1330,7 @@ impl SupervisionRecord {
             });
         }
 
-        self.invalidate_all(DecisionInvalidation::GenerationSuperseded {
-            to: target_version,
-        });
+        self.invalidate_all(DecisionInvalidation::GenerationSuperseded { to: target_version });
         self.condition_version = condition_version;
         self.condition_ids = condition_ids.clone();
         self.required_checks = required_checks;

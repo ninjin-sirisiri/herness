@@ -833,8 +833,8 @@ mod tests {
         );
         let mut small = policy();
         small.source_bytes_limit = 4;
-        let request =
-            WorkspaceCaptureRequest::new(document(), source.clone(), Vec::new(), small).expect("request");
+        let request = WorkspaceCaptureRequest::new(document(), source.clone(), Vec::new(), small)
+            .expect("request");
         assert!(WorkspaceReader::new(reader).capture(&request).is_err());
 
         let mut reader = FakeReader::default();
@@ -844,8 +844,9 @@ mod tests {
         reader
             .files
             .insert("assets/logo.png".to_owned(), vec![0xff, 0x00, 0xfe]);
-        let deps = vec![DependencyPath::new("assets/logo.png", DependencyKind::Resource)
-            .expect("resource")];
+        let deps = vec![
+            DependencyPath::new("assets/logo.png", DependencyKind::Resource).expect("resource"),
+        ];
         let request =
             WorkspaceCaptureRequest::new(document(), source, deps, policy()).expect("request");
         let snapshot = WorkspaceReader::new(reader)

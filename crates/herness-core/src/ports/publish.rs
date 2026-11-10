@@ -35,10 +35,8 @@ pub trait PublicationArchivePort {
 /// no write occurs.
 pub trait PublicationGatePort {
     /// Returns `Ok(())` only when this exact request is authorized now.
-    fn authorize_publication(
-        &self,
-        request: &PublicationRequest,
-    ) -> Result<(), PublicationFailure>;
+    fn authorize_publication(&self, request: &PublicationRequest)
+    -> Result<(), PublicationFailure>;
 }
 
 /// Loads and persists one publication request record.
@@ -49,10 +47,7 @@ pub trait PublicationGatePort {
 /// an error, never an empty result.
 pub trait PublicationRecordPort {
     /// Loads the durable record for `key`.
-    fn load_publication(
-        &self,
-        key: &str,
-    ) -> Result<Option<PublicationRecord>, PublicationFailure>;
+    fn load_publication(&self, key: &str) -> Result<Option<PublicationRecord>, PublicationFailure>;
 
     /// Persists the record and appends its audit events atomically.
     fn save_publication(
@@ -95,16 +90,12 @@ impl<S> StorePublicationRecords<S> {
 }
 
 impl<S: RuntimeStore> PublicationRecordPort for StorePublicationRecords<S> {
-    fn load_publication(
-        &self,
-        key: &str,
-    ) -> Result<Option<PublicationRecord>, PublicationFailure> {
-        let bytes = self
-            .store
-            .load_host_state(key)
-            .map_err(|error| PublicationFailure::RecordUnavailable {
+    fn load_publication(&self, key: &str) -> Result<Option<PublicationRecord>, PublicationFailure> {
+        let bytes = self.store.load_host_state(key).map_err(|error| {
+            PublicationFailure::RecordUnavailable {
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         match bytes {
             Some(bytes) => PublicationRecord::from_bytes(&bytes).map(Some),
             None => Ok(None),

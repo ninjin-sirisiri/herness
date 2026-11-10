@@ -15,11 +15,11 @@ use herness_desktop::html_sync::policy::{ConnectedPolicyBridge, HtmlPolicyBridge
 use herness_html_sync::{
     AppliedEvaluation, AssessmentPlan, CheckSet, ConditionBinding, CoverageReport, DocumentKey,
     EvaluationBinding, EvidenceBuildInput, EvidenceCheckResult, EvidenceFingerprints,
-    EvidenceOrigin, EvidencePack, EvidenceValidationError, GenerationId,
-    MAX_DEFAULT_SLICE_BYTES, MAX_DEFAULT_SLICE_UNITS, RenderCandidateFingerprints,
-    RenderConfigurationEvidence, RenderEvidence, RenderPngEvidence, RenderSignalEvidence,
-    RequiredCheck, RequiredCheckKind, RubricSet, SliceAssessment, SourceRevision, SourceSnapshot,
-    SourceUnits, StrictRequirement, UnitEvidence,
+    EvidenceOrigin, EvidencePack, EvidenceValidationError, GenerationId, MAX_DEFAULT_SLICE_BYTES,
+    MAX_DEFAULT_SLICE_UNITS, RenderCandidateFingerprints, RenderConfigurationEvidence,
+    RenderEvidence, RenderPngEvidence, RenderSignalEvidence, RequiredCheck, RequiredCheckKind,
+    RubricSet, SliceAssessment, SourceRevision, SourceSnapshot, SourceUnits, StrictRequirement,
+    UnitEvidence,
 };
 use herness_supervision::assessment::{
     AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult, ConditionVerdict,
@@ -700,11 +700,9 @@ pub fn positive_evaluation(pack: &EvidencePack) -> AppliedEvaluation {
             .expect("slice assessment"),
         );
     }
-    let binding = EvaluationBinding::verification(
-        pack.fingerprints().clone(),
-        pack.fingerprints().clone(),
-    )
-    .with_assessment(pack.fingerprints().clone(), pack.fingerprints().clone());
+    let binding =
+        EvaluationBinding::verification(pack.fingerprints().clone(), pack.fingerprints().clone())
+            .with_assessment(pack.fingerprints().clone(), pack.fingerprints().clone());
     AppliedEvaluation::apply(&plan, results, binding, false, now()).expect("applied evaluation")
 }
 

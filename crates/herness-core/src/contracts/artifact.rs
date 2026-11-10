@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::errors::{ArgumentViolation, CoreError};
 use crate::contracts::ids::ProjectId;
-use crate::tools::arguments::FileVersion;
 use crate::tools::NonEmptyText;
+use crate::tools::arguments::FileVersion;
 
 /// Host-issued handle for one candidate authoring context.
 ///
@@ -123,13 +123,8 @@ impl<'de> Deserialize<'de> for ArtifactHandle {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(
-            wire.project_id,
-            wire.job_id,
-            wire.generation,
-            wire.token,
-        )
-        .map_err(de::Error::custom)
+        Self::new(wire.project_id, wire.job_id, wire.generation, wire.token)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -264,10 +259,13 @@ mod tests {
     #[test]
     fn only_candidate_slots_are_writable() {
         for slot in ArtifactSlot::ALL {
-            assert_eq!(slot.is_candidate(), matches!(
-                slot,
-                ArtifactSlot::CandidateHtml | ArtifactSlot::CandidateProvenance
-            ));
+            assert_eq!(
+                slot.is_candidate(),
+                matches!(
+                    slot,
+                    ArtifactSlot::CandidateHtml | ArtifactSlot::CandidateProvenance
+                )
+            );
         }
         assert_eq!(ArtifactSlot::CandidateHtml.as_str(), "candidate_html");
     }

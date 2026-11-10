@@ -642,10 +642,9 @@ pub(crate) fn save_pending_plan(
             detail: "a staged plan needs the target record revision".to_owned(),
         });
     }
-    let bytes =
-        serde_json::to_vec(pending).map_err(|error| SupervisionError::StorageFailure {
-            detail: format!("could not encode the pending supervision plan: {error}"),
-        })?;
+    let bytes = serde_json::to_vec(pending).map_err(|error| SupervisionError::StorageFailure {
+        detail: format!("could not encode the pending supervision plan: {error}"),
+    })?;
     store
         .lock()
         .save_host_state(&pending_plan_key(project, supervision), &bytes)
@@ -669,10 +668,11 @@ pub(crate) fn load_pending_plan(
     bytes
         .as_deref()
         .map(|bytes| {
-            let pending: PendingPlan =
-                serde_json::from_slice(bytes).map_err(|error| SupervisionError::StorageFailure {
+            let pending: PendingPlan = serde_json::from_slice(bytes).map_err(|error| {
+                SupervisionError::StorageFailure {
                     detail: format!("could not decode the pending supervision plan: {error}"),
-                })?;
+                }
+            })?;
             pending.plan.verify()?;
             Ok(pending)
         })
@@ -696,10 +696,11 @@ pub fn decode_plan(bytes: &[u8]) -> Result<StoredPlan, SupervisionError> {
         serde_json::from_slice(bytes).map_err(|error| SupervisionError::StorageFailure {
             detail: format!("could not decode the supervision plan: {error}"),
         })?;
-    let probe: VersionProbe =
-        serde_json::from_value(value.clone()).map_err(|error| SupervisionError::StorageFailure {
+    let probe: VersionProbe = serde_json::from_value(value.clone()).map_err(|error| {
+        SupervisionError::StorageFailure {
             detail: format!("could not read the supervision plan format: {error}"),
-        })?;
+        }
+    })?;
     match probe.format_version {
         Some(PLAN_FORMAT_VERSION) => {
             let plan: StoredPlan = serde_json::from_value(value).map_err(|error| {
@@ -764,10 +765,7 @@ pub fn load_plan(
         .map_err(|error| SupervisionError::StorageFailure {
             detail: error.to_string(),
         })?;
-    bytes
-        .as_deref()
-        .map(decode_plan)
-        .transpose()
+    bytes.as_deref().map(decode_plan).transpose()
 }
 
 /// Persists one durable plan after verifying its packet binding.

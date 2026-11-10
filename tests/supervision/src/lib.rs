@@ -12,6 +12,7 @@ use herness_core::contracts::{
     AgentId, AuthMethod, ConnectionCapabilities, ConnectionId, ConnectionStatus, ConnectionUsage,
     EndpointClass, InputCapabilities, ModelId, ProjectId, Provider, SessionId, Timestamp,
 };
+use herness_supervision::WorkPacket;
 use herness_supervision::approval::{
     ApprovalActor, ApprovalBasis, ConditionApproval, OwnerApprovalSource,
 };
@@ -47,7 +48,6 @@ use herness_supervision::profiles::{
     ProfileThresholds, ProfileVersion, ProviderKind, RubricVersion,
 };
 use herness_supervision::state::{CompletionSnapshot, SupervisionRecord};
-use herness_supervision::WorkPacket;
 
 /// Deterministic project UUID used by every fixture.
 pub const PROJECT_UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -101,10 +101,8 @@ impl ScriptedOwnerApprovalRegistry {
 
     /// Inserts or replaces the current entry for one project and owner.
     pub fn insert(&mut self, approval: OwnerApproval) {
-        self.entries.insert(
-            (approval.project_id(), approval.owner().clone()),
-            approval,
-        );
+        self.entries
+            .insert((approval.project_id(), approval.owner().clone()), approval);
     }
 
     /// Removes the current entry for one project and owner.
@@ -120,10 +118,7 @@ impl OwnerApprovalRegistryPort for ScriptedOwnerApprovalRegistry {
         owner: &OwnerRef,
         _now: Timestamp,
     ) -> Result<Option<OwnerApproval>, SupervisionError> {
-        Ok(self
-            .entries
-            .get(&(project_id, owner.clone()))
-            .cloned())
+        Ok(self.entries.get(&(project_id, owner.clone())).cloned())
     }
 }
 
@@ -1136,7 +1131,11 @@ pub fn owner_contract_succeeding(
 ) -> SupervisionContract {
     let project = current.project_id();
     let owner = current.subject().owner().clone();
-    let source = match current.conditions().approval().map(|approval| approval.basis()) {
+    let source = match current
+        .conditions()
+        .approval()
+        .map(|approval| approval.basis())
+    {
         Some(ApprovalBasis::InheritedOwner { source, .. }) => *source,
         _ => panic!("the current contract must carry an inherited owner approval"),
     };

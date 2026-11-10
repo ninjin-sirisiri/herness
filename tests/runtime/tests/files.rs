@@ -386,10 +386,7 @@ impl FaultyRecords {
 }
 
 impl PublicationRecordPort for FaultyRecords {
-    fn load_publication(
-        &self,
-        key: &str,
-    ) -> Result<Option<PublicationRecord>, PublicationFailure> {
+    fn load_publication(&self, key: &str) -> Result<Option<PublicationRecord>, PublicationFailure> {
         self.inner.load_publication(key)
     }
 
@@ -1392,11 +1389,7 @@ impl TestArtifactPort {
     fn seed(&mut self, artifact: ArtifactSlot, content: &str) {
         self.state.lock().expect("state").artifacts.insert(
             artifact,
-            ArtifactSnapshot::new(
-                artifact,
-                hash_bytes(content.as_bytes()),
-                content.to_owned(),
-            ),
+            ArtifactSnapshot::new(artifact, hash_bytes(content.as_bytes()), content.to_owned()),
         );
     }
 }
@@ -1443,9 +1436,9 @@ impl ArtifactPort for TestArtifactPort {
         if expected_version != current.as_ref().map(ArtifactSnapshot::version) {
             return Err(ArtifactFailure::VersionConflict {
                 artifact,
-                expected: expected_version.cloned().unwrap_or_else(|| {
-                    FileVersion::new("absent").expect("placeholder version")
-                }),
+                expected: expected_version
+                    .cloned()
+                    .unwrap_or_else(|| FileVersion::new("absent").expect("placeholder version")),
                 actual: current
                     .as_ref()
                     .map(|snapshot| snapshot.version().clone())
@@ -1464,11 +1457,8 @@ impl ArtifactPort for TestArtifactPort {
                 .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND);
             state.intent_seen_before_write = !pending.is_empty() && intended;
         }
-        let snapshot = ArtifactSnapshot::new(
-            artifact,
-            hash_bytes(content.as_bytes()),
-            content.to_owned(),
-        );
+        let snapshot =
+            ArtifactSnapshot::new(artifact, hash_bytes(content.as_bytes()), content.to_owned());
         state.artifacts.insert(artifact, snapshot.clone());
         state.writes += 1;
         Ok(snapshot)
@@ -1556,15 +1546,13 @@ fn candidate_write_and_edit_persist_intent_before_the_host_artifact_change() {
     allow_candidate_tools(&mut harness);
     let policy = harness.policy();
     let grant = candidate_grant(&harness, &policy);
-    let handle = ArtifactHandle::new(
+    let handle = ArtifactHandle::new(harness.fixture.project_id, "job-1", 2, "capability-token")
+        .expect("handle");
+    let (port, state) = TestArtifactPort::new(
+        handle.clone(),
         harness.fixture.project_id,
-        "job-1",
-        2,
-        "capability-token",
-    )
-    .expect("handle");
-    let (port, state) =
-        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, Some(harness.store()));
+        Some(harness.store()),
+    );
     let mut gateway = ToolGateway::new(
         CandidateArtifactTools::new(
             harness.store(),
@@ -1617,7 +1605,8 @@ fn candidate_write_and_edit_persist_intent_before_the_host_artifact_change() {
     );
     assert_eq!(intended.payload().as_value()["artifact"], "candidate_html");
     assert!(event_of_kind(&stored_events, ARTIFACT_CHANGE_EVENT_KIND).is_some());
-    let record = operation_record(gateway.executor().store(), write.operation_id()).expect("record");
+    let record =
+        operation_record(gateway.executor().store(), write.operation_id()).expect("record");
     assert_eq!(
         record.result().expect("result").outcome(),
         OperationOutcome::Applied
@@ -1664,9 +1653,13 @@ fn candidate_write_and_edit_persist_intent_before_the_host_artifact_change() {
         "<html><body>v2</body></html>"
     );
     let stored_events = events(gateway.executor().store(), harness.fixture.project_id);
-    assert!(stored_events.iter().filter(|event| {
-        event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
-    }).count() >= 2);
+    assert!(
+        stored_events
+            .iter()
+            .filter(|event| { event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND })
+            .count()
+            >= 2
+    );
     assert!(stored_events.iter().any(|event| {
         event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
             && event.payload().as_value()["rationale"] == "revise the candidate"
@@ -1679,15 +1672,9 @@ fn candidate_read_returns_immutable_snapshots_and_current_candidates() {
     allow_candidate_tools(&mut harness);
     let policy = harness.policy();
     let grant = candidate_grant(&harness, &policy);
-    let handle = ArtifactHandle::new(
-        harness.fixture.project_id,
-        "job-1",
-        2,
-        "capability-token",
-    )
-    .expect("handle");
-    let (mut port, state) =
-        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, None);
+    let handle = ArtifactHandle::new(harness.fixture.project_id, "job-1", 2, "capability-token")
+        .expect("handle");
+    let (mut port, state) = TestArtifactPort::new(handle.clone(), harness.fixture.project_id, None);
     port.seed(ArtifactSlot::SourceMarkdown, "# Source\n");
     port.seed(ArtifactSlot::ExistingHtml, "<html>old</html>");
     let mut gateway = ToolGateway::new(
@@ -1811,15 +1798,13 @@ fn candidate_executor_rejects_stale_handles_other_projects_and_shell_before_pers
     allow_candidate_tools(&mut harness);
     harness.allow_tool(ToolName::Bash);
     let policy = harness.policy();
-    let current = ArtifactHandle::new(
+    let current = ArtifactHandle::new(harness.fixture.project_id, "job-1", 2, "current-token")
+        .expect("current handle");
+    let (port, state) = TestArtifactPort::new(
+        current.clone(),
         harness.fixture.project_id,
-        "job-1",
-        2,
-        "current-token",
-    )
-    .expect("current handle");
-    let (port, state) =
-        TestArtifactPort::new(current.clone(), harness.fixture.project_id, Some(harness.store()));
+        Some(harness.store()),
+    );
     let mut gateway = ToolGateway::new(
         CandidateArtifactTools::new(
             harness.store(),
@@ -1831,13 +1816,8 @@ fn candidate_executor_rejects_stale_handles_other_projects_and_shell_before_pers
         .expect("candidate executor"),
     );
 
-    let stale = ArtifactHandle::new(
-        harness.fixture.project_id,
-        "job-1",
-        1,
-        "stale-token",
-    )
-    .expect("stale handle");
+    let stale = ArtifactHandle::new(harness.fixture.project_id, "job-1", 1, "stale-token")
+        .expect("stale handle");
     let stale_write = candidate_write_op(
         &harness,
         &stale,
@@ -1951,15 +1931,13 @@ fn candidate_edit_rejects_version_conflicts_and_non_unique_text_before_intent() 
     allow_candidate_tools(&mut harness);
     let policy = harness.policy();
     let grant = candidate_grant(&harness, &policy);
-    let handle = ArtifactHandle::new(
+    let handle = ArtifactHandle::new(harness.fixture.project_id, "job-1", 2, "capability-token")
+        .expect("handle");
+    let (mut port, state) = TestArtifactPort::new(
+        handle.clone(),
         harness.fixture.project_id,
-        "job-1",
-        2,
-        "capability-token",
-    )
-    .expect("handle");
-    let (mut port, state) =
-        TestArtifactPort::new(handle.clone(), harness.fixture.project_id, Some(harness.store()));
+        Some(harness.store()),
+    );
     port.seed(ArtifactSlot::CandidateHtml, "<html>same same</html>");
     let mut gateway = ToolGateway::new(
         CandidateArtifactTools::new(
@@ -2017,9 +1995,11 @@ fn candidate_edit_rejects_version_conflicts_and_non_unique_text_before_intent() 
     );
     assert_eq!(state.lock().expect("state").writes, 0);
     let events = events(gateway.executor().store(), harness.fixture.project_id);
-    assert!(!events.iter().any(|event| {
-        event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND
-    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND })
+    );
 }
 
 #[test]
@@ -2028,13 +2008,8 @@ fn unwired_candidate_capability_is_explicitly_unsupported() {
     allow_candidate_tools(&mut harness);
     let policy = harness.policy();
     let grant = candidate_grant(&harness, &policy);
-    let handle = ArtifactHandle::new(
-        harness.fixture.project_id,
-        "job-1",
-        1,
-        "capability-token",
-    )
-    .expect("handle");
+    let handle = ArtifactHandle::new(harness.fixture.project_id, "job-1", 1, "capability-token")
+        .expect("handle");
     let mut gateway = ToolGateway::new(
         CandidateArtifactTools::new(
             harness.store(),
@@ -2109,10 +2084,7 @@ fn publication_version_conflict_does_not_replace_and_duplicate_is_not_retried() 
     assert_eq!(record.status(), PublicationStatus::NotPublished);
     let before_events = events(writer.records().store(), harness.fixture.project_id);
     assert_eq!(before_events.len(), 1);
-    assert_eq!(
-        before_events[0].kind().as_str(),
-        PUBLICATION_EVENT_KIND
-    );
+    assert_eq!(before_events[0].kind().as_str(), PUBLICATION_EVENT_KIND);
 
     let duplicate = writer
         .publish(request.clone())
@@ -2245,11 +2217,8 @@ fn publication_old_version_save_rejection_never_replaces() {
         ExpectedTargetVersion::present(hash_bytes(b"old\n")),
         "new\n",
     );
-    let mut writer = harness.publication_writer(
-        FailingArchive { calls: 0 },
-        AllowGate,
-        RunControl::new(),
-    );
+    let mut writer =
+        harness.publication_writer(FailingArchive { calls: 0 }, AllowGate, RunControl::new());
 
     let failure = writer
         .publish(request.clone())
@@ -2275,9 +2244,7 @@ fn publication_old_version_save_rejection_never_replaces() {
     let event_count = events(writer.records().store(), harness.fixture.project_id).len();
     assert_eq!(event_count, 2, "intent and not-published result");
 
-    let duplicate = writer
-        .publish(request)
-        .expect("stored rejection result");
+    let duplicate = writer.publish(request).expect("stored rejection result");
     assert!(duplicate.duplicate());
     assert_eq!(duplicate.status(), PublicationStatus::NotPublished);
     assert_eq!(writer.archive().calls, 1, "duplicate must not re-archive");
@@ -2386,10 +2353,7 @@ fn publication_intent_persistence_fault_leaves_the_target_untouched() {
     let failure = writer
         .publish(request.clone())
         .expect_err("intent persistence fault");
-    assert!(matches!(
-        failure,
-        PublicationFailure::NotExecutable { .. }
-    ));
+    assert!(matches!(failure, PublicationFailure::NotExecutable { .. }));
     assert!(!harness.path("page.html").exists());
     assert!(events(writer.records().store(), harness.fixture.project_id).is_empty());
     assert!(
@@ -2431,10 +2395,7 @@ fn publication_result_persistence_fault_is_unverifiable_and_never_republished() 
     let failure = writer
         .publish(request.clone())
         .expect_err("result persistence fault");
-    assert!(matches!(
-        failure,
-        PublicationFailure::Unverifiable { .. }
-    ));
+    assert!(matches!(failure, PublicationFailure::Unverifiable { .. }));
     assert_eq!(
         fs::read_to_string(harness.path("page.html")).expect("replaced target"),
         "new\n"
@@ -2530,10 +2491,7 @@ fn publication_duplicate_returns_the_stored_result_with_a_host_activity_audit_su
         assert_eq!(payload["actor"], "host");
         assert_eq!(payload["requestId"], "publish-duplicate");
         assert_eq!(payload["unit"], "single_file");
-        assert_eq!(
-            payload["purpose"],
-            "publish the approved formal companion"
-        );
+        assert_eq!(payload["purpose"], "publish the approved formal companion");
         assert!(payload.get("rationale").is_none());
         assert!(payload.get("runId").is_none());
         assert!(payload.get("operationId").is_none());

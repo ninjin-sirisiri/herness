@@ -217,7 +217,11 @@ impl SourceSnapshot {
     /// The observed counter may be lower than the stored revision after a
     /// watcher restart. The stored revision is then kept. Returning to earlier
     /// bytes changes the digest and still advances or keeps the revision.
-    pub fn observe(previous: Option<&Self>, observed: u64, digest: ContentDigest) -> Result<Self, H3Error> {
+    pub fn observe(
+        previous: Option<&Self>,
+        observed: u64,
+        digest: ContentDigest,
+    ) -> Result<Self, H3Error> {
         if observed == 0 {
             return Err(H3Error::must_be_positive("sourceRevision"));
         }
@@ -374,4 +378,3 @@ impl crate::version::H3Record for FingerprintSet {
         self.format_version
     }
 }
-

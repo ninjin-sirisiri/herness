@@ -18,8 +18,8 @@ pub mod render;
 #[cfg(target_os = "macos")]
 mod render_macos;
 pub mod render_test;
-pub mod verification;
 pub mod store;
+pub mod verification;
 pub mod worker;
 
 pub use observer::{
@@ -27,9 +27,27 @@ pub use observer::{
     native_saved_change, shell_change, signal_from_absolute,
 };
 
+pub use assessment::{HTML_ASSESSMENT_PURPOSE, HtmlAssessmentHost};
+pub use composition::{
+    DesktopH4Barrier, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView,
+    HtmlSyncCapability, HtmlSyncCapabilityReport, HtmlSyncCapabilityState, HtmlSyncDocumentCommand,
+    HtmlSyncDocumentView, HtmlSyncEnableView, HtmlSyncH2View, HtmlSyncHistoryEntryView,
+    HtmlSyncHistoryView, HtmlSyncMissingCompanion, HtmlSyncObserverView, HtmlSyncOperationView,
+    HtmlSyncProjectView, HtmlSyncPublicationView, HtmlSyncPurposeView, HtmlSyncSendScopeView,
+    HtmlSyncServices, HtmlSyncSettingsView, MULTI_CYCLE_COST_WARNING,
+};
+pub use operations::{DesktopHtmlSyncOperations, PrivateHistoryReader, validate_current_html};
 pub use policy::{
     CandidateCheck, CandidateDecision, CandidateStage, ConnectedPolicyBridge, HtmlPolicyBridge,
     PackProbe, PolicyBootstrap, PolicyBridgeError, PolicyFinding,
+};
+pub use publish::{
+    DesktopPublisher, H3PublicationRecords, H3PublicationSafety, ObserverWriteExpectations,
+    PolicyFinalCheck, ProjectPublicationFiles, SharedHistoryArchive,
+};
+pub use recovery::{
+    HtmlSyncQuitReport, HtmlSyncRecoveryFailure, HtmlSyncRecoveryHost, HtmlSyncStartupReport,
+    RecoveryProject,
 };
 pub use render::{
     BrowserEvidence, CancellationToken, CandidateEvidence, ConfigurationEvidence, CssViewport,
@@ -43,25 +61,5 @@ pub use render_test::RenderTestLaunch;
 pub use verification::{
     CandidateVerification, CandidateVerificationRequest, FingerprintCapture, PolicyCheckSummary,
     render_facts, verify_candidate,
-};
-pub use assessment::{HTML_ASSESSMENT_PURPOSE, HtmlAssessmentHost};
-pub use composition::{
-    DesktopH4Barrier, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView,
-    HtmlSyncCapability, HtmlSyncCapabilityReport, HtmlSyncCapabilityState, HtmlSyncDocumentCommand,
-    HtmlSyncDocumentView, HtmlSyncEnableView, HtmlSyncH2View, HtmlSyncHistoryEntryView,
-    HtmlSyncHistoryView, HtmlSyncMissingCompanion, HtmlSyncObserverView, HtmlSyncOperationView,
-    HtmlSyncProjectView, HtmlSyncPublicationView, HtmlSyncPurposeView, HtmlSyncSendScopeView,
-    HtmlSyncServices, HtmlSyncSettingsView, MULTI_CYCLE_COST_WARNING,
-};
-pub use operations::{
-    DesktopHtmlSyncOperations, PrivateHistoryReader, validate_current_html,
-};
-pub use publish::{
-    DesktopPublisher, H3PublicationRecords, H3PublicationSafety, ObserverWriteExpectations,
-    PolicyFinalCheck, ProjectPublicationFiles, SharedHistoryArchive,
-};
-pub use recovery::{
-    HtmlSyncQuitReport, HtmlSyncRecoveryFailure, HtmlSyncRecoveryHost, HtmlSyncStartupReport,
-    RecoveryProject,
 };
 pub use worker::{HtmlSyncWorker, ProjectWorkspaces};

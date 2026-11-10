@@ -30,14 +30,14 @@ pub use bash::{
     BashExecutor, BashOutput, SHELL_FINISHED_EVENT_KIND, SHELL_SPAWNED_EVENT_KIND,
     SHELL_STARTED_EVENT_KIND, ShellReconciliation, reconcile_shell_operation,
 };
+pub use candidate::{
+    ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, CandidateArtifactTools,
+    CandidateChange, CandidateReadOutput, CandidateToolOutput,
+};
 pub use diff::{FileDiff, MAX_DIFF_BYTES};
 pub use files::{
     FILE_CHANGE_EVENT_KIND, FILE_CHANGE_INTENDED_EVENT_KIND, FileChange, FileLockGuard,
     FileLockRegistry, FileToolOutput, NativeFileTools, hash_bytes,
-};
-pub use candidate::{
-    ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, CandidateArtifactTools,
-    CandidateChange, CandidateReadOutput, CandidateToolOutput,
 };
 pub use gateway::{GatewayError, ToolExecutor, ToolGateway};
 pub use path::{ProjectRoot, ResolvedPath};

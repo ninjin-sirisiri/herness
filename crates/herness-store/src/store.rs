@@ -1961,7 +1961,10 @@ fn prepare_location(config: &StoreConfig) -> Result<(), StoreError> {
     Ok(())
 }
 
-pub(crate) fn next_sequence(transaction: &Transaction<'_>, project: &ProjectId) -> Result<u64, StoreError> {
+pub(crate) fn next_sequence(
+    transaction: &Transaction<'_>,
+    project: &ProjectId,
+) -> Result<u64, StoreError> {
     let current: Option<i64> = transaction
         .query_row(
             "SELECT next_sequence FROM project_sequences WHERE project_id = ?1",

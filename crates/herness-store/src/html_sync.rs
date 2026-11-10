@@ -18,16 +18,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::StoreError;
 use crate::fault::CommitPoint;
-use crate::store::{
-    Store, append_event_drafts, next_sequence, sequence_to_sql,
-};
+use crate::store::{Store, append_event_drafts, next_sequence, sequence_to_sql};
 
 impl From<H3Error> for StoreError {
     fn from(error: H3Error) -> Self {
         match error {
-            H3Error::CrossProject { expected, found, .. } => {
-                Self::HtmlSyncCrossProject { expected, found }
-            }
+            H3Error::CrossProject {
+                expected, found, ..
+            } => Self::HtmlSyncCrossProject { expected, found },
             H3Error::UnsupportedFormat {
                 record,
                 found,
@@ -92,7 +90,9 @@ impl From<StoreError> for H3Error {
                 recorded,
                 supplied,
             },
-            StoreError::HtmlSyncRecordConflict { record, id } => Self::RecordConflict { record, id },
+            StoreError::HtmlSyncRecordConflict { record, id } => {
+                Self::RecordConflict { record, id }
+            }
             StoreError::HtmlSyncFormat {
                 record,
                 found,
@@ -131,11 +131,7 @@ fn timestamp(value: Timestamp, field: &str) -> Result<i64, StoreError> {
         .map_err(|_| StoreError::corrupt(format!("{field} does not fit in sqlite")))
 }
 
-fn check_revision(
-    expected: Option<u64>,
-    found: Option<u64>,
-    key: &str,
-) -> Result<(), StoreError> {
+fn check_revision(expected: Option<u64>, found: Option<u64>, key: &str) -> Result<(), StoreError> {
     let matches = match (expected, found) {
         (None, None) => true,
         (Some(expected), Some(found)) => expected == found,
@@ -163,10 +159,7 @@ fn next_revision(found: Option<u64>, key: &str) -> Result<u64, StoreError> {
         .map(|revision| revision.unwrap_or(1))
 }
 
-fn settings_revision(
-    conn: &Connection,
-    project: ProjectId,
-) -> Result<Option<u64>, StoreError> {
+fn settings_revision(conn: &Connection, project: ProjectId) -> Result<Option<u64>, StoreError> {
     let value: Option<i64> = conn
         .query_row(
             "SELECT revision FROM html_sync_settings WHERE project_id = ?1",
@@ -174,7 +167,9 @@ fn settings_revision(
             |row| row.get(0),
         )
         .optional()?;
-    value.map(|value| positive(value, "settings revision")).transpose()
+    value
+        .map(|value| positive(value, "settings revision"))
+        .transpose()
 }
 
 fn document_revision(
@@ -190,7 +185,9 @@ fn document_revision(
             |row| row.get(0),
         )
         .optional()?;
-    value.map(|value| positive(value, "document revision")).transpose()
+    value
+        .map(|value| positive(value, "document revision"))
+        .transpose()
 }
 
 fn load_settings(
@@ -414,26 +411,26 @@ fn ensure_generation_update(
         && existing.superseded_at() == next.superseded_at();
     let allowed = same_active
         || match existing.status() {
-        herness_html_sync::GenerationStatus::Active => matches!(
-            next.status(),
-            herness_html_sync::GenerationStatus::Completed
-                | herness_html_sync::GenerationStatus::Superseded
-                | herness_html_sync::GenerationStatus::Failed
-                | herness_html_sync::GenerationStatus::Cancelled
-                | herness_html_sync::GenerationStatus::Orphaned
-        ),
-        herness_html_sync::GenerationStatus::Completed => matches!(
-            next.status(),
-            herness_html_sync::GenerationStatus::Superseded
-                | herness_html_sync::GenerationStatus::Orphaned
-        ),
-        herness_html_sync::GenerationStatus::Superseded => {
-            next.status() == herness_html_sync::GenerationStatus::Orphaned
-        }
-        herness_html_sync::GenerationStatus::Failed
-        | herness_html_sync::GenerationStatus::Cancelled
-        | herness_html_sync::GenerationStatus::Orphaned => false,
-    };
+            herness_html_sync::GenerationStatus::Active => matches!(
+                next.status(),
+                herness_html_sync::GenerationStatus::Completed
+                    | herness_html_sync::GenerationStatus::Superseded
+                    | herness_html_sync::GenerationStatus::Failed
+                    | herness_html_sync::GenerationStatus::Cancelled
+                    | herness_html_sync::GenerationStatus::Orphaned
+            ),
+            herness_html_sync::GenerationStatus::Completed => matches!(
+                next.status(),
+                herness_html_sync::GenerationStatus::Superseded
+                    | herness_html_sync::GenerationStatus::Orphaned
+            ),
+            herness_html_sync::GenerationStatus::Superseded => {
+                next.status() == herness_html_sync::GenerationStatus::Orphaned
+            }
+            herness_html_sync::GenerationStatus::Failed
+            | herness_html_sync::GenerationStatus::Cancelled
+            | herness_html_sync::GenerationStatus::Orphaned => false,
+        };
     if !allowed {
         return Err(conflict());
     }
@@ -615,8 +612,7 @@ impl Store {
         }
         if existing.updated_at() > journal.updated_at() {
             return Err(StoreError::HtmlSyncInvalidCommit {
-                detail: "the publication journal cannot move its update time backwards"
-                    .to_owned(),
+                detail: "the publication journal cannot move its update time backwards".to_owned(),
             });
         }
         let payload = encode_record(&journal)?;
@@ -721,11 +717,7 @@ impl Store {
 
         if let Some(settings) = commit.settings() {
             let current = settings_revision(&transaction, project)?;
-            check_revision(
-                settings.expected_revision(),
-                current,
-                "html sync settings",
-            )?;
+            check_revision(settings.expected_revision(), current, "html sync settings")?;
         }
         if let Some(document) = commit.document() {
             let key = document.document().document_key();
@@ -852,7 +844,11 @@ impl Store {
                     sequence_to_sql(final_sequence)?,
                 ],
             )?;
-            Some(H3DocumentRecord::new(revision, final_sequence, state.clone())?)
+            Some(H3DocumentRecord::new(
+                revision,
+                final_sequence,
+                state.clone(),
+            )?)
         } else {
             None
         };
@@ -1077,10 +1073,7 @@ impl H3StorePort for Store {
         Store::commit_html_sync(self, commit).map_err(H3Error::from)
     }
 
-    fn update_html_sync_publication(
-        &mut self,
-        journal: PublicationJournal,
-    ) -> Result<(), H3Error> {
+    fn update_html_sync_publication(&mut self, journal: PublicationJournal) -> Result<(), H3Error> {
         Store::update_html_sync_publication(self, journal).map_err(H3Error::from)
     }
 }

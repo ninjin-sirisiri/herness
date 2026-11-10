@@ -85,7 +85,11 @@ pub enum H3Approver {
 
 /// Lifecycle of an approval. Scope is immutable; only the lifecycle changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum H3ApprovalState {
     /// The approval is current unless its optional expiry has passed.
     Approved,
@@ -961,7 +965,11 @@ impl H3ConfigurationApproval {
     fn compute_fingerprint(&self) -> Result<ContentDigest, H3Error> {
         let mut hasher = Sha256::new();
         hasher.update(APPROVAL_FINGERPRINT_DOMAIN);
-        mix_field(&mut hasher, b"project", self.project_id.to_string().as_bytes());
+        mix_field(
+            &mut hasher,
+            b"project",
+            self.project_id.to_string().as_bytes(),
+        );
         mix_field(
             &mut hasher,
             b"settingsVersion",
@@ -985,7 +993,11 @@ impl H3ConfigurationApproval {
         mix_field(&mut hasher, b"versions", &record_bytes(&self.versions)?);
         mix_field(&mut hasher, b"limits", &record_bytes(&self.limits)?);
         mix_field(&mut hasher, b"autoPublish", &[u8::from(self.auto_publish)]);
-        mix_field(&mut hasher, b"retainHistory", &[u8::from(self.retain_history)]);
+        mix_field(
+            &mut hasher,
+            b"retainHistory",
+            &[u8::from(self.retain_history)],
+        );
         mix_field(
             &mut hasher,
             b"automaticCompanion",
@@ -1328,11 +1340,11 @@ impl herness_supervision::owner_launch::OwnerApprovalRegistryPort
         owner: &OwnerRef,
         now: Timestamp,
     ) -> Result<Option<OwnerApproval>, SupervisionError> {
-        let approval = self
-            .current_approval(project_id, now)
-            .map_err(|error| SupervisionError::StorageFailure {
+        let approval = self.current_approval(project_id, now).map_err(|error| {
+            SupervisionError::StorageFailure {
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         let Some(approval) = approval else {
             return Ok(None);
         };

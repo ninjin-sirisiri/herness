@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use herness_core::{
-    ConnectionAdmin, CredentialAvailability, CredentialPort, ResolvedCredential,
-};
+use herness_core::{ConnectionAdmin, CredentialAvailability, CredentialPort, ResolvedCredential};
 use herness_desktop::host::DesktopHost;
 use herness_engine_pi::ProviderEndpoints;
 use herness_html_sync::{
@@ -70,9 +68,8 @@ fn native_lifecycle_startup_quit_and_restore_keep_the_h3_recovery_latch() {
     fs::write(project_root.join(TARGET), SOURCE_V1).expect("source");
 
     let credentials: Arc<dyn CredentialPort + Send + Sync> = Arc::new(UnavailableCredentials);
-    let endpoints =
-        ProviderEndpoints::for_loopback("http://127.0.0.1:1/v1", "http://127.0.0.1:1")
-            .expect("loopback endpoints");
+    let endpoints = ProviderEndpoints::for_loopback("http://127.0.0.1:1/v1", "http://127.0.0.1:1")
+        .expect("loopback endpoints");
 
     // First host open only assigns the durable project identity.
     let (mut host, _) = DesktopHost::open(
@@ -117,9 +114,7 @@ fn native_lifecycle_startup_quit_and_restore_keep_the_h3_recovery_latch() {
             None,
         ),
         H3Reason::new(
-            H3StateReasonKind::Pending {
-                source_revision: 1,
-            },
+            H3StateReasonKind::Pending { source_revision: 1 },
             Vec::new(),
         )
         .expect("reason"),
@@ -129,15 +124,8 @@ fn native_lifecycle_startup_quit_and_restore_keep_the_h3_recovery_latch() {
         fixtures::now(),
     )
     .expect("document");
-    let cycle = SyncCycle::new(
-        cycle_id,
-        key.clone(),
-        1,
-        fixtures::now(),
-        source,
-        None,
-    )
-    .expect("cycle");
+    let cycle =
+        SyncCycle::new(cycle_id, key.clone(), 1, fixtures::now(), source, None).expect("cycle");
     let event = document_state_event(&key, None, &document, fixtures::now()).expect("event");
     let config = StoreConfig::new(&app_data).expect("store config");
     let mut store = Store::open(config).expect("store");
@@ -165,7 +153,10 @@ fn native_lifecycle_startup_quit_and_restore_keep_the_h3_recovery_latch() {
         stdout.contains("H3_LIFECYCLE_OK:"),
         "launcher did not report success: {stdout}"
     );
-    assert!(stdout.contains("projects=1"), "one restored project: {stdout}");
+    assert!(
+        stdout.contains("projects=1"),
+        "one restored project: {stdout}"
+    );
     assert!(
         stdout.contains("failures=0") && stdout.contains("request_count=0"),
         "startup must not fail or send: {stdout}"

@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use herness_assessment::llm::EvidenceDocument;
-use herness_html_sync::{EvidenceContentKind, EvidenceContentSource};
 use herness_assessment::{
     AssessmentEndpoints, AssessmentTransport, DecisionsAssessmentAdapter, JevAssessmentAdapter,
     LlmAssessmentAdapter,
@@ -19,6 +18,7 @@ use herness_core::{
     ModelRequestGatePort, ModelRequestObservation, RequestGateIntent, RequestGateOutcome,
     RequestId, RequestOutcome, RequestPurpose, StopDeadlineControl, TokenUsage,
 };
+use herness_html_sync::{EvidenceContentKind, EvidenceContentSource};
 use herness_supervision::budget::gate::BudgetRequestGate;
 use herness_supervision::budget::ledger::BudgetLedger;
 use herness_supervision::supervisor::{AssessmentProfileFacts, ConditionAssessmentPort};
@@ -370,8 +370,9 @@ impl HostAssessmentPort {
             ProfilePurpose::Html => "html_assessment",
             ProfilePurpose::Permission => {
                 return Err(SupervisionError::Unsupported {
-                    feature: "the permission purpose has its own evaluator, not a condition assessment"
-                        .to_owned(),
+                    feature:
+                        "the permission purpose has its own evaluator, not a condition assessment"
+                            .to_owned(),
                 });
             }
         };
@@ -522,14 +523,12 @@ impl ConditionAssessmentPort for HostAssessmentPort {
                                 detail: "text evidence content is missing".to_owned(),
                             });
                         };
-                        documents.push(
-                            EvidenceDocument::text(*evidence_id, text).map_err(|error| {
-                                SupervisionError::AssessmentContractViolation {
-                                    field: "assessment.evidence".to_owned(),
-                                    detail: error.to_string(),
-                                }
-                            })?,
-                        );
+                        documents.push(EvidenceDocument::text(*evidence_id, text).map_err(
+                            |error| SupervisionError::AssessmentContractViolation {
+                                field: "assessment.evidence".to_owned(),
+                                detail: error.to_string(),
+                            },
+                        )?);
                     }
                     EvidenceContentKind::Image => {
                         let Some(media_type) = content.media_type() else {
@@ -546,17 +545,11 @@ impl ConditionAssessmentPort for HostAssessmentPort {
                         };
                         has_image = true;
                         documents.push(
-                            EvidenceDocument::image(
-                                *evidence_id,
-                                media_type,
-                                bytes.to_vec(),
-                            )
-                            .map_err(|error| {
-                                SupervisionError::AssessmentContractViolation {
+                            EvidenceDocument::image(*evidence_id, media_type, bytes.to_vec())
+                                .map_err(|error| SupervisionError::AssessmentContractViolation {
                                     field: "assessment.evidence".to_owned(),
                                     detail: error.to_string(),
-                                }
-                            })?,
+                                })?,
                         );
                     }
                 }

@@ -38,10 +38,10 @@ use herness_supervision::supervisor::{
     SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest,
 };
 use herness_supervision::{
-    ApprovalActor, ApprovalBasis, BudgetUsage, ConditionApproval, ConditionVersion,
-    ConsentBinding, ConsentState, DisclosureDataKind, HumanAction, ProfileBinding, ProfilePurpose,
-    ProviderOrigin, SupervisionCommand, SupervisionError, SupervisionId, SupervisionRecord,
-    SupervisionRequestId, SupervisionState, TargetReadSet, TargetVersion, WorkPacket,
+    ApprovalActor, ApprovalBasis, BudgetUsage, ConditionApproval, ConditionVersion, ConsentBinding,
+    ConsentState, DisclosureDataKind, HumanAction, ProfileBinding, ProfilePurpose, ProviderOrigin,
+    SupervisionCommand, SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId,
+    SupervisionState, TargetReadSet, TargetVersion, WorkPacket,
 };
 use serde::Serialize;
 
@@ -54,8 +54,8 @@ use assessment::{AssessmentHost, build_profile};
 use checks::HostCheckPort;
 use permission::PermissionRuntime;
 use plan::{
-    BudgetSnapshot, ConfigStore, PLAN_FORMAT_VERSION, PendingPlan, build_conditions, load_pending_plan,
-    load_plan, plan_child, save_pending_plan, save_plan,
+    BudgetSnapshot, ConfigStore, PLAN_FORMAT_VERSION, PendingPlan, build_conditions,
+    load_pending_plan, load_plan, plan_child, save_pending_plan, save_plan,
 };
 use runtime::DesktopSupervisionRuntime;
 use store::{HostBudgetClock, HostClock, StoreHandle};
@@ -926,12 +926,7 @@ impl SupervisionHost {
         let record = self.load(project, supervision)?;
         let plan = self.plan(project, supervision)?;
         let contract = plan.contract(&record, self.clock.now())?;
-        OwnerLaunchBinding::from_contract(
-            &contract,
-            plan.budget_version,
-            settings_version,
-            job_id,
-        )
+        OwnerLaunchBinding::from_contract(&contract, plan.budget_version, settings_version, job_id)
     }
 
     /// Starts the first run of a ready target using a host-minted approved-owner
@@ -1272,20 +1267,19 @@ impl SupervisionHost {
                 })?,
             None => current_plan.profile.clone(),
         };
-        let consent = match request.consent_purpose {
-            Some(purpose) => {
-                let consent =
-                    config
-                        .consent(purpose)
-                        .cloned()
-                        .ok_or(SupervisionError::ConsentBlocked {
+        let consent =
+            match request.consent_purpose {
+                Some(purpose) => {
+                    let consent = config.consent(purpose).cloned().ok_or(
+                        SupervisionError::ConsentBlocked {
                             reason: herness_supervision::ConsentBlock::Revoked,
-                        })?;
-                consent.require_granted()?;
-                consent
-            }
-            None => current_plan.consent.clone(),
-        };
+                        },
+                    )?;
+                    consent.require_granted()?;
+                    consent
+                }
+                None => current_plan.consent.clone(),
+            };
         let budget = match request.budget.as_ref() {
             Some(input) => input.policy()?,
             None => current_plan.budget.policy()?,
@@ -1342,9 +1336,7 @@ impl SupervisionHost {
             Ok(Some(pending)) => pending,
             Ok(None) => return Ok(false),
             Err(error) => {
-                eprintln!(
-                    "SUPERVISION_PENDING_PLAN_ERROR: {project} {supervision}: {error}"
-                );
+                eprintln!("SUPERVISION_PENDING_PLAN_ERROR: {project} {supervision}: {error}");
                 return Ok(false);
             }
         };

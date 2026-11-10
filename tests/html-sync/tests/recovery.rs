@@ -24,13 +24,12 @@ use herness_html_sync::observer::{DependencyKind, DependencyPath, dependency_fin
 use herness_html_sync::{
     Applicability, ApplicabilityReason, CandidateArtifactStore, CandidateBytes,
     CandidateGenerationRequest, CandidateId, CandidateRecord, CandidateVerification, CycleId,
-    CycleLatch, DocumentCommit,
-    DocumentKey, FingerprintSet, GenerationId, GenerationRecord, H2RecoveryFacts, H2Reference,
-    H3DocumentRecord, H3DocumentState, H3Error, H3Reason, H3Settings, H3SettingsRecord, H3State,
-    H3StateReasonKind, H3StopCause, HtmlSyncCommit, HumanWaitCause, PublicationFileJournal,
-    PublicationFileRole, PublicationId, PublicationJournal, PublicationStatus, RecoveryBoundary,
-    RecoveryReadPort, RecoveryRuntimePort, RecoveryService, RecoverySideEffects, RecoveryStop,
-    RequiredAction, SourceSnapshot, SyncCycle,
+    CycleLatch, DocumentCommit, DocumentKey, FingerprintSet, GenerationId, GenerationRecord,
+    H2RecoveryFacts, H2Reference, H3DocumentRecord, H3DocumentState, H3Error, H3Reason, H3Settings,
+    H3SettingsRecord, H3State, H3StateReasonKind, H3StopCause, HtmlSyncCommit, HumanWaitCause,
+    PublicationFileJournal, PublicationFileRole, PublicationId, PublicationJournal,
+    PublicationStatus, RecoveryBoundary, RecoveryReadPort, RecoveryRuntimePort, RecoveryService,
+    RecoverySideEffects, RecoveryStop, RequiredAction, SourceSnapshot, SyncCycle,
 };
 use herness_html_sync_tests::fixtures;
 use herness_store::{Store, StoreConfig};
@@ -581,12 +580,7 @@ fn candidate_verification_uses_exact_private_bytes_without_a_raw_token() {
         .write_artifact(&handle, ArtifactSlot::CandidateHtml, CANDIDATE_HTML, None)
         .expect("html");
     store
-        .write_artifact(
-            &handle,
-            ArtifactSlot::CandidateProvenance,
-            PROVENANCE,
-            None,
-        )
+        .write_artifact(&handle, ArtifactSlot::CandidateProvenance, PROVENANCE, None)
         .expect("provenance");
     let record = CandidateRecord::new(
         fixtures::ids(fixtures::project()).candidate_one,

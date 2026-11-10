@@ -15,20 +15,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use herness_core::{
-    ArchivedVersion, EventDraft, ExpectedTargetVersion, OldVersionArchive, ProjectId, ProjectRoot,
-    PublicationFailure, PublicationRecord, PublicationRequest, RunControl, Timestamp,
-};
 use herness_core::ports::publish::{
     PublicationArchivePort, PublicationGatePort, PublicationRecordPort,
 };
 use herness_core::runtime::{PrivateAppArchive, PublicationWriter};
+use herness_core::{
+    ArchivedVersion, EventDraft, ExpectedTargetVersion, OldVersionArchive, ProjectId, ProjectRoot,
+    PublicationFailure, PublicationRecord, PublicationRequest, RunControl, Timestamp,
+};
 use herness_html_sync::{
-    CandidatePublication, ExpectedPublicationWrite, FilesystemSourceReader,
-    FinalCandidateCheck, FinalCandidateCheckPort, FinalCandidateCheckRequest, H3Error,
-    H3OperationRequest, H3StorePort, HistoryReadPort, HistoryRestoreOutcome, ObservationClock,
-    ProjectObserver, PublicationFileReadPort, PublicationId, PublicationOrchestrator,
-    PublicationOutcome, PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
+    CandidatePublication, ExpectedPublicationWrite, FilesystemSourceReader, FinalCandidateCheck,
+    FinalCandidateCheckPort, FinalCandidateCheckRequest, H3Error, H3OperationRequest, H3StorePort,
+    HistoryReadPort, HistoryRestoreOutcome, ObservationClock, ProjectObserver,
+    PublicationFileReadPort, PublicationId, PublicationOrchestrator, PublicationOutcome,
+    PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
     PublicationWriteExpectationPort, SourceReadError, SourceReadPort, replace_with_regenerated,
     restore_history,
 };
@@ -81,10 +81,9 @@ impl PublicationFileReadPort for ProjectPublicationFiles {
     }
 
     fn ensure_parent(&self, path: &str) -> Result<(), H3Error> {
-        let parent = Path::new(path).parent().ok_or_else(|| H3Error::invalid(
-            "publicationPath",
-            "the formal path has no parent",
-        ))?;
+        let parent = Path::new(path)
+            .parent()
+            .ok_or_else(|| H3Error::invalid("publicationPath", "the formal path has no parent"))?;
         if parent.as_os_str().is_empty() {
             return Ok(());
         }
@@ -247,8 +246,7 @@ impl PublicationSafetyPort for H3PublicationSafety {
             let assessment = approval.assessment();
             let consent = assessment.consent();
             let profile_matches = assessment.profile() == request.profile;
-            if !profile_matches || consent.purpose() != herness_supervision::ProfilePurpose::Html
-            {
+            if !profile_matches || consent.purpose() != herness_supervision::ProfilePurpose::Html {
                 return false;
             }
             if consent.target_scope_version() == request.target_version {
@@ -271,10 +269,7 @@ impl PublicationSafetyPort for H3PublicationSafety {
             let disclosure = assessment.disclosure();
             record.get("schema").and_then(serde_json::Value::as_str)
                 == Some("h3-range-consent-reissue-v1")
-                && record
-                    .get("purpose")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("html")
+                && record.get("purpose").and_then(serde_json::Value::as_str) == Some("html")
                 && record
                     .get("targetVersion")
                     .and_then(serde_json::Value::as_u64)
@@ -363,9 +358,7 @@ impl<'a, R: SourceReadPort, C: ObservationClock> ObserverWriteExpectations<'a, R
     }
 
     /// Uncertainty results produced while retiring expectations.
-    pub fn take_uncertainties(
-        &mut self,
-    ) -> Vec<herness_html_sync::ObservationUncertainty> {
+    pub fn take_uncertainties(&mut self) -> Vec<herness_html_sync::ObservationUncertainty> {
         std::mem::take(&mut self.uncertainties)
     }
 }
@@ -473,17 +466,12 @@ impl H3PublicationRecords {
 }
 
 impl PublicationRecordPort for H3PublicationRecords {
-    fn load_publication(
-        &self,
-        key: &str,
-    ) -> Result<Option<PublicationRecord>, PublicationFailure> {
-        let bytes = self
-            .store
-            .lock()
-            .load_host_state(key)
-            .map_err(|error| PublicationFailure::RecordUnavailable {
+    fn load_publication(&self, key: &str) -> Result<Option<PublicationRecord>, PublicationFailure> {
+        let bytes = self.store.lock().load_host_state(key).map_err(|error| {
+            PublicationFailure::RecordUnavailable {
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         match bytes {
             Some(bytes) => PublicationRecord::from_bytes(&bytes).map(Some),
             None => Ok(None),
@@ -590,11 +578,10 @@ impl DesktopPublisher {
             )
         })?;
         let archive_root = archive_root.into();
-        let archive_probe = SharedHistoryArchive::new(&archive_root).map_err(|error| {
-            H3Error::Storage {
+        let archive_probe =
+            SharedHistoryArchive::new(&archive_root).map_err(|error| H3Error::Storage {
                 detail: format!("the private history archive is unavailable: {error}"),
-            }
-        })?;
+            })?;
         if archive_probe.root().starts_with(&canonical_project) {
             return Err(H3Error::invalid(
                 "archiveRoot",
@@ -692,11 +679,10 @@ impl DesktopPublisher {
         expectations: &mut dyn PublicationWriteExpectationPort,
         run: impl FnOnce(&mut PublicationOrchestrator<'_>) -> Result<R, H3Error>,
     ) -> Result<R, H3Error> {
-        let mut archive = SharedHistoryArchive::new(&self.archive_root).map_err(|error| {
-            H3Error::Storage {
+        let mut archive =
+            SharedHistoryArchive::new(&self.archive_root).map_err(|error| H3Error::Storage {
                 detail: format!("the private history archive is unavailable: {error}"),
-            }
-        })?;
+            })?;
         let gate = H3PublicationGate {
             store: self.store.clone(),
             safety: &self.safety,
@@ -708,9 +694,8 @@ impl DesktopPublisher {
         };
         let mut writer = PublicationWriter::new(
             self.project,
-            ProjectRoot::new(&self.project_root).map_err(|error| {
-                H3Error::invalid("projectRoot", error.to_string())
-            })?,
+            ProjectRoot::new(&self.project_root)
+                .map_err(|error| H3Error::invalid("projectRoot", error.to_string()))?,
             H3PublicationRecords::new(self.store.clone()),
             archive.clone(),
             gate,
@@ -783,11 +768,10 @@ impl DesktopPublisher {
                 record: "generation",
                 id: generation.to_string(),
             })?;
-        let mut archive = SharedHistoryArchive::new(&self.archive_root).map_err(|error| {
-            H3Error::Storage {
+        let mut archive =
+            SharedHistoryArchive::new(&self.archive_root).map_err(|error| H3Error::Storage {
                 detail: format!("the private history archive is unavailable: {error}"),
-            }
-        })?;
+            })?;
         let gate = H3PublicationGate {
             store: self.store.clone(),
             safety: &self.safety,

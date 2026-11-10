@@ -4,11 +4,11 @@
 
 use herness_core::{ExpectedTargetVersion, ProjectId, Timestamp};
 use herness_html_sync::{
-    Applicability, ApplicabilityReason, CandidateId, CandidateRecord, CandidateStorageRef,
-    CycleId, DocumentKey, FingerprintSet, GenerationId, GenerationRecord, GenerationStatus,
-    H2Reference, H3DocumentState, H3Operation, H3OperationOutcome, H3OperationRequest,
-    H3OperationResult, H3Reason, H3RequestId, H3Settings, H3State, H3StateReasonKind, JobId,
-    PublicationId, PublicationJournal, RequestCommit, SourceRevision, SourceSnapshot, SyncCycle,
+    Applicability, ApplicabilityReason, CandidateId, CandidateRecord, CandidateStorageRef, CycleId,
+    DocumentKey, FingerprintSet, GenerationId, GenerationRecord, GenerationStatus, H2Reference,
+    H3DocumentState, H3Operation, H3OperationOutcome, H3OperationRequest, H3OperationResult,
+    H3Reason, H3RequestId, H3Settings, H3State, H3StateReasonKind, JobId, PublicationId,
+    PublicationJournal, RequestCommit, SourceRevision, SourceSnapshot, SyncCycle,
 };
 use herness_supervision::ContentDigest;
 use uuid::Uuid;
@@ -286,11 +286,8 @@ pub fn h2_reference() -> H2Reference {
 
 /// Candidate storage reference with a valid namespace shape.
 pub fn candidate_storage() -> CandidateStorageRef {
-    CandidateStorageRef::new(
-        "ab".repeat(32),
-        ContentDigest::sha256(b"fixture-token"),
-    )
-    .expect("candidate storage")
+    CandidateStorageRef::new("ab".repeat(32), ContentDigest::sha256(b"fixture-token"))
+        .expect("candidate storage")
 }
 
 /// A candidate record for one generation.
@@ -398,8 +395,6 @@ pub fn settings_commit(settings: H3Settings) -> herness_html_sync::SettingsCommi
 }
 
 /// A document commit for creation.
-pub fn document_commit(
-    document: H3DocumentState,
-) -> herness_html_sync::DocumentCommit {
+pub fn document_commit(document: H3DocumentState) -> herness_html_sync::DocumentCommit {
     herness_html_sync::DocumentCommit::new(None, document).expect("document commit")
 }

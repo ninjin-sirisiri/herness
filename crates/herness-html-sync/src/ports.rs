@@ -56,10 +56,7 @@ pub struct DocumentCommit {
 
 impl DocumentCommit {
     /// Creates a document write against an observed revision.
-    pub fn new(
-        expected_revision: Option<u64>,
-        document: H3DocumentState,
-    ) -> Result<Self, H3Error> {
+    pub fn new(expected_revision: Option<u64>, document: H3DocumentState) -> Result<Self, H3Error> {
         if expected_revision == Some(0) {
             return Err(H3Error::must_be_positive("expectedDocumentRevision"));
         }
@@ -244,7 +241,11 @@ impl HtmlSyncCommit {
             ));
         }
         if let Some(key) = &document_key
-            && Some(key) != self.document.as_ref().map(|document| document.document().document_key())
+            && Some(key)
+                != self
+                    .document
+                    .as_ref()
+                    .map(|document| document.document().document_key())
         {
             return Err(H3Error::invalid(
                 "document",
@@ -368,12 +369,32 @@ impl HtmlSyncCommit {
         self.document
             .as_ref()
             .map(|document| document.document().project_id())
-            .or_else(|| self.settings.as_ref().map(|settings| settings.settings().project_id()))
-            .or_else(|| self.request.as_ref().map(|request| request.request().project_id()))
+            .or_else(|| {
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.settings().project_id())
+            })
+            .or_else(|| {
+                self.request
+                    .as_ref()
+                    .map(|request| request.request().project_id())
+            })
             .or_else(|| self.cycle.as_ref().map(SyncCycle::project_id))
-            .or_else(|| self.generations.first().map(|generation| generation.project_id()))
-            .or_else(|| self.candidate.as_ref().map(|candidate| candidate.project_id()))
-            .or_else(|| self.publication.as_ref().map(|publication| publication.project_id()))
+            .or_else(|| {
+                self.generations
+                    .first()
+                    .map(|generation| generation.project_id())
+            })
+            .or_else(|| {
+                self.candidate
+                    .as_ref()
+                    .map(|candidate| candidate.project_id())
+            })
+            .or_else(|| {
+                self.publication
+                    .as_ref()
+                    .map(|publication| publication.project_id())
+            })
     }
 
     /// Document key derived from any document-scoped record.
@@ -381,10 +402,26 @@ impl HtmlSyncCommit {
         self.document
             .as_ref()
             .map(|document| document.document().document_key().clone())
-            .or_else(|| self.cycle.as_ref().map(|cycle| cycle.document_key().clone()))
-            .or_else(|| self.generations.first().map(|generation| generation.document_key().clone()))
-            .or_else(|| self.candidate.as_ref().map(|candidate| candidate.document_key().clone()))
-            .or_else(|| self.publication.as_ref().map(|publication| publication.document_key().clone()))
+            .or_else(|| {
+                self.cycle
+                    .as_ref()
+                    .map(|cycle| cycle.document_key().clone())
+            })
+            .or_else(|| {
+                self.generations
+                    .first()
+                    .map(|generation| generation.document_key().clone())
+            })
+            .or_else(|| {
+                self.candidate
+                    .as_ref()
+                    .map(|candidate| candidate.document_key().clone())
+            })
+            .or_else(|| {
+                self.publication
+                    .as_ref()
+                    .map(|publication| publication.document_key().clone())
+            })
     }
 }
 
@@ -577,10 +614,7 @@ pub trait H3StorePort {
     /// H3 uses this only to fill the assigned synced sequence after the
     /// atomic state/event commit. It never changes the document, generation,
     /// candidate, or event stream.
-    fn update_html_sync_publication(
-        &mut self,
-        journal: PublicationJournal,
-    ) -> Result<(), H3Error>;
+    fn update_html_sync_publication(&mut self, journal: PublicationJournal) -> Result<(), H3Error>;
 }
 
 /// Decodes one stored settings payload.

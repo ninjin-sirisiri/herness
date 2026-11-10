@@ -20,9 +20,8 @@ use herness_html_sync::{
     Applicability, ApplicabilityReason, AuthoringJob, CoordinatorTick, DocumentCommit, DocumentKey,
     FingerprintSet, H3ApprovalLimits, H3ConfigurationApproval, H3ConfigurationDraft,
     H3ConnectionApproval, H3DocumentState, H3OwnerBinding, H3Reason, H3Settings, H3State,
-    H3StateReasonKind, H3StorePort, H3VersionBinding, HtmlSyncCommit, OfferOutcome,
-    RequiredAction, SettingsCommit, SourceRevision, SourceSnapshot, SyncCoordinator,
-    document_state_event,
+    H3StateReasonKind, H3StorePort, H3VersionBinding, HtmlSyncCommit, OfferOutcome, RequiredAction,
+    SettingsCommit, SourceRevision, SourceSnapshot, SyncCoordinator, document_state_event,
 };
 use herness_supervision::{
     BudgetPolicy, ConditionDigest, ConditionVersion, ConsentBinding, ContentDigest,
@@ -76,10 +75,7 @@ fn consent(project: ProjectId, purpose: ProfilePurpose) -> ConsentBinding {
         ProfilePurpose::Permission => "20000000-0000-4000-8000-000000000003",
     };
     ConsentBinding::new(
-        herness_supervision::ConsentId::from_parts(
-            project,
-            Uuid::parse_str(seed).expect("uuid"),
-        ),
+        herness_supervision::ConsentId::from_parts(project, Uuid::parse_str(seed).expect("uuid")),
         1,
         purpose,
         TargetVersion::new(1).expect("target"),
@@ -258,7 +254,10 @@ fn restart_reconciles_without_sending_and_preserves_the_saved_document() {
     );
     let record = second
         .store_handle()
-        .load_html_sync_document(project, &DocumentKey::new(project, TARGET).expect("document"))
+        .load_html_sync_document(
+            project,
+            &DocumentKey::new(project, TARGET).expect("document"),
+        )
         .expect("load")
         .expect("document");
     assert_eq!(record.state().source().revision().get(), 1);
@@ -327,10 +326,7 @@ fn dirty_documents_keep_notification_order_under_one_app_wide_slot() {
         OfferOutcome::Updated,
         "a duplicate updates one entry without changing its position"
     );
-    assert_eq!(
-        coordinator.queued_documents(),
-        vec![document_b, document_a]
-    );
+    assert_eq!(coordinator.queued_documents(), vec![document_b, document_a]);
     assert!(!coordinator.is_authoring());
     assert_eq!(herness_html_sync::APP_WIDE_AUTHORING_CONCURRENCY, 1);
     assert_eq!(herness_html_sync::DOCUMENT_PUBLICATION_CONCURRENCY, 1);

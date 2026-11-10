@@ -39,9 +39,9 @@ use crate::ports::{
     DocumentCommit, H3DocumentRecord, H3StorePort, HtmlSyncCommit, HtmlSyncCommitOutcome,
 };
 use crate::state::{
-    Applicability, GenerationRecord, H3DocumentState, H3FailureCause, H3Reason, H3Settings, H3State,
-    H3StateReasonKind, H3StopCause, HumanWaitCause, PublicationFileJournal, PublicationFileRole,
-    PublicationJournal, PublicationStatus, RequiredAction,
+    Applicability, GenerationRecord, H3DocumentState, H3FailureCause, H3Reason, H3Settings,
+    H3State, H3StateReasonKind, H3StopCause, HumanWaitCause, PublicationFileJournal,
+    PublicationFileRole, PublicationJournal, PublicationStatus, RequiredAction,
 };
 
 /// Receipt schema written by this build.
@@ -442,19 +442,14 @@ impl PublicationSafety {
 /// Host port re-reading publication preconditions.
 pub trait PublicationSafetyPort {
     /// Re-checks exactly what the current attempt requires.
-    fn recheck(
-        &self,
-        request: &PublicationSafetyRequest<'_>,
-    ) -> Result<PublicationSafety, H3Error>;
+    fn recheck(&self, request: &PublicationSafetyRequest<'_>)
+    -> Result<PublicationSafety, H3Error>;
 }
 
 /// Registers and retires the observer's expected publication write.
 pub trait PublicationWriteExpectationPort {
     /// Registers the exact HTML/receipt bytes before any side effect.
-    fn expect(
-        &mut self,
-        write: crate::observer::ExpectedPublicationWrite,
-    ) -> Result<(), H3Error>;
+    fn expect(&mut self, write: crate::observer::ExpectedPublicationWrite) -> Result<(), H3Error>;
 
     /// Removes the expectation after the journal reaches a terminal state.
     fn retire(&mut self, publication: PublicationId);
@@ -638,44 +633,57 @@ impl PublicationOrchestrator<'_> {
                         "the existing receipt is not UTF-8",
                         receipt_path,
                     );
-                    return self.persist_terminal(&attempt, &document_record, journal, refusal, now);
+                    return self.persist_terminal(
+                        &attempt,
+                        &document_record,
+                        journal,
+                        refusal,
+                        now,
+                    );
                 }
             },
             None => None,
         };
 
-        let receipt = match build_publication_receipt(self.store, &attempt, settings, previous_receipt) {
-            Ok(receipt) => receipt,
-            Err(_error) if attempt.explicit_resolution => {
-                // An explicit human resolution may replace invalid metadata. The
-                // old receipt is still archived byte-exactly before replacement.
-                match build_publication_receipt(self.store, &attempt, settings, None) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        let refusal = Refusal::conflict(
-                            HumanWaitCause::ExternalHtmlConflict,
-                            error.to_string(),
-                            receipt_path,
-                        );
-                        return self.persist_terminal(
-                            &attempt,
-                            &document_record,
-                            journal,
-                            refusal,
-                            now,
-                        );
+        let receipt =
+            match build_publication_receipt(self.store, &attempt, settings, previous_receipt) {
+                Ok(receipt) => receipt,
+                Err(_error) if attempt.explicit_resolution => {
+                    // An explicit human resolution may replace invalid metadata. The
+                    // old receipt is still archived byte-exactly before replacement.
+                    match build_publication_receipt(self.store, &attempt, settings, None) {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            let refusal = Refusal::conflict(
+                                HumanWaitCause::ExternalHtmlConflict,
+                                error.to_string(),
+                                receipt_path,
+                            );
+                            return self.persist_terminal(
+                                &attempt,
+                                &document_record,
+                                journal,
+                                refusal,
+                                now,
+                            );
+                        }
                     }
                 }
-            }
-            Err(error) => {
-                let refusal = Refusal::conflict(
-                    HumanWaitCause::ExternalHtmlConflict,
-                    error.to_string(),
-                    receipt_path,
-                );
-                return self.persist_terminal(&attempt, &document_record, journal, refusal, now);
-            }
-        };
+                Err(error) => {
+                    let refusal = Refusal::conflict(
+                        HumanWaitCause::ExternalHtmlConflict,
+                        error.to_string(),
+                        receipt_path,
+                    );
+                    return self.persist_terminal(
+                        &attempt,
+                        &document_record,
+                        journal,
+                        refusal,
+                        now,
+                    );
+                }
+            };
         journal = journal
             .with_receipt(
                 &receipt_path,
@@ -684,16 +692,14 @@ impl PublicationOrchestrator<'_> {
                 receipt_request_id(attempt.publication_id()),
                 now,
             )?
-            .with_file(
-                PublicationFileJournal::pending(
-                    PublicationFileRole::Receipt,
-                    &receipt_path,
-                    attempt.expected_receipt().clone(),
-                    receipt.digest().clone(),
-                    Some(receipt_request_id(attempt.publication_id())),
-                    now,
-                )?,
-            )?;
+            .with_file(PublicationFileJournal::pending(
+                PublicationFileRole::Receipt,
+                &receipt_path,
+                attempt.expected_receipt().clone(),
+                receipt.digest().clone(),
+                Some(receipt_request_id(attempt.publication_id())),
+                now,
+            )?)?;
 
         // Final pre-side-effect stop/safety check.
         if !self.control.permits_side_effect() {
@@ -806,9 +812,10 @@ impl PublicationOrchestrator<'_> {
             Ok(saved) => saved,
             Err(error) => {
                 let detail = format!("the old HTML version could not be archived: {error}");
-                let journal = journal
-                    .clone()
-                    .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
+                let journal =
+                    journal
+                        .clone()
+                        .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
                 return self.persist_terminal(
                     &attempt,
                     &current_document,
@@ -832,9 +839,10 @@ impl PublicationOrchestrator<'_> {
             Ok(saved) => saved,
             Err(error) => {
                 let detail = format!("the old receipt could not be archived: {error}");
-                let journal = journal
-                    .clone()
-                    .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
+                let journal =
+                    journal
+                        .clone()
+                        .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
                 return self.persist_terminal(
                     &attempt,
                     &current_document,
@@ -945,9 +953,10 @@ impl PublicationOrchestrator<'_> {
         )?;
         if !self.control.permits_side_effect() {
             let detail = "the host stop or deadline is set before the HTML replacement".to_owned();
-            let journal = replacing
-                .clone()
-                .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
+            let journal =
+                replacing
+                    .clone()
+                    .failed(PublicationStatus::NotPublished, detail.clone(), now)?;
             return self.persist_terminal(
                 &attempt,
                 &current_document,
@@ -969,19 +978,17 @@ impl PublicationOrchestrator<'_> {
                 );
             }
         };
-        let journal = replacing
-            .clone()
-            .with_file(
-                PublicationFileJournal::pending(
-                    PublicationFileRole::Html,
-                    attempt.document().companion_path(),
-                    attempt.expected_html().clone(),
-                    ContentDigest::sha256(attempt.candidate_html.as_bytes()),
-                    Some(html_request_id(attempt.publication_id())),
-                    now,
-                )?
-                .observed(published_file_digest(&html_result)?, now),
-            )?;
+        let journal = replacing.clone().with_file(
+            PublicationFileJournal::pending(
+                PublicationFileRole::Html,
+                attempt.document().companion_path(),
+                attempt.expected_html().clone(),
+                ContentDigest::sha256(attempt.candidate_html.as_bytes()),
+                Some(html_request_id(attempt.publication_id())),
+                now,
+            )?
+            .observed(published_file_digest(&html_result)?, now),
+        )?;
 
         // Publish the receipt as a second single-file request.
         let receipt_request = h1_request(
@@ -993,7 +1000,8 @@ impl PublicationOrchestrator<'_> {
             "publish the approved evaluation receipt",
         )?;
         if !self.control.permits_side_effect() {
-            let detail = "the host stop or deadline is set before the receipt replacement".to_owned();
+            let detail =
+                "the host stop or deadline is set before the receipt replacement".to_owned();
             let journal = journal
                 .clone()
                 .with_file(
@@ -1047,19 +1055,17 @@ impl PublicationOrchestrator<'_> {
                 );
             }
         };
-        let journal = journal
-            .clone()
-            .with_file(
-                PublicationFileJournal::pending(
-                    PublicationFileRole::Receipt,
-                    &receipt_path,
-                    attempt.expected_receipt().clone(),
-                    receipt.digest().clone(),
-                    Some(receipt_request_id(attempt.publication_id())),
-                    now,
-                )?
-                .observed(published_file_digest(&receipt_result)?, now),
-            )?;
+        let journal = journal.clone().with_file(
+            PublicationFileJournal::pending(
+                PublicationFileRole::Receipt,
+                &receipt_path,
+                attempt.expected_receipt().clone(),
+                receipt.digest().clone(),
+                Some(receipt_request_id(attempt.publication_id())),
+                now,
+            )?
+            .observed(published_file_digest(&receipt_result)?, now),
+        )?;
 
         // Re-read both formal files and the source/dependency set.
         let observed_html = self.files.read(&attempt.document().companion_path())?;
@@ -1107,9 +1113,12 @@ impl PublicationOrchestrator<'_> {
             Applicability::current_synced(),
             now,
         )?;
-        let published = journal
-            .clone()
-            .published_pair(html_digest.clone(), receipt.digest().clone(), None, now)?;
+        let published = journal.clone().published_pair(
+            html_digest.clone(),
+            receipt.digest().clone(),
+            None,
+            now,
+        )?;
         let synced_event = crate::events::document_state_event(
             attempt.document(),
             Some(current_document.state().state()),
@@ -1524,7 +1533,8 @@ impl PublicationOrchestrator<'_> {
             }
         }
         match self.collect_inputs(&attempt.css, DependencyKind::Css)? {
-            Ok(css) if Some(&css) == attempt.generation.fingerprints().get(FingerprintKind::Css) => {}
+            Ok(css)
+                if Some(&css) == attempt.generation.fingerprints().get(FingerprintKind::Css) => {}
             Ok(_) => {
                 return Ok(Some(
                     "the CSS fingerprint changed after the formal files were replaced".to_owned(),
@@ -1564,7 +1574,8 @@ impl PublicationOrchestrator<'_> {
         let version = hash_bytes(content);
         let text = std::str::from_utf8(content)
             .map_err(|_| H3Error::invalid("archive", "the old version is not UTF-8"))?;
-        let archive = OldVersionArchive::new(request_id, document.project_id(), path, &version, text);
+        let archive =
+            OldVersionArchive::new(request_id, document.project_id(), path, &version, text);
         let archived: ArchivedVersion =
             self.archive
                 .save_old_version(&archive)
@@ -1601,8 +1612,9 @@ impl PublicationOrchestrator<'_> {
                     journal.failed(PublicationStatus::NotPublished, refusal.detail.clone(), now)?
                 }
             }
-            RefusalKind::Waiting | RefusalKind::Stopped | RefusalKind::Failed => journal
-                .failed(PublicationStatus::NotPublished, refusal.detail.clone(), now)?,
+            RefusalKind::Waiting | RefusalKind::Stopped | RefusalKind::Failed => {
+                journal.failed(PublicationStatus::NotPublished, refusal.detail.clone(), now)?
+            }
         };
         let reason = refusal.reason(document)?;
         let next = rebuild_document(document.state(), reason, now)?;
@@ -1658,14 +1670,8 @@ impl PublicationOrchestrator<'_> {
             PublicationFailure::Unverifiable { .. }
                 | PublicationFailure::ReconciliationRequired { .. }
         );
-        let file = PublicationFileJournal::pending(
-            role,
-            path,
-            expected,
-            digest,
-            Some(request_id),
-            now,
-        )?;
+        let file =
+            PublicationFileJournal::pending(role, path, expected, digest, Some(request_id), now)?;
         let file = if unknown {
             file.unverifiable(now)
         } else {
@@ -1805,9 +1811,7 @@ impl Refusal {
             RefusalKind::Conflict | RefusalKind::Waiting | RefusalKind::Reconciliation => {
                 H3Reason::new(
                     H3StateReasonKind::WaitingHuman {
-                        cause: self
-                            .cause
-                            .unwrap_or(HumanWaitCause::RecoveryReconciliation),
+                        cause: self.cause.unwrap_or(HumanWaitCause::RecoveryReconciliation),
                     },
                     self.action.clone().into_iter().collect(),
                 )
@@ -1849,9 +1853,7 @@ impl Refusal {
             },
             RefusalKind::Waiting => PublicationOutcome::WaitingHuman {
                 publication,
-                cause: self
-                    .cause
-                    .unwrap_or(HumanWaitCause::RecoveryReconciliation),
+                cause: self.cause.unwrap_or(HumanWaitCause::RecoveryReconciliation),
                 detail: self.detail.clone(),
             },
             RefusalKind::Reconciliation => PublicationOutcome::ReconciliationRequired {
@@ -1924,17 +1926,15 @@ fn expected_mismatch(
             "{path} exists with version {} but absence was expected",
             ContentDigest::sha256(bytes)
         )),
-        (ExpectedTargetVersion::Present { version }, None) => Some(format!(
-            "{path} is missing; expected version {version}"
-        )),
+        (ExpectedTargetVersion::Present { version }, None) => {
+            Some(format!("{path} is missing; expected version {version}"))
+        }
         (ExpectedTargetVersion::Present { version }, Some(bytes)) => {
             let observed = ContentDigest::sha256(bytes);
             if observed.as_str() == version.as_str() {
                 None
             } else {
-                Some(format!(
-                    "{path} has version {observed}; expected {version}"
-                ))
+                Some(format!("{path} has version {observed}; expected {version}"))
             }
         }
     }
@@ -2254,9 +2254,11 @@ fn published_file_digest(result: &PublicationResult) -> Result<ContentDigest, H3
             detail: "the host writer returned a non-published file result".to_owned(),
         });
     }
-    let version = result.observed_after_version().ok_or_else(|| H3Error::Storage {
-        detail: "the host writer returned no observed version".to_owned(),
-    })?;
+    let version = result
+        .observed_after_version()
+        .ok_or_else(|| H3Error::Storage {
+            detail: "the host writer returned no observed version".to_owned(),
+        })?;
     file_version_digest(version)
 }
 
@@ -2446,7 +2448,9 @@ pub fn build_publication_receipt(
         check_entry(
             checks
                 .get(RequiredCheckKind::CommonStructural)
-                .ok_or_else(|| H3Error::invalid("verification", "the structural check is missing"))?,
+                .ok_or_else(|| {
+                    H3Error::invalid("verification", "the structural check is missing")
+                })?,
         )?,
         check_entry(
             checks
@@ -2584,7 +2588,10 @@ struct PreviousGeneration {
 
 fn parse_previous_receipt(text: &str) -> Result<PreviousReceipt, H3Error> {
     let receipt: PreviousReceipt = serde_json::from_str(text).map_err(|error| {
-        H3Error::invalid("receipt", format!("the existing receipt is invalid: {error}"))
+        H3Error::invalid(
+            "receipt",
+            format!("the existing receipt is invalid: {error}"),
+        )
     })?;
     if receipt.schema != RECEIPT_SCHEMA
         || receipt.version != RECEIPT_VERSION
@@ -2622,33 +2629,68 @@ fn parse_previous_receipt(text: &str) -> Result<PreviousReceipt, H3Error> {
         .get("css")
         .and_then(serde_json::Value::as_array)
         .filter(|entries| !entries.is_empty())
-        .ok_or_else(|| H3Error::invalid("receipt", "the existing receipt has no CSS fingerprints"))?;
+        .ok_or_else(|| {
+            H3Error::invalid("receipt", "the existing receipt has no CSS fingerprints")
+        })?;
     if !css.iter().all(|entry| {
-        entry.get("path").and_then(serde_json::Value::as_str).is_some()
+        entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
             && entry
                 .get("digest")
                 .and_then(serde_json::Value::as_str)
                 .is_some()
     }) {
-        return Err(H3Error::invalid("receipt", "the existing receipt CSS entries are invalid"));
+        return Err(H3Error::invalid(
+            "receipt",
+            "the existing receipt CSS entries are invalid",
+        ));
     }
-    if receipt.inputs.get("resources").and_then(serde_json::Value::as_array).is_none() {
-        return Err(H3Error::invalid("receipt", "the existing receipt resources are invalid"));
-    }
-    let policy = receipt
+    if receipt
         .inputs
-        .get("policy")
-        .ok_or_else(|| H3Error::invalid("receipt", "the existing receipt has no policy identity"))?;
-    if policy.get("version").and_then(serde_json::Value::as_str).is_none()
-        || policy.get("digest").and_then(serde_json::Value::as_str).is_none()
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
     {
-        return Err(H3Error::invalid("receipt", "the existing receipt policy identity is invalid"));
+        return Err(H3Error::invalid(
+            "receipt",
+            "the existing receipt resources are invalid",
+        ));
     }
-    if receipt.h2.get("purpose").and_then(serde_json::Value::as_str) != Some("Html") {
-        return Err(H3Error::invalid("receipt", "the existing receipt purpose is not Html"));
+    let policy = receipt.inputs.get("policy").ok_or_else(|| {
+        H3Error::invalid("receipt", "the existing receipt has no policy identity")
+    })?;
+    if policy
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || policy
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err(H3Error::invalid(
+            "receipt",
+            "the existing receipt policy identity is invalid",
+        ));
+    }
+    if receipt
+        .h2
+        .get("purpose")
+        .and_then(serde_json::Value::as_str)
+        != Some("Html")
+    {
+        return Err(H3Error::invalid(
+            "receipt",
+            "the existing receipt purpose is not Html",
+        ));
     }
     if !matches!(
-        receipt.verification.get("result").and_then(serde_json::Value::as_str),
+        receipt
+            .verification
+            .get("result")
+            .and_then(serde_json::Value::as_str),
         Some("pass" | "fail")
     ) || receipt
         .verification
@@ -2656,27 +2698,45 @@ fn parse_previous_receipt(text: &str) -> Result<PreviousReceipt, H3Error> {
         .and_then(serde_json::Value::as_array)
         .is_none_or(|checks| checks.is_empty())
     {
-        return Err(H3Error::invalid("receipt", "the existing receipt verification is invalid"));
+        return Err(H3Error::invalid(
+            "receipt",
+            "the existing receipt verification is invalid",
+        ));
     }
     let mut conditions = std::collections::BTreeSet::new();
-    let condition_entries = receipt
-        .conditions
-        .as_array()
-        .ok_or_else(|| H3Error::invalid("receipt", "the existing receipt conditions are invalid"))?;
+    let condition_entries = receipt.conditions.as_array().ok_or_else(|| {
+        H3Error::invalid("receipt", "the existing receipt conditions are invalid")
+    })?;
     for condition in condition_entries {
         let id = condition
             .get("id")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| H3Error::invalid("receipt", "the existing receipt condition id is missing"))?;
+            .ok_or_else(|| {
+                H3Error::invalid("receipt", "the existing receipt condition id is missing")
+            })?;
         let decision = condition
             .get("decision")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| H3Error::invalid("receipt", "the existing receipt condition decision is missing"))?;
-        if !matches!(decision, "met" | "unmet" | "insufficient" | "not_run" | "unavailable") {
-            return Err(H3Error::invalid("receipt", "the existing receipt condition decision is invalid"));
+            .ok_or_else(|| {
+                H3Error::invalid(
+                    "receipt",
+                    "the existing receipt condition decision is missing",
+                )
+            })?;
+        if !matches!(
+            decision,
+            "met" | "unmet" | "insufficient" | "not_run" | "unavailable"
+        ) {
+            return Err(H3Error::invalid(
+                "receipt",
+                "the existing receipt condition decision is invalid",
+            ));
         }
         if !conditions.insert(id) {
-            return Err(H3Error::invalid("receipt", "the existing receipt has duplicate conditions"));
+            return Err(H3Error::invalid(
+                "receipt",
+                "the existing receipt has duplicate conditions",
+            ));
         }
     }
     for expected in ["information", "support", "usability", "render"] {
@@ -2702,23 +2762,15 @@ fn target_version_matches_range_consent(
     if assessment.consent().target_scope_version() == version {
         return true;
     }
-    let key = format!(
-        "h3.consent.reissue:{}:html:{}",
-        project,
-        version.get()
-    );
+    let key = format!("h3.consent.reissue:{}:html:{}", project, version.get());
     let Ok(Some(bytes)) = store.load_html_sync_host_state(&key) else {
         return false;
     };
     let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    record.get("schema").and_then(serde_json::Value::as_str)
-        == Some("h3-range-consent-reissue-v1")
-        && record
-            .get("purpose")
-            .and_then(serde_json::Value::as_str)
-            == Some("html")
+    record.get("schema").and_then(serde_json::Value::as_str) == Some("h3-range-consent-reissue-v1")
+        && record.get("purpose").and_then(serde_json::Value::as_str) == Some("html")
         && record
             .get("targetVersion")
             .and_then(serde_json::Value::as_u64)

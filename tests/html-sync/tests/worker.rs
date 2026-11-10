@@ -313,9 +313,10 @@ fn extract_handle(body: &str) -> Value {
     let text = response_content_text(&value).join("\n");
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("Candidate handle JSON: ")
-            && let Ok(handle) = serde_json::from_str(rest.trim()) {
-                return handle;
-            }
+            && let Ok(handle) = serde_json::from_str(rest.trim())
+        {
+            return handle;
+        }
     }
     Value::Null
 }

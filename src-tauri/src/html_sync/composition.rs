@@ -1537,12 +1537,7 @@ fn resume_document(
     // stop/cancel. An already-open cycle is reused so the H2 budget ledger is
     // not replaced; a stopped cycle is never reopened.
     let state = record.state();
-    let (cycle, new_cycle) = resumable_cycle(
-        host,
-        state,
-        state.settings_version(),
-        now,
-    )?;
+    let (cycle, new_cycle) = resumable_cycle(host, state, state.settings_version(), now)?;
     let reason = H3Reason::new(
         H3StateReasonKind::Pending {
             source_revision: state.source().revision().get(),
@@ -1709,28 +1704,27 @@ fn reassess_saved_candidate(
             state: H3State::Synced,
             revision: record.revision(),
         },
-        Ok(crate::html_sync::pipeline::PostCandidateOutcome::WaitingHuman {
-            cause,
-            detail: _,
-        }) => H3OperationOutcome::Rejected {
-            reason: H3Reason::new(
-                H3StateReasonKind::WaitingHuman { cause: *cause },
-                vec![RequiredAction::ReassessCandidate],
-            )
-            .map_err(|error| error.to_string())?,
-        },
+        Ok(crate::html_sync::pipeline::PostCandidateOutcome::WaitingHuman { cause, detail: _ }) => {
+            H3OperationOutcome::Rejected {
+                reason: H3Reason::new(
+                    H3StateReasonKind::WaitingHuman { cause: *cause },
+                    vec![RequiredAction::ReassessCandidate],
+                )
+                .map_err(|error| error.to_string())?,
+            }
+        }
         Ok(crate::html_sync::pipeline::PostCandidateOutcome::FixableUnmet { .. })
-        | Ok(crate::html_sync::pipeline::PostCandidateOutcome::VerificationRejected {
-            ..
-        }) => H3OperationOutcome::Rejected {
-            reason: H3Reason::new(
-                H3StateReasonKind::Failed {
-                    cause: herness_html_sync::H3FailureCause::CandidateRejected,
-                },
-                vec![RequiredAction::ReviewFailure],
-            )
-            .map_err(|error| error.to_string())?,
-        },
+        | Ok(crate::html_sync::pipeline::PostCandidateOutcome::VerificationRejected { .. }) => {
+            H3OperationOutcome::Rejected {
+                reason: H3Reason::new(
+                    H3StateReasonKind::Failed {
+                        cause: herness_html_sync::H3FailureCause::CandidateRejected,
+                    },
+                    vec![RequiredAction::ReviewFailure],
+                )
+                .map_err(|error| error.to_string())?,
+            }
+        }
         Ok(_) => H3OperationOutcome::Accepted {
             state: record.state().state(),
             revision: record.revision(),
@@ -1745,8 +1739,8 @@ fn reassess_saved_candidate(
             .map_err(|error| error.to_string())?,
         },
     };
-    let result = H3OperationResult::new(request, outcome, 0, now)
-        .map_err(|error| error.to_string())?;
+    let result =
+        H3OperationResult::new(request, outcome, 0, now).map_err(|error| error.to_string())?;
     commit_request_with_current_state(host, request, result, now)?;
     operation_view(host, request)
 }
@@ -1832,17 +1826,19 @@ fn resolve_conflict(
                         .map_err(|error| error.to_string())?,
                     }
                 }
-                herness_html_sync::AdoptionOutcome::Conflict { .. } => H3OperationOutcome::Rejected {
-                    reason: H3Reason::new(
-                        H3StateReasonKind::WaitingHuman {
-                            cause: herness_html_sync::HumanWaitCause::ExternalHtmlConflict,
-                        },
-                        vec![RequiredAction::ResolveHtmlConflict {
-                            target: record.state().document_key().companion_path(),
-                        }],
-                    )
-                    .map_err(|error| error.to_string())?,
-                },
+                herness_html_sync::AdoptionOutcome::Conflict { .. } => {
+                    H3OperationOutcome::Rejected {
+                        reason: H3Reason::new(
+                            H3StateReasonKind::WaitingHuman {
+                                cause: herness_html_sync::HumanWaitCause::ExternalHtmlConflict,
+                            },
+                            vec![RequiredAction::ResolveHtmlConflict {
+                                target: record.state().document_key().companion_path(),
+                            }],
+                        )
+                        .map_err(|error| error.to_string())?,
+                    }
+                }
                 _ => H3OperationOutcome::Rejected {
                     reason: H3Reason::new(
                         H3StateReasonKind::WaitingHuman {
@@ -1862,12 +1858,9 @@ fn resolve_conflict(
         }
         ConflictResolution::ReplaceWithCandidate => {
             let document = record.state().document_key().clone();
-            let generation = record
-                .state()
-                .generation()
-                .ok_or_else(|| {
-                    "replacing the current HTML requires a saved scanned candidate".to_owned()
-                })?;
+            let generation = record.state().generation().ok_or_else(|| {
+                "replacing the current HTML requires a saved scanned candidate".to_owned()
+            })?;
             let candidate_exists = host
                 .store_handle()
                 .html_sync_generations(record.state().project_id(), &document)

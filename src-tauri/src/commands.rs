@@ -21,12 +21,12 @@ use herness_core::{
     HistoryLimit, InputCapabilities, InsecureRemoteHttp, OperationId, PermissionMode, ProjectId,
     Provider, RunId, SecretString, StopReason,
 };
+use herness_html_sync::{BarrierOutcome, H3Operation, H3OperationRequest};
 use herness_supervision::operations::{HumanOperation, SupervisionOperationRequest};
 use herness_supervision::{
     DisclosureDataKind, ProfilePurpose, ProviderOrigin, SupervisionId, SupervisionRequestId,
     TargetVersion,
 };
-use herness_html_sync::{BarrierOutcome, H3Operation, H3OperationRequest};
 use serde::Serialize;
 use tauri::{Manager, State};
 
@@ -34,8 +34,9 @@ use crate::app::AppState;
 use crate::guard;
 use crate::host::DesktopHost;
 use crate::html_sync::composition::{
-    self, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView, HtmlSyncDocumentCommand,
-    HtmlSyncEnableView, HtmlSyncHistoryView, HtmlSyncOperationView, HtmlSyncProjectView,
+    self, HtmlSyncApprovalRequest, HtmlSyncApprovalView, HtmlSyncBudgetView,
+    HtmlSyncDocumentCommand, HtmlSyncEnableView, HtmlSyncHistoryView, HtmlSyncOperationView,
+    HtmlSyncProjectView,
 };
 use crate::lifecycle::quit::{self as quit_flow, QuitChoice, QuitSnapshot};
 use crate::supervision::{
@@ -1034,7 +1035,8 @@ fn run_document_command(
 ) -> Result<HtmlSyncOperationView, CommandFailure> {
     verify_supervision_source(window)?;
     let request = document_request(&command, operation)?;
-    let mut host = lock_host(state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let mut host =
+        lock_host(state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
     let _confirmation = host.confirm_supervision(ConfirmationKind::H3DocumentOperation);
     composition::apply_document_operation(&mut host, request).map_err(html_sync_failure)
 }
@@ -1173,9 +1175,7 @@ pub fn html_sync_resolve_conflict(
     let resolution = match resolution.trim().to_ascii_lowercase().as_str() {
         "keep_waiting" => herness_html_sync::ConflictResolution::KeepWaiting,
         "adopt_current" => herness_html_sync::ConflictResolution::AdoptCurrent,
-        "replace_with_candidate" => {
-            herness_html_sync::ConflictResolution::ReplaceWithCandidate
-        }
+        "replace_with_candidate" => herness_html_sync::ConflictResolution::ReplaceWithCandidate,
         other => {
             return Err(CommandFailure::invalid(
                 "resolution",

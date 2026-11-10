@@ -2401,10 +2401,7 @@ fn publication_record_and_host_activity_events_are_durable_across_reopen() {
     assert_eq!(record.status(), PublicationStatus::Published);
     assert_eq!(record.project_id(), fixture.project_id);
     assert_eq!(record.request_id(), request.request_id());
-    assert_eq!(
-        record.before_version(),
-        Some(&hash_bytes(b"old\n"))
-    );
+    assert_eq!(record.before_version(), Some(&hash_bytes(b"old\n")));
     assert_eq!(record.approved_version(), request.approved_version());
     assert!(record.old_version_save().is_saved());
 

@@ -257,7 +257,10 @@ impl H3OperationRequest {
         {
             return Err(H3Error::must_be_positive("historyLimit"));
         }
-        if let H3Operation::SourceRemoved { new_path: Some(path) } = &operation {
+        if let H3Operation::SourceRemoved {
+            new_path: Some(path),
+        } = &operation
+        {
             let new_document = DocumentKey::new(project_id, path.clone())?;
             if document
                 .as_ref()
@@ -357,9 +360,10 @@ impl H3OperationRequest {
         format!(
             "{} document={} expectedRevision={:?}",
             self.operation.as_str(),
-            self.document
-                .as_ref()
-                .map_or_else(|| "<project>".to_owned(), |key| key.target_path().to_owned()),
+            self.document.as_ref().map_or_else(
+                || "<project>".to_owned(),
+                |key| key.target_path().to_owned()
+            ),
             self.expected_revision
         )
     }
@@ -624,10 +628,7 @@ pub struct RequestCommit {
 
 impl RequestCommit {
     /// Creates a commit after checking that the result answers the request.
-    pub fn new(
-        request: H3OperationRequest,
-        result: H3OperationResult,
-    ) -> Result<Self, H3Error> {
+    pub fn new(request: H3OperationRequest, result: H3OperationResult) -> Result<Self, H3Error> {
         if !result.matches_request(&request) {
             return Err(H3Error::invalid(
                 "operationResult",

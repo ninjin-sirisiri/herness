@@ -28,20 +28,18 @@ use crate::contracts::events::{EventDraft, EventKind, EventPayload};
 use crate::contracts::ids::{HostActivityId, ProjectId};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::publication::{
-    ArchivedVersion, ExpectedTargetVersion, OldVersionArchive, OldVersionSave, PublicationRecord,
-    PublicationRequest, PublicationRequestId, PublicationResult, PublicationStatus,
-    PublicationUnit, PUBLICATION_ACTIVITY_KIND, PUBLICATION_EVENT_KIND,
-    PUBLICATION_INTENDED_EVENT_KIND,
+    ArchivedVersion, ExpectedTargetVersion, OldVersionArchive, OldVersionSave,
+    PUBLICATION_ACTIVITY_KIND, PUBLICATION_EVENT_KIND, PUBLICATION_INTENDED_EVENT_KIND,
+    PublicationRecord, PublicationRequest, PublicationRequestId, PublicationResult,
+    PublicationStatus, PublicationUnit,
 };
 use crate::contracts::time::Timestamp;
 use crate::permissions::RunControl;
-use crate::ports::publish::{
-    PublicationArchivePort, PublicationGatePort, PublicationRecordPort,
-};
+use crate::ports::publish::{PublicationArchivePort, PublicationGatePort, PublicationRecordPort};
 use crate::tools::diff::line_diff;
-use crate::tools::files::{atomic_write, FileLockRegistry};
+use crate::tools::files::{FileLockRegistry, atomic_write};
 use crate::tools::path::{ProjectRoot, ResolvedPath};
-use crate::tools::{hash_bytes, FileVersion};
+use crate::tools::{FileVersion, hash_bytes};
 
 /// Current format of one private archived-version file.
 const ARCHIVE_FORMAT: u32 = 1;
@@ -214,7 +212,10 @@ impl<S: PublicationRecordPort, A: PublicationArchivePort, G: PublicationGatePort
             None,
             None,
         )?;
-        if let Err(error) = self.records.save_publication(&key, &pending, vec![intended]) {
+        if let Err(error) = self
+            .records
+            .save_publication(&key, &pending, vec![intended])
+        {
             return Err(PublicationFailure::NotExecutable {
                 detail: error.to_string(),
             });
@@ -276,12 +277,7 @@ impl<S: PublicationRecordPort, A: PublicationArchivePort, G: PublicationGatePort
                             other => other,
                         };
                         return self.finish_without_replace(
-                            &key,
-                            &request,
-                            &pending,
-                            &before,
-                            failure,
-                            old_save,
+                            &key, &request, &pending, &before, failure, old_save,
                         );
                     }
                 }
@@ -709,14 +705,14 @@ impl<S, A, G> PublicationWriter<S, A, G> {
             diff: diff.text(),
             diff_truncated: diff.is_truncated(),
         };
-        let value = serde_json::to_value(&payload).map_err(|error| {
-            PublicationFailure::NotExecutable {
+        let value =
+            serde_json::to_value(&payload).map_err(|error| PublicationFailure::NotExecutable {
                 detail: format!("publication audit payload: {error}"),
-            }
-        })?;
-        let event_kind = EventKind::new(kind).map_err(|error| PublicationFailure::NotExecutable {
-            detail: format!("publication audit kind: {error}"),
-        })?;
+            })?;
+        let event_kind =
+            EventKind::new(kind).map_err(|error| PublicationFailure::NotExecutable {
+                detail: format!("publication audit kind: {error}"),
+            })?;
         EventDraft::for_host_activity(
             request.project_id(),
             record.activity_kind().clone(),
@@ -779,9 +775,9 @@ fn duplicate_result(
         });
     }
     match record.status() {
-        PublicationStatus::Published | PublicationStatus::NotPublished => Ok(
-            PublicationResult::from_record(&record, true, None),
-        ),
+        PublicationStatus::Published | PublicationStatus::NotPublished => {
+            Ok(PublicationResult::from_record(&record, true, None))
+        }
         PublicationStatus::Pending => Err(PublicationFailure::ReconciliationRequired {
             request_id: request.request_id().to_string(),
             detail: "the request has a durable intent but no durable result".to_owned(),
@@ -827,14 +823,20 @@ fn classify_write_error(
             detail: format!("{detail}; the target is no longer a regular file"),
         },
         Ok(_) => match fs::read(target.resolved.absolute()) {
-            Ok(bytes) if bytes == request.content().as_bytes() => PublicationFailure::Unverifiable {
-                detail: format!(
-                    "{detail}; the target already has the approved bytes and may have been replaced"
-                ),
-            },
+            Ok(bytes) if bytes == request.content().as_bytes() => {
+                PublicationFailure::Unverifiable {
+                    detail: format!(
+                        "{detail}; the target already has the approved bytes and may have been replaced"
+                    ),
+                }
+            }
             Ok(bytes) => {
                 let current = hash_bytes(&bytes);
-                if target.version.as_ref().is_some_and(|before| before == &current) {
+                if target
+                    .version
+                    .as_ref()
+                    .is_some_and(|before| before == &current)
+                {
                     PublicationFailure::NotExecutable { detail }
                 } else {
                     PublicationFailure::Unverifiable {
@@ -882,16 +884,17 @@ impl PrivateAppArchive {
         fs::create_dir_all(root).map_err(|error| PublicationFailure::ArchiveUnavailable {
             detail: format!("cannot create the private archive root: {:?}", error.kind()),
         })?;
-        let root = fs::canonicalize(root).map_err(|error| {
-            PublicationFailure::ArchiveUnavailable {
-                detail: format!("cannot canonicalize the private archive root: {:?}", error.kind()),
-            }
-        })?;
-        let metadata = fs::metadata(&root).map_err(|error| {
-            PublicationFailure::ArchiveUnavailable {
+        let root =
+            fs::canonicalize(root).map_err(|error| PublicationFailure::ArchiveUnavailable {
+                detail: format!(
+                    "cannot canonicalize the private archive root: {:?}",
+                    error.kind()
+                ),
+            })?;
+        let metadata =
+            fs::metadata(&root).map_err(|error| PublicationFailure::ArchiveUnavailable {
                 detail: format!("cannot read the private archive root: {:?}", error.kind()),
-            }
-        })?;
+            })?;
         if !metadata.is_dir() {
             return Err(PublicationFailure::ArchiveUnavailable {
                 detail: "the private archive root is not a directory".to_owned(),
@@ -936,19 +939,16 @@ impl PublicationArchivePort for PrivateAppArchive {
         let reference = format!("{}/{}", archive.project_id(), file_name);
 
         if path.exists() {
-            let existing = fs::read(&path).map_err(|error| {
-                PublicationFailure::OldVersionSaveFailed {
-                    detail: format!(
-                        "cannot read the existing archive entry: {:?}",
-                        error.kind()
-                    ),
-                }
-            })?;
-            let existing: ArchivedVersionFile = serde_json::from_slice(&existing).map_err(
-                |error| PublicationFailure::OldVersionSaveFailed {
-                    detail: format!("the existing archive entry is corrupt: {error}"),
-                },
-            )?;
+            let existing =
+                fs::read(&path).map_err(|error| PublicationFailure::OldVersionSaveFailed {
+                    detail: format!("cannot read the existing archive entry: {:?}", error.kind()),
+                })?;
+            let existing: ArchivedVersionFile =
+                serde_json::from_slice(&existing).map_err(|error| {
+                    PublicationFailure::OldVersionSaveFailed {
+                        detail: format!("the existing archive entry is corrupt: {error}"),
+                    }
+                })?;
             if existing.format != ARCHIVE_FORMAT {
                 return Err(PublicationFailure::OldVersionSaveFailed {
                     detail: format!(
@@ -1014,14 +1014,13 @@ fn ensure_private_directory(directory: &Path) -> Result<(), PublicationFailure> 
         Ok(_) => Err(PublicationFailure::ArchiveUnavailable {
             detail: "the private archive project path is not a directory".to_owned(),
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(directory).map_err(|error| PublicationFailure::ArchiveUnavailable {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(directory)
+            .map_err(|error| PublicationFailure::ArchiveUnavailable {
                 detail: format!(
                     "cannot create the private archive project directory: {:?}",
                     error.kind()
                 ),
-            })
-        }
+            }),
         Err(error) => Err(PublicationFailure::ArchiveUnavailable {
             detail: format!(
                 "cannot inspect the private archive project directory: {:?}",
@@ -1030,4 +1029,3 @@ fn ensure_private_directory(directory: &Path) -> Result<(), PublicationFailure> 
         }),
     }
 }
-

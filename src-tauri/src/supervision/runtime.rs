@@ -334,7 +334,10 @@ fn file_scope_rule(
         detail: error.to_string(),
     })?;
     PermissionRule::allow(
-        RuleTarget::FilePath { tool, root: absolute },
+        RuleTarget::FilePath {
+            tool,
+            root: absolute,
+        },
         MatchMethod::PathPrefix,
     )
     .map_err(|error| SupervisionError::InvalidValue {

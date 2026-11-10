@@ -25,12 +25,10 @@ use herness_html_sync::config::{
     HOST_API_VERSION, PACK_INTEGRATION_SCHEMA, PACK_POLICY_VERSION,
     StoreBackedOwnerApprovalRegistry,
 };
-use herness_html_sync::{
-    H3Settings, HtmlSyncCommit, SettingsCommit, decode_record,
-};
+use herness_html_sync::{H3Settings, HtmlSyncCommit, SettingsCommit, decode_record};
 use herness_store::{Store, StoreConfig};
 use herness_supervision::owner_launch::{
-    authorize_owner_launch, OwnerApproval, OwnerApprovalRegistryPort, OwnerLaunchBinding,
+    OwnerApproval, OwnerApprovalRegistryPort, OwnerLaunchBinding, authorize_owner_launch,
 };
 use herness_supervision::{
     BudgetPolicy, ConditionDigest, ConditionVersion, ConsentBinding, ConsentId, ContentDigest,
@@ -83,10 +81,9 @@ fn consent_binding(purpose: ProfilePurpose, version: u64) -> ConsentBinding {
 
 fn disclosure(purpose: ProfilePurpose, target: &str) -> DisclosureScope {
     let kinds = match purpose {
-        ProfilePurpose::Completion => BTreeSet::from([
-            DisclosureDataKind::Text,
-            DisclosureDataKind::Code,
-        ]),
+        ProfilePurpose::Completion => {
+            BTreeSet::from([DisclosureDataKind::Text, DisclosureDataKind::Code])
+        }
         ProfilePurpose::Html => BTreeSet::from([DisclosureDataKind::Text]),
         ProfilePurpose::Permission => BTreeSet::from([DisclosureDataKind::Text]),
     };
@@ -187,7 +184,10 @@ fn owner_binding_with_job(job: &str) -> H3OwnerBinding {
     .expect("owner binding")
 }
 
-fn versions(policy_fingerprint: ContentDigest, pack_fingerprint: ContentDigest) -> H3VersionBinding {
+fn versions(
+    policy_fingerprint: ContentDigest,
+    pack_fingerprint: ContentDigest,
+) -> H3VersionBinding {
     H3VersionBinding::new(
         PACK_INTEGRATION_SCHEMA,
         1,
@@ -242,12 +242,8 @@ fn approval_with(
 ) -> H3ConfigurationApproval {
     let mut draft = approval_draft(policy_fingerprint, pack_fingerprint);
     draft.expires_at = expires_at;
-    H3ConfigurationApproval::approve(
-        draft,
-        herness_html_sync::config::H3Approver::Human,
-        now(),
-    )
-    .expect("approval")
+    H3ConfigurationApproval::approve(draft, herness_html_sync::config::H3Approver::Human, now())
+        .expect("approval")
 }
 
 fn dummy_approval() -> H3ConfigurationApproval {
@@ -285,13 +281,16 @@ impl StoreHarness {
 fn store_settings(store: &mut Store, settings: H3Settings) {
     store
         .commit_html_sync(
-            HtmlSyncCommit::new().with_settings(SettingsCommit::new(None, settings).expect("commit")),
+            HtmlSyncCommit::new()
+                .with_settings(SettingsCommit::new(None, settings).expect("commit")),
         )
         .expect("commit settings");
 }
 
 fn real_pack_present() -> bool {
-    Path::new(REAL_PACK_ROOT).join("scripts/html-docs").is_file()
+    Path::new(REAL_PACK_ROOT)
+        .join("scripts/html-docs")
+        .is_file()
 }
 
 fn toolchain() -> herness_core::ToolchainConfig {
@@ -346,7 +345,12 @@ fn approval_from_bridge(bridge: &HtmlPolicyBridge) -> H3ConfigurationApproval {
     )
 }
 
-fn connect_real(bridge: HtmlPolicyBridge) -> (herness_desktop::html_sync::policy::ConnectedPolicyBridge, H3ConfigurationApproval) {
+fn connect_real(
+    bridge: HtmlPolicyBridge,
+) -> (
+    herness_desktop::html_sync::policy::ConnectedPolicyBridge,
+    H3ConfigurationApproval,
+) {
     let approval = approval_from_bridge(&bridge);
     let connected = bridge
         .connect(&approval.pack_binding())
@@ -364,8 +368,11 @@ fn real_pack_candidate_check_allows_without_writing_and_uses_the_common_fixture_
     // The disk pair is deliberately stale. The supplied bytes must be used and
     // the official files must not be written.
     fs::write(project.root.join("CONTEXT.md"), b"# stale on disk\n").expect("stale source");
-    fs::write(project.root.join("CONTEXT.html"), b"<html>stale disk candidate</html>")
-        .expect("stale companion");
+    fs::write(
+        project.root.join("CONTEXT.html"),
+        b"<html>stale disk candidate</html>",
+    )
+    .expect("stale companion");
     let before_source = fs::read(project.root.join("CONTEXT.md")).expect("read source");
     let before_html = fs::read(project.root.join("CONTEXT.html")).expect("read companion");
     let before_listing = sorted_tree(&project.root);
@@ -385,7 +392,12 @@ fn real_pack_candidate_check_allows_without_writing_and_uses_the_common_fixture_
         connected.bootstrap().capabilities()["protocol"]["version"],
         json!(1)
     );
-    assert!(connected.bootstrap().operations().contains("candidate-check"));
+    assert!(
+        connected
+            .bootstrap()
+            .operations()
+            .contains("candidate-check")
+    );
     assert_eq!(connected.bootstrap(), connected.bootstrap());
     assert_eq!(connected.invocations(), 1, "cached bootstrap is reused");
 
@@ -394,7 +406,12 @@ fn real_pack_candidate_check_allows_without_writing_and_uses_the_common_fixture_
         .expect("discover");
     assert_eq!(discovered["targets"][0]["source"], "CONTEXT.md");
     assert_eq!(discovered["targets"][0]["html"], "CONTEXT.html");
-    assert!(discovered["unrelated"].as_array().expect("unrelated").is_empty());
+    assert!(
+        discovered["unrelated"]
+            .as_array()
+            .expect("unrelated")
+            .is_empty()
+    );
 
     let check = connected
         .candidate_check(
@@ -411,21 +428,12 @@ fn real_pack_candidate_check_allows_without_writing_and_uses_the_common_fixture_
     assert_eq!(check.contract(), "strict");
     assert_eq!(connected.invocations(), 3, "capabilities, discover, check");
 
-    let source_digest = format!(
-        "sha256:{}",
-        ContentDigest::sha256(&project.source).as_str()
-    );
-    let candidate_digest = format!(
-        "sha256:{}",
-        ContentDigest::sha256(&project.html).as_str()
-    );
+    let source_digest = format!("sha256:{}", ContentDigest::sha256(&project.source).as_str());
+    let candidate_digest = format!("sha256:{}", ContentDigest::sha256(&project.html).as_str());
     assert_eq!(check.digests()["source"], json!(source_digest));
     assert_eq!(check.digests()["candidate"], json!(candidate_digest));
     assert!(check.digests()["receipt"].is_null());
-    assert_eq!(
-        check.input_digests()["CONTEXT.md"],
-        json!(source_digest)
-    );
+    assert_eq!(check.input_digests()["CONTEXT.md"], json!(source_digest));
     assert_eq!(
         check.input_digests()["CONTEXT.html"],
         json!(candidate_digest)
@@ -519,7 +527,9 @@ fn approved_pack_identity_is_checked_before_any_host_api_process() {
     assert_eq!(
         bridge.clone().connect(&changed_policy).unwrap_err(),
         PolicyBridgeError::PolicyFingerprintMismatch {
-            approved: ContentDigest::sha256(b"different-policy").as_str().to_owned(),
+            approved: ContentDigest::sha256(b"different-policy")
+                .as_str()
+                .to_owned(),
             found: probe.policy_fingerprint().as_str().to_owned(),
         }
     );
@@ -620,7 +630,11 @@ fn old_or_changed_pack_is_explicitly_unavailable() {
             .expect("changed pack validator"),
     )
     .expect("changed pack detection");
-    let changed_found = changed_bridge.probe().policy_fingerprint().as_str().to_owned();
+    let changed_found = changed_bridge
+        .probe()
+        .policy_fingerprint()
+        .as_str()
+        .to_owned();
     assert_eq!(
         changed_bridge.clone().connect(&approved).unwrap_err(),
         PolicyBridgeError::PolicyFingerprintMismatch {
@@ -800,16 +814,20 @@ fn store_backed_registry_returns_none_for_unapproved_revoked_expired_superseded_
         .expect("current approval");
     assert_eq!(current.settings_version(), 1);
     assert_eq!(current.job_id(), "job-14");
-    assert_eq!(current.conditions_digest(), &ConditionDigest::sha256(b"condition-14"));
+    assert_eq!(
+        current.conditions_digest(),
+        &ConditionDigest::sha256(b"condition-14")
+    );
     assert_eq!(current.profile(), profile(ProfilePurpose::Completion, 1));
-    assert_eq!(current.consent(), consent_binding(ProfilePurpose::Completion, 1));
+    assert_eq!(
+        current.consent(),
+        consent_binding(ProfilePurpose::Completion, 1)
+    );
     assert_eq!(current.budget_policy_version(), 1);
     assert_eq!(current.budget(), &BudgetPolicy::h2_default());
-    let binding = OwnerLaunchBinding::new(
-        SupervisionId::new(project()),
-        requested_owner_approval(),
-    )
-    .expect("binding");
+    let binding =
+        OwnerLaunchBinding::new(SupervisionId::new(project()), requested_owner_approval())
+            .expect("binding");
     assert!(
         authorize_owner_launch(&registry, &binding, now()).is_ok(),
         "only the fully matching current entry mints authority"
@@ -919,9 +937,8 @@ fn tampered_settings_and_scope_expansion_are_rejected_instead_of_approved() {
     assert!(!tampered.verify_fingerprint());
     store
         .commit_html_sync(
-            HtmlSyncCommit::new().with_settings(
-                SettingsCommit::new(Some(1), tampered).expect("tampered commit"),
-            ),
+            HtmlSyncCommit::new()
+                .with_settings(SettingsCommit::new(Some(1), tampered).expect("tampered commit")),
         )
         .expect("store accepts opaque payload");
     let registry = StoreBackedOwnerApprovalRegistry::new(&store);
@@ -1025,20 +1042,8 @@ fn every_scope_change_requires_a_new_human_approval() {
     );
 
     let mut new_limits = base.clone();
-    new_limits.limits = H3ApprovalLimits::new(
-        1024,
-        2048,
-        100,
-        1000,
-        100,
-        1000,
-        1,
-        1,
-        60,
-        3,
-        1,
-    )
-    .expect("lower limits");
+    new_limits.limits = H3ApprovalLimits::new(1024, 2048, 100, 1000, 100, 1000, 1, 1, 60, 3, 1)
+        .expect("lower limits");
     assert_eq!(
         approved.scope_change(&new_limits).changes(),
         &[H3ScopeChangeKind::Limits]
@@ -1219,8 +1224,8 @@ fn scripted_registry_is_only_used_to_prove_every_field_mismatch_is_rejected() {
             herness_supervision::OwnerLaunchRejection::BudgetMismatch,
         ),
     ] {
-        let binding = OwnerLaunchBinding::new(SupervisionId::new(project()), variant)
-            .expect("binding");
+        let binding =
+            OwnerLaunchBinding::new(SupervisionId::new(project()), variant).expect("binding");
         let error = authorize_owner_launch(&registry, &binding, now()).unwrap_err();
         assert_eq!(
             error,

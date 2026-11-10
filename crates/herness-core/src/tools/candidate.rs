@@ -273,9 +273,14 @@ impl<S: StorePort, P: ArtifactPort> CandidateArtifactTools<S, P> {
     ) -> Result<CandidateReadOutput, CoreError> {
         let tool = ToolName::CandidateRead;
         self.verify_handle(tool, operation, &args.handle)?;
-        let snapshot = self
-            .read_current(tool, args.artifact)?
-            .ok_or_else(|| artifact_error(tool, ArtifactFailure::NotFound { artifact: args.artifact }))?;
+        let snapshot = self.read_current(tool, args.artifact)?.ok_or_else(|| {
+            artifact_error(
+                tool,
+                ArtifactFailure::NotFound {
+                    artifact: args.artifact,
+                },
+            )
+        })?;
         Ok(CandidateReadOutput {
             artifact: args.artifact,
             version: snapshot.version().clone(),
@@ -301,9 +306,7 @@ impl<S: StorePort, P: ArtifactPort> CandidateArtifactTools<S, P> {
         let before = self.read_current(tool, args.artifact)?;
         let after_version = hash_bytes(args.content.as_bytes());
         let diff = line_diff(
-            before
-                .as_ref()
-                .map_or("", ArtifactSnapshot::content),
+            before.as_ref().map_or("", ArtifactSnapshot::content),
             &args.content,
             args.artifact.as_str(),
         );
@@ -360,9 +363,14 @@ impl<S: StorePort, P: ArtifactPort> CandidateArtifactTools<S, P> {
                 },
             ));
         }
-        let before = self
-            .read_current(tool, args.artifact)?
-            .ok_or_else(|| artifact_error(tool, ArtifactFailure::NotFound { artifact: args.artifact }))?;
+        let before = self.read_current(tool, args.artifact)?.ok_or_else(|| {
+            artifact_error(
+                tool,
+                ArtifactFailure::NotFound {
+                    artifact: args.artifact,
+                },
+            )
+        })?;
         if let Some(expected) = &args.expected_version
             && expected != before.version()
         {
@@ -506,7 +514,14 @@ impl<S: StorePort, P: ArtifactPort> CandidateArtifactTools<S, P> {
             diff,
             rationale,
         )?;
-        let checkpoint = audit_checkpoint(operation, tool, "intent", artifact, before, Some(planned_after))?;
+        let checkpoint = audit_checkpoint(
+            operation,
+            tool,
+            "intent",
+            artifact,
+            before,
+            Some(planned_after),
+        )?;
         let intent = OperationIntent::new(operation.clone(), Timestamp::now());
         let commit = CheckpointCommit::new(checkpoint, Some(intent), vec![event])?;
         match self.store.commit_checkpoint(commit) {

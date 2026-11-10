@@ -21,7 +21,7 @@ use crate::contracts::errors::{ArgumentViolation, CoreError, PublicationFailure}
 use crate::contracts::events::{Event, EventKind};
 use crate::contracts::ids::{HostActivityId, ProjectId};
 use crate::contracts::time::Timestamp;
-use crate::tools::{hash_bytes, FileVersion, NonEmptyText, Purpose};
+use crate::tools::{FileVersion, NonEmptyText, Purpose, hash_bytes};
 
 /// Maximum Unicode scalar values in a publication request identifier.
 pub const MAX_PUBLICATION_REQUEST_ID_SCALARS: usize = 200;
@@ -860,8 +860,15 @@ mod tests {
         let target = NonEmptyText::new("page.html").expect("target");
         let purpose = Purpose::new("publish").expect("purpose");
         assert!(
-            PublicationRequest::new(project, id.clone(), target.clone(), ExpectedTargetVersion::absent(), "x", purpose.clone())
-                .is_ok()
+            PublicationRequest::new(
+                project,
+                id.clone(),
+                target.clone(),
+                ExpectedTargetVersion::absent(),
+                "x",
+                purpose.clone()
+            )
+            .is_ok()
         );
         assert!(PublicationRequestId::new(" ").is_err());
         assert!(PublicationRequestId::new("x\ny").is_err());
@@ -870,26 +877,38 @@ mod tests {
         );
         let absolute = NonEmptyText::new("/tmp/page.html").expect("target");
         assert!(
-            PublicationRequest::new(project, id, absolute, ExpectedTargetVersion::absent(), "x", purpose)
-                .is_err()
+            PublicationRequest::new(
+                project,
+                id,
+                absolute,
+                ExpectedTargetVersion::absent(),
+                "x",
+                purpose
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn fingerprints_bind_the_exact_payload() {
         let project = ProjectId::new();
-        let first = request_for(project, "<html>one</html>", "publish the approved companion");
-        let second = request_for(project, "<html>one</html>", "publish the approved companion");
+        let first = request_for(
+            project,
+            "<html>one</html>",
+            "publish the approved companion",
+        );
+        let second = request_for(
+            project,
+            "<html>one</html>",
+            "publish the approved companion",
+        );
         let changed_content = request_for(
             project,
             "<html>two</html>",
             "publish the approved companion",
         );
-        let changed_purpose = request_for(
-            project,
-            "<html>one</html>",
-            "publish a different companion",
-        );
+        let changed_purpose =
+            request_for(project, "<html>one</html>", "publish a different companion");
         assert_eq!(first.fingerprint(), second.fingerprint());
         assert_ne!(first.fingerprint(), changed_content.fingerprint());
         assert_ne!(first.fingerprint(), changed_purpose.fingerprint());

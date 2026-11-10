@@ -25,8 +25,8 @@ use herness_core::{ExpectedTargetVersion, FileVersion, ProjectId, Timestamp};
 use herness_html_sync::ids::PublicationId;
 use herness_html_sync::observer::{DependencyKind, DependencyPath, dependency_fingerprint};
 use herness_html_sync::{
-    AppliedEvaluation, CandidateArtifactStore, CandidateRecord, CheckSet,
-    ConditionBinding, CycleLatch, CycleState, DocumentCommit, DocumentKey, EvidenceContentStore,
+    AppliedEvaluation, CandidateArtifactStore, CandidateRecord, CheckSet, ConditionBinding,
+    CycleLatch, CycleState, DocumentCommit, DocumentKey, EvidenceContentStore,
     EvidenceFingerprints, EvidencePack, EvidenceValidationError, GenerationRecord,
     H3DocumentRecord, H3DocumentState, H3Error, H3FailureCause, H3Reason, H3Settings,
     H3StateReasonKind, H3StorePort, HumanWaitCause, PublicationPolicyIdentity, RequiredAction,
@@ -42,8 +42,8 @@ use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::policy::ConnectedPolicyBridge;
 use crate::html_sync::publish::ProjectPublicationFiles;
 use crate::html_sync::render::{
-    CancellationToken, RENDER_HARD_TIMEOUT, RenderBudget, RenderEvidence, RenderJob, RenderResource,
-    render_candidate,
+    CancellationToken, RENDER_HARD_TIMEOUT, RenderBudget, RenderEvidence, RenderJob,
+    RenderResource, render_candidate,
 };
 use crate::html_sync::verification::{
     CandidateVerificationRequest as HostVerificationRequest, FingerprintCapture, verify_candidate,
@@ -101,12 +101,13 @@ impl CandidateRenderPort for NativeRenderPort {
             capability: "h3.render.job".to_owned(),
             detail: error.label(),
         })?;
-        let budget = RenderBudget::new(input.timeout.min(RENDER_HARD_TIMEOUT), None).map_err(
-            |error| H3Error::Unavailable {
-                capability: "h3.render.budget".to_owned(),
-                detail: error.label(),
-            },
-        )?;
+        let budget =
+            RenderBudget::new(input.timeout.min(RENDER_HARD_TIMEOUT), None).map_err(|error| {
+                H3Error::Unavailable {
+                    capability: "h3.render.budget".to_owned(),
+                    detail: error.label(),
+                }
+            })?;
         let cancellation = CancellationToken::new();
         render_candidate(&self.app, &job, budget, &cancellation).map_err(|failure| {
             H3Error::Unavailable {
@@ -348,10 +349,13 @@ pub fn load_prepared(
             record: "document state",
             id: document.target_path().to_owned(),
         })?;
-    let generation_id = record.state().generation().ok_or_else(|| H3Error::NotFound {
-        record: "active generation",
-        id: document.target_path().to_owned(),
-    })?;
+    let generation_id = record
+        .state()
+        .generation()
+        .ok_or_else(|| H3Error::NotFound {
+            record: "active generation",
+            id: document.target_path().to_owned(),
+        })?;
     let generation = store
         .html_sync_generations(project, document)?
         .into_iter()
@@ -366,16 +370,21 @@ pub fn load_prepared(
             id: generation_id.to_string(),
         });
     }
-    let candidate = generation.candidate().cloned().ok_or_else(|| H3Error::NotFound {
-        record: "candidate",
-        id: generation_id.to_string(),
-    })?;
+    let candidate = generation
+        .candidate()
+        .cloned()
+        .ok_or_else(|| H3Error::NotFound {
+            record: "candidate",
+            id: generation_id.to_string(),
+        })?;
     let (html, provenance) = candidates.read_candidate_record(&candidate)?;
 
-    let source = files.read(document.target_path())?.ok_or_else(|| H3Error::NotFound {
-        record: "source",
-        id: document.target_path().to_owned(),
-    })?;
+    let source = files
+        .read(document.target_path())?
+        .ok_or_else(|| H3Error::NotFound {
+            record: "source",
+            id: document.target_path().to_owned(),
+        })?;
     if ContentDigest::sha256(&source) != *generation.source().digest() {
         return Err(H3Error::Unavailable {
             capability: "h3.verification.source".to_owned(),
@@ -404,7 +413,10 @@ pub fn load_prepared(
         DependencyKind::Resource,
         resources.iter().map(|input| (input.path(), input.digest())),
     );
-    if Some(&css_fingerprint) != generation.fingerprints().get(herness_html_sync::FingerprintKind::Css)
+    if Some(&css_fingerprint)
+        != generation
+            .fingerprints()
+            .get(herness_html_sync::FingerprintKind::Css)
         || Some(&resource_fingerprint)
             != generation
                 .fingerprints()
@@ -486,8 +498,14 @@ pub fn verify(
 ) -> Result<crate::html_sync::verification::CandidateVerification, H3Error> {
     let render = render_port.capture(&render_input(prepared)?)?;
     let mut inputs = BTreeMap::new();
-    inputs.insert(prepared.document.target_path().to_owned(), prepared.source.clone());
-    inputs.insert(prepared.document.companion_path(), prepared.html.as_bytes().to_vec());
+    inputs.insert(
+        prepared.document.target_path().to_owned(),
+        prepared.source.clone(),
+    );
+    inputs.insert(
+        prepared.document.companion_path(),
+        prepared.html.as_bytes().to_vec(),
+    );
     for input in prepared.css.iter().chain(prepared.resources.iter()) {
         inputs.insert(input.path().to_owned(), input.bytes().to_vec());
     }
@@ -737,7 +755,11 @@ pub fn persist_evidence(
     content: &EvidenceContentStore,
 ) -> Result<PathBuf, H3Error> {
     let directory = persist_evidence_root(root)?;
-    let file = directory.join(format!("{}-{}.json", document.project_id(), generation.local_id()));
+    let file = directory.join(format!(
+        "{}-{}.json",
+        document.project_id(),
+        generation.local_id()
+    ));
     content.save(&file).map_err(H3Error::from)?;
     Ok(file)
 }
@@ -749,7 +771,11 @@ pub fn load_evidence(
     generation: herness_html_sync::GenerationId,
 ) -> Result<EvidenceContentStore, H3Error> {
     let directory = persist_evidence_root(root)?;
-    let file = directory.join(format!("{}-{}.json", document.project_id(), generation.local_id()));
+    let file = directory.join(format!(
+        "{}-{}.json",
+        document.project_id(),
+        generation.local_id()
+    ));
     EvidenceContentStore::load(&file).map_err(H3Error::from)
 }
 
@@ -794,7 +820,13 @@ pub fn verification_detail(
                 check.result()
             ));
         }
-        detail.push_str(&format!("; binding_current={}", verification.binding.as_ref().is_some_and(herness_html_sync::EvaluationBinding::is_current)));
+        detail.push_str(&format!(
+            "; binding_current={}",
+            verification
+                .binding
+                .as_ref()
+                .is_some_and(herness_html_sync::EvaluationBinding::is_current)
+        ));
         (detail, true)
     } else {
         ("the verification is usable".to_owned(), false)
@@ -824,10 +856,12 @@ pub fn cycle_is_open(store: &mut StoreHandle, record: &H3DocumentRecord) -> Resu
 pub fn extract_provenance(html: &str) -> Result<String, H3Error> {
     let lower = html.to_ascii_lowercase();
     let marker = "id=\"sdd-provenance\"";
-    let id_position = lower.find(marker).ok_or_else(|| H3Error::invalid(
-        "provenance",
-        "the current HTML has no sdd-provenance template",
-    ))?;
+    let id_position = lower.find(marker).ok_or_else(|| {
+        H3Error::invalid(
+            "provenance",
+            "the current HTML has no sdd-provenance template",
+        )
+    })?;
     let open_end = lower[id_position..]
         .find('>')
         .map(|offset| id_position + offset + 1)

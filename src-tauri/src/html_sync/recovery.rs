@@ -24,8 +24,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use herness_core::{ProjectId, StopReason, Timestamp};
 use herness_html_sync::observer::{
     ChangeSignal, DependencyKind, DependencyPath, FilesystemSourceReader, ObservationEligibility,
-    ObservationTargets, ObserverHealth, ObserverTick, ProjectObserver, SourceChange, SourceReadError,
-    SystemObservationClock, dependency_fingerprint,
+    ObservationTargets, ObserverHealth, ObserverTick, ProjectObserver, SourceChange,
+    SourceReadError, SystemObservationClock, dependency_fingerprint,
 };
 use herness_html_sync::recovery::{
     self, CandidateBytes, H2RecoveryFacts, H2RequestUnknown, ProjectRecoveryReport,
@@ -250,7 +250,9 @@ impl HtmlSyncRecoveryHost {
 
     /// Registered project root.
     pub fn project_root(&self, project: ProjectId) -> Option<&Path> {
-        self.projects.get(&project).map(|binding| binding.root.as_path())
+        self.projects
+            .get(&project)
+            .map(|binding| binding.root.as_path())
     }
 
     /// Whether the project is bound to the app-lifetime worker.
@@ -266,11 +268,7 @@ impl HtmlSyncRecoveryHost {
     /// Stores one host-computed capability report. An unavailable report
     /// unbinds the project's worker so a missing capability cannot keep
     /// authoring active.
-    pub fn set_capability_report(
-        &mut self,
-        project: ProjectId,
-        report: HtmlSyncCapabilityReport,
-    ) {
+    pub fn set_capability_report(&mut self, project: ProjectId, report: HtmlSyncCapabilityReport) {
         if !report.available() {
             self.bound.remove(&project);
             self.observers.remove(&project);
@@ -416,7 +414,8 @@ impl HtmlSyncRecoveryHost {
                 self.pending_source_changes.push(observation.clone());
             }
         }
-        self.pending_companions.extend(tick.companions.iter().cloned());
+        self.pending_companions
+            .extend(tick.companions.iter().cloned());
     }
 
     fn drain_watch_notices(&mut self) {
@@ -571,8 +570,7 @@ impl HtmlSyncRecoveryHost {
                         ) {
                             Ok(true) => {
                                 if let Some(job_id) = self.durable_job_id(project)
-                                    && let Err(error) =
-                                        self.worker.restore_job_id(project, job_id)
+                                    && let Err(error) = self.worker.restore_job_id(project, job_id)
                                 {
                                     failures.push(HtmlSyncRecoveryFailure {
                                         project_id: project,
@@ -702,19 +700,24 @@ impl HtmlSyncRecoveryHost {
                 capability: "h3.job".to_owned(),
                 detail: "the project is not bound to an approved H3 job".to_owned(),
             })?;
-        let binding = self.projects.get(&project).ok_or_else(|| H3Error::NotFound {
-            record: "open project",
-            id: project.to_string(),
-        })?;
+        let binding = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| H3Error::NotFound {
+                record: "open project",
+                id: project.to_string(),
+            })?;
         let reader = FilesystemSourceReader::new(&binding.root)?;
         let reads = DesktopRecoveryReads {
             reader,
             candidates: self.candidates.clone(),
         };
-        let bytes = reads.read_source(document)?.ok_or_else(|| H3Error::NotFound {
-            record: "source",
-            id: document.target_path().to_owned(),
-        })?;
+        let bytes = reads
+            .read_source(document)?
+            .ok_or_else(|| H3Error::NotFound {
+                record: "source",
+                id: document.target_path().to_owned(),
+            })?;
         let record = self
             .store
             .load_html_sync_document(project, document)?

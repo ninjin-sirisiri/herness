@@ -163,7 +163,12 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                     quit_test,
                     close_reopen_test,
                     h3_lifecycle_test,
-                } => (*smoke_test, *quit_test, *close_reopen_test, *h3_lifecycle_test),
+                } => (
+                    *smoke_test,
+                    *quit_test,
+                    *close_reopen_test,
+                    *h3_lifecycle_test,
+                ),
                 LaunchMode::RenderTest(_) => unreachable!("render mode returned above"),
             };
 

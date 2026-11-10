@@ -30,8 +30,6 @@ use herness_store::{Store, StoreConfig};
 use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::composition::HtmlSyncServices;
 use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
-use herness_html_sync::observer::{DependencyKind, DependencyPath};
-use herness_html_sync::{H3StorePort, PublicationFileReadPort};
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -41,6 +39,8 @@ use crate::supervision::{
     ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, HumanConfirmation,
     PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
 };
+use herness_html_sync::observer::{DependencyKind, DependencyPath};
+use herness_html_sync::{H3StorePort, PublicationFileReadPort};
 use herness_supervision::{
     ProviderOrigin, SupervisionError, SupervisionId, SupervisionOperationRequest,
     SupervisionRequestId, TargetVersion,
@@ -287,11 +287,7 @@ impl DesktopHost {
             let dependencies = stored_settings(&store, view.project_id())
                 .map(|settings| discovered_dependencies(view.path().as_path(), &settings))
                 .unwrap_or_else(|| default_dependencies(view.path().as_path()));
-            html_sync.register_project(
-                view.project_id(),
-                view.path().as_path(),
-                dependencies,
-            );
+            html_sync.register_project(view.project_id(), view.path().as_path(), dependencies);
         }
         let mut html_sync_services = HtmlSyncServices::new(
             StoreHandle::new(Arc::clone(&store)),
@@ -322,12 +318,8 @@ impl DesktopHost {
             }
             let h2 = approved_supervision(&supervision, &html_sync_services, project)
                 .and_then(|supervision_id| supervision.get(project, supervision_id).ok());
-            let report = html_sync_services.evaluate(
-                project,
-                view.path().as_path(),
-                settings,
-                h2.as_ref(),
-            );
+            let report =
+                html_sync_services.evaluate(project, view.path().as_path(), settings, h2.as_ref());
             html_sync.set_capability_report(project, report);
         }
         let startup = html_sync.restore(&mut runtime, &mut supervision, Timestamp::now());
@@ -573,12 +565,11 @@ impl DesktopHost {
                     companion.document.target_path()
                 );
             } else {
-                self.html_sync_mut()
-                    .seed_latch(
-                        companion.document.clone(),
-                        Some(herness_html_sync::CycleLatch::WaitingHuman),
-                        "the formal HTML changed outside H3",
-                    );
+                self.html_sync_mut().seed_latch(
+                    companion.document.clone(),
+                    Some(herness_html_sync::CycleLatch::WaitingHuman),
+                    "the formal HTML changed outside H3",
+                );
             }
         }
         Ok(report)
@@ -708,10 +699,14 @@ impl DesktopHost {
 
         let project = document.project_id();
         let now = Timestamp::now();
-        if let Ok(Some(record)) = self.store_handle().load_html_sync_document(project, document)
+        if let Ok(Some(record)) = self
+            .store_handle()
+            .load_html_sync_document(project, document)
             && record.state().state() == herness_html_sync::H3State::Synced
         {
-            return Err("the document is already synced; it is not re-verified or rewritten".to_owned());
+            return Err(
+                "the document is already synced; it is not re-verified or rewritten".to_owned(),
+            );
         }
         let root = self
             .html_sync
@@ -731,19 +726,12 @@ impl DesktopHost {
         let supervision_id = self
             .html_sync_supervision_id(project)
             .ok_or_else(|| "the project has no approved H2 target".to_owned())?;
-        let plan = crate::supervision::plan::load_plan(
-            &self.store_handle(),
-            project,
-            supervision_id,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
-        let context = AssessmentContext::from_plan(
-            project,
-            &plan,
-            approval.assessment().profile(),
-        )
-        .map_err(|error| error.to_string())?;
+        let plan =
+            crate::supervision::plan::load_plan(&self.store_handle(), project, supervision_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
+        let context = AssessmentContext::from_plan(project, &plan, approval.assessment().profile())
+            .map_err(|error| error.to_string())?;
         let files = crate::html_sync::publish::ProjectPublicationFiles::new(&root)
             .map_err(|error| error.to_string())?;
         let candidates = self.html_sync.candidate_store();
@@ -869,8 +857,8 @@ impl DesktopHost {
         use herness_html_sync::EvaluationDispositionState;
         match evaluation.disposition().state() {
             EvaluationDispositionState::CompletionReady => {
-                let policy = pipeline::policy_identity(&settings)
-                    .map_err(|error| error.to_string())?;
+                let policy =
+                    pipeline::policy_identity(&settings).map_err(|error| error.to_string())?;
                 let attempt =
                     pipeline::publication_attempt(&files, &prepared, &evaluation, &policy, now)
                         .map_err(|error| error.to_string())?;
@@ -881,8 +869,7 @@ impl DesktopHost {
                 };
                 let services = &mut self.html_sync_services;
                 let recovery = &mut self.html_sync;
-                let operations = services
-                    .ensure_operations(project, &root)?;
+                let operations = services.ensure_operations(project, &root)?;
                 let published = recovery
                     .with_publication_expectations(project, |expectations| {
                         if explicit {
@@ -932,7 +919,6 @@ impl DesktopHost {
         }
     }
 
-
     /// Builds and runs the real human adoption payload for the exact current
     /// external HTML.
     ///
@@ -970,19 +956,12 @@ impl DesktopHost {
         let supervision_id = self
             .html_sync_supervision_id(project)
             .ok_or_else(|| "the project has no approved H2 target".to_owned())?;
-        let plan = crate::supervision::plan::load_plan(
-            &self.store_handle(),
-            project,
-            supervision_id,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
-        let context = AssessmentContext::from_plan(
-            project,
-            &plan,
-            approval.assessment().profile(),
-        )
-        .map_err(|error| error.to_string())?;
+        let plan =
+            crate::supervision::plan::load_plan(&self.store_handle(), project, supervision_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the approved H2 plan is unavailable".to_owned())?;
+        let context = AssessmentContext::from_plan(project, &plan, approval.assessment().profile())
+            .map_err(|error| error.to_string())?;
         let files = crate::html_sync::publish::ProjectPublicationFiles::new(&root)
             .map_err(|error| error.to_string())?;
         let record = self
@@ -998,11 +977,9 @@ impl DesktopHost {
             .read(&document.companion_path())
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "the external HTML is missing".to_owned())?;
-        let html = String::from_utf8(html_bytes).map_err(|_| {
-            "the external HTML is not UTF-8 and cannot be adopted".to_owned()
-        })?;
-        let provenance = pipeline::extract_provenance(&html)
-            .map_err(|error| error.to_string())?;
+        let html = String::from_utf8(html_bytes)
+            .map_err(|_| "the external HTML is not UTF-8 and cannot be adopted".to_owned())?;
+        let provenance = pipeline::extract_provenance(&html).map_err(|error| error.to_string())?;
         let dependencies = self.html_sync.dependencies(project);
         let mut css = Vec::new();
         let mut resources = Vec::new();
@@ -1013,11 +990,8 @@ impl DesktopHost {
             else {
                 continue;
             };
-            let input = herness_html_sync::PublicationFileInput::new(
-                dependency.path(),
-                bytes,
-            )
-            .map_err(|error| error.to_string())?;
+            let input = herness_html_sync::PublicationFileInput::new(dependency.path(), bytes)
+                .map_err(|error| error.to_string())?;
             match dependency.kind() {
                 herness_html_sync::observer::DependencyKind::Css => css.push(input),
                 herness_html_sync::observer::DependencyKind::Resource => resources.push(input),
@@ -1100,9 +1074,7 @@ impl DesktopHost {
             settings.fingerprint().clone(),
             approval.versions().policy_fingerprint().clone(),
             herness_supervision::ContentDigest::sha256(
-                css.first()
-                    .map(|input| input.bytes())
-                    .unwrap_or_default(),
+                css.first().map(|input| input.bytes()).unwrap_or_default(),
             ),
             herness_supervision::ContentDigest::sha256(b"adoption-resources"),
             Some(herness_supervision::ContentDigest::sha256(html.as_bytes())),
@@ -1234,11 +1206,7 @@ impl DesktopHost {
             now,
         )
         .map_err(|error| error.to_string())?
-        .with_candidate(
-            prepared
-                .candidate
-                .clone(),
-        )
+        .with_candidate(prepared.candidate.clone())
         .map_err(|error| error.to_string())?
         .with_h2(h2);
         prepared.generation = generation.clone();
@@ -1270,8 +1238,7 @@ impl DesktopHost {
             validation,
             pipeline::current_expected(&files, &document.companion_path())
                 .map_err(|error| error.to_string())?,
-            pipeline::current_expected(&files, &receipt_path)
-                .map_err(|error| error.to_string())?,
+            pipeline::current_expected(&files, &receipt_path).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         recovery
@@ -1639,11 +1606,7 @@ impl DesktopHost {
             .flatten()
             .map(|record| discovered_dependencies(project.as_path(), record.settings()))
             .unwrap_or_else(|| default_dependencies(project.as_path()));
-        html_sync.register_project(
-            view.project_id(),
-            project.as_path(),
-            dependencies,
-        );
+        html_sync.register_project(view.project_id(), project.as_path(), dependencies);
         Ok(view)
     }
 
@@ -1791,7 +1754,8 @@ pub fn discovered_dependencies(
         .collect::<std::collections::BTreeSet<_>>();
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for target in settings.target_paths() {
-        let Ok(document) = herness_html_sync::DocumentKey::new(settings.project_id(), target.clone())
+        let Ok(document) =
+            herness_html_sync::DocumentKey::new(settings.project_id(), target.clone())
         else {
             continue;
         };
@@ -1803,7 +1767,9 @@ pub fn discovered_dependencies(
             if dependencies.len() >= 64 {
                 break;
             }
-            if reference.ends_with(".css") || reference.ends_with(".md") || reference.ends_with(".html")
+            if reference.ends_with(".css")
+                || reference.ends_with(".md")
+                || reference.ends_with(".html")
             {
                 continue;
             }
@@ -1822,9 +1788,7 @@ pub fn discovered_dependencies(
             {
                 continue;
             }
-            if let Ok(dependency) =
-                DependencyPath::new(relative, DependencyKind::Resource)
-            {
+            if let Ok(dependency) = DependencyPath::new(relative, DependencyKind::Resource) {
                 dependencies.push(dependency);
             }
         }

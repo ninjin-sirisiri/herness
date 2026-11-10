@@ -384,10 +384,7 @@ impl WorkPacket {
         })
     }
 
-    fn revised(
-        &self,
-        update: impl FnOnce(&mut Self),
-    ) -> Result<Self, SupervisionError> {
+    fn revised(&self, update: impl FnOnce(&mut Self)) -> Result<Self, SupervisionError> {
         let mut next = self.clone();
         next.packet_version = next.packet_version.saturating_add(1);
         update(&mut next);
@@ -447,7 +444,10 @@ impl WorkPacket {
 /// Paths are sorted and deduplicated so the fingerprint describes the set, not
 /// the enumeration order.
 pub fn read_set_digest(paths: &[String]) -> Result<ContentDigest, SupervisionError> {
-    let mut canonical = paths.iter().filter(|path| !path.trim().is_empty()).collect::<Vec<_>>();
+    let mut canonical = paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .collect::<Vec<_>>();
     canonical.sort_unstable();
     canonical.dedup();
     let bytes = serde_json::to_vec(&canonical).map_err(|error| SupervisionError::InvalidValue {

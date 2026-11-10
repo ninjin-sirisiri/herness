@@ -25,8 +25,8 @@ use herness_html_sync::{
     OwnerProgress, OwnerStartRequest, OwnerStarted, OwnerSupersedeRequest, RequiredAction,
     SourceObservation, StopOutcome, SupersessionOutcome, SyncCoordinator, WorkspaceReader,
 };
-use herness_supervision::owner_launch::{OwnerApprovalRegistryPort, authorize_owner_launch};
 use herness_supervision::owner_launch::OwnerApproval;
+use herness_supervision::owner_launch::{OwnerApprovalRegistryPort, authorize_owner_launch};
 use herness_supervision::{
     ApprovalActor, ConsentBinding, ConsentId, DisclosureConsent, DisclosureScope, ProfilePurpose,
     StopCause, SupervisionId, SupervisionRequestId, SupervisionState, TargetVersion,
@@ -169,10 +169,14 @@ impl HtmlSyncWorker {
         project: ProjectId,
         job_id: herness_html_sync::JobId,
     ) -> Result<(), H3Error> {
-        let job = self.jobs.get(&project).cloned().ok_or_else(|| H3Error::NotFound {
-            record: "authoring job",
-            id: project.to_string(),
-        })?;
+        let job = self
+            .jobs
+            .get(&project)
+            .cloned()
+            .ok_or_else(|| H3Error::NotFound {
+                record: "authoring job",
+                id: project.to_string(),
+            })?;
         let job = job.with_durable_job_id(job_id)?;
         self.jobs.insert(project, job.clone());
         self.coordinator.bind_job(job);
@@ -495,10 +499,13 @@ impl SupervisionAuthoringControl<'_> {
                 detail: "the stored H3 settings are disabled or tampered".to_owned(),
             });
         }
-        let approval = settings.approval().cloned().ok_or_else(|| H3Error::Unavailable {
-            capability: "h3.consent.approval".to_owned(),
-            detail: "the stored settings carry no human range approval".to_owned(),
-        })?;
+        let approval = settings
+            .approval()
+            .cloned()
+            .ok_or_else(|| H3Error::Unavailable {
+                capability: "h3.consent.approval".to_owned(),
+                detail: "the stored settings carry no human range approval".to_owned(),
+            })?;
         if !approval.is_current_at(self.now) {
             return Err(H3Error::Unavailable {
                 capability: "h3.consent.approval".to_owned(),
@@ -914,7 +921,6 @@ impl AuthoringControlPort for SupervisionAuthoringControl<'_> {
     }
 }
 
-
 /// Owner-approval registry that adopts one recorded range-consent reissue for
 /// the exact approved Target set.
 ///
@@ -939,10 +945,7 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
         owner: &herness_supervision::OwnerRef,
         now: Timestamp,
     ) -> Result<Option<OwnerApproval>, herness_supervision::SupervisionError> {
-        let Some(approval) = self
-            .inner
-            .current_owner_approval(project_id, owner, now)?
-        else {
+        let Some(approval) = self.inner.current_owner_approval(project_id, owner, now)? else {
             return Ok(None);
         };
         if project_id != self.project {
@@ -953,13 +956,11 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
             self.project,
             self.target_version.get()
         );
-        let Some(bytes) = self
-            .store
-            .lock()
-            .load_host_state(&key)
-            .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
+        let Some(bytes) = self.store.lock().load_host_state(&key).map_err(|error| {
+            herness_supervision::SupervisionError::StorageFailure {
                 detail: error.to_string(),
-            })?
+            }
+        })?
         else {
             return Ok(Some(approval));
         };
@@ -970,9 +971,11 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
             .store
             .lock()
             .load_html_sync_settings(self.project)
-            .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
-                detail: error.to_string(),
-            })?
+            .map_err(
+                |error| herness_supervision::SupervisionError::StorageFailure {
+                    detail: error.to_string(),
+                },
+            )?
         else {
             return Ok(Some(approval));
         };
@@ -980,14 +983,9 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
             return Ok(Some(approval));
         };
         let disclosure = human.authoring().disclosure();
-        let record_matches = record
-            .get("schema")
-            .and_then(serde_json::Value::as_str)
+        let record_matches = record.get("schema").and_then(serde_json::Value::as_str)
             == Some("h3-range-consent-reissue-v1")
-            && record
-                .get("purpose")
-                .and_then(serde_json::Value::as_str)
-                == Some("completion")
+            && record.get("purpose").and_then(serde_json::Value::as_str) == Some("completion")
             && record
                 .get("targetVersion")
                 .and_then(serde_json::Value::as_u64)
@@ -1023,7 +1021,11 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
         if !record_matches {
             return Ok(Some(approval));
         }
-        let Some(current) = self.config.get(self.project).consent(ProfilePurpose::Completion).cloned()
+        let Some(current) = self
+            .config
+            .get(self.project)
+            .consent(ProfilePurpose::Completion)
+            .cloned()
         else {
             return Ok(Some(approval));
         };
@@ -1049,9 +1051,11 @@ impl OwnerApprovalRegistryPort for RangeConsentApprovalRegistry<'_> {
             approval.budget_policy_version(),
             approval.budget().clone(),
         )
-        .map_err(|error| herness_supervision::SupervisionError::StorageFailure {
-            detail: error.to_string(),
-        })?;
+        .map_err(
+            |error| herness_supervision::SupervisionError::StorageFailure {
+                detail: error.to_string(),
+            },
+        )?;
         let _ = self.now;
         Ok(Some(rebuilt))
     }

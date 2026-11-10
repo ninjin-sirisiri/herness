@@ -2241,8 +2241,9 @@ fn collect_tree(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>
             collect_tree(root, &path, files);
         } else if metadata.is_file()
             && let Ok(bytes) = fs::read(&path)
-                && let Ok(relative) = path.strip_prefix(root) {
-                    files.push((relative.to_path_buf(), bytes));
-                }
+            && let Ok(relative) = path.strip_prefix(root)
+        {
+            files.push((relative.to_path_buf(), bytes));
+        }
     }
 }

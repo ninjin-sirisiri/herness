@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use herness_core::RunState;
 use herness_core::contracts::{
     AgentId, AttemptId, AuthMethod, ConnectionId, EventSubject, ModelRequestObservation, ProjectId,
     ProviderFailureKind, RequestGateIntent, RequestGateOutcome, RequestGateRefusal, RequestId,
@@ -16,7 +17,6 @@ use herness_core::contracts::{
 };
 use herness_core::ports::request_gate::ModelRequestGatePort;
 use herness_core::runtime::RecoveryMode;
-use herness_core::RunState;
 use herness_store::test_support::CommitFault;
 use herness_store::{Store, StoreConfig};
 use herness_supervision::operations::{
@@ -29,8 +29,8 @@ use herness_supervision::recovery::{
 use herness_supervision::supervisor::StopDisposition;
 use herness_supervision::{
     BudgetClockPort, BudgetLedger, BudgetLedgerRecord, BudgetLimit, BudgetPolicy,
-    BudgetRequestGate, BudgetRequestId, BudgetStorePort, ChangeKind, ClockPort, ClockReading, Money,
-    MoneyCap, MoneyReservation, MoneyReservationState, MoneySettlement, OwnerApprovalSource,
+    BudgetRequestGate, BudgetRequestId, BudgetStorePort, ChangeKind, ClockPort, ClockReading,
+    Money, MoneyCap, MoneyReservation, MoneyReservationState, MoneySettlement, OwnerApprovalSource,
     OwnerKind, OwnerRef, OwnerSupersessionRejection, PriceVersion, RequestBudgetEstimate,
     RequestBudgetEstimator, StoredBudgetRecord, SupervisionError, SupervisionId, SupervisionRecord,
     SupervisionRequestId, SupervisionState,
@@ -1397,8 +1397,9 @@ fn owner_generation_change_preserves_consumed_and_reserved_budget_across_7199_an
     // A further generation change is refused by the exhausted budget latch and
     // cannot reset the ledger or consume a thirty-second run.
     let replacement_three = owner_contract_succeeding(&replacement, 3, 1, policy.clone());
-    let binding_three = OwnerLaunchBinding::from_contract(&replacement_three, 1, 1, "generation-job")
-        .expect("binding three");
+    let binding_three =
+        OwnerLaunchBinding::from_contract(&replacement_three, 1, 1, "generation-job")
+            .expect("binding three");
     registry.insert(binding_three.approval().clone());
     let authority_three =
         authorize_owner_launch(&registry, &binding_three, now()).expect("authority three");

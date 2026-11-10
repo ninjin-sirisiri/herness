@@ -29,6 +29,11 @@ use herness_core::{
 };
 use herness_desktop::host::DesktopHost;
 use herness_desktop::html_sync::composition;
+use herness_desktop::html_sync::pipeline::{
+    AssessmentContext, CandidateRenderPort, HostFingerprints, PostCandidateOutcome,
+    PreparedCandidate, RenderInput, verify,
+};
+use herness_desktop::html_sync::policy::CandidateDecision;
 use herness_desktop::supervision::assessment::build_human_consent;
 use herness_desktop::supervision::plan::{RequestActor, load_plan};
 use herness_desktop::supervision::store::HostBudgetClock;
@@ -36,19 +41,15 @@ use herness_desktop::supervision::{
     ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
 };
 use herness_engine_pi::ProviderEndpoints;
-use herness_desktop::html_sync::pipeline::{
-    AssessmentContext, CandidateRenderPort, HostFingerprints, PostCandidateOutcome,
-    PreparedCandidate, RenderInput, verify,
-};
 use herness_html_sync::observer::{ChangeSignal, ChangeSource, DependencyKind};
 use herness_html_sync::{
-    ConflictResolution, DocumentKey, H3ApprovalLimits, H3Approver, H3Condition, H3ConfigurationApproval,
-    H3ConfigurationDraft, H3ConnectionApproval, H3OwnerBinding, H3Settings, H3State, H3StorePort,
-    H3Operation, H3OperationRequest, H3RequestId, H3VersionBinding, HtmlSyncCommit,
-    ObservationEligibility, ObservationTrigger, PublicationFileInput, SettingsCommit,
-    SourceChange, SourceObservation, SourceRevision, SourceSnapshot,
+    ConflictResolution, DocumentKey, H3ApprovalLimits, H3Approver, H3Condition,
+    H3ConfigurationApproval, H3ConfigurationDraft, H3ConnectionApproval, H3Operation,
+    H3OperationRequest, H3OwnerBinding, H3RequestId, H3Settings, H3State, H3StorePort,
+    H3VersionBinding, HtmlSyncCommit, ObservationEligibility, ObservationTrigger,
+    PublicationFileInput, SettingsCommit, SourceChange, SourceObservation, SourceRevision,
+    SourceSnapshot,
 };
-use herness_desktop::html_sync::policy::CandidateDecision;
 use herness_supervision::profiles::{
     AdapterVersion, AssessmentProfile, ProfileInputs, ProfilePurpose, ProfileThresholds,
     ProfileVersion, ProviderKind, RubricVersion,
@@ -209,7 +210,11 @@ fn write_response(mut stream: TcpStream, response: MockResponse) {
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.status,
-        if response.status == 200 { "OK" } else { "Error" },
+        if response.status == 200 {
+            "OK"
+        } else {
+            "Error"
+        },
         response.content_type,
         response.body.len()
     );
@@ -429,17 +434,23 @@ fn scripted_met(request: &RecordedRequest) -> MockResponse {
 struct ChildRenderPort;
 
 impl CandidateRenderPort for ChildRenderPort {
-    fn capture(&self, input: &RenderInput) -> Result<herness_desktop::html_sync::RenderEvidence, herness_html_sync::H3Error> {
-        let temp = tempfile::tempdir().map_err(|error| herness_html_sync::H3Error::Unavailable {
-            capability: "h3.render.fixture".to_owned(),
-            detail: error.to_string(),
-        })?;
-        let fixture = temp.path().join("fixture");
-        let output = temp.path().join("output");
-        std::fs::create_dir_all(&fixture).map_err(|error| herness_html_sync::H3Error::Unavailable {
+    fn capture(
+        &self,
+        input: &RenderInput,
+    ) -> Result<herness_desktop::html_sync::RenderEvidence, herness_html_sync::H3Error> {
+        let temp =
+            tempfile::tempdir().map_err(|error| herness_html_sync::H3Error::Unavailable {
                 capability: "h3.render.fixture".to_owned(),
                 detail: error.to_string(),
             })?;
+        let fixture = temp.path().join("fixture");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(&fixture).map_err(|error| {
+            herness_html_sync::H3Error::Unavailable {
+                capability: "h3.render.fixture".to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
         std::fs::write(fixture.join("candidate.html"), &input.html).map_err(|error| {
             herness_html_sync::H3Error::Unavailable {
                 capability: "h3.render.fixture".to_owned(),
@@ -548,10 +559,7 @@ struct FakeCredentials {
 }
 
 impl CredentialPort for FakeCredentials {
-    fn availability(
-        &self,
-        connection: &ConnectionId,
-    ) -> Result<CredentialAvailability, CoreError> {
+    fn availability(&self, connection: &ConnectionId) -> Result<CredentialAvailability, CoreError> {
         Ok(if self.connections.contains(connection) {
             CredentialAvailability::Available
         } else {
@@ -619,10 +627,9 @@ impl Acceptance {
         let pack = Path::new(support::REAL_PACK_ROOT);
         let source = std::fs::read(pack.join("tests/fixtures/adr/0001-queue-choice.md"))
             .expect("fixture source");
-        let candidate_html = std::fs::read_to_string(
-            pack.join("tests/fixtures/adr/0001-queue-choice.html"),
-        )
-        .expect("fixture candidate");
+        let candidate_html =
+            std::fs::read_to_string(pack.join("tests/fixtures/adr/0001-queue-choice.html"))
+                .expect("fixture candidate");
         let css = std::fs::read(pack.join("tests/fixtures/docs/sdd/assets/sdd.css"))
             .expect("fixture css");
         std::fs::write(root.join(TARGET), &source).expect("write source");
@@ -634,11 +641,9 @@ impl Acceptance {
             None => MockServer::start(authoring_model(candidate_html.clone())),
         };
         let assessment = MockServer::start(|_, request| scripted_met(request));
-        let provider_endpoints = ProviderEndpoints::for_loopback(
-            format!("{}/v1", authoring.url()),
-            authoring.url(),
-        )
-        .expect("provider endpoints");
+        let provider_endpoints =
+            ProviderEndpoints::for_loopback(format!("{}/v1", authoring.url()), authoring.url())
+                .expect("provider endpoints");
         let assessment_endpoints = AssessmentEndpoints::for_loopback(
             assessment.url(),
             format!("{}/v1", assessment.url()),
@@ -794,8 +799,7 @@ impl Acceptance {
         let created = host
             .supervision_create(
                 PlanRequestActor::ApprovedOwner {
-                    owner: OwnerRef::new(OwnerKind::H3HtmlJob, "h3-acceptance-job")
-                        .expect("owner"),
+                    owner: OwnerRef::new(OwnerKind::H3HtmlJob, "h3-acceptance-job").expect("owner"),
                     source: herness_supervision::OwnerApprovalSource::H3ApprovedSettings,
                 },
                 CreateSupervisionRequest {
@@ -806,7 +810,10 @@ impl Acceptance {
                         .into_iter()
                         .map(|condition| ConditionInput {
                             title: condition.as_str().to_owned(),
-                            rubric: format!("H3 {} condition acceptance rubric", condition.as_str()),
+                            rubric: format!(
+                                "H3 {} condition acceptance rubric",
+                                condition.as_str()
+                            ),
                             checks: Vec::new(),
                         })
                         .collect(),
@@ -849,9 +856,8 @@ impl Acceptance {
         );
         host.store_handle()
             .commit_html_sync(
-                HtmlSyncCommit::new().with_settings(
-                    SettingsCommit::new(None, approval).expect("settings commit"),
-                ),
+                HtmlSyncCommit::new()
+                    .with_settings(SettingsCommit::new(None, approval).expect("settings commit")),
             )
             .expect("settings");
 
@@ -1077,11 +1083,8 @@ impl Acceptance {
             .find(|generation| generation.generation_id() == generation_id)
             .expect("current generation");
         let source = std::fs::read(self.root.join(TARGET)).expect("source");
-        let css = PublicationFileInput::new(
-            CSS,
-            std::fs::read(self.root.join(CSS)).expect("css"),
-        )
-        .expect("css input");
+        let css = PublicationFileInput::new(CSS, std::fs::read(self.root.join(CSS)).expect("css"))
+            .expect("css input");
         PreparedCandidate {
             document: self.document.clone(),
             record,
@@ -1159,9 +1162,11 @@ fn native_shell_external_edit_reaches_synced_through_the_real_adapter() {
     assert!(record.state().applicability().is_applicable());
     let (html, receipt) = h.files_exist();
     assert!(html && receipt, "both formal files must exist");
-    let receipt_text =
-        std::fs::read_to_string(h.root.join(herness_html_sync::html_evidence_path(&h.document)))
-            .expect("receipt");
+    let receipt_text = std::fs::read_to_string(
+        h.root
+            .join(herness_html_sync::html_evidence_path(&h.document)),
+    )
+    .expect("receipt");
     let receipt_json: Value = serde_json::from_str(&receipt_text).expect("receipt json");
     assert_eq!(receipt_json["schema"], "sdd-html-receipt");
     assert_eq!(receipt_json["version"], 1);
@@ -1187,7 +1192,10 @@ fn native_shell_external_edit_reaches_synced_through_the_real_adapter() {
             .iter()
             .all(|request| request.path == "/v1/responses")
     );
-    assert!(h.authoring.count() >= 3, "authoring tool calls and final turn");
+    assert!(
+        h.authoring.count() >= 3,
+        "authoring tool calls and final turn"
+    );
     // The raw source was never rewritten by the candidate run.
     let source = std::fs::read_to_string(h.root.join(TARGET)).expect("source");
     assert!(source.contains("750 ms"));
@@ -1195,9 +1203,10 @@ fn native_shell_external_edit_reaches_synced_through_the_real_adapter() {
 
     // No fake/static-only render may produce this result: the saved state says
     // the real render check passed and the accessibility source is host JS.
-    let candidate = record.state().fingerprints().get(
-        herness_html_sync::FingerprintKind::Candidate,
-    );
+    let candidate = record
+        .state()
+        .fingerprints()
+        .get(herness_html_sync::FingerprintKind::Candidate);
     assert!(candidate.is_some());
     assert_eq!(
         source,
@@ -1226,7 +1235,9 @@ fn discovered_dependencies_include_css_and_referenced_resources() {
     std::fs::write(root.join(CSS), "body { color: #111; }\n").expect("css");
 
     let settings = H3Settings::new(
-        "44444444-4444-4444-8444-444444444444".parse().expect("project"),
+        "44444444-4444-4444-8444-444444444444"
+            .parse()
+            .expect("project"),
         1,
         false,
         vec![TARGET.to_owned()],
@@ -1273,17 +1284,14 @@ fn every_structural_variant_is_denied_by_the_real_pack_without_writing() {
     let baseline = h.candidate_html.clone();
 
     let variants = [
-        (
-            "omission",
-            {
-                let start = baseline.find("<p id=\"decision\">").expect("decision");
-                let end = baseline[start..]
-                    .find("</p>")
-                    .map(|offset| start + offset + 4)
-                    .expect("decision end");
-                format!("{}{}", &baseline[..start], &baseline[end..])
-            },
-        ),
+        ("omission", {
+            let start = baseline.find("<p id=\"decision\">").expect("decision");
+            let end = baseline[start..]
+                .find("</p>")
+                .map(|offset| start + offset + 4)
+                .expect("decision end");
+            format!("{}{}", &baseline[..start], &baseline[end..])
+        }),
         (
             "changed-code",
             baseline.replace(
@@ -1356,7 +1364,10 @@ fn revoked_html_consent_blocks_every_assessment_send_and_publication() {
     let mut h = Acceptance::new(true);
     {
         let mut config = h.host.supervision().config().get(h.project);
-        let consent = config.consent(ProfilePurpose::Html).cloned().expect("consent");
+        let consent = config
+            .consent(ProfilePurpose::Html)
+            .cloned()
+            .expect("consent");
         let revoked = consent
             .revoke(herness_supervision::ApprovalActor::Human, Timestamp::now())
             .expect("revoke");
@@ -1385,8 +1396,8 @@ fn an_external_html_edit_becomes_waiting_human_and_is_never_overwritten() {
     );
     let external = b"<!doctype html><html><body><p>external edit</p></body></html>".to_vec();
     std::fs::write(h.root.join(COMPANION), &external).expect("external edit");
-    let signal = ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher)
-        .expect("companion signal");
+    let signal =
+        ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher).expect("companion signal");
     assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -1431,9 +1442,7 @@ fn a_seeded_latch_holds_the_document_and_never_starts_authoring() {
         document: h.document.clone(),
         snapshot: SourceSnapshot::new(
             SourceRevision::new(1).expect("revision"),
-            ContentDigest::sha256(
-                &std::fs::read(h.root.join(TARGET)).expect("source"),
-            ),
+            ContentDigest::sha256(&std::fs::read(h.root.join(TARGET)).expect("source")),
         ),
         change: SourceChange::Modified,
         trigger: ObservationTrigger::FileNotification,
@@ -1488,8 +1497,8 @@ fn reassess_reuses_the_saved_candidate_through_verification_and_assessment() {
         Timestamp::now(),
     )
     .expect("reassess request");
-    let view = composition::apply_document_operation(&mut h.host, request)
-        .expect("reassess operation");
+    let view =
+        composition::apply_document_operation(&mut h.host, request).expect("reassess operation");
     assert!(
         matches!(
             view.result.outcome(),
@@ -1534,8 +1543,8 @@ fn adopt_current_external_html_reaches_synced_with_a_valid_receipt() {
         .candidate_html
         .replace("Choosing a queue", "Choosing the queue");
     std::fs::write(h.root.join(COMPANION), &external).expect("external edit");
-    let signal = ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher)
-        .expect("companion signal");
+    let signal =
+        ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher).expect("companion signal");
     assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
     wait_for_external_conflict(&mut h);
 
@@ -1552,8 +1561,8 @@ fn adopt_current_external_html_reaches_synced_with_a_valid_receipt() {
         Timestamp::now(),
     )
     .expect("adoption request");
-    let view = composition::apply_document_operation(&mut h.host, request)
-        .expect("adoption operation");
+    let view =
+        composition::apply_document_operation(&mut h.host, request).expect("adoption operation");
     assert!(
         matches!(
             view.result.outcome(),
@@ -1607,8 +1616,8 @@ fn an_adoption_with_a_failing_evaluation_keeps_waiting_without_overwriting() {
     );
     assert_ne!(external, h.candidate_html);
     std::fs::write(h.root.join(COMPANION), &external).expect("external edit");
-    let signal = ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher)
-        .expect("companion signal");
+    let signal =
+        ChangeSignal::new(COMPANION, ChangeSource::FilesystemWatcher).expect("companion signal");
     assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
     wait_for_external_conflict(&mut h);
 
@@ -1625,8 +1634,8 @@ fn an_adoption_with_a_failing_evaluation_keeps_waiting_without_overwriting() {
         Timestamp::now(),
     )
     .expect("adoption request");
-    let view = composition::apply_document_operation(&mut h.host, request)
-        .expect("adoption operation");
+    let view =
+        composition::apply_document_operation(&mut h.host, request).expect("adoption operation");
     assert!(
         matches!(
             view.result.outcome(),
@@ -1652,8 +1661,7 @@ fn an_adoption_with_a_failing_evaluation_keeps_waiting_without_overwriting() {
 // Continuous source-change fixture.
 // ---------------------------------------------------------------------------
 
-const V2_SOURCE: &[u8] =
-    b"# Queue choice v2\n\nUse the durable queue with a 500 ms window.\n";
+const V2_SOURCE: &[u8] = b"# Queue choice v2\n\nUse the durable queue with a 500 ms window.\n";
 
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -1825,7 +1833,10 @@ fn continuous_model(v1_html: String, v2_html: String) -> MockHandler {
             .and_then(|items| items.last())
             .cloned()
             .unwrap_or(Value::Null);
-        let last_type = last.get("type").and_then(Value::as_str).unwrap_or("message");
+        let last_type = last
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
         let call_id = last.get("call_id").and_then(Value::as_str).unwrap_or("");
         let output = last.get("output").and_then(Value::as_str).unwrap_or("");
         if last_type != "function_call_output" {
@@ -1882,9 +1893,7 @@ fn start_first_authoring_run(h: &mut Acceptance) {
     h.host.pump().expect("first pump");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if h.host.html_sync().active_project() == Some(h.project)
-            && h.authoring.count() >= 1
-        {
+        if h.host.html_sync().active_project() == Some(h.project) && h.authoring.count() >= 1 {
             return;
         }
         h.host.pump().expect("pump");
@@ -1894,8 +1903,7 @@ fn start_first_authoring_run(h: &mut Acceptance) {
 }
 
 fn notify_source_changed(h: &mut Acceptance) {
-    let signal = ChangeSignal::new(TARGET, ChangeSource::FilesystemWatcher)
-        .expect("source signal");
+    let signal = ChangeSignal::new(TARGET, ChangeSource::FilesystemWatcher).expect("source signal");
     assert!(h.host.html_sync_mut().observe_signal(h.project, signal));
 }
 
@@ -1930,7 +1938,22 @@ fn continuous_source_change_supersedes_reissues_consent_and_reaches_synced() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(h.state(), H3State::Synced, "the new source must reach synced; reason={:?} generations={:?}", h.record().state().reason(), h.host.store_handle().html_sync_generations(h.project, &h.document).map(|generations| generations.into_iter().map(|generation| (generation.generation(), format!("{:?}", generation.status()))).collect::<Vec<_>>()));
+    assert_eq!(
+        h.state(),
+        H3State::Synced,
+        "the new source must reach synced; reason={:?} generations={:?}",
+        h.record().state().reason(),
+        h.host
+            .store_handle()
+            .html_sync_generations(h.project, &h.document)
+            .map(|generations| generations
+                .into_iter()
+                .map(|generation| (
+                    generation.generation(),
+                    format!("{:?}", generation.status())
+                ))
+                .collect::<Vec<_>>())
+    );
     assert_eq!(
         std::fs::read(h.root.join(COMPANION)).expect("companion"),
         v2_html.as_bytes(),
@@ -1955,12 +1978,10 @@ fn continuous_source_change_supersedes_reissues_consent_and_reaches_synced() {
                 | herness_html_sync::GenerationStatus::Completed
         )
     }));
-    let history = composition::history_view(&h.host, h.project, &h.document, 10)
-        .expect("history");
+    let history = composition::history_view(&h.host, h.project, &h.document, 10).expect("history");
     assert_eq!(history.generations.len(), 2);
     assert_ne!(
-        history.generations[0].candidate_html_digest,
-        history.generations[1].candidate_html_digest,
+        history.generations[0].candidate_html_digest, history.generations[1].candidate_html_digest,
         "the two versions have different candidate bytes"
     );
     let budget_after = h
@@ -2027,7 +2048,10 @@ fn consent_reissue_refuses_a_target_expansion_and_never_starts_the_new_generatio
     start_first_authoring_run(&mut h);
     {
         let mut config = h.host.supervision().config().get(h.project);
-        let consent = config.consent(ProfilePurpose::Html).cloned().expect("consent");
+        let consent = config
+            .consent(ProfilePurpose::Html)
+            .cloned()
+            .expect("consent");
         let scope = DisclosureScope::new(
             ProfilePurpose::Html,
             consent.scope().data_kinds().clone(),

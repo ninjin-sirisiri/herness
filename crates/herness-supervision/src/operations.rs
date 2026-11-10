@@ -486,9 +486,7 @@ pub fn execute_operation(
 ///
 /// This is the shared latch check used by the host composition and the
 /// operation itself. It never clears the latch and never resumes anything.
-pub fn ensure_owner_supersedable(
-    record: &SupervisionRecord,
-) -> Result<(), SupervisionError> {
+pub fn ensure_owner_supersedable(record: &SupervisionRecord) -> Result<(), SupervisionError> {
     match record.state() {
         SupervisionState::Ready
         | SupervisionState::Running
@@ -780,9 +778,7 @@ fn ensure_replacement_generation(
             OwnerSupersessionRejection::ConditionsMismatch,
         ));
     }
-    if replacement.work_packet().packet_version()
-        <= current.work_packet().packet_version()
-    {
+    if replacement.work_packet().packet_version() <= current.work_packet().packet_version() {
         return Err(rejected_supersession(
             OwnerSupersessionRejection::ConditionsMismatch,
         ));
@@ -841,9 +837,7 @@ fn replacement_actor(
     Ok(ApprovalActor::ApprovedOwner { owner, source })
 }
 
-fn supersession_recovery_rejection(
-    report: &RecoveryReport,
-) -> Option<OwnerSupersessionRejection> {
+fn supersession_recovery_rejection(report: &RecoveryReport) -> Option<OwnerSupersessionRejection> {
     match report.block_reasons().first() {
         Some(RecoveryBlockReason::BudgetExhausted { limit }) => {
             Some(OwnerSupersessionRejection::BudgetExhausted { limit: *limit })

@@ -123,10 +123,7 @@ impl H3StorePort for StoreHandle {
         self.lock().commit_html_sync(commit).map_err(H3Error::from)
     }
 
-    fn update_html_sync_publication(
-        &mut self,
-        journal: PublicationJournal,
-    ) -> Result<(), H3Error> {
+    fn update_html_sync_publication(&mut self, journal: PublicationJournal) -> Result<(), H3Error> {
         self.lock()
             .update_html_sync_publication(journal)
             .map_err(H3Error::from)

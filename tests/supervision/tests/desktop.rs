@@ -23,7 +23,8 @@ use herness_desktop::guard::{self, GuardError, Navigation};
 use herness_desktop::supervision::ChangeSupervisionRequest;
 use herness_desktop::supervision::assessment::AssessmentHost;
 use herness_desktop::supervision::plan::ConfigStore;
-use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};use herness_desktop::supervision::store::StoreHandle;
+use herness_desktop::supervision::runtime::{ChildIdentity, DesktopSupervisionRuntime};
+use herness_desktop::supervision::store::StoreHandle;
 use herness_desktop::supervision::{
     CheckInput, ConditionInput, ConfirmationKind, CreateSupervisionRequest, PlanRequestActor,
     SupersedeSupervisionRequest, SupervisionHost,
@@ -46,11 +47,11 @@ use herness_supervision::supervisor::{
 };
 use herness_supervision::{
     AdapterVersion, AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
-    ChangeKind, CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer, EvidenceOutcome,
-    EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind, OwnerLaunchRejection,
-    OwnerRef, OwnerSupersessionRejection, ProfilePurpose, ProfileThresholds, ProviderKind,
-    ProviderOrigin, RubricVersion, SupervisionError, SupervisionId, SupervisionRecord,
-    SupervisionRequestId, TargetReadSet, TargetVersion, WorkPacketRejection,
+    ChangeKind, CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer,
+    EvidenceOutcome, EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind,
+    OwnerLaunchRejection, OwnerRef, OwnerSupersessionRejection, ProfilePurpose, ProfileThresholds,
+    ProviderKind, ProviderOrigin, RubricVersion, SupervisionError, SupervisionId,
+    SupervisionRecord, SupervisionRequestId, TargetReadSet, TargetVersion, WorkPacketRejection,
 };
 use herness_supervision_tests::ScriptedOwnerApprovalRegistry;
 use tempfile::TempDir;
@@ -1428,12 +1429,7 @@ fn owner_supersession_after_confirmed_stop_updates_generation_and_starts_one_run
 
     // The human settings UI approved the new target scope version.
     harness.grant_completion(2);
-    let supersede = supersede_request(
-        harness.project,
-        created.supervision_id,
-        before.revision,
-        2,
-    );
+    let supersede = supersede_request(harness.project, created.supervision_id, before.revision, 2);
     let binding = harness
         .host
         .owner_supersession_binding(&mut harness.runtime, &supersede)
@@ -1506,12 +1502,14 @@ fn owner_supersession_after_confirmed_stop_updates_generation_and_starts_one_run
         record.change_log()[0].budget_after().runs_started(),
         before_usage.runs_started()
     );
-    assert!(record.change_log()[0]
-        .budget_after()
-        .active_seconds_consumed()
-        >= record.change_log()[0]
-            .budget_before()
-            .active_seconds_consumed());
+    assert!(
+        record.change_log()[0]
+            .budget_after()
+            .active_seconds_consumed()
+            >= record.change_log()[0]
+                .budget_before()
+                .active_seconds_consumed()
+    );
 
     // Exactly one new run starts in the same target and conversation.
     std::thread::sleep(supervision_interval());
@@ -1552,7 +1550,12 @@ fn owner_supersession_after_confirmed_stop_updates_generation_and_starts_one_run
     assert_eq!(duplicate.run_group.len(), started.run_group.len());
     assert_eq!(harness.runtime.starts, starts_before + 1);
     assert_eq!(
-        duplicate.budget.as_ref().expect("budget").usage.runs_started(),
+        duplicate
+            .budget
+            .as_ref()
+            .expect("budget")
+            .usage
+            .runs_started(),
         started_usage.runs_started()
     );
 }
@@ -1584,12 +1587,8 @@ fn stale_owner_registry_entry_is_refused_before_stop_or_generation_change() {
         .host
         .get(harness.project, created.supervision_id)
         .expect("view");
-    let mut supersede = supersede_request(
-        harness.project,
-        created.supervision_id,
-        view.revision,
-        2,
-    );
+    let mut supersede =
+        supersede_request(harness.project, created.supervision_id, view.revision, 2);
     supersede.conditions = Some(vec![ConditionInput {
         title: "Changed generation condition".to_owned(),
         rubric: "The changed target must be reassessed.".to_owned(),
@@ -1658,12 +1657,7 @@ fn crashed_owner_supersession_is_not_recorded_and_restart_neither_supersedes_nor
         .host
         .get(harness.project, created.supervision_id)
         .expect("view");
-    let supersede = supersede_request(
-        harness.project,
-        created.supervision_id,
-        view.revision,
-        2,
-    );
+    let supersede = supersede_request(harness.project, created.supervision_id, view.revision, 2);
     let binding = harness
         .host
         .owner_supersession_binding(&mut harness.runtime, &supersede)
@@ -1691,12 +1685,14 @@ fn crashed_owner_supersession_is_not_recorded_and_restart_neither_supersedes_nor
     assert_eq!(after_crash.target_version, 1);
     assert_eq!(after_crash.revision, view.revision);
     assert_eq!(harness.runtime.starts, 1);
-    assert!(harness
-        .store
-        .lock()
-        .command_result(supersede.request_id)
-        .expect("command lookup")
-        .is_none());
+    assert!(
+        harness
+            .store
+            .lock()
+            .command_result(supersede.request_id)
+            .expect("command lookup")
+            .is_none()
+    );
     let plan_after_crash = herness_desktop::supervision::plan::load_plan(
         &harness.store,
         harness.project,
@@ -1807,10 +1803,7 @@ fn model_actor_missing_confirmation_and_h4_never_start_a_run() {
         created.revision,
         None,
     );
-    assert!(matches!(
-        missing,
-        Err(SupervisionError::Unsupported { .. })
-    ));
+    assert!(matches!(missing, Err(SupervisionError::Unsupported { .. })));
     let wrong = harness.host.start(
         &mut harness.runtime,
         harness.project,
@@ -1819,10 +1812,7 @@ fn model_actor_missing_confirmation_and_h4_never_start_a_run() {
         created.revision,
         Some(harness.host.confirm(ConfirmationKind::Create)),
     );
-    assert!(matches!(
-        wrong,
-        Err(SupervisionError::Unsupported { .. })
-    ));
+    assert!(matches!(wrong, Err(SupervisionError::Unsupported { .. })));
     assert_eq!(harness.runtime.starts, 0);
 
     let h4_owner = OwnerRef::new(OwnerKind::H4SddTask, "task-6-fixture").expect("H4 owner");
@@ -1915,7 +1905,8 @@ fn restored_target_is_not_auto_started_and_human_start_still_works() {
         )
         .expect("human start after restore");
     assert_eq!(human.state, "running");
-    host.pump(&mut runtime, &[project]).expect("pump human start");
+    host.pump(&mut runtime, &[project])
+        .expect("pump human start");
     assert_eq!(runtime.starts, 1);
 }
 
@@ -2203,7 +2194,10 @@ fn legacy_plan_without_a_recoverable_packet_is_refused_explicitly() {
     let object = legacy.as_object_mut().expect("plan object");
     object.remove("formatVersion");
     object.remove("packet");
-    if let Some(contract) = object.get_mut("contract").and_then(|value| value.as_object_mut()) {
+    if let Some(contract) = object
+        .get_mut("contract")
+        .and_then(|value| value.as_object_mut())
+    {
         contract.remove("workPacket");
     }
     let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy bytes");
@@ -2873,7 +2867,8 @@ mod permission_composition {
                         instructions: PACKET_INSTRUCTION.to_owned(),
                         conditions: vec![super::ConditionInput {
                             title: "The real check passes".to_owned(),
-                            rubric: "The failing scripted check forces one continuation.".to_owned(),
+                            rubric: "The failing scripted check forces one continuation."
+                                .to_owned(),
                             checks: vec![super::CheckInput {
                                 command: "false".to_owned(),
                                 description: "scripted failing check".to_owned(),
@@ -3291,8 +3286,12 @@ mod permission_composition {
                 "purpose": "attempt shell while allowShell is false",
             }),
         ));
-        harness.server.push_sse(completions_text("first turn complete"));
-        harness.server.push_sse(completions_text("second turn complete"));
+        harness
+            .server
+            .push_sse(completions_text("first turn complete"));
+        harness
+            .server
+            .push_sse(completions_text("second turn complete"));
 
         let (_created, supervision) = harness.create_packet_started();
         let view = harness.pump_until(supervision, 5, 2);
@@ -3326,9 +3325,7 @@ mod permission_composition {
 
         let continuation = requests
             .iter()
-            .find(|request| {
-                String::from_utf8_lossy(&request.body).contains("Current deficiency:")
-            })
+            .find(|request| String::from_utf8_lossy(&request.body).contains("Current deficiency:"))
             .expect("the second run must include the current deficiency");
         let continuation = String::from_utf8_lossy(&continuation.body);
         assert!(
@@ -3581,10 +3578,7 @@ mod permission_composition {
         harness: &mut PermissionHost,
         connection: ConnectionId,
         budget: Option<HostBudgetInput>,
-    ) -> (
-        herness_desktop::supervision::SupervisionView,
-        SupervisionId,
-    ) {
+    ) -> (herness_desktop::supervision::SupervisionView, SupervisionId) {
         let project = harness.project;
         let view = harness
             .host
@@ -3631,13 +3625,10 @@ mod permission_composition {
         start_run: bool,
     ) -> BudgetPolicy {
         let store = harness.host.store_handle();
-        let plan = herness_desktop::supervision::plan::load_plan(
-            &store,
-            harness.project,
-            supervision,
-        )
-        .expect("load plan")
-        .expect("plan");
+        let plan =
+            herness_desktop::supervision::plan::load_plan(&store, harness.project, supervision)
+                .expect("load plan")
+                .expect("plan");
         let policy = plan.budget.policy().expect("budget policy");
         let mut ledger = BudgetLedger::open(
             store,
@@ -3844,14 +3835,17 @@ mod permission_composition {
         let html_facts = port
             .profile(html_profile.binding())
             .expect("html profile facts");
-        assert_eq!(html_facts.adapter_version().as_str(), "herness-llm-condition-v1");
+        assert_eq!(
+            html_facts.adapter_version().as_str(),
+            "herness-llm-condition-v1"
+        );
         let result = port.assess(&request).expect("html assessment");
         assert_eq!(result.purpose(), ProfilePurpose::Html);
+        assert_eq!(result.provenance().purpose(), Some(ProfilePurpose::Html));
         assert_eq!(
-            result.provenance().purpose(),
-            Some(ProfilePurpose::Html)
+            result.reported_verdict(),
+            herness_supervision::ConditionVerdict::Met
         );
-        assert_eq!(result.reported_verdict(), herness_supervision::ConditionVerdict::Met);
         assert_eq!(html_server.count(), 1);
         assert_eq!(harness.server.count(), 0);
         let html_body = html_server.requests()[0].json_body();
@@ -3898,7 +3892,10 @@ mod permission_composition {
         purposes.sort();
         assert_eq!(
             purposes,
-            vec!["completion_assessment".to_owned(), "html_assessment".to_owned()]
+            vec![
+                "completion_assessment".to_owned(),
+                "html_assessment".to_owned()
+            ]
         );
 
         let budget = harness
@@ -4065,7 +4062,8 @@ mod permission_composition {
             Timestamp::now(),
         )
         .expect("html assessment consent");
-        let authoring_origin = ProviderOrigin::parse(harness.server.url()).expect("authoring origin");
+        let authoring_origin =
+            ProviderOrigin::parse(harness.server.url()).expect("authoring origin");
         let authoring_request = DisclosureRequest::new(
             harness.project,
             authoring_origin,
@@ -4350,10 +4348,7 @@ mod permission_composition {
         );
         let error = port.assess(&oversized_request).unwrap_err();
         assert!(
-            matches!(
-                error,
-                SupervisionError::AssessmentContractViolation { .. }
-            ),
+            matches!(error, SupervisionError::AssessmentContractViolation { .. }),
             "unexpected oversize error: {error:?}"
         );
         assert_eq!(harness.server.count(), 0);

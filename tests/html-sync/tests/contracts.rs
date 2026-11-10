@@ -6,11 +6,11 @@
 use herness_core::{ExpectedTargetVersion, Timestamp};
 use herness_html_sync::{
     Applicability, ApplicabilityReason, ArchivedVersionRef, DocumentKey, FingerprintKind,
-    FingerprintSet, GenerationStatus, H3DocumentState, H3Error, H3Operation,
-    H3OperationOutcome, H3OperationRequest, H3OperationResult, H3Reason, H3Settings, H3State,
-    H3StateReasonKind, H3StopCause, PublicationJournal, PublicationStatus, RequestCommit,
-    SourceRevision, SourceSnapshot, StoredRequestResult, decode_record, document_state_event,
-    publication_event, settings_event,
+    FingerprintSet, GenerationStatus, H3DocumentState, H3Error, H3Operation, H3OperationOutcome,
+    H3OperationRequest, H3OperationResult, H3Reason, H3Settings, H3State, H3StateReasonKind,
+    H3StopCause, PublicationJournal, PublicationStatus, RequestCommit, SourceRevision,
+    SourceSnapshot, StoredRequestResult, decode_record, document_state_event, publication_event,
+    settings_event,
 };
 use herness_html_sync_tests::fixtures::{
     TARGET_PATH, accepted_result, authored_fingerprints, candidate, conflict_reason, digest,
@@ -65,23 +65,27 @@ fn versioned_reasons_require_actions_and_reject_unknown_formats_or_fields() {
         "resolve_html_conflict"
     );
 
-    assert!(H3Reason::new(
-        H3StateReasonKind::WaitingHuman {
-            cause: herness_html_sync::HumanWaitCause::PermissionDenied,
-        },
-        Vec::new(),
-    )
-    .is_err());
-    assert!(H3Reason::new(
-        H3StateReasonKind::Stopped {
-            cause: H3StopCause::HumanRequest,
-        },
-        vec![
-            herness_html_sync::RequiredAction::ResumeCycle,
-            herness_html_sync::RequiredAction::ResumeCycle,
-        ],
-    )
-    .is_err());
+    assert!(
+        H3Reason::new(
+            H3StateReasonKind::WaitingHuman {
+                cause: herness_html_sync::HumanWaitCause::PermissionDenied,
+            },
+            Vec::new(),
+        )
+        .is_err()
+    );
+    assert!(
+        H3Reason::new(
+            H3StateReasonKind::Stopped {
+                cause: H3StopCause::HumanRequest,
+            },
+            vec![
+                herness_html_sync::RequiredAction::ResumeCycle,
+                herness_html_sync::RequiredAction::ResumeCycle,
+            ],
+        )
+        .is_err()
+    );
 
     let encoded = serde_json::to_value(&reason).expect("serialize reason");
     assert_eq!(encoded["formatVersion"], 1);
@@ -154,10 +158,7 @@ fn dependency_fingerprints_stay_separate_and_invalidate_current_applicability() 
         None,
         None,
     );
-    assert_eq!(
-        base.changed_since(&changed_css),
-        Some(FingerprintKind::Css)
-    );
+    assert_eq!(base.changed_since(&changed_css), Some(FingerprintKind::Css));
     assert_eq!(
         base.changed_since(&base),
         None,
@@ -229,10 +230,19 @@ fn h3_identifiers_roundtrip_and_reject_other_projects_and_kinds() {
         assert!(value.contains(&project().to_string()));
     }
     assert_eq!(
-        ids.job.to_string().parse::<herness_html_sync::JobId>().unwrap(),
+        ids.job
+            .to_string()
+            .parse::<herness_html_sync::JobId>()
+            .unwrap(),
         ids.job
     );
-    assert!(ids.job.to_string().replace("h3_job", "h3_cycle").parse::<herness_html_sync::JobId>().is_err());
+    assert!(
+        ids.job
+            .to_string()
+            .replace("h3_job", "h3_cycle")
+            .parse::<herness_html_sync::JobId>()
+            .is_err()
+    );
     assert!(matches!(
         ids.job.validate_in(other_project()),
         Err(H3Error::CrossProject { .. })
@@ -304,15 +314,9 @@ fn past_generation_success_is_separate_from_current_synced_applicability() {
             .get(FingerprintKind::Resources)
             .unwrap()
             .clone(),
-        later_fingerprints
-            .get(FingerprintKind::Candidate)
-            .cloned(),
-        later_fingerprints
-            .get(FingerprintKind::Provenance)
-            .cloned(),
-        later_fingerprints
-            .get(FingerprintKind::Evidence)
-            .cloned(),
+        later_fingerprints.get(FingerprintKind::Candidate).cloned(),
+        later_fingerprints.get(FingerprintKind::Provenance).cloned(),
+        later_fingerprints.get(FingerprintKind::Evidence).cloned(),
     );
     let pending = H3DocumentState::new(
         document_key(),
@@ -334,17 +338,17 @@ fn past_generation_success_is_separate_from_current_synced_applicability() {
     assert_eq!(pending.state(), H3State::Pending);
     assert!(!pending.applicability().is_applicable());
     assert!(first.completed(), "the first past success stays in history");
-    assert!(second.completed(), "the second past success stays in history");
+    assert!(
+        second.completed(),
+        "the second past success stays in history"
+    );
 
-    assert!(generation(
-        ids.generation_one,
-        1,
-        first_source,
-        fingerprints(),
-    )
-    .complete(now())
-    .and_then(|record| record.complete(now()))
-    .is_err());
+    assert!(
+        generation(ids.generation_one, 1, first_source, fingerprints(),)
+            .complete(now())
+            .and_then(|record| record.complete(now()))
+            .is_err()
+    );
 }
 
 #[test]
@@ -355,66 +359,78 @@ fn operation_requests_enforce_scope_revision_and_canonical_idempotency() {
     assert!(request.operation().requires_expected_revision());
     assert_eq!(request.document(), Some(&document_key()));
 
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        project(),
-        None,
-        Some(1),
-        None,
-        H3Operation::Pause,
-        now(),
-    )
-    .is_err());
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        project(),
-        Some(document_key()),
-        None,
-        None,
-        H3Operation::Pause,
-        now(),
-    )
-    .is_err());
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        project(),
-        Some(document_key()),
-        Some(0),
-        None,
-        H3Operation::Pause,
-        now(),
-    )
-    .is_err());
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        project(),
-        Some(document_key()),
-        None,
-        None,
-        H3Operation::ListDocuments,
-        now(),
-    )
-    .is_err());
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        project(),
-        Some(document_key()),
-        None,
-        Some(digest("source")),
-        H3Operation::GetDocument,
-        now(),
-    )
-    .is_ok());
-    assert!(H3OperationRequest::new(
-        ids.request_two,
-        other_project(),
-        None,
-        None,
-        None,
-        H3Operation::ListDocuments,
-        now(),
-    )
-    .is_err());
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            project(),
+            None,
+            Some(1),
+            None,
+            H3Operation::Pause,
+            now(),
+        )
+        .is_err()
+    );
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            project(),
+            Some(document_key()),
+            None,
+            None,
+            H3Operation::Pause,
+            now(),
+        )
+        .is_err()
+    );
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            project(),
+            Some(document_key()),
+            Some(0),
+            None,
+            H3Operation::Pause,
+            now(),
+        )
+        .is_err()
+    );
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            project(),
+            Some(document_key()),
+            None,
+            None,
+            H3Operation::ListDocuments,
+            now(),
+        )
+        .is_err()
+    );
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            project(),
+            Some(document_key()),
+            None,
+            Some(digest("source")),
+            H3Operation::GetDocument,
+            now(),
+        )
+        .is_ok()
+    );
+    assert!(
+        H3OperationRequest::new(
+            ids.request_two,
+            other_project(),
+            None,
+            None,
+            None,
+            H3Operation::ListDocuments,
+            now(),
+        )
+        .is_err()
+    );
 
     let same = herness_html_sync_tests::fixtures::pause_request(ids.request_one, 1);
     assert_eq!(request.fingerprint(), same.fingerprint());
@@ -485,8 +501,14 @@ fn publication_journal_links_to_h1_and_never_claims_an_unobserved_success() {
     assert_eq!(journal.h1_request_id().as_str(), "h1-publication-1");
     assert!(journal.old_html().is_none());
 
-    let journal = journal.replacing(now()).expect("absent target is replaceable");
-    assert!(journal.published(digest("<html>candidate</html>"), now()).is_ok());
+    let journal = journal
+        .replacing(now())
+        .expect("absent target is replaceable");
+    assert!(
+        journal
+            .published(digest("<html>candidate</html>"), now())
+            .is_ok()
+    );
 
     let existing = PublicationJournal::new(
         ids.publication,
@@ -502,7 +524,12 @@ fn publication_journal_links_to_h1_and_never_claims_an_unobserved_success() {
     )
     .expect("journal");
     assert!(existing.clone().replacing(now()).is_err());
-    assert!(existing.clone().old_versions_saved(None, None, now()).is_err());
+    assert!(
+        existing
+            .clone()
+            .old_versions_saved(None, None, now())
+            .is_err()
+    );
     let saved = existing
         .old_versions_saved(
             Some(
@@ -514,11 +541,19 @@ fn publication_journal_links_to_h1_and_never_claims_an_unobserved_success() {
         )
         .expect("old version saved");
     let replacing = saved.replacing(now()).expect("replaceable");
-    assert!(replacing.published(digest("<html>candidate</html>"), now()).is_ok());
+    assert!(
+        replacing
+            .published(digest("<html>candidate</html>"), now())
+            .is_ok()
+    );
 
     assert!(ArchivedVersionRef::new("/absolute.json", digest("x")).is_err());
     assert!(ArchivedVersionRef::new("../escape.json", digest("x")).is_err());
-    assert!(journal_with_status().failed(PublicationStatus::Published, "bad", now()).is_err());
+    assert!(
+        journal_with_status()
+            .failed(PublicationStatus::Published, "bad", now())
+            .is_err()
+    );
 }
 
 fn journal_with_status() -> PublicationJournal {
@@ -536,49 +571,55 @@ fn document_state_rejects_inconsistent_applicability_and_cross_project_ids() {
     let ids = ids(project());
     let source = source("source v1");
     let synced = herness_html_sync_tests::fixtures::synced_reason(ids.generation_two, &source);
-    assert!(H3DocumentState::new(
-        document_key(),
-        1,
-        Some(ids.job),
-        Some(ids.cycle),
-        Some(ids.generation_two),
-        source.clone(),
-        fingers(),
-        synced,
-        None,
-        Vec::new(),
-        Applicability::not_applicable(ApplicabilityReason::NeverPublished),
-        now(),
-    )
-    .is_err());
+    assert!(
+        H3DocumentState::new(
+            document_key(),
+            1,
+            Some(ids.job),
+            Some(ids.cycle),
+            Some(ids.generation_two),
+            source.clone(),
+            fingers(),
+            synced,
+            None,
+            Vec::new(),
+            Applicability::not_applicable(ApplicabilityReason::NeverPublished),
+            now(),
+        )
+        .is_err()
+    );
 
     let other_job = herness_html_sync::JobId::from_parts(other_project(), uuid::Uuid::nil());
-    assert!(H3DocumentState::new(
-        document_key(),
-        1,
-        Some(other_job),
-        Some(ids.cycle),
-        Some(ids.generation_two),
-        source.clone(),
-        fingers(),
-        pending_reason(1),
-        None,
-        Vec::new(),
-        Applicability::not_applicable(ApplicabilityReason::NeverPublished),
-        now(),
-    )
-    .is_err());
+    assert!(
+        H3DocumentState::new(
+            document_key(),
+            1,
+            Some(other_job),
+            Some(ids.cycle),
+            Some(ids.generation_two),
+            source.clone(),
+            fingers(),
+            pending_reason(1),
+            None,
+            Vec::new(),
+            Applicability::not_applicable(ApplicabilityReason::NeverPublished),
+            now(),
+        )
+        .is_err()
+    );
 
-    assert!(H3Settings::new(
-        project(),
-        1,
-        true,
-        vec!["docs/../escape.md".to_owned()],
-        true,
-        true,
-        now(),
-    )
-    .is_err());
+    assert!(
+        H3Settings::new(
+            project(),
+            1,
+            true,
+            vec!["docs/../escape.md".to_owned()],
+            true,
+            true,
+            now(),
+        )
+        .is_err()
+    );
     let settings = settings(true);
     let enabled = settings.clone().enable(now()).expect("enable");
     assert_eq!(enabled.version(), 2);
@@ -690,10 +731,7 @@ fn public_document_status_is_versioned_and_carries_sequence_applicability_and_re
 
 #[test]
 fn settings_and_operation_results_roundtrip_without_unknown_fields() {
-    let request = herness_html_sync_tests::fixtures::pause_request(
-        ids(project()).request_one,
-        1,
-    );
+    let request = herness_html_sync_tests::fixtures::pause_request(ids(project()).request_one, 1);
     let result = accepted_result(&request, 2).with_final_project_sequence(4);
     let bytes = serde_json::to_vec(&result).expect("serialize");
     let decoded: H3OperationResult =
@@ -705,8 +743,7 @@ fn settings_and_operation_results_roundtrip_without_unknown_fields() {
 
     let settings = settings(true);
     let encoded = serde_json::to_vec(&settings).expect("settings bytes");
-    let decoded: H3Settings =
-        herness_html_sync::decode_record(&encoded).expect("settings decode");
+    let decoded: H3Settings = herness_html_sync::decode_record(&encoded).expect("settings decode");
     assert_eq!(decoded, settings);
     let mut future: serde_json::Value = serde_json::from_slice(&encoded).expect("value");
     future["formatVersion"] = json!(99);

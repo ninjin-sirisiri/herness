@@ -852,10 +852,9 @@ impl fmt::Display for ArgumentViolation {
                 f,
                 "must contain at most {max} Unicode scalar values, found {actual}"
             ),
-            Self::TooLongBytes { actual, max } => write!(
-                f,
-                "must contain at most {max} UTF-8 bytes, found {actual}"
-            ),
+            Self::TooLongBytes { actual, max } => {
+                write!(f, "must contain at most {max} UTF-8 bytes, found {actual}")
+            }
             Self::MustBePositive => f.write_str("must be a positive integer"),
             Self::Invalid { detail } => f.write_str(detail),
         }
@@ -1131,9 +1130,7 @@ impl fmt::Display for ArtifactFailure {
                 f,
                 "the host artifact store returned an unexpected body or version for {artifact}"
             ),
-            Self::Unavailable => {
-                f.write_str("the host candidate artifact store is not available")
-            }
+            Self::Unavailable => f.write_str("the host candidate artifact store is not available"),
             Self::NotExecutable { detail } => {
                 write!(f, "operation was not executed: {detail}")
             }
@@ -1149,7 +1146,10 @@ impl fmt::Display for PublicationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest { field, violation } => {
-                write!(f, "invalid publication request field {field:?}: {violation}")
+                write!(
+                    f,
+                    "invalid publication request field {field:?}: {violation}"
+                )
             }
             Self::CrossProject { expected, found } => write!(
                 f,
@@ -1180,10 +1180,16 @@ impl fmt::Display for PublicationFailure {
             }
             Self::Stopped { detail } => write!(f, "publication stopped: {detail}"),
             Self::OldVersionSaveFailed { detail } => {
-                write!(f, "the old version was not saved, so no replacement occurred: {detail}")
+                write!(
+                    f,
+                    "the old version was not saved, so no replacement occurred: {detail}"
+                )
             }
             Self::ArchiveUnavailable { detail } => {
-                write!(f, "the private publication archive is unavailable: {detail}")
+                write!(
+                    f,
+                    "the private publication archive is unavailable: {detail}"
+                )
             }
             Self::RecordUnavailable { detail } => {
                 write!(f, "the publication record store is unavailable: {detail}")
@@ -1201,10 +1207,7 @@ impl fmt::Display for PublicationFailure {
                 f,
                 "publication may be applied but its result is not durable; reconciliation required: {detail}"
             ),
-            Self::ReconciliationRequired {
-                request_id,
-                detail,
-            } => write!(
+            Self::ReconciliationRequired { request_id, detail } => write!(
                 f,
                 "publication request {request_id} requires reconciliation: {detail}"
             ),

@@ -120,7 +120,10 @@ fn legacy_snapshot(conn: &Connection) -> LegacySnapshot {
     );
     values.insert(
         "model_requests",
-        relation(conn, "SELECT attempt_id FROM model_requests ORDER BY attempt_id"),
+        relation(
+            conn,
+            "SELECT attempt_id FROM model_requests ORDER BY attempt_id",
+        ),
     );
     values.insert(
         "supervised_state",
@@ -231,11 +234,7 @@ fn seed_schema_eight(config: &StoreConfig) -> LegacySnapshot {
         "INSERT INTO operations (operation_id, project_id, run_id, tool, arguments, cwd,
                                  policy_version, permission_mode, recorded_at)
          VALUES (?1, ?2, ?3, 'write', '{\"path\":\"notes.txt\"}', '/tmp', 7, 'configured', 11)",
-        rusqlite::params![
-            operation.to_string(),
-            project.to_string(),
-            run.to_string(),
-        ],
+        rusqlite::params![operation.to_string(), project.to_string(), run.to_string(),],
     )
     .unwrap();
     conn.execute(
@@ -390,7 +389,9 @@ fn schema_eight_rows_and_ids_survive_the_ordered_migration_to_nine() {
         "html_sync_requests",
     ] {
         let rows: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .expect("table count");
         assert_eq!(rows, 0, "{table} must start empty");
     }
@@ -459,9 +460,7 @@ fn settings_and_documents_use_revision_cas_and_reject_foreign_projects() {
         .commit_html_sync(
             HtmlSyncCommit::new()
                 .with_settings(SettingsCommit::new(Some(2), settings(true)).expect("commit"))
-                .with_events(vec![
-                    settings_event(&settings(true), now()).expect("event")
-                ]),
+                .with_events(vec![settings_event(&settings(true), now()).expect("event")]),
         )
         .expect_err("stale settings revision");
     assert!(matches!(
@@ -624,15 +623,14 @@ fn duplicate_request_returns_the_stored_result_without_another_write_or_event() 
     let error = store
         .commit_html_sync(
             HtmlSyncCommit::new()
-                .with_document(DocumentCommit::new(Some(2), pending_document(source("v2"))).expect("commit"))
+                .with_document(
+                    DocumentCommit::new(Some(2), pending_document(source("v2"))).expect("commit"),
+                )
                 .with_request(request_commit(conflicting, 3))
                 .with_events(vec![]),
         )
         .expect_err("same request id with another request");
-    assert!(matches!(
-        error,
-        StoreError::HtmlSyncRequestConflict { .. }
-    ));
+    assert!(matches!(error, StoreError::HtmlSyncRequestConflict { .. }));
     assert_eq!(event_count(&store, project), before_events + 1);
 }
 
@@ -647,12 +645,7 @@ fn competing_writers_fail_cas_before_history_or_events_change() {
     create_document(&mut store);
     let before_events = event_count(&store, project);
 
-    let first_generation = generation(
-        ids.generation_one,
-        1,
-        source("source v1"),
-        fingerprints(),
-    );
+    let first_generation = generation(ids.generation_one, 1, source("source v1"), fingerprints());
     let first_state = pending_document_with(source("source v1"), Some(ids.generation_one));
     let first_event =
         document_state_event(&key, Some(H3State::Pending), &first_state, now()).expect("event");
@@ -665,12 +658,7 @@ fn competing_writers_fail_cas_before_history_or_events_change() {
         )
         .expect("first writer");
 
-    let second_generation = generation(
-        ids.generation_two,
-        2,
-        source("source v2"),
-        fingerprints(),
-    );
+    let second_generation = generation(ids.generation_two, 2, source("source v2"), fingerprints());
     let second_state = pending_document_with(source("source v2"), Some(ids.generation_two));
     let second_event =
         document_state_event(&key, Some(H3State::Pending), &second_state, now()).expect("event");
@@ -918,8 +906,8 @@ fn cycles_generations_candidates_publication_and_history_are_persisted() {
         second_source.clone(),
         second_fingerprints,
     );
-    let event = document_state_event(&key, Some(H3State::Synced), &synced_two, now())
-        .expect("event");
+    let event =
+        document_state_event(&key, Some(H3State::Synced), &synced_two, now()).expect("event");
     store
         .commit_html_sync(
             HtmlSyncCommit::new()
@@ -933,11 +921,11 @@ fn cycles_generations_candidates_publication_and_history_are_persisted() {
     let history = store.html_sync_generations(project, &key).expect("history");
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].generation_id(), ids.generation_one);
-    assert_eq!(history[0].status(), herness_html_sync::GenerationStatus::Superseded);
-    assert!(
-        history[0].completed(),
-        "past success survives supersession"
+    assert_eq!(
+        history[0].status(),
+        herness_html_sync::GenerationStatus::Superseded
     );
+    assert!(history[0].completed(), "past success survives supersession");
     assert!(history[1].completed());
     let document = store
         .load_html_sync_document(project, &key)
@@ -1012,12 +1000,7 @@ fn generation_status_can_progress_but_immutable_source_or_evidence_cannot_shrink
     let ids = ids(project);
     create_settings(&mut store);
 
-    let active = generation(
-        ids.generation_one,
-        1,
-        source("source v1"),
-        fingerprints(),
-    );
+    let active = generation(ids.generation_one, 1, source("source v1"), fingerprints());
     let state = pending_document_with(source("source v1"), Some(ids.generation_one));
     let event = document_state_event(&key, None, &state, now()).expect("event");
     store
@@ -1049,12 +1032,7 @@ fn generation_status_can_progress_but_immutable_source_or_evidence_cannot_shrink
         )
         .expect("completion update");
 
-    let different_source = generation(
-        ids.generation_one,
-        1,
-        source("different"),
-        fingerprints(),
-    );
+    let different_source = generation(ids.generation_one, 1, source("different"), fingerprints());
     let state = pending_document_with(source("source v1"), Some(ids.generation_one));
     let event = document_state_event(&key, Some(H3State::Pending), &state, now()).expect("event");
     let error = store
@@ -1160,23 +1138,22 @@ fn candidate_store_is_private_generation_scoped_and_enforces_the_limits() {
         Some("body{}".to_owned()),
     )
     .expect("generation request");
-    let opened = store.open_generation(request.clone()).expect("open generation");
+    let opened = store
+        .open_generation(request.clone())
+        .expect("open generation");
     let handle = opened.handle().clone();
     assert_eq!(handle.project_id(), project());
     assert_eq!(handle.job_id(), "job-1");
     assert_eq!(handle.generation(), 1);
     assert_eq!(opened.storage().namespace().len(), 64);
-    assert!(opened
-        .storage()
-        .namespace()
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit()));
-    assert_eq!(
+    assert!(
         opened
-            .document()
-            .target_path(),
-        TARGET_PATH
+            .storage()
+            .namespace()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     );
+    assert_eq!(opened.document().target_path(), TARGET_PATH);
 
     let mut port = store.clone();
     let source_snapshot = port
@@ -1241,12 +1218,7 @@ fn candidate_store_is_private_generation_scoped_and_enforces_the_limits() {
     .expect("compare-and-swap candidate");
 
     assert!(matches!(
-        port.write_artifact(
-            &handle,
-            ArtifactSlot::SourceMarkdown,
-            "changed",
-            None
-        ),
+        port.write_artifact(&handle, ArtifactSlot::SourceMarkdown, "changed", None),
         Err(ArtifactFailure::NotCandidateTarget {
             artifact: ArtifactSlot::SourceMarkdown
         })
@@ -1274,22 +1246,27 @@ fn candidate_store_is_private_generation_scoped_and_enforces_the_limits() {
         "<html>third</html>"
     );
 
-    let foreign_project = ArtifactHandle::new(other_project(), "job-1", 1, "token-1").expect("handle");
-    assert!(port
-        .read_artifact(&foreign_project, ArtifactSlot::CandidateHtml)
-        .is_err());
+    let foreign_project =
+        ArtifactHandle::new(other_project(), "job-1", 1, "token-1").expect("handle");
+    assert!(
+        port.read_artifact(&foreign_project, ArtifactSlot::CandidateHtml)
+            .is_err()
+    );
     let foreign_job = ArtifactHandle::new(project(), "job-2", 1, "token-1").expect("handle");
-    assert!(port
-        .read_artifact(&foreign_job, ArtifactSlot::CandidateHtml)
-        .is_err());
+    assert!(
+        port.read_artifact(&foreign_job, ArtifactSlot::CandidateHtml)
+            .is_err()
+    );
     let foreign_generation = ArtifactHandle::new(project(), "job-1", 2, "token-1").expect("handle");
-    assert!(port
-        .read_artifact(&foreign_generation, ArtifactSlot::CandidateHtml)
-        .is_err());
+    assert!(
+        port.read_artifact(&foreign_generation, ArtifactSlot::CandidateHtml)
+            .is_err()
+    );
     let foreign_token = ArtifactHandle::new(project(), "job-1", 1, "token-2").expect("handle");
-    assert!(port
-        .read_artifact(&foreign_token, ArtifactSlot::CandidateHtml)
-        .is_err());
+    assert!(
+        port.read_artifact(&foreign_token, ArtifactSlot::CandidateHtml)
+            .is_err()
+    );
 
     let reopened = store
         .open_generation(request.clone())
@@ -1317,13 +1294,8 @@ fn candidate_store_is_private_generation_scoped_and_enforces_the_limits() {
     roots.sort();
     assert_eq!(roots.len(), 1, "one generation directory");
     assert_eq!(roots[0].to_string_lossy().len(), 64);
-    let manifest = std::fs::read(
-        harness
-            .candidate_root
-            .join(&roots[0])
-            .join("manifest.json"),
-    )
-    .expect("manifest");
+    let manifest = std::fs::read(harness.candidate_root.join(&roots[0]).join("manifest.json"))
+        .expect("manifest");
     assert!(
         !String::from_utf8_lossy(&manifest).contains("token-1"),
         "the raw capability token is not persisted"

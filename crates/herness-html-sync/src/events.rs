@@ -14,9 +14,7 @@ use serde_json::json;
 
 use crate::document::DocumentKey;
 use crate::error::H3Error;
-use crate::state::{
-    H3DocumentState, H3Settings, H3State, PublicationJournal, PublicationStatus,
-};
+use crate::state::{H3DocumentState, H3Settings, H3State, PublicationJournal, PublicationStatus};
 
 /// Host-activity kind for one H3 document.
 pub const H3_DOCUMENT_ACTIVITY_KIND: &str = "html_sync.document";
@@ -89,7 +87,13 @@ pub fn settings_event(
         "retainHistory": settings.retain_history(),
         "settingsFingerprint": settings.fingerprint(),
     });
-    project_event(settings.project_id(), activity_id, H3_SETTINGS_EVENT_KIND, occurred_at, payload)
+    project_event(
+        settings.project_id(),
+        activity_id,
+        H3_SETTINGS_EVENT_KIND,
+        occurred_at,
+        payload,
+    )
 }
 
 /// Builds one publication journal status event.

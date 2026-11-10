@@ -465,11 +465,9 @@ fn scripted_judge(fixture: &Fixture, case: &Case, method: Method) -> JudgeOutcom
     let usability = "met";
     let render = "met";
 
-    let disposition = if [information, support, usability, render].contains(&"unmet")
-    {
+    let disposition = if [information, support, usability, render].contains(&"unmet") {
         Disposition::Reject
-    } else if [information, support, usability, render].contains(&"insufficient")
-    {
+    } else if [information, support, usability, render].contains(&"insufficient") {
         Disposition::Hold
     } else {
         Disposition::Sync

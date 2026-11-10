@@ -91,7 +91,10 @@ impl CandidateGenerationRequest {
             return Err(H3Error::empty("jobId"));
         }
         if job_id.chars().any(char::is_control) {
-            return Err(H3Error::invalid("jobId", "control characters are not allowed"));
+            return Err(H3Error::invalid(
+                "jobId",
+                "control characters are not allowed",
+            ));
         }
         if let Some(token) = &token
             && (token.trim().is_empty() || token.chars().any(char::is_control))
@@ -105,9 +108,7 @@ impl CandidateGenerationRequest {
         if source_markdown.len() > MAX_SOURCE_MARKDOWN_BYTES {
             return Err(H3Error::invalid(
                 "sourceMarkdown",
-                format!(
-                    "the Markdown source exceeds the {MAX_SOURCE_MARKDOWN_BYTES} byte limit"
-                ),
+                format!("the Markdown source exceeds the {MAX_SOURCE_MARKDOWN_BYTES} byte limit"),
             ));
         }
         Ok(Self {
@@ -266,8 +267,7 @@ impl CandidateArtifactStore {
             let bytes = fs::read(&manifest_path).map_err(|error| H3Error::Storage {
                 detail: format!("candidate manifest: {error}"),
             })?;
-            let existing_manifest =
-                crate::version::decode_record::<CandidateManifest>(&bytes)?;
+            let existing_manifest = crate::version::decode_record::<CandidateManifest>(&bytes)?;
             if existing_manifest != manifest {
                 return Err(H3Error::RecordConflict {
                     record: "candidate generation",
@@ -291,8 +291,8 @@ impl CandidateArtifactStore {
         if let Some(content) = &request.shared_css {
             write_atomic(&directory.join(SLOT_CSS), content.as_bytes())?;
         }
-        let manifest_bytes = crate::version::encode_record(&manifest)
-            .map_err(|error| H3Error::Storage {
+        let manifest_bytes =
+            crate::version::encode_record(&manifest).map_err(|error| H3Error::Storage {
                 detail: format!("candidate manifest: {error}"),
             })?;
         write_atomic(&manifest_path, &manifest_bytes)?;
@@ -335,16 +335,16 @@ impl CandidateArtifactStore {
         {
             return Ok(CandidateVerification::Missing);
         }
-        let html = read_optional_slot(&directory, ArtifactSlot::CandidateHtml).map_err(|error| {
-            H3Error::Storage {
-                detail: format!("candidate html read: {error}"),
-            }
-        })?;
-        let provenance = read_optional_slot(&directory, ArtifactSlot::CandidateProvenance).map_err(
-            |error| H3Error::Storage {
+        let html =
+            read_optional_slot(&directory, ArtifactSlot::CandidateHtml).map_err(|error| {
+                H3Error::Storage {
+                    detail: format!("candidate html read: {error}"),
+                }
+            })?;
+        let provenance = read_optional_slot(&directory, ArtifactSlot::CandidateProvenance)
+            .map_err(|error| H3Error::Storage {
                 detail: format!("candidate provenance read: {error}"),
-            },
-        )?;
+            })?;
         match (html, provenance) {
             (None, _) | (_, None) => Ok(CandidateVerification::Missing),
             (Some(html), Some(provenance)) => {
@@ -426,7 +426,8 @@ impl CandidateArtifactStore {
         &self,
         handle: &ArtifactHandle,
     ) -> Result<(PathBuf, CandidateManifest), ArtifactFailure> {
-        let namespace = candidate_namespace(handle.project_id(), handle.job_id(), handle.generation());
+        let namespace =
+            candidate_namespace(handle.project_id(), handle.job_id(), handle.generation());
         let directory = self.generation_directory(&namespace);
         let manifest_path = directory.join(MANIFEST_FILE);
         let bytes = match fs::read(&manifest_path) {
@@ -519,9 +520,7 @@ impl ArtifactPort for CandidateArtifactStore {
         }
         if content.len() > MAX_CANDIDATE_BYTES {
             return Err(ArtifactFailure::NotExecutable {
-                detail: format!(
-                    "candidate content exceeds the {MAX_CANDIDATE_BYTES} byte limit"
-                ),
+                detail: format!("candidate content exceeds the {MAX_CANDIDATE_BYTES} byte limit"),
             });
         }
         let (directory, _manifest) = self.resolve(handle)?;
@@ -663,7 +662,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), H3Error> {
     let directory = path.parent().ok_or_else(|| H3Error::Storage {
         detail: "candidate path has no parent".to_owned(),
     })?;
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
     let temp = directory.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let result = (|| -> io::Result<()> {
         let mut options = OpenOptions::new();

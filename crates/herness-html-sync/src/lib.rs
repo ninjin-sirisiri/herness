@@ -19,8 +19,8 @@ pub mod config;
 pub mod coordinator;
 pub mod document;
 pub mod error;
-pub mod evidence;
 pub mod events;
+pub mod evidence;
 pub mod ids;
 pub mod observer;
 pub mod operations;
@@ -42,18 +42,18 @@ pub use candidate::{
     MAX_SOURCE_MARKDOWN_BYTES, OpenedCandidateGeneration,
 };
 pub use config::{
-    APPROVED_AUTHORING_CONCURRENCY, APPROVED_DOCUMENT_PUBLICATION_CONCURRENCY,
-    H3ApprovalLimits, H3ApprovalState, H3Approver, H3ConfigurationApproval,
-    H3ConfigurationDraft, H3ConnectionApproval, H3OwnerBinding, H3PackBinding, H3ScopeChange,
-    H3ScopeChangeKind, H3VersionBinding, HOST_API_PROTOCOL, HOST_API_VERSION,
-    MAX_APPROVED_ADDITIONAL_RUNS, MAX_APPROVED_CANDIDATE_BYTES, MAX_APPROVED_CONSECUTIVE_STALLS,
+    APPROVED_AUTHORING_CONCURRENCY, APPROVED_DOCUMENT_PUBLICATION_CONCURRENCY, H3ApprovalLimits,
+    H3ApprovalState, H3Approver, H3ConfigurationApproval, H3ConfigurationDraft,
+    H3ConnectionApproval, H3OwnerBinding, H3PackBinding, H3ScopeChange, H3ScopeChangeKind,
+    H3VersionBinding, HOST_API_PROTOCOL, HOST_API_VERSION, MAX_APPROVED_ADDITIONAL_RUNS,
+    MAX_APPROVED_CANDIDATE_BYTES, MAX_APPROVED_CONSECUTIVE_STALLS,
     MAX_APPROVED_CYCLE_ACTIVE_SECONDS, MAX_APPROVED_RECONCILE_INTERVAL_MS,
     MAX_APPROVED_RENDER_TIMEOUT_MS, MAX_APPROVED_SETTLE_MS, MAX_APPROVED_SOURCE_BYTES,
-    MAX_APPROVED_SVG_ELEMENTS, PACK_INTEGRATION_HOST, PACK_INTEGRATION_SCHEMA,
-    PACK_POLICY_VERSION, StoreBackedOwnerApprovalRegistry,
+    MAX_APPROVED_SVG_ELEMENTS, PACK_INTEGRATION_HOST, PACK_INTEGRATION_SCHEMA, PACK_POLICY_VERSION,
+    StoreBackedOwnerApprovalRegistry,
 };
 pub use coordinator::{
-    ActiveOwner, APP_WIDE_AUTHORING_CONCURRENCY, AuthoringBrief, AuthoringControlPort,
+    APP_WIDE_AUTHORING_CONCURRENCY, ActiveOwner, AuthoringBrief, AuthoringControlPort,
     AuthoringGate, AuthoringJob, CandidateAuthored, CandidateIntake, CoordinatorPorts,
     CoordinatorTick, DOCUMENT_PUBLICATION_CONCURRENCY, GenerationStarted, HeldAuthoring,
     OfferOutcome, OwnerGateRequest, OwnerProgress, OwnerStartRequest, OwnerStarted,
@@ -64,27 +64,24 @@ pub use document::{
     SourceSnapshot,
 };
 pub use error::H3Error;
+pub use events::{
+    H3_DOCUMENT_ACTIVITY_KIND, H3_PROJECT_ACTIVITY_KIND, H3_PUBLICATION_EVENT_KIND,
+    H3_SETTINGS_EVENT_KIND, H3_STATE_EVENT_KIND, document_state_event, publication_event,
+    publication_status_label, settings_event,
+};
 pub use evidence::{
     AppliedEvaluation, AssessmentPlan, AssessmentSlice, CheckSet, ConditionAdoption,
     ConditionBinding, ConditionEvidenceRef, ConditionEvidenceSummary, CoverageReport,
     EvaluationBinding, EvaluationDisposition, EvaluationDispositionState, EvaluationSplit,
     EvidenceBuildInput, EvidenceCheckResult, EvidenceContentKind, EvidenceContentSource,
     EvidenceContentStore, EvidenceDocumentContent, EvidenceFingerprints, EvidenceImage,
-    EvidenceOrigin, EvidencePack, EvidenceValidationError, H3Condition, HOST_JS_ACCESSIBILITY_SOURCE,
-    H3_EVIDENCE_CONTENT_SCHEMA, H3_EVIDENCE_SCHEMA, H3_RENDER_MANIFEST_VERSION,
+    EvidenceOrigin, EvidencePack, EvidenceValidationError, H3_EVIDENCE_CONTENT_SCHEMA,
+    H3_EVIDENCE_SCHEMA, H3_RENDER_MANIFEST_VERSION, H3Condition, HOST_JS_ACCESSIBILITY_SOURCE,
     MAX_DEFAULT_SLICE_BYTES, MAX_DEFAULT_SLICE_UNITS, NATIVE_RENDER_SOURCE, Provenance,
     RenderCandidateFingerprints, RenderConfigurationEvidence, RenderEvidence, RenderPngEvidence,
     RenderSignalEvidence, RequiredCheck, RequiredCheckKind, ScannedHtml, SliceAssessment,
-    SourceUnitDefinition, SourceUnits, StrictRequirement, SupportEvidence, SupplementaryEvidence,
+    SourceUnitDefinition, SourceUnits, StrictRequirement, SupplementaryEvidence, SupportEvidence,
     UnitEvidence, UsabilityEvidence,
-};
-pub use rubric::{
-    ConditionRubric, H3_RUBRIC_SCHEMA, H3_RUBRIC_VERSION, RubricSet, condition_rubric,
-};
-pub use events::{
-    H3_DOCUMENT_ACTIVITY_KIND, H3_PROJECT_ACTIVITY_KIND, H3_PUBLICATION_EVENT_KIND,
-    H3_SETTINGS_EVENT_KIND, H3_STATE_EVENT_KIND, document_state_event, publication_event,
-    publication_status_label, settings_event,
 };
 pub use ids::{
     CandidateId, CycleId, GenerationId, H3KeyKind, H3RequestId, H3ScopedId, JobId, PublicationId,
@@ -113,11 +110,11 @@ pub use ports::{
 };
 pub use publish::{
     BuiltReceipt, CandidatePublication, FinalCandidateCheck, FinalCandidateCheckPort,
-    FinalCandidateCheckRequest, HostPublicationPort, PublicationFileInput,
-    PublicationFileReadPort, PublicationOrchestrator, PublicationOutcome,
-    PublicationPolicyIdentity, PublicationSafety, PublicationSafetyPort, PublicationSafetyRequest,
-    PublicationWriteExpectationPort, RECEIPT_CONTRACT, RECEIPT_DIRECTORY, RECEIPT_SCHEMA,
-    RECEIPT_VERSION, SHARED_STYLESHEET, build_publication_receipt,
+    FinalCandidateCheckRequest, HostPublicationPort, PublicationFileInput, PublicationFileReadPort,
+    PublicationOrchestrator, PublicationOutcome, PublicationPolicyIdentity, PublicationSafety,
+    PublicationSafetyPort, PublicationSafetyRequest, PublicationWriteExpectationPort,
+    RECEIPT_CONTRACT, RECEIPT_DIRECTORY, RECEIPT_SCHEMA, RECEIPT_VERSION, SHARED_STYLESHEET,
+    build_publication_receipt,
 };
 pub use recovery::{
     CandidateBytes, CandidateRecovery, DocumentRecovery, H2RecoveryFacts, H2RequestUnknown,
@@ -129,6 +126,9 @@ pub use recovery::{
 pub use request::{
     ConflictResolution, H3Operation, H3OperationOutcome, H3OperationRequest, H3OperationResult,
     H3RequestFingerprint, RequestCommit, StoredRequestResult, decode_stored_request_result,
+};
+pub use rubric::{
+    ConditionRubric, H3_RUBRIC_SCHEMA, H3_RUBRIC_VERSION, RubricSet, condition_rubric,
 };
 pub use state::{
     Applicability, ApplicabilityReason, ArchivedVersionRef, CandidateRecord, CandidateStorageRef,

@@ -392,16 +392,26 @@ fn h3_policy_bridge_capability_is_available_without_claiming_worker_or_dispatch(
     );
 
     let encoded = serde_json::to_value(h3).expect("serialize capabilities");
-    assert_eq!(encoded["policyBridge"], serde_json::json!({"status": "available"}));
+    assert_eq!(
+        encoded["policyBridge"],
+        serde_json::json!({"status": "available"})
+    );
     assert_eq!(encoded["htmlWorker"]["status"], "unavailable");
     assert_eq!(encoded["authoringDispatch"]["status"], "unavailable");
-    assert_eq!(encoded["authoringDispatch"]["reason"], "not_implemented_yet");
+    assert_eq!(
+        encoded["authoringDispatch"]["reason"],
+        "not_implemented_yet"
+    );
 
     let flipped = h3.with_status(
         HostCapability::AuthoringDispatch,
         CapabilityStatus::Available,
     );
-    assert!(flipped.status(HostCapability::AuthoringDispatch).is_available());
+    assert!(
+        flipped
+            .status(HostCapability::AuthoringDispatch)
+            .is_available()
+    );
     assert!(!flipped.status(HostCapability::HtmlWorker).is_available());
     assert!(flipped.status(HostCapability::PolicyBridge).is_available());
 }

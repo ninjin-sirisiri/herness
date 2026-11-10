@@ -2303,12 +2303,8 @@ fn target_version_matches_html_range_consent(
     let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    record.get("schema").and_then(serde_json::Value::as_str)
-        == Some("h3-range-consent-reissue-v1")
-        && record
-            .get("purpose")
-            .and_then(serde_json::Value::as_str)
-            == Some("html")
+    record.get("schema").and_then(serde_json::Value::as_str) == Some("h3-range-consent-reissue-v1")
+        && record.get("purpose").and_then(serde_json::Value::as_str) == Some("html")
         && record
             .get("targetVersion")
             .and_then(serde_json::Value::as_u64)

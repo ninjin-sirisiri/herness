@@ -15,20 +15,20 @@ use herness_core::runtime::{
     AgentSpec, RunToolContext, Runtime, RuntimeDependencies, RuntimeToolExecutor, ToolExecution,
 };
 use herness_core::{
-    AbsolutePath, AgentId, ArtifactFailure, ArtifactHandle, ArtifactPort, ArtifactSlot,
-    ArtifactSnapshot, AuthMethod, Checkpoint, CheckpointCommit, CheckpointFormatVersion,
-    CheckpointPayload, ConnectionAdmin, ConnectionDirectory, ConnectionId, ConnectionSettings,
-    ConversationFailure, CoreError, CredentialAvailability, CredentialKind, CredentialPort,
-    CredentialService, CredentialVault, Endpoint, EngineEvent, EngineFailureKind, EngineInput,
-    EnginePort, EngineStart, EvaluationRequest, EvaluatorAvailability, FileVersion,
-    FrozenOperation, GrantScope, HistoryLimit, HistoryQuery, MatchMethod, ModelRequestGatePort,
-    ModelRequestObservation, OperationOutcome, PermissionDecision, PermissionEvaluatorPort,
-    PermissionMode, PermissionPolicy, PermissionRule, PolicyAdmin, PortFeature, ProjectId,
-    Provider, RequestGateIntent, RequestGateOutcome, RequestGateRefusal, RequestOutcome,
-    ResolvedCredential, RuleTarget, RunControl, RunId, RunPermissionContext, RunState,
-    SecretString, SessionId, SharedPermissionEvaluator, SharedPolicy, StopReason, StopReport,
-    StoreFailureKind, StorePort, TokenCount, TokenUsage, ToolExecutor, ToolName, VaultAccount,
-    VaultFailure, ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, hash_bytes,
+    ARTIFACT_CHANGE_EVENT_KIND, ARTIFACT_CHANGE_INTENDED_EVENT_KIND, AbsolutePath, AgentId,
+    ArtifactFailure, ArtifactHandle, ArtifactPort, ArtifactSlot, ArtifactSnapshot, AuthMethod,
+    Checkpoint, CheckpointCommit, CheckpointFormatVersion, CheckpointPayload, ConnectionAdmin,
+    ConnectionDirectory, ConnectionId, ConnectionSettings, ConversationFailure, CoreError,
+    CredentialAvailability, CredentialKind, CredentialPort, CredentialService, CredentialVault,
+    Endpoint, EngineEvent, EngineFailureKind, EngineInput, EnginePort, EngineStart,
+    EvaluationRequest, EvaluatorAvailability, FileVersion, FrozenOperation, GrantScope,
+    HistoryLimit, HistoryQuery, MatchMethod, ModelRequestGatePort, ModelRequestObservation,
+    OperationOutcome, PermissionDecision, PermissionEvaluatorPort, PermissionMode,
+    PermissionPolicy, PermissionRule, PolicyAdmin, PortFeature, ProjectId, Provider,
+    RequestGateIntent, RequestGateOutcome, RequestGateRefusal, RequestOutcome, ResolvedCredential,
+    RuleTarget, RunControl, RunId, RunPermissionContext, RunState, SecretString, SessionId,
+    SharedPermissionEvaluator, SharedPolicy, StopReason, StopReport, StoreFailureKind, StorePort,
+    TokenCount, TokenUsage, ToolExecutor, ToolName, VaultAccount, VaultFailure, hash_bytes,
 };
 use herness_engine_pi::{PiEngine, PiEngineConfig, ProviderEndpoints};
 use herness_store::{Store, StoreConfig};
@@ -2882,11 +2882,8 @@ impl ArtifactPort for EngineArtifactPort {
                 .any(|event| event.kind().as_str() == ARTIFACT_CHANGE_INTENDED_EVENT_KIND);
             state.intent_seen_before_write = !pending.is_empty() && intended;
         }
-        let snapshot = ArtifactSnapshot::new(
-            artifact,
-            hash_bytes(content.as_bytes()),
-            content.to_owned(),
-        );
+        let snapshot =
+            ArtifactSnapshot::new(artifact, hash_bytes(content.as_bytes()), content.to_owned());
         state.artifacts.insert(artifact, snapshot.clone());
         state.writes += 1;
         Ok(snapshot)
@@ -2910,10 +2907,7 @@ fn candidate_policy() -> PermissionPolicy {
     admin.policy().clone()
 }
 
-fn candidate_fixture(
-    connection: ConnectionId,
-    responses: Responses,
-) -> (MockServer, Fixture) {
+fn candidate_fixture(connection: ConnectionId, responses: Responses) -> (MockServer, Fixture) {
     let server = MockServer::start({
         let responses = responses.clone();
         move |_request| responses.next()
@@ -2988,8 +2982,7 @@ fn candidate_context_exposes_only_candidate_tools_and_applies_one_change() {
     ));
     responses.push(responses_text("candidate written"));
 
-    let (_, _, run, start) =
-        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let (_, _, run, start) = engine_start_candidate(&fixture, "You are a test agent.", handle);
     let event_store = Arc::clone(&fixture.store);
     let event_project = fixture.project_id;
     let mut engine = fixture.engine;
@@ -3026,10 +3019,7 @@ fn candidate_context_exposes_only_candidate_tools_and_applies_one_change() {
         intended.payload().as_value()["rationale"],
         "author the candidate"
     );
-    assert_eq!(
-        intended.payload().as_value()["artifact"],
-        "candidate_html"
-    );
+    assert_eq!(intended.payload().as_value()["artifact"], "candidate_html");
     assert!(stored.iter().any(|event| {
         event.kind().as_str() == ARTIFACT_CHANGE_EVENT_KIND
             && event.payload().as_value()["rationale"] == "author the candidate"
@@ -3050,10 +3040,22 @@ fn candidate_context_exposes_only_candidate_tools_and_applies_one_change() {
     assert!(first.contains("\"candidate_read\""));
     assert!(first.contains("\"candidate_write\""));
     assert!(first.contains("\"candidate_edit\""));
-    assert!(!first.contains("\"bash\""), "candidate runs must not expose shell");
-    assert!(!first.contains("\"write\""), "candidate runs must not expose native write");
-    assert!(!first.contains("\"edit\""), "candidate runs must not expose native edit");
-    assert!(!first.contains("\"read\""), "candidate runs must not expose native read");
+    assert!(
+        !first.contains("\"bash\""),
+        "candidate runs must not expose shell"
+    );
+    assert!(
+        !first.contains("\"write\""),
+        "candidate runs must not expose native write"
+    );
+    assert!(
+        !first.contains("\"edit\""),
+        "candidate runs must not expose native edit"
+    );
+    assert!(
+        !first.contains("\"read\""),
+        "candidate runs must not expose native read"
+    );
 }
 
 #[test]
@@ -3102,8 +3104,7 @@ fn candidate_context_rejects_forbidden_targets_and_empty_rationale_without_chang
     ));
     responses.push(responses_text("forbidden attempts rejected"));
 
-    let (_, _, run, start) =
-        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let (_, _, run, start) = engine_start_candidate(&fixture, "You are a test agent.", handle);
     let event_store = Arc::clone(&fixture.store);
     let event_project = fixture.project_id;
     let mut engine = fixture.engine;
@@ -3159,12 +3160,8 @@ fn candidate_context_rejects_a_stopped_run_before_the_artifact_write() {
     );
     responses.push(responses_text("late candidate"));
     let control = RunControl::new();
-    let (_, _, run, start) = engine_start_candidate_with_control(
-        &fixture,
-        "You are a test agent.",
-        control,
-        handle,
-    );
+    let (_, _, run, start) =
+        engine_start_candidate_with_control(&fixture, "You are a test agent.", control, handle);
     let event_store = Arc::clone(&fixture.store);
     let event_project = fixture.project_id;
     let mut engine = fixture.engine;
@@ -3196,8 +3193,7 @@ fn candidate_context_without_a_host_port_fails_explicitly() {
     let responses = Responses::new(Vec::new());
     let (server, fixture) = candidate_fixture(connection, responses);
     let handle = artifact_handle(&fixture, 1, "candidate-token");
-    let (_, _, _, start) =
-        engine_start_candidate(&fixture, "You are a test agent.", handle);
+    let (_, _, _, start) = engine_start_candidate(&fixture, "You are a test agent.", handle);
     let mut engine = fixture.engine;
     let error = engine.start(start).expect_err("missing artifact port");
     assert_eq!(
@@ -3208,8 +3204,6 @@ fn candidate_context_without_a_host_port_fails_explicitly() {
     );
     assert_eq!(server.request_count(), 0);
 }
-
-
 
 fn rewritten_checkpoint(
     checkpoint: &Checkpoint,

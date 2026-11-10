@@ -196,10 +196,16 @@ impl fmt::Display for PolicyBridgeError {
                 write!(f, "policy bridge unavailable: {tool} is {status}")
             }
             Self::PackUnavailable { detail } => {
-                write!(f, "policy bridge unavailable: pack cannot be read: {detail}")
+                write!(
+                    f,
+                    "policy bridge unavailable: pack cannot be read: {detail}"
+                )
             }
             Self::IntegrationInvalid { detail } => {
-                write!(f, "policy bridge unavailable: invalid pack integration metadata: {detail}")
+                write!(
+                    f,
+                    "policy bridge unavailable: invalid pack integration metadata: {detail}"
+                )
             }
             Self::IntegrationMismatch {
                 field,
@@ -226,17 +232,26 @@ impl fmt::Display for PolicyBridgeError {
                 "policy bridge unavailable: host API {found}, approved {approved}"
             ),
             Self::MissingCapability { operation } => {
-                write!(f, "policy bridge unavailable: missing capability {operation}")
+                write!(
+                    f,
+                    "policy bridge unavailable: missing capability {operation}"
+                )
             }
             Self::InvalidMetadata { detail } => {
-                write!(f, "policy bridge unavailable: invalid host API metadata: {detail}")
+                write!(
+                    f,
+                    "policy bridge unavailable: invalid host API metadata: {detail}"
+                )
             }
             Self::InvalidJson { detail, exit_code } => write!(
                 f,
                 "policy bridge unavailable: invalid JSON (exit {exit_code:?}): {detail}"
             ),
             Self::Timeout { timeout_ms } => {
-                write!(f, "policy bridge unavailable: host API timed out after {timeout_ms} ms")
+                write!(
+                    f,
+                    "policy bridge unavailable: host API timed out after {timeout_ms} ms"
+                )
             }
             Self::ProcessFailed { detail, exit_code } => write!(
                 f,
@@ -406,20 +421,19 @@ impl HtmlPolicyBridge {
                     error.kind()
                 ),
             })?;
-        let definition: IntegrationDefinition = serde_json::from_slice(&definition_bytes)
-            .map_err(|error| PolicyBridgeError::IntegrationInvalid {
-                detail: error.to_string(),
+        let definition: IntegrationDefinition =
+            serde_json::from_slice(&definition_bytes).map_err(|error| {
+                PolicyBridgeError::IntegrationInvalid {
+                    detail: error.to_string(),
+                }
             })?;
         definition
             .validate()
             .map_err(|detail| PolicyBridgeError::IntegrationInvalid { detail })?;
         let definition_digest = ContentDigest::sha256(&definition_bytes);
         let policy_fingerprint = policy_fingerprint(pack.root())?;
-        let pack_fingerprint = pack_fingerprint(
-            &definition,
-            &definition_digest,
-            &policy_fingerprint,
-        )?;
+        let pack_fingerprint =
+            pack_fingerprint(&definition, &definition_digest, &policy_fingerprint)?;
         let probe = PackProbe {
             integration_schema: definition.schema.clone(),
             integration_version: definition.version,
@@ -427,7 +441,12 @@ impl HtmlPolicyBridge {
             definition_digest: definition_digest.clone(),
             policy_version: definition.pack.policy.clone(),
             policy_fingerprint,
-            host_api_protocol: definition.capability.requires.policy_bridge.protocol.clone(),
+            host_api_protocol: definition
+                .capability
+                .requires
+                .policy_bridge
+                .protocol
+                .clone(),
             host_api_version: definition.capability.requires.policy_bridge.version,
             pack_fingerprint,
         };
@@ -507,7 +526,10 @@ impl HtmlPolicyBridge {
     /// the exact integration definition, policy module bytes, and combined
     /// fingerprint must match the approved binding. A mismatch is unavailable
     /// before any process starts.
-    pub fn connect(self, approved: &H3PackBinding) -> Result<ConnectedPolicyBridge, PolicyBridgeError> {
+    pub fn connect(
+        self,
+        approved: &H3PackBinding,
+    ) -> Result<ConnectedPolicyBridge, PolicyBridgeError> {
         self.verify_approved(approved)?;
         let (envelope, capabilities) = self.call("capabilities", json!({}))?;
         let operations = validate_capabilities(&capabilities, &self.probe)?;
@@ -592,11 +614,7 @@ impl HtmlPolicyBridge {
         Ok(())
     }
 
-    fn call(
-        &self,
-        operation: &str,
-        extra: Value,
-    ) -> Result<(Value, Value), PolicyBridgeError> {
+    fn call(&self, operation: &str, extra: Value) -> Result<(Value, Value), PolicyBridgeError> {
         let mut request = Map::new();
         request.insert("version".to_owned(), json!(1));
         request.insert("operation".to_owned(), json!(operation));
@@ -616,12 +634,11 @@ impl HtmlPolicyBridge {
             detail: "the host API wrote non-UTF-8 output".to_owned(),
             exit_code: None,
         })?;
-        let envelope: Value = serde_json::from_str(&text).map_err(|error| {
-            PolicyBridgeError::InvalidJson {
+        let envelope: Value =
+            serde_json::from_str(&text).map_err(|error| PolicyBridgeError::InvalidJson {
                 detail: error.to_string(),
                 exit_code: None,
-            }
-        })?;
+            })?;
         let ok = envelope.get("ok").and_then(Value::as_bool).ok_or_else(|| {
             PolicyBridgeError::InvalidMetadata {
                 detail: "the host API envelope has no boolean ok".to_owned(),
@@ -647,11 +664,13 @@ impl HtmlPolicyBridge {
                 detail: "the host API envelope version or operation does not match".to_owned(),
             });
         }
-        let result = envelope.get("result").cloned().ok_or_else(|| {
-            PolicyBridgeError::InvalidMetadata {
-                detail: "the host API envelope has no result".to_owned(),
-            }
-        })?;
+        let result =
+            envelope
+                .get("result")
+                .cloned()
+                .ok_or_else(|| PolicyBridgeError::InvalidMetadata {
+                    detail: "the host API envelope has no result".to_owned(),
+                })?;
         Ok((envelope, result))
     }
 
@@ -842,9 +861,7 @@ impl ConnectedPolicyBridge {
                 detail: "discover requires at least one path".to_owned(),
             });
         }
-        let (_, result) = self
-            .inner
-            .call("discover", json!({ "paths": paths }))?;
+        let (_, result) = self.inner.call("discover", json!({ "paths": paths }))?;
         Ok(result)
     }
 
@@ -882,9 +899,7 @@ impl ConnectedPolicyBridge {
             extra.insert("receipt".to_owned(), json!(receipt));
         }
         extra.insert("inputs".to_owned(), encode_inputs(inputs));
-        let (_, result) = self
-            .inner
-            .call("candidate-check", Value::Object(extra))?;
+        let (_, result) = self.inner.call("candidate-check", Value::Object(extra))?;
         CandidateCheck::from_value(result)
     }
 
@@ -892,13 +907,13 @@ impl ConnectedPolicyBridge {
         let mut total: u64 = 0;
         for bytes in inputs.values() {
             let size = bytes.len() as u64;
-            total = total.checked_add(size).ok_or_else(|| {
-                PolicyBridgeError::LimitExceeded {
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| PolicyBridgeError::LimitExceeded {
                     field: "inputs.total".to_owned(),
                     limit: 64 * 1024 * 1024,
                     actual: u64::MAX,
-                }
-            })?;
+                })?;
         }
         if total > 64 * 1024 * 1024 {
             return Err(PolicyBridgeError::LimitExceeded {
@@ -991,12 +1006,11 @@ impl CandidateCheck {
                 detail: "candidate-check has no stage".to_owned(),
             })?
             .to_owned();
-        let final_pass = value
-            .get("final")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| PolicyBridgeError::InvalidMetadata {
+        let final_pass = value.get("final").and_then(Value::as_bool).ok_or_else(|| {
+            PolicyBridgeError::InvalidMetadata {
                 detail: "candidate-check has no final flag".to_owned(),
-            })?;
+            }
+        })?;
         let final_binding = value
             .get("final_binding")
             .and_then(Value::as_bool)
@@ -1010,11 +1024,13 @@ impl CandidateCheck {
                 detail: "candidate-check has no contract".to_owned(),
             })?
             .to_owned();
-        let digests = value.get("digests").cloned().ok_or_else(|| {
-            PolicyBridgeError::InvalidMetadata {
-                detail: "candidate-check has no digests".to_owned(),
-            }
-        })?;
+        let digests =
+            value
+                .get("digests")
+                .cloned()
+                .ok_or_else(|| PolicyBridgeError::InvalidMetadata {
+                    detail: "candidate-check has no digests".to_owned(),
+                })?;
         let input_digests = value.get("input_digests").cloned().ok_or_else(|| {
             PolicyBridgeError::InvalidMetadata {
                 detail: "candidate-check has no input_digests".to_owned(),
@@ -1096,20 +1112,19 @@ fn findings(value: Option<&Value>) -> Result<Vec<PolicyFinding>, PolicyBridgeErr
     let Some(value) = value else {
         return Ok(Vec::new());
     };
-    let items = value.as_array().ok_or_else(|| {
-        PolicyBridgeError::InvalidMetadata {
+    let items = value
+        .as_array()
+        .ok_or_else(|| PolicyBridgeError::InvalidMetadata {
             detail: "candidate-check findings must be an array".to_owned(),
-        }
-    })?;
+        })?;
     items
         .iter()
         .map(|item| {
-            let code = item
-                .get("code")
-                .and_then(Value::as_str)
-                .ok_or_else(|| PolicyBridgeError::InvalidMetadata {
+            let code = item.get("code").and_then(Value::as_str).ok_or_else(|| {
+                PolicyBridgeError::InvalidMetadata {
                     detail: "a candidate-check finding has no code".to_owned(),
-                })?;
+                }
+            })?;
             let message = item
                 .get("message")
                 .and_then(Value::as_str)
@@ -1273,8 +1288,7 @@ fn encode_inputs(inputs: &BTreeMap<String, Vec<u8>>) -> Value {
 /// Standard base64 without padding ambiguity. Kept local so the policy bridge
 /// adds no dependency and has no encoder hidden behind a feature.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = chunk[0];
@@ -1305,11 +1319,10 @@ fn policy_fingerprint(pack_root: &Path) -> Result<ContentDigest, PolicyBridgeErr
     let directory = pack_root.join("scripts/sddlib");
     let mut hasher = Sha256::new();
     for name in POLICY_FILES {
-        let bytes = fs::read(directory.join(name)).map_err(|error| {
-            PolicyBridgeError::PackUnavailable {
+        let bytes =
+            fs::read(directory.join(name)).map_err(|error| PolicyBridgeError::PackUnavailable {
                 detail: format!("cannot read policy module {name}: {:?}", error.kind()),
-            }
-        })?;
+            })?;
         hasher.update(name.as_bytes());
         hasher.update([0]);
         hasher.update(bytes.len().to_string().as_bytes());
@@ -1337,7 +1350,14 @@ fn pack_fingerprint(
     component(&definition.pack.policy);
     component(policy_fingerprint.as_str());
     component(&definition.capability.requires.policy_bridge.protocol);
-    component(&definition.capability.requires.policy_bridge.version.to_string());
+    component(
+        &definition
+            .capability
+            .requires
+            .policy_bridge
+            .version
+            .to_string(),
+    );
     Ok(finish_digest(hasher))
 }
 
