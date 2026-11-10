@@ -1578,12 +1578,13 @@ fn validate_approval(
             selection.method_ids().join(",")
         ));
     }
-    if let Some((fixture, required)) = per_fixture_worst.iter().max_by_key(|(_, value)| *value) {
-        if per_fixture_max != 0 && per_fixture_max < *required {
-            refusal.push(format!(
-                "requestPlan.requestBudget.perFixtureMax must be at least {required} for fixture {fixture} under the selected plan"
-            ));
-        }
+    if let Some((fixture, required)) = per_fixture_worst.iter().max_by_key(|(_, value)| *value)
+        && per_fixture_max != 0
+        && per_fixture_max < *required
+    {
+        refusal.push(format!(
+            "requestPlan.requestBudget.perFixtureMax must be at least {required} for fixture {fixture} under the selected plan"
+        ));
     }
 
     if !refusal.is_empty() {
@@ -3738,10 +3739,12 @@ fn wrong_connection_auth_provider_model_or_origin_refuses_before_send() {
 
     // A gate-valid approval can still be refused by the real connection
     // preflight. That refusal happens before send as well.
-    let mut driver = RecordingDriver::default();
-    driver.prepare_refusal = Some(vec![
-        "the approved normal-LLM connection is not ChatGPT login".to_owned(),
-    ]);
+    let mut driver = RecordingDriver {
+        prepare_refusal: Some(vec![
+            "the approved normal-LLM connection is not ChatGPT login".to_owned(),
+        ]),
+        ..RecordingDriver::default()
+    };
     let run = run_with_value(
         Some(&valid_approval()),
         &mut driver,
