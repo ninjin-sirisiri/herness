@@ -1432,6 +1432,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "herness-sdd-execute"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-html-sync",
+ "herness-supervision",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "herness-sdd-execute-tests"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-html-sync",
+ "herness-sdd-execute",
+ "herness-supervision",
+ "serde_json",
+]
+
+[[package]]
 name = "herness-store"
 version = "0.1.0"
 dependencies = [
