@@ -33,13 +33,14 @@ use uuid::Uuid;
 use crate::assessment::{AssessmentRequest, AssessmentResult};
 use crate::budget::{BudgetLimit, H2_STAGNATION_CYCLES};
 use crate::command::{CommandResult, SupervisionCommand};
-use crate::conditions::{Condition, ConditionVersion, RequiredCheck};
+use crate::conditions::{Condition, ConditionMode, ConditionVersion, RequiredCheck};
 use crate::contract::SupervisionContract;
 use crate::error::SupervisionError;
 use crate::evidence::{
-    CheckStatus, ContentDigest, EvidenceRecord, RequiredCheckResult, TargetVersion,
+    CheckStatus, ContentDigest, EvidenceInvocation, EvidenceRecord, RequiredCheckResult,
+    TargetVersion,
 };
-use crate::freshness::TargetManifest;
+use crate::freshness::{TargetManifest, input_manifest_digest};
 use crate::ids::{
     BudgetRequestId, CheckId, ConditionId, DecisionId, EvidenceId, SupervisionId,
     SupervisionRequestId,
@@ -542,6 +543,8 @@ impl<'a> Supervisor<'a> {
             }
         }
 
+        let remaining_active_seconds = self.ports.budget.remaining_active_seconds()?;
+
         for check in contract.conditions().checks() {
             if next.supervisor().cycle_checks_done().contains(&check.id()) {
                 continue;
@@ -575,6 +578,8 @@ impl<'a> Supervisor<'a> {
                 evidence_id,
                 sequence,
                 check.operation().clone(),
+                check.invocation().clone(),
+                remaining_active_seconds,
                 contract.evidence_target().read_set().to_vec(),
             );
             let execution = match self.ports.checks.execute(&check_request) {
@@ -588,7 +593,18 @@ impl<'a> Supervisor<'a> {
                     );
                 }
             };
-            if !execution_matches(record, check, &execution, evidence_id) {
+            let expected_invocation = match expected_invocation(check, &manifest) {
+                Ok(expected) => expected,
+                Err(_) => {
+                    return self.fail(
+                        record,
+                        record.clone(),
+                        request,
+                        SupervisionFailure::VerificationUnavailable,
+                    );
+                }
+            };
+            if !execution_matches(record, check, &expected_invocation, &execution, evidence_id) {
                 return self.fail(
                     record,
                     record.clone(),
@@ -699,7 +715,7 @@ impl<'a> Supervisor<'a> {
             return self.finish_cycle(record, request, &manifest, &evidence);
         };
 
-        if !self.ports.assessment.requires_assessment(condition) {
+        if condition.mode() == ConditionMode::Checks {
             return self
                 .assess_deterministic_condition(record, request, condition, &manifest, &evidence);
         }
@@ -807,10 +823,18 @@ impl<'a> Supervisor<'a> {
                 all_pass = false;
                 break;
             };
+            let expected = match expected_invocation(check, manifest) {
+                Ok(expected) => expected,
+                Err(_) => {
+                    all_pass = false;
+                    break;
+                }
+            };
             if stored.status() != CheckStatus::Pass
                 || stored.check_id() != Some(check.id())
                 || stored.condition_id() != Some(check.condition_id())
                 || stored.operation() != check.operation()
+                || stored.invocation() != Some(&expected)
                 || !evidence_applies(manifest, stored)
             {
                 all_pass = false;
@@ -1324,11 +1348,19 @@ impl<'a> Supervisor<'a> {
         record: &SupervisionRecord,
         contract: &SupervisionContract,
     ) -> Result<TargetManifest, SupervisionError> {
+        let mut read_set = contract.evidence_target().read_set().to_vec();
+        for check in contract.conditions().checks() {
+            for path in check.invocation().input_paths() {
+                if !read_set.contains(path) {
+                    read_set.push(path.clone());
+                }
+            }
+        }
         let request = TargetSnapshotRequest::new(
             record.project_id(),
             record.supervision_id(),
             record.target_version(),
-            contract.evidence_target().read_set().to_vec(),
+            read_set,
         );
         self.ports.runtime.target_snapshot(&request)
     }
@@ -1462,6 +1494,7 @@ fn reusable_check_result(
     manifest: &TargetManifest,
     evidence: &[EvidenceRecord],
 ) -> Result<Option<RequiredCheckResult>, SupervisionError> {
+    let expected = expected_invocation(check, manifest)?;
     let mut candidates = evidence
         .iter()
         .filter(|item| {
@@ -1469,6 +1502,7 @@ fn reusable_check_result(
                 && item.condition_id() == Some(check.condition_id())
                 && item.status() == CheckStatus::Pass
                 && item.operation() == check.operation()
+                && item.invocation() == Some(&expected)
                 && evidence_applies(manifest, item)
         })
         .collect::<Vec<_>>();
@@ -1480,9 +1514,22 @@ fn reusable_check_result(
     Ok(Some(result))
 }
 
+/// Exact invocation and input manifest a fresh check run must record.
+fn expected_invocation(
+    check: &RequiredCheck,
+    manifest: &TargetManifest,
+) -> Result<EvidenceInvocation, SupervisionError> {
+    let input_digest = input_manifest_digest(manifest, check.invocation().input_paths())?;
+    Ok(EvidenceInvocation::new(
+        check.invocation().clone(),
+        input_digest,
+    ))
+}
+
 fn execution_matches(
     record: &SupervisionRecord,
     check: &RequiredCheck,
+    expected_invocation: &EvidenceInvocation,
     execution: &CheckExecution,
     evidence_id: EvidenceId,
 ) -> bool {
@@ -1503,6 +1550,7 @@ fn execution_matches(
                 && stored.project_id() == record.project_id()
                 && stored.target().version() == record.target_version()
                 && stored.operation() == check.operation()
+                && stored.invocation() == Some(expected_invocation)
         }
         (CheckStatus::Pass, None) => false,
         (_, Some(stored)) => {
@@ -1572,10 +1620,12 @@ fn all_checks_pass(
         let Some(stored) = evidence.iter().find(|item| item.id() == evidence_id) else {
             return Ok((false, Vec::new()));
         };
+        let expected = expected_invocation(check, manifest)?;
         if stored.status() != CheckStatus::Pass
             || stored.check_id() != Some(check.id())
             || stored.condition_id() != Some(check.condition_id())
             || stored.operation() != check.operation()
+            || stored.invocation() != Some(&expected)
             || !evidence_applies(manifest, stored)
         {
             return Ok((false, Vec::new()));

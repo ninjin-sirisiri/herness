@@ -814,6 +814,7 @@ impl Acceptance {
                                 "H3 {} condition acceptance rubric",
                                 condition.as_str()
                             ),
+                            mode: herness_supervision::ConditionMode::Assessment,
                             checks: Vec::new(),
                         })
                         .collect(),

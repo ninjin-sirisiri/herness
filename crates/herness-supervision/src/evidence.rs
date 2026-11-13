@@ -335,10 +335,121 @@ impl VerificationOperation {
 pub enum EvidenceAcquirer {
     /// The supervised child agent.
     ChildAgent,
+    /// The host process ran the approved operation itself.
+    Host,
     /// A CI or other automated external executor.
     Ci,
     /// A human observer.
     Human,
+}
+
+/// Exact approved execution details of one required check.
+///
+/// The value is stored with the approved check. `input_digest` is added only
+/// when evidence is recorded, so the approved scope and the observed input
+/// manifest are compared separately and never inferred from one another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckInvocation {
+    cwd: String,
+    timeout_seconds: u64,
+    input_paths: Vec<String>,
+}
+
+impl CheckInvocation {
+    /// Creates a validated approved invocation.
+    pub fn new(
+        cwd: impl AsRef<str>,
+        timeout_seconds: u64,
+        input_paths: Vec<String>,
+    ) -> Result<Self, SupervisionError> {
+        let cwd = cwd.as_ref().trim().to_owned();
+        crate::conditions::validate_check_cwd(&cwd)?;
+        if timeout_seconds == 0 {
+            return Err(SupervisionError::InvalidValue {
+                field: "check.timeoutSeconds".to_owned(),
+                detail: "the timeout must be a positive finite number of seconds".to_owned(),
+            });
+        }
+        for path in &input_paths {
+            crate::conditions::validate_check_input_path(path)?;
+        }
+        let mut unique = input_paths.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != input_paths.len() {
+            return Err(SupervisionError::InvalidValue {
+                field: "check.inputPaths".to_owned(),
+                detail: "input paths must be unique".to_owned(),
+            });
+        }
+        Ok(Self {
+            cwd,
+            timeout_seconds,
+            input_paths,
+        })
+    }
+
+    /// The exact pre-mode behavior: project root, the host's 60-second bound,
+    /// and no separately declared inputs.
+    ///
+    /// This exists only for the explicit format-2 decoder and its fixtures. It
+    /// is never applied to a newly approved check.
+    pub fn legacy() -> Self {
+        Self {
+            cwd: ".".to_owned(),
+            timeout_seconds: crate::conditions::LEGACY_CHECK_TIMEOUT_SECONDS,
+            input_paths: Vec::new(),
+        }
+    }
+
+    /// Approved working directory: `.` or a project-relative directory.
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Approved explicit timeout in seconds.
+    pub const fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+
+    /// Approved input paths whose content must be bound to the evidence.
+    pub fn input_paths(&self) -> &[String] {
+        &self.input_paths
+    }
+}
+
+/// One observed invocation bound to the input manifest it was acquired against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceInvocation {
+    invocation: CheckInvocation,
+    input_digest: ContentDigest,
+}
+
+impl EvidenceInvocation {
+    /// Binds an approved invocation to an observed input digest.
+    pub const fn new(invocation: CheckInvocation, input_digest: ContentDigest) -> Self {
+        Self {
+            invocation,
+            input_digest,
+        }
+    }
+
+    /// Approved invocation that was observed.
+    pub const fn invocation(&self) -> &CheckInvocation {
+        &self.invocation
+    }
+
+    /// Digest of the declared inputs observed for the evidence.
+    pub const fn input_digest(&self) -> &ContentDigest {
+        &self.input_digest
+    }
+
+    /// Whether this observation is for exactly `expected` inputs.
+    pub fn matches(&self, expected: &CheckInvocation, input_digest: &ContentDigest) -> bool {
+        &self.invocation == expected && &self.input_digest == input_digest
+    }
 }
 
 /// Actual result of the verification operation.
@@ -497,6 +608,8 @@ pub struct EvidenceRecord {
     observed_at: Timestamp,
     #[serde(default)]
     observer: Option<String>,
+    #[serde(default)]
+    invocation: Option<EvidenceInvocation>,
 }
 
 impl EvidenceRecord {
@@ -554,6 +667,7 @@ impl EvidenceRecord {
             sequence,
             observed_at,
             observer: None,
+            invocation: None,
         })
     }
 
@@ -562,6 +676,18 @@ impl EvidenceRecord {
     pub fn with_observer(mut self, observer: impl AsRef<str>) -> Self {
         self.observer = Some(observer.as_ref().trim().to_owned());
         self
+    }
+
+    /// Records the exact approved invocation and observed input manifest.
+    #[must_use]
+    pub fn with_invocation(mut self, invocation: EvidenceInvocation) -> Self {
+        self.invocation = Some(invocation);
+        self
+    }
+
+    /// Observed invocation and input manifest, when the operation was a check.
+    pub const fn invocation(&self) -> Option<&EvidenceInvocation> {
+        self.invocation.as_ref()
     }
 
     /// Contract version written by this build.

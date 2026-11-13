@@ -35,7 +35,7 @@ use herness_engine_pi::ProviderEndpoints;
 use herness_runtime_tests::fixtures::ProjectFixture;
 use herness_store::test_support::open_at_schema_version;
 use herness_store::{Store, StoreConfig};
-use herness_supervision::freshness::capture_manifest;
+use herness_supervision::freshness::{capture_manifest, input_manifest_digest};
 use herness_supervision::supervisor::{
     AssessmentProfileFacts, CheckExecution, CheckExecutionRequest, ConditionAssessmentPort,
     RequiredCheckPort,
@@ -512,19 +512,26 @@ impl RequiredCheckPort for PassCheck {
     ) -> Result<CheckExecution, herness_supervision::SupervisionError> {
         let workspace =
             herness_desktop::supervision::workspace::ProjectWorkspace::new(self.root.clone());
+        let mut read_set = request.read_set().to_vec();
+        for path in request.invocation().input_paths() {
+            if !read_set.contains(path) {
+                read_set.push(path.clone());
+            }
+        }
         let manifest = capture_manifest(
             &workspace,
             request.project_id(),
             request.target_version(),
-            TargetReadSet::Declared(request.read_set().to_vec()),
+            TargetReadSet::Declared(read_set),
         )?;
         let target = manifest.target_scope()?;
+        let input_digest = input_manifest_digest(&manifest, request.invocation().input_paths())?;
         let evidence = EvidenceRecord::new(
             request.evidence_id(),
             request.supervision_id(),
             Some(request.condition_id()),
             Some(request.check_id()),
-            EvidenceAcquirer::ChildAgent,
+            EvidenceAcquirer::Host,
             request.operation().clone(),
             EvidenceOutcome::new(Some(0), None, false, false, "exit=0")?,
             target,
@@ -535,7 +542,11 @@ impl RequiredCheckPort for PassCheck {
             CheckStatus::Pass,
             request.sequence(),
             Timestamp::now(),
-        )?;
+        )?
+        .with_invocation(herness_supervision::EvidenceInvocation::new(
+            request.invocation().clone(),
+            input_digest,
+        ));
         let result = herness_supervision::RequiredCheckResult::from_evidence(
             &evidence,
             request.condition_version(),
@@ -1026,9 +1037,13 @@ fn old_store_real_pi_supervision_budget_permission_and_quit_restore() {
                 conditions: vec![ConditionInput {
                     title: "The check passes".to_owned(),
                     rubric: "The required check must pass on the current target.".to_owned(),
+                    mode: herness_supervision::ConditionMode::Assessment,
                     checks: vec![CheckInput {
                         command: "true".to_owned(),
                         description: "trivial scripted passing command".to_owned(),
+                        cwd: ".".to_owned(),
+                        timeout_seconds: 60,
+                        input_paths: Vec::new(),
                     }],
                 }],
                 read_set: vec!["src/main.rs".to_owned()],

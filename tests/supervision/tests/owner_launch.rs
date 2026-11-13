@@ -460,9 +460,13 @@ impl Harness {
             conditions: vec![ConditionInput {
                 title: "The check passes".to_owned(),
                 rubric: "The required check must pass.".to_owned(),
+                mode: herness_supervision::ConditionMode::Assessment,
                 checks: vec![CheckInput {
                     command: "true".to_owned(),
                     description: "trivial passing command".to_owned(),
+                    cwd: ".".to_owned(),
+                    timeout_seconds: 60,
+                    input_paths: Vec::new(),
                 }],
             }],
             read_set: vec!["src/main.rs".to_owned()],

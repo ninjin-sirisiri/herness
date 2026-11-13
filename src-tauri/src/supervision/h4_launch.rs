@@ -40,9 +40,11 @@ use herness_supervision::owner_launch::{
 };
 use herness_supervision::ports::{ClockPort, SupervisionStorePort};
 use herness_supervision::{
-    ApprovalActor, ApprovalBasis, ExecutionScope, OwnerApprovalSource, OwnerKind, OwnerRef,
-    ProfilePurpose, SupervisionContract, SupervisionError, SupervisionId, SupervisionRecord,
-    SupervisionRequestId, TargetReadSet, WorkPacket,
+    ApprovalActor, ApprovalBasis, CheckId, CheckInvocation, Condition, ConditionApproval,
+    ConditionId, ConditionMode, ConditionOrigin, ConditionVersion, ExecutionScope,
+    OwnerApprovalSource, OwnerKind, OwnerRef, ProfilePurpose, RequiredCheck, SupervisionContract,
+    SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId, TargetReadSet,
+    VerificationOperation, WorkPacket,
 };
 
 use serde::{Deserialize, Serialize};
@@ -503,6 +505,103 @@ pub fn h4_commit_authorization(
     run_hooks: bool,
 ) -> Result<H4CommitAuthorization, SupervisionError> {
     H4CommitAuthorization::new(host_commit, run_hooks)
+}
+
+/// Builds the approved H2 condition set of one H4 Task.
+///
+/// Every value the human approved is carried explicitly: the condition mode,
+/// the exact check command, its `cwd`, its positive `timeoutSeconds`, and its
+/// `inputPaths`. Nothing is defaulted from the old host behavior. The
+/// identifiers are derived deterministically from the Task identity and the
+/// plan's stable condition/check identifiers, so the same approved Task always
+/// yields the same set.
+///
+/// Approval stays an inherited H4 owner approval. Merely building this value is
+/// not a start and not a registry match.
+pub fn h4_approved_conditions(
+    owner: &OwnerRef,
+    version: ConditionVersion,
+    task: &herness_sdd_execute::TaskApproval,
+    now: herness_core::Timestamp,
+) -> Result<ConditionSet, SupervisionError> {
+    let project = task.task().project_id();
+    let task_ref = task.task();
+    let condition_id = |stable: &str| {
+        ConditionId::from_parts(
+            project,
+            deterministic_uuid(&["h4.condition", &task_ref.to_string(), stable]),
+        )
+    };
+    let check_id = |stable: &str| {
+        CheckId::from_parts(
+            project,
+            deterministic_uuid(&["h4.check", &task_ref.to_string(), stable]),
+        )
+    };
+
+    let mut checks = Vec::new();
+    for check in task.checks() {
+        let invocation = CheckInvocation::new(
+            check.cwd(),
+            check.timeout_seconds(),
+            check.input_paths().to_vec(),
+        )?;
+        checks.push(RequiredCheck::new(
+            check_id(check.id()),
+            condition_id(check.condition_id()),
+            VerificationOperation::command(check.command())?,
+            invocation,
+            check.description(),
+        )?);
+    }
+    let mut conditions = Vec::new();
+    for condition in task.conditions() {
+        let condition_id = condition_id(condition.id());
+        let required = checks
+            .iter()
+            .filter(|check| check.condition_id() == condition_id)
+            .map(|check| check.id())
+            .collect::<Vec<_>>();
+        conditions.push(Condition::new(
+            condition_id,
+            condition.title(),
+            condition.rubric(),
+            h2_condition_mode(condition.mode()),
+            required,
+            ConditionOrigin::ApprovedOwner {
+                owner: owner.clone(),
+            },
+        )?);
+    }
+
+    let mut set = ConditionSet::new(project, version, conditions, checks)?;
+    let approval = ConditionApproval::new(
+        project,
+        ApprovalBasis::InheritedOwner {
+            owner: owner.clone(),
+            source: OwnerApprovalSource::H4ApprovedPlan,
+            approved_at: now,
+            expires_at: None,
+        },
+        version,
+        set.digest().clone(),
+    )?;
+    set.approve(
+        ApprovalActor::ApprovedOwner {
+            owner: owner.clone(),
+            source: OwnerApprovalSource::H4ApprovedPlan,
+        },
+        approval,
+        now,
+    )?;
+    Ok(set)
+}
+
+fn h2_condition_mode(mode: herness_sdd_execute::ConditionMode) -> ConditionMode {
+    match mode {
+        herness_sdd_execute::ConditionMode::Checks => ConditionMode::Checks,
+        herness_sdd_execute::ConditionMode::Assessment => ConditionMode::Assessment,
+    }
 }
 
 /// Resolves one reserved H4 child into the H4 dispatch identity.

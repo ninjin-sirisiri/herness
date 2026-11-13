@@ -23,7 +23,7 @@ use herness_supervision::assessment::{
 use herness_supervision::budget::BudgetPolicy;
 use herness_supervision::command::CommandResult;
 use herness_supervision::conditions::{
-    Condition, ConditionOrigin, ConditionSet, ConditionVersion, RequiredCheck,
+    Condition, ConditionMode, ConditionOrigin, ConditionSet, ConditionVersion, RequiredCheck,
 };
 use herness_supervision::consent::{
     DisclosureConsent, DisclosureDataKind, DisclosureRequest, DisclosureScope, ProviderOrigin,
@@ -33,9 +33,9 @@ use herness_supervision::contract::{
 };
 use herness_supervision::error::SupervisionError;
 use herness_supervision::evidence::{
-    CheckStatus, ContentDigest, ContentFingerprint, EvidenceAcquirer, EvidenceOutcome,
-    EvidenceRecord, EvidenceScope, RequiredCheckResult, TargetScope, TargetVersion,
-    VerificationOperation,
+    CheckInvocation, CheckStatus, ContentDigest, ContentFingerprint, EvidenceAcquirer,
+    EvidenceOutcome, EvidenceRecord, EvidenceScope, RequiredCheckResult, TargetScope,
+    TargetVersion, VerificationOperation,
 };
 use herness_supervision::ids::{
     CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId, RunGroupId, SupervisionId,
@@ -289,6 +289,7 @@ pub fn checks(ids: Ids) -> Vec<RequiredCheck> {
             ids.check_a,
             ids.condition_a,
             VerificationOperation::command("cargo test -p fixture-app --locked").expect("command"),
+            CheckInvocation::legacy(),
             "the fixture test suite passes",
         )
         .expect("check"),
@@ -297,7 +298,30 @@ pub fn checks(ids: Ids) -> Vec<RequiredCheck> {
             ids.condition_b,
             VerificationOperation::command("cargo clippy -p fixture-app --locked")
                 .expect("command"),
+            CheckInvocation::legacy(),
             "the fixture lint pass is clean",
+        )
+        .expect("check"),
+    ]
+}
+
+/// Checks whose mode is decided only by their own result.
+pub fn checks_mode_checks(ids: Ids) -> Vec<RequiredCheck> {
+    vec![
+        RequiredCheck::new(
+            ids.check_a,
+            ids.condition_a,
+            VerificationOperation::command("true").expect("command"),
+            CheckInvocation::legacy(),
+            "the fixture check passes",
+        )
+        .expect("check"),
+        RequiredCheck::new(
+            ids.check_b,
+            ids.condition_b,
+            VerificationOperation::command("true").expect("command"),
+            CheckInvocation::legacy(),
+            "the second fixture check passes",
         )
         .expect("check"),
     ]
@@ -310,6 +334,7 @@ pub fn conditions(ids: Ids) -> Vec<Condition> {
             ids.condition_a,
             "fixture tests pass",
             "Every test named in the fixture rubric passes with exit code 0 and no truncation.",
+            ConditionMode::Assessment,
             vec![ids.check_a],
             ConditionOrigin::Human,
         )
@@ -318,6 +343,31 @@ pub fn conditions(ids: Ids) -> Vec<Condition> {
             ids.condition_b,
             "fixture lint is clean",
             "Clippy reports no warnings for the fixture package.",
+            ConditionMode::Assessment,
+            vec![ids.check_b],
+            ConditionOrigin::Human,
+        )
+        .expect("condition"),
+    ]
+}
+
+/// Checks-mode conditions in the fixture set.
+pub fn checks_mode_conditions(ids: Ids) -> Vec<Condition> {
+    vec![
+        Condition::new(
+            ids.condition_a,
+            "fixture check A passes",
+            "The first fixture check decides this condition without a model judgment.",
+            ConditionMode::Checks,
+            vec![ids.check_a],
+            ConditionOrigin::Human,
+        )
+        .expect("condition"),
+        Condition::new(
+            ids.condition_b,
+            "fixture check B passes",
+            "The second fixture check decides this condition without a model judgment.",
+            ConditionMode::Checks,
             vec![ids.check_b],
             ConditionOrigin::Human,
         )
@@ -340,6 +390,27 @@ pub fn condition_set_at(project: ProjectId, version: u64) -> ConditionSet {
         checks(ids),
     )
     .expect("condition set")
+}
+
+/// An unapproved fixture condition set whose conditions are decided by checks.
+pub fn checks_mode_condition_set(project: ProjectId) -> ConditionSet {
+    let ids = ids(project);
+    ConditionSet::new(
+        project,
+        ConditionVersion::new(1).expect("version"),
+        checks_mode_conditions(ids),
+        checks_mode_checks(ids),
+    )
+    .expect("checks-mode condition set")
+}
+
+/// A human-approved checks-mode fixture condition set.
+pub fn approved_checks_mode_condition_set(project: ProjectId) -> ConditionSet {
+    let mut set = checks_mode_condition_set(project);
+    let approval = human_approval(&set);
+    set.approve(ApprovalActor::Human, approval, now())
+        .expect("approval");
+    set
 }
 
 /// A human approval bound to the exact fixture condition set.
@@ -938,6 +1009,14 @@ pub fn disclosure_request(
 
 /// A complete approved fixture contract.
 pub fn contract(project: ProjectId) -> SupervisionContract {
+    contract_with_conditions(project, approved_condition_set(project))
+}
+
+/// A complete approved fixture contract carrying explicit conditions.
+pub fn contract_with_conditions(
+    project: ProjectId,
+    conditions: ConditionSet,
+) -> SupervisionContract {
     let ids = ids(project);
     let subject = SupervisionSubject::new(
         project,
@@ -958,7 +1037,6 @@ pub fn contract(project: ProjectId) -> SupervisionContract {
     let consent = consent(project, ProfilePurpose::Completion, 1);
     let target = target_scope(project, 1);
     let budget = BudgetPolicy::h2_default();
-    let conditions = approved_condition_set(project);
     let packet = work_packet(
         project,
         &target,

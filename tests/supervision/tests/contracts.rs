@@ -93,6 +93,7 @@ fn fake_foreign_expired_and_stale_approvals_are_rejected() {
             fixture_ids.condition_a,
             "changed fixture condition",
             "Different content with the same version.",
+            herness_supervision::ConditionMode::Assessment,
             vec![fixture_ids.check_a],
             ConditionOrigin::Human,
         )
@@ -173,6 +174,7 @@ fn model_origin_conditions_cannot_be_approved_or_changed_by_a_model() {
         fixture_ids.condition_a,
         "model-proposed condition",
         "A model proposed this and a human must confirm it.",
+        herness_supervision::ConditionMode::Assessment,
         vec![fixture_ids.check_a],
         ConditionOrigin::ModelProposal,
     )

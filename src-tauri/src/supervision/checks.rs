@@ -5,7 +5,7 @@
 //! run tools. A denied, human-waiting, unsupported, or non-shell check becomes
 //! an explicit `unavailable` result; it is never a pass.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use herness_core::permissions::{EvaluationContext, GrantScope, PermissionMode, SharedPolicy};
 use herness_core::tools::{
@@ -21,7 +21,7 @@ use herness_supervision::verification::{
 };
 use herness_supervision::{
     CheckStatus, EvidenceAcquirer, EvidenceScope, RequiredCheckResult, SupervisionError,
-    SupervisionStorePort,
+    SupervisionStorePort, ensure_inputs_in_scope, validate_check_cwd,
 };
 
 use crate::supervision::store::{HostClock, StoreHandle};
@@ -81,6 +81,22 @@ impl RequiredCheckPort for HostCheckPort {
             return Self::unavailable(request);
         };
 
+        let invocation = request.invocation();
+        let Ok(timeout_ms) = effective_check_timeout_ms(
+            invocation.timeout_seconds(),
+            request.remaining_active_seconds(),
+        ) else {
+            return Self::unavailable(request);
+        };
+        let Ok(cwd_path) = resolve_check_cwd(&self.root, invocation.cwd()) else {
+            // An escaping cwd, a missing directory, or a symlink that leaves
+            // the project is refused before anything is spawned.
+            return Self::unavailable(request);
+        };
+        if ensure_inputs_in_scope(invocation.input_paths(), request.read_set()).is_err() {
+            return Self::unavailable(request);
+        }
+
         let record = self
             .store
             .load(request.project_id(), request.supervision_id())?
@@ -114,11 +130,12 @@ impl RequiredCheckPort for HostCheckPort {
                     detail: error.to_string(),
                 }
             })?,
-            // Bound one check so a hanging command cannot occupy the host
-            // pump, stop path, or quit worker indefinitely.
-            timeout_ms: Some(60_000),
+            // Bound one check by the approved timeout and the remaining Task
+            // time, whichever is shorter. An unstoppable or unknown exit stays
+            // a non-pass.
+            timeout_ms: Some(timeout_ms),
         });
-        let cwd = AbsolutePath::new(self.root.to_string_lossy()).map_err(|error| {
+        let cwd = AbsolutePath::new(cwd_path.to_string_lossy()).map_err(|error| {
             SupervisionError::InvalidValue {
                 field: "check.cwd".to_owned(),
                 detail: error.to_string(),
@@ -140,22 +157,41 @@ impl RequiredCheckPort for HostCheckPort {
 
         let workspace = ProjectWorkspace::new(self.root.clone());
         let service = VerificationService::new(workspace, HostClock);
+        let mut read_set = request.read_set().to_vec();
+        for path in invocation.input_paths() {
+            if !read_set.contains(path) {
+                read_set.push(path.clone());
+            }
+        }
         let plan = VerificationPlan::new(
             request.evidence_id(),
             request.supervision_id(),
             Some(request.condition_id()),
             Some(request.check_id()),
-            EvidenceAcquirer::ChildAgent,
+            // The host ran the approved operation itself. Claiming the child
+            // did would be dishonest evidence.
+            EvidenceAcquirer::Host,
             None,
             request.operation().clone(),
             EvidenceScope::new(
-                vec![format!("command: {command}")],
-                vec!["required checks run in the project working directory".to_owned()],
+                vec![
+                    format!("command: {command}"),
+                    format!("cwd: {}", invocation.cwd()),
+                    format!("timeoutSeconds: {}", invocation.timeout_seconds()),
+                    format!("inputs: {}", invocation.input_paths().len()),
+                ],
+                vec![
+                    "the host executed the approved check through the H1 permission boundary"
+                        .to_owned(),
+                    "the observation is bounded by the approved timeout and remaining Task time"
+                        .to_owned(),
+                ],
             )?,
             request.sequence(),
             request.target_version(),
-            TargetReadSet::Declared(request.read_set().to_vec()),
-        )?;
+            TargetReadSet::Declared(read_set),
+        )?
+        .with_invocation(invocation.clone());
 
         let bash = BashExecutor::new(
             self.agent,
@@ -201,9 +237,56 @@ impl ToolExecutor for CheckExecutor {
         &mut self,
         operation: &herness_core::FrozenOperation,
     ) -> Result<VerificationExecution, herness_core::CoreError> {
-        let output = self.bash.execute(operation)?;
-        execution_from_output(&output)
+        match self.bash.execute(operation) {
+            Ok(output) => execution_from_output(&output),
+            // A timeout, a stop request, or an unconfirmed process group is an
+            // observed non-pass, not a missing observation. Record it so the
+            // evidence says what happened instead of claiming the check never
+            // ran.
+            Err(error @ herness_core::CoreError::ShellToolFailed { .. }) => {
+                execution_from_shell_failure(&error)
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn execution_from_shell_failure(
+    error: &herness_core::CoreError,
+) -> Result<VerificationExecution, herness_core::CoreError> {
+    let herness_core::CoreError::ShellToolFailed { failure, .. } = error else {
+        return Err(error.clone());
+    };
+    let (status, exit_code, signal, timed_out) = match failure {
+        herness_core::ShellFailure::TimedOut { confirmed } => (
+            if *confirmed {
+                CheckStatus::Fail
+            } else {
+                CheckStatus::Inconclusive
+            },
+            None,
+            None,
+            true,
+        ),
+        herness_core::ShellFailure::Stopped { .. }
+        | herness_core::ShellFailure::Unconfirmed { .. }
+        | herness_core::ShellFailure::Unverifiable { .. } => return Err(error.clone()),
+        _ => return Err(error.clone()),
+    };
+    VerificationExecution::new(
+        status,
+        exit_code,
+        signal,
+        timed_out,
+        false,
+        format!("shell failure observed: {failure}"),
+    )
+    .map_err(|error| herness_core::CoreError::InvalidValue {
+        field: "verificationExecution".to_owned(),
+        violation: herness_core::ArgumentViolation::Invalid {
+            detail: error.to_string(),
+        },
+    })
 }
 
 fn execution_from_output(
@@ -219,8 +302,19 @@ fn execution_from_output(
         && !truncated
     {
         CheckStatus::Pass
-    } else {
+    } else if matches!(
+        stop,
+        herness_core::ShellStopStatus::Completed
+            | herness_core::ShellStopStatus::ExitedNonZero
+            | herness_core::ShellStopStatus::Killed
+            | herness_core::ShellStopStatus::Timeout
+    ) {
         CheckStatus::Fail
+    } else {
+        // A stop the host sent, or an exit it could not confirm, never
+        // establishes a pass. It stays inconclusive instead of being reported
+        // as an observed failure.
+        CheckStatus::Inconclusive
     };
     let stdout = bounded(observation.stdout().text());
     let stderr = bounded(observation.stderr().text());
@@ -268,6 +362,69 @@ fn bounded(value: &str) -> String {
     let mut truncated = value.chars().take(LIMIT).collect::<String>();
     truncated.push_str("… [truncated]");
     truncated
+}
+
+/// Milliseconds one check may run: the shorter of the approved timeout and the
+/// remaining supervised Task time.
+///
+/// A zero remaining time is refused instead of spawning a process with no
+/// budget. Both values are finite seconds; the conversion saturates.
+pub fn effective_check_timeout_ms(
+    explicit_seconds: u64,
+    remaining_seconds: u64,
+) -> Result<u64, SupervisionError> {
+    if explicit_seconds == 0 {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.timeoutSeconds".to_owned(),
+            detail: "the approved timeout must be positive".to_owned(),
+        });
+    }
+    if remaining_seconds == 0 {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.remainingActiveSeconds".to_owned(),
+            detail: "no supervised Task time remains for a check".to_owned(),
+        });
+    }
+    Ok(explicit_seconds
+        .min(remaining_seconds)
+        .saturating_mul(1_000))
+}
+
+/// Resolves an approved check `cwd` against the canonical project root.
+///
+/// The value must be `.` or a directory inside the root. A missing directory,
+/// an escaping path, or a symlink that resolves outside the root is refused
+/// before a process is spawned.
+pub fn resolve_check_cwd(root: &Path, cwd: &str) -> Result<PathBuf, SupervisionError> {
+    validate_check_cwd(cwd)?;
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|error| SupervisionError::InvalidValue {
+            field: "check.cwd".to_owned(),
+            detail: format!("the project root cannot be resolved: {error}"),
+        })?;
+    let joined = if cwd == "." {
+        canonical_root.clone()
+    } else {
+        canonical_root.join(cwd)
+    };
+    let canonical =
+        std::fs::canonicalize(&joined).map_err(|error| SupervisionError::InvalidValue {
+            field: "check.cwd".to_owned(),
+            detail: format!("the approved working directory is unavailable: {error}"),
+        })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.cwd".to_owned(),
+            detail: "the approved working directory resolves outside the project root".to_owned(),
+        });
+    }
+    if !canonical.is_dir() {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.cwd".to_owned(),
+            detail: "the approved working directory is not a directory".to_owned(),
+        });
+    }
+    Ok(canonical)
 }
 
 /// Explicitly marks a manifest whose scope could not be established.

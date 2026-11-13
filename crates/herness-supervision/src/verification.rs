@@ -19,10 +19,12 @@ use herness_core::tools::{ToolArguments, ToolExecutor, ToolGateway};
 
 use crate::error::SupervisionError;
 use crate::evidence::{
-    CheckStatus, EvidenceAcquirer, EvidenceOutcome, EvidenceRecord, EvidenceScope, TargetVersion,
-    VerificationOperation,
+    CheckInvocation, CheckStatus, EvidenceAcquirer, EvidenceInvocation, EvidenceOutcome,
+    EvidenceRecord, EvidenceScope, TargetVersion, VerificationOperation,
 };
-use crate::freshness::{FreshnessService, TargetManifest, TargetReadSet, WorkspaceSnapshotPort};
+use crate::freshness::{
+    FreshnessService, TargetManifest, TargetReadSet, WorkspaceSnapshotPort, input_manifest_digest,
+};
 use crate::ids::{CheckId, ConditionId, EvidenceId, SupervisionId};
 use crate::ports::{ClockPort, EvidenceStorePort};
 
@@ -40,6 +42,7 @@ pub struct VerificationPlan {
     sequence: u64,
     target_version: TargetVersion,
     read_set: TargetReadSet,
+    invocation: Option<CheckInvocation>,
 }
 
 impl VerificationPlan {
@@ -86,7 +89,15 @@ impl VerificationPlan {
             sequence,
             target_version,
             read_set,
+            invocation: None,
         })
+    }
+
+    /// Records the approved invocation observed by this verification.
+    #[must_use]
+    pub fn with_invocation(mut self, invocation: CheckInvocation) -> Self {
+        self.invocation = Some(invocation);
+        self
     }
 
     /// Project that owns the plan.
@@ -487,6 +498,10 @@ impl<W: WorkspaceSnapshotPort, C: ClockPort> VerificationService<W, C> {
         if let Some(observer) = plan.observer {
             record = record.with_observer(observer);
         }
+        if let Some(invocation) = plan.invocation {
+            let input_digest = input_manifest_digest(&before, invocation.input_paths())?;
+            record = record.with_invocation(EvidenceInvocation::new(invocation, input_digest));
+        }
         validate_evidence_record(&record, execution.operation_outcome)?;
         let stored = store.append(record)?;
         Ok(VerificationDisposition::Recorded(Box::new(stored)))
@@ -522,7 +537,24 @@ pub fn validate_evidence_record(
                 record.observer().map(str::to_owned),
             )?;
         }
-        EvidenceAcquirer::ChildAgent | EvidenceAcquirer::Ci => {}
+        EvidenceAcquirer::ChildAgent | EvidenceAcquirer::Host | EvidenceAcquirer::Ci => {}
+    }
+
+    if let Some(invocation) = record.invocation() {
+        for path in invocation.invocation().input_paths() {
+            if !record.target().read_set().iter().any(|item| item == path)
+                || !record
+                    .target()
+                    .fingerprints()
+                    .iter()
+                    .any(|item| item.path() == path)
+            {
+                return Err(SupervisionError::EvidenceContractViolation {
+                    field: "evidence.invocation.inputPaths".to_owned(),
+                    detail: "a recorded check input must be part of the evidence target".to_owned(),
+                });
+            }
+        }
     }
 
     if is_bare_success(record.operation().as_str()) {
@@ -630,7 +662,9 @@ fn validate_observer(
             }
             Ok(Some(observer.to_owned()))
         }
-        EvidenceAcquirer::ChildAgent | EvidenceAcquirer::Ci => Ok(observer),
+        EvidenceAcquirer::ChildAgent | EvidenceAcquirer::Host | EvidenceAcquirer::Ci => {
+            Ok(observer)
+        }
     }
 }
 

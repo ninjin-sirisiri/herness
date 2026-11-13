@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::assessment::{AssessmentRequest, AssessmentResult};
 use crate::budget::ledger::BudgetClockPort;
 use crate::budget::ledger::BudgetLedger;
-use crate::conditions::{Condition, ConditionVersion};
+use crate::conditions::ConditionVersion;
 use crate::consent::ConsentBinding;
 use crate::error::SupervisionError;
 use crate::evidence::{
-    CheckStatus, EvidenceRecord, RequiredCheckResult, TargetVersion, VerificationOperation,
+    CheckInvocation, CheckStatus, EvidenceRecord, RequiredCheckResult, TargetVersion,
+    VerificationOperation,
 };
 use crate::freshness::{TargetManifest, TargetReadSet, WorkspaceSnapshotPort};
 use crate::ids::{
@@ -435,6 +436,8 @@ pub struct CheckExecutionRequest {
     evidence_id: EvidenceId,
     sequence: u64,
     operation: VerificationOperation,
+    invocation: CheckInvocation,
+    remaining_active_seconds: u64,
     read_set: Vec<String>,
 }
 
@@ -451,6 +454,8 @@ impl CheckExecutionRequest {
         evidence_id: EvidenceId,
         sequence: u64,
         operation: VerificationOperation,
+        invocation: CheckInvocation,
+        remaining_active_seconds: u64,
         read_set: Vec<String>,
     ) -> Self {
         Self {
@@ -463,6 +468,8 @@ impl CheckExecutionRequest {
             evidence_id,
             sequence,
             operation,
+            invocation,
+            remaining_active_seconds,
             read_set,
         }
     }
@@ -510,6 +517,19 @@ impl CheckExecutionRequest {
     /// Exact command or equivalent operation.
     pub const fn operation(&self) -> &VerificationOperation {
         &self.operation
+    }
+
+    /// Approved working directory, timeout, and input paths.
+    pub const fn invocation(&self) -> &CheckInvocation {
+        &self.invocation
+    }
+
+    /// Remaining supervised active seconds when the check was requested.
+    ///
+    /// The host must run the check for at most the shorter of the approved
+    /// timeout and this value.
+    pub const fn remaining_active_seconds(&self) -> u64 {
+        self.remaining_active_seconds
     }
 
     /// Approved bounded read set.
@@ -592,17 +612,6 @@ impl AssessmentProfileFacts {
 
 /// Per-condition, tool-free assessment boundary.
 pub trait ConditionAssessmentPort {
-    /// Whether a condition needs a semantic model judgment.
-    ///
-    /// The default is conservative: every condition is assessed. A host that
-    /// has an approved deterministic condition may return false; the
-    /// supervisor then requires every required check of that condition to pass
-    /// with applicable evidence and records the host-owned result without a
-    /// model request.
-    fn requires_assessment(&self, _condition: &Condition) -> bool {
-        true
-    }
-
     /// Resolves the exact facts of a fixed profile binding. No fallback exists.
     fn profile(&self, binding: ProfileBinding) -> Result<AssessmentProfileFacts, SupervisionError>;
 
