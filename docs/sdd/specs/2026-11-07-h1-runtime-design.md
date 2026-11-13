@@ -225,7 +225,7 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 
 ## H4 integration additions
 
-2026-11-13の[H4設計](2026-11-13-h4-sdd-execute-design.md)が必要とする追加契約案。保存済み文書はレビュー待ちで、既存H1の承認には含めない。本実装・実DB移行・実接続を開始しない。
+2026-11-13の[H4設計](2026-11-13-h4-sdd-execute-design.md)が必要とする追加契約。同日、保存済みH4 specと本追加契約へのレビュー依頼に利用者が「ok」と回答し、承認済み。H4実装planへ含めるが、本実装・実DB移行・実接続を開始しない。
 
 1. **host Git境界:** 人間の開始承認に結び付けたH4内部要求だけが、選択したcheckout・branch・期待HEAD・明示path/bytesに対してstage・commitできる。初回worktree・新branchの作成は別途の明示的な隔離選択に結び付け、commit許可から推定せず、削除も含めない。既存の許可優先順位・停止・副作用前の意図保存を維持し、host専用操作をmodel toolやpreviewへ公開しない。shell文字列の接頭辞照合で代替せず、Git argvとcwdを確定する。push・merge・履歴書換え・変更破棄をこの権限へ含めない。
 2. **Git監査と結果不明:** host activityとして要求ID・目的・期待parent/tree・対象・hook・実結果を記録し、架空runやagentの変更理由を作らない。H4がjournalとTask進行を所有する。Git成功後の保存失敗、hookによる変更、branch/index競合、停止未確認では自動rollback・再実行せず照合する。GitとDBが原子的とは主張しない。

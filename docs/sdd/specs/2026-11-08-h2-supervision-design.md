@@ -188,12 +188,13 @@ H2受入には上記の自動検証、H1前提の実adapter検証、許可済み
 
 ## H4 integration additions
 
-2026-11-13の[H4設計](2026-11-13-h4-sdd-execute-design.md)に対する追加契約案。保存後のレビュー待ちで、既存H2・H3接続の承認とは区別する。現在のH4ApprovalUnavailableを、owner名を指定するだけで解除しない。
+2026-11-13の[H4設計](2026-11-13-h4-sdd-execute-design.md)に対する追加契約。同日、保存済みH4 specと本追加契約へのレビュー依頼に利用者が「ok」と回答し、承認済み。H4実装planへ含めるが、本実装・実接続は開始しない。現在のH4ApprovalUnavailableを、owner名を指定するだけで解除しない。
 
 1. **承認と冪等な対象作成:** H4の現在のregistryを照合して、execution・Task・plan版・条件digest・packet・scope・profile・consent・上限に束縛したhost権限を発行する。H3承認やrepo内宣言は根拠にしない。ownerの作成要求IDから一つのsupervision/child対応を永続的に回復でき、応答喪失で子を作り直さない。対応不明は照合待ちにする。H4 packetを初回・継続へ保持する。
 2. **検証準備gate:** ownerが必要な成果物の安定を確認する内部portはready・pending・blockedを返し、H4は必要なH3同期に使用する。対応入力の完結・Idle後、検証開始前に照合する。pendingは新runや失敗証拠・停滞サイクルを増やさず、停止・deadline・予算は維持する。blockedは理由と必要操作を持つ待機とする。ready後も通常の必須検証・条件別評価・入力鮮度を省略しない。
 3. **条件と対象別pump:** 新形式planのchecks modeは指定した全必須checkのpassだけで当該条件を扱い、assessment modeは既存の条件別モデル評価へ渡す。どちらも証拠とmanifestを保持する。H3-active project全体を除外せず、候補専用adapterが必要な監督対象だけを分離して各対象を一度ずつpumpする。候補以外のtargetに候補toolを使わせない。
 4. **停止・結果引継ぎ:** plan変更等によるH4停止要求は、人間待ち・上限・停滞・復旧のlatchを維持する。再承認・再開で同じTaskの消費・予約をリセットせず、保存状態・revision・完了snapshotを再取得できる。H2 completedをcommit・次Task・公開の許可としない。
+5. **検証操作の束縛:** H4の承認済みcheckが持つcommand・cwd・timeoutSeconds・inputPathsを保存し、実行・許可・証拠鮮度へ反映する。project rootと固定60秒に置き換えない。実timeoutは指定値と残りTask時間の短い方とし、cwdのroot脱出、変更された操作への承認再利用、入力不足を拒否する。hostが実行した検証を子が実行した証拠と偽らず、旧保存形式は既存の意味を保つ明示decoderで読む。この項目はH4 New plan format and inspectionの承認済みcheck要件を具体化する。
 
 受入ではH4 registryの正例・偽承認/古い版の負例、作成前後crashと重複要求、初回/継続packet、H3待機中の進行・停止・timeout、両condition mode、同projectでの対象別pumpと既存H3/Human owner回帰を検証する。既存の閾値・許可優先順位・送信範囲・providerの未確認を緩めない。
 

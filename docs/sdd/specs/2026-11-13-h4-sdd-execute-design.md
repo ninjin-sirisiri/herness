@@ -2,7 +2,7 @@
 
 **Classification:** architectural
 
-**Status:** 2026-11-13の面談で方針と設計文書の保存を確認した。保存したspecとH1/H2追加契約はレビュー待ち。本実装・pack変更・実モデル送信・sdd-plan・pushの許可ではない。
+**Status:** 2026-11-13、保存済みspecとH1/H2のH4 integration additionsへのレビュー依頼に対する利用者の「ok」により、設計と追加契約を承認済み。H4だけのsdd-planへ進む。本実装・pack変更・実モデル送信・pushの許可ではない。
 
 **Chosen approach:** 新形式のMarkdown planを決定的に取り込み、人間が承認した版に対してRust hostがTask起動・監督・HTML同期確認・commit・進行台帳を制御する。既存の散文planをモデルで解釈して実行しない。
 
@@ -199,3 +199,5 @@ packとherness両方の開発変更を必要とするが、このspec保存は�
 未決定の製品動作を実装者へ委ねない。parser schema・host Git・owner/readiness接続は本specと各正本の追加案をレビューしてから実装planに落とす。OS・配布・完成版画面はH5、実provider能力・実接続の受入は有効化前に別途確認する。未確認を理由に条件や送信同意を黙って緩めない。
 
 利用者は、新形式だけの取込み、1リポジトリ、plan変更時の現在Taskの安全停止、hernessによるcommitを選択した。上限継承・台帳・finishまでの設計要約を確認し、「ok」と回答して設計文書の保存を許可した。この記録は保存後のspec・追加契約の承認ではない。文書の検証・設計文書だけのcommit後にレビューを依頼し、明示的な承認後にH4のsdd-planへ進む。
+
+続いて、設計文書commit `2d53146`のH4 specとH1/H2のH4 integration additionsへのレビュー依頼に、利用者が「ok」と回答した。2026-11-13の設計・追加契約の承認として記録し、H4だけの実装planを作成する。H1/H2の受入未完了とH3の限定受入は維持し、本実装・別repo編集・実接続・pushはまだ許可しない。
