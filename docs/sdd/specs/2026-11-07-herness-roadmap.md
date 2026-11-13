@@ -2,7 +2,7 @@
 
 **Classification:** architectural / multi-spec
 
-**Status:** 分割・依存関係、H1〜H4のspecとH1/H2の接続追加契約は承認済み。H1〜H3の実装はmainへ統合済み。H1・H2は受入未完了、H3はtext-only reduced scopeでaccepted-with-exceptions。現在はH4実装planを作成中。追加の本実装・実接続の許可ではない。
+**Status:** 分割・依存関係、H1〜H4のspecとH1/H2の接続追加契約は承認済み。H1〜H3の実装はmainへ統合済み。H1・H2は受入未完了、H3はtext-only reduced scopeでaccepted-with-exceptions。H4実装planを保存済み・実装指示待ち。追加の本実装・実接続の許可ではない。
 
 ## 全体目標
 
@@ -91,7 +91,8 @@ H1〜H4は承認済みのspecである。H5は未作成の予定specであり、
 - **観測可能な完了:** 親モデルがsubagent toolを呼ばなくてもTaskが順番に実行され、Global Constraintsと正本specが引き継がれる。停止・再開・未完了を追跡でき、必要な検証やHTML同期が不成立なら先へ進まない。
 - **初期範囲:** 新形式planだけを対象とし、1 planにつき1リポジトリ・1実装checkoutで直列実行する。plan変更で現在Taskも安全停止し、必要な検証・HTML同期の確認後にhernessがcommitする。詳細な契約はH4 specを正本とする。
 - **消費先:** H5。
-- **Spec:** [H4: herness主導のsdd-execute](2026-11-13-h4-sdd-execute-design.md)。2026-11-13にH1/H2のH4接続追加契約とともに承認済み。plan作成中・未実装。
+- **Spec:** [H4: herness主導のsdd-execute](2026-11-13-h4-sdd-execute-design.md)。2026-11-13にH1/H2のH4接続追加契約とともに承認済み。未実装。
+- **Plan:** [H4 Host-owned SDD Execution Implementation Plan](../plans/2026-11-13-h4-sdd-execute.md)。packの新形式/実行連携、H1/H2前提補修、Task実行・Git・復旧・受入を25 Taskで直列に計画済み。既存ホストによる開発用planであり、新H4による複数repo実行を許可しない。実装指示待ち。
 
 ### H5 — デスクトップ操作とmacOS配布
 
@@ -112,7 +113,7 @@ H1〜H4は承認済みのspecである。H5は未作成の予定specであり、
 
 承認済みの設計順序はH1 → H2 → H3 → H4 → H5とする。これは個別specを自動で連続設計・実装する指示ではない。UIの実装を最後まで禁止せず、必要最小限の接続確認は各specの受入条件で扱う。
 
-**現在の対象は、specとH1/H2追加契約が承認済みでplan作成中のH4である。** H1・H2の受入未完了とH3の限定受入・未確認範囲を引き継ぐ。H4の承認済みplan取込み、Task進行台帳、owner起動の承認接続は未実装であり、既存のH2監督機構やH3 barrierだけでH4が利用可能とはみなさない。H4だけのsdd-planへ進み、sdd-executeの指示までは本実装を始めず、実接続には別途許可を必要とする。H5へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。
+**現在の対象は、plan保存済み・実装指示待ちのH4である。** H1・H2の受入未完了とH3の限定受入・未確認範囲を引き継ぐ。H4の承認済みplan取込み、Task進行台帳、owner起動の承認接続は未実装であり、既存のH2監督機構やH3 barrierだけでH4が利用可能とはみなさない。sdd-executeの指示までは本実装を始めず、別repoの書込みと実接続にはそれぞれ許可を必要とする。H5へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。
 
 ## 共通契約の所有者
 
@@ -178,3 +179,5 @@ H1正本へ追加契約を保存・検証した後、利用者が「追加契約
 2026-11-13、利用者がロードマップのH4の設計開始を指示した。既存の分割・依存関係・契約所有者を再利用して面談を行い、新形式planのみ、1リポジトリ、plan変更時の現在Taskの安全停止、hernessによるcommitを選択した。設計要約への「ok」に基づきH4 specと各正本のH1/H2接続追加案を保存した。これは保存後のspec・追加契約の承認、sdd-plan・sdd-execute・本実装・実モデル送信・pushの許可ではない。
 
 続いてcommit `2d53146`のH4 specとH1/H2のH4 integration additionsへのレビュー依頼に、利用者が「ok」と回答した。設計と追加契約を承認し、H4だけのsdd-planへ進む。本実装・別repo編集・実接続・pushの許可ではない。
+
+この承認に基づきH4の25 Taskの実装planを保存した。既存検証経路のroot/60秒固定とH3-active project除外などを先行補修に含め、H1/H2/H3未確認とPhase Bの別途許可を維持する。plan保存は本実装開始ではない。
