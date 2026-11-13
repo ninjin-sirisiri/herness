@@ -1341,6 +1341,7 @@ dependencies = [
  "herness-core",
  "herness-engine-pi",
  "herness-html-sync",
+ "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
  "notify",
@@ -1450,6 +1451,7 @@ name = "herness-sdd-execute-tests"
 version = "0.1.0"
 dependencies = [
  "herness-core",
+ "herness-desktop",
  "herness-html-sync",
  "herness-sdd-execute",
  "herness-store",

@@ -13,4 +13,5 @@ pub mod html_sync;
 pub mod lifecycle;
 pub mod login;
 pub mod real_check;
+pub mod sdd_execute;
 pub mod supervision;

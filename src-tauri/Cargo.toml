@@ -24,6 +24,7 @@ herness-core = { path = "../crates/herness-core" }
 herness-assessment = { path = "../crates/herness-assessment" }
 herness-engine-pi = { path = "../crates/herness-engine-pi" }
 herness-html-sync = { path = "../crates/herness-html-sync" }
+herness-sdd-execute = { path = "../crates/herness-sdd-execute" }
 herness-store = { path = "../crates/herness-store" }
 herness-supervision = { path = "../crates/herness-supervision" }
 notify = "=8.2.0"
