@@ -876,6 +876,11 @@ impl GitJournalEntry {
         self.request.identity()
     }
 
+    /// Content fingerprint recorded from the intent.
+    pub fn fingerprint(&self) -> &RequestFingerprint {
+        self.request.fingerprint()
+    }
+
     /// Recorded intent.
     pub fn intent(&self) -> &GitCommitIntent {
         &self.intent
@@ -1136,6 +1141,11 @@ impl ProgressJournalEntry {
     /// Mandatory request guard.
     pub const fn identity(&self) -> &RequestIdentity<crate::ids::ProgressKind> {
         self.request.identity()
+    }
+
+    /// Content fingerprint recorded from the intent.
+    pub fn fingerprint(&self) -> &RequestFingerprint {
+        self.request.fingerprint()
     }
 
     /// Written content.

@@ -503,11 +503,12 @@ fn newer_schema_version_is_rejected_and_the_database_is_untouched() {
     let error = Store::open(harness.config.clone()).expect_err("newer schema is rejected");
     assert!(matches!(
         error,
-        StoreError::UnsupportedSchemaVersion {
-            found: 999,
-            supported: 9
-        }
+        StoreError::UnsupportedSchemaVersion { found: 999, .. }
     ));
+    let StoreError::UnsupportedSchemaVersion { supported, .. } = error else {
+        unreachable!()
+    };
+    assert_eq!(supported, herness_store::latest_schema_version());
     assert_eq!(fs::read(&database).unwrap(), before);
     assert_eq!(
         raw(&database)
@@ -711,7 +712,10 @@ fn failing_migration_rolls_back_and_preserves_the_existing_database() {
     }
 
     let mut reopened = harness.open();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(
+        reopened.schema_version().unwrap(),
+        herness_store::latest_schema_version()
+    );
     assert_eq!(
         reopened.load_checkpoint(&fixture.run_id).unwrap(),
         Some(stored_checkpoint)
@@ -766,7 +770,10 @@ fn failing_first_migration_on_a_fresh_database_leaves_no_partial_schema() {
     }
 
     let store = harness.open();
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        herness_store::latest_schema_version()
+    );
 }
 
 #[test]
@@ -1033,7 +1040,10 @@ fn opening_and_migrating_touches_only_the_configured_database_file() {
     let before = fs::read(&sibling).unwrap();
 
     let store = harness.open();
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        herness_store::latest_schema_version()
+    );
     drop(store);
 
     assert_eq!(fs::read(&sibling).unwrap(), before);
@@ -1347,7 +1357,10 @@ fn schema_three_v1_history_is_preserved_exactly_with_its_ids_sequence_and_payloa
     };
 
     let mut store = harness.open();
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        herness_store::latest_schema_version()
+    );
 
     {
         let conn = raw(&harness.database_path());
@@ -1670,7 +1683,10 @@ fn failed_event_subject_and_request_migrations_roll_back_to_schema_three() {
         }
 
         let mut reopened = harness.open();
-        assert_eq!(reopened.schema_version().unwrap(), 9);
+        assert_eq!(
+            reopened.schema_version().unwrap(),
+            herness_store::latest_schema_version()
+        );
         assert_eq!(
             reopened.load_checkpoint(&fixture.run_id).unwrap(),
             Some(stored_checkpoint)
@@ -1696,7 +1712,10 @@ fn older_build_target_cannot_migrate_a_newer_database_down() {
     let fixture = ProjectFixture::new();
     {
         let mut store = harness.open();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            herness_store::latest_schema_version()
+        );
         store
             .append_events(vec![draft(&fixture, "run.started", 11)])
             .expect("event before downgrade attempt");
@@ -1706,14 +1725,17 @@ fn older_build_target_cannot_migrate_a_newer_database_down() {
         .expect_err("an older schema target must not rewrite a newer database");
     assert!(matches!(
         error,
-        StoreError::MigrationFailed { version: 9, .. }
+        StoreError::MigrationFailed {
+            version,
+            ..
+        } if version == herness_store::latest_schema_version()
     ));
 
     let conn = raw(&harness.database_path());
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, i64::from(herness_store::latest_schema_version()));
     assert_eq!(legacy_event_rows(&conn).len(), 1);
     assert_eq!(
         conn.query_row(

@@ -1998,6 +1998,9 @@ fn core_supervision_and_html_sync_do_not_depend_on_h4() {
         .nth(2)
         .expect("workspace root")
         .to_path_buf();
+    // The contract crates stay free of H4. `herness-store` is the one approved
+    // exception after Task 5: the SQLite adapter implements the H4 ports, so
+    // store -> H4 is allowed and H4 -> store still is not.
     let manifests = [
         ("herness-core", "crates/herness-core/Cargo.toml"),
         (
@@ -2005,7 +2008,6 @@ fn core_supervision_and_html_sync_do_not_depend_on_h4() {
             "crates/herness-supervision/Cargo.toml",
         ),
         ("herness-html-sync", "crates/herness-html-sync/Cargo.toml"),
-        ("herness-store", "crates/herness-store/Cargo.toml"),
     ];
     for (name, relative) in manifests {
         let path = workspace_root.join(relative);
@@ -2016,6 +2018,12 @@ fn core_supervision_and_html_sync_do_not_depend_on_h4() {
             "{name} must not list herness-sdd-execute"
         );
     }
+    let store = std::fs::read_to_string(workspace_root.join("crates/herness-store/Cargo.toml"))
+        .expect("store manifest");
+    assert!(
+        store.contains("herness-sdd-execute"),
+        "the store implements the H4 ports and must depend on herness-sdd-execute"
+    );
 
     // The H4 crate itself depends only on the public contract crates.
     let h4 = std::fs::read_to_string(workspace_root.join("crates/herness-sdd-execute/Cargo.toml"))

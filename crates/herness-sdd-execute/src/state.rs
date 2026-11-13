@@ -787,6 +787,17 @@ pub enum AppliedRevisionState {
     Stale,
 }
 
+impl AppliedRevisionState {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Current => "current",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 /// The plan revision currently applied and whether it is current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

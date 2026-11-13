@@ -186,6 +186,43 @@ pub enum StoreError {
         /// Sanitized validation detail.
         detail: String,
     },
+    /// A different immutable H4 record is already stored for the same ID.
+    SddExecutionRecordConflict {
+        /// H4 record kind.
+        record: &'static str,
+        /// Record identifier.
+        id: String,
+    },
+    /// The same H4 request identifier was recorded with another request.
+    SddExecutionRequestConflict {
+        /// Request identifier.
+        request: String,
+        /// Recorded request description.
+        recorded: String,
+        /// Newly supplied request description.
+        supplied: String,
+    },
+    /// A saved H4 record declares an unknown payload or contract version.
+    SddExecutionFormat {
+        /// H4 record kind.
+        record: &'static str,
+        /// Version found in the row.
+        found: u32,
+        /// Version written by this build.
+        expected: u32,
+    },
+    /// An H4 value belongs to another project.
+    SddExecutionCrossProject {
+        /// Project the operation is bound to.
+        expected: ProjectId,
+        /// Project found on the value.
+        found: ProjectId,
+    },
+    /// An H4 write is structurally invalid before any write.
+    SddExecutionInvalidCommit {
+        /// Sanitized validation detail.
+        detail: String,
+    },
     /// Stored data failed an integrity check.
     CorruptData {
         /// Sanitized description of the failed check.
@@ -337,6 +374,32 @@ impl fmt::Display for StoreError {
             Self::HtmlSyncInvalidCommit { detail } => {
                 write!(f, "invalid H3 commit: {detail}")
             }
+            Self::SddExecutionRecordConflict { record, id } => {
+                write!(f, "H4 {record} {id} is already stored with another value")
+            }
+            Self::SddExecutionRequestConflict {
+                request,
+                recorded,
+                supplied,
+            } => write!(
+                f,
+                "H4 request {request} was already recorded as {recorded}, not {supplied}"
+            ),
+            Self::SddExecutionFormat {
+                record,
+                found,
+                expected,
+            } => write!(
+                f,
+                "stored H4 {record} format version {found} is not supported (expected {expected})"
+            ),
+            Self::SddExecutionCrossProject { expected, found } => write!(
+                f,
+                "H4 value belongs to project {found}, not the expected project {expected}"
+            ),
+            Self::SddExecutionInvalidCommit { detail } => {
+                write!(f, "invalid H4 commit: {detail}")
+            }
             Self::CrossProjectReference { expected, found } => write!(
                 f,
                 "history cursor belongs to project {found}, not the expected project {expected}"
@@ -440,14 +503,18 @@ impl From<StoreError> for CoreError {
             | StoreError::CommandResultConflict { .. }
             | StoreError::BudgetReservationConflict { .. }
             | StoreError::HtmlSyncRecordConflict { .. }
-            | StoreError::HtmlSyncRequestConflict { .. } => CoreError::StoreUnavailable {
+            | StoreError::HtmlSyncRequestConflict { .. }
+            | StoreError::SddExecutionRecordConflict { .. }
+            | StoreError::SddExecutionRequestConflict { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::Conflict,
             },
             StoreError::CorruptData { .. }
             | StoreError::Codec { .. }
             | StoreError::ForeignDatabase
             | StoreError::HtmlSyncFormat { .. }
-            | StoreError::HtmlSyncCrossProject { .. } => CoreError::StoreUnavailable {
+            | StoreError::HtmlSyncCrossProject { .. }
+            | StoreError::SddExecutionFormat { .. }
+            | StoreError::SddExecutionCrossProject { .. } => CoreError::StoreUnavailable {
                 failure: StoreFailureKind::CorruptData,
             },
             StoreError::InvalidConfig { .. }
@@ -456,6 +523,7 @@ impl From<StoreError> for CoreError {
             | StoreError::UnknownRequestAttempt { .. }
             | StoreError::InvalidStateKey
             | StoreError::HtmlSyncInvalidCommit { .. }
+            | StoreError::SddExecutionInvalidCommit { .. }
             | StoreError::Database { .. }
             | StoreError::Io { .. }
             | StoreError::InjectedFault { .. } => CoreError::StoreUnavailable {

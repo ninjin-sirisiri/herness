@@ -1451,8 +1451,12 @@ dependencies = [
  "herness-core",
  "herness-html-sync",
  "herness-sdd-execute",
+ "herness-store",
  "herness-supervision",
+ "rusqlite",
  "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -1461,6 +1465,7 @@ version = "0.1.0"
 dependencies = [
  "herness-core",
  "herness-html-sync",
+ "herness-sdd-execute",
  "herness-supervision",
  "rusqlite",
  "serde",

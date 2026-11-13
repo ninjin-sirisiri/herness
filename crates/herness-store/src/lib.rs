@@ -12,6 +12,7 @@ mod error;
 mod fault;
 mod html_sync;
 mod migrations;
+mod sdd_execute;
 mod store;
 
 #[cfg(feature = "test-support")]
@@ -22,6 +23,7 @@ pub use error::{ConfigViolation, StoreError};
 pub use herness_core::{
     FileObservation, OperationEvidence, OperationOutcome, OperationRecord, OperationResult,
 };
+pub use migrations::latest_schema_version;
 pub use store::{
     CheckpointRecord, ModelRequestRecord, Store, StoreRecoverySnapshot, SupervisedStateRecord,
 };

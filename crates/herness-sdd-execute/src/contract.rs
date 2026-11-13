@@ -107,6 +107,23 @@ impl fmt::Display for ExecutionOperation {
     }
 }
 
+/// The idempotency content of one control request is its operation.
+///
+/// The request guard already binds the project, execution, request ID, and
+/// expected revision, so the fingerprint only has to distinguish pause from
+/// resume and so on. The resulting snapshot is the stored outcome, never the
+/// request content: a re-delivered request returns the stored result instead of
+/// computing a new fingerprint from a changed snapshot.
+impl crate::journal::JournalContent for ExecutionOperation {
+    fn content_fingerprint(&self) -> Result<crate::version::RequestFingerprint, SddExecutionError> {
+        let bytes = serde_json::to_vec(self).map_err(|error| SddExecutionError::InvalidValue {
+            field: "operation.content".to_owned(),
+            detail: format!("could not encode the operation: {error}"),
+        })?;
+        Ok(crate::version::RequestFingerprint::sha256(&bytes))
+    }
+}
+
 /// A read-only operation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -198,6 +215,28 @@ impl ExecutionOperationRequest {
     /// Update operation.
     pub const fn operation(&self) -> ExecutionOperation {
         self.operation
+    }
+
+    /// Records this request as an intent before any side effect.
+    ///
+    /// The fingerprint binds the operation only; the request guard already
+    /// binds the project, execution, request ID, and expected revision.
+    pub fn intent(&self) -> Result<ControlRecord, SddExecutionError> {
+        ControlRecord::intent(*self.identity(), &self.operation)
+    }
+
+    /// Returns a recorded copy for a completed operation.
+    pub fn recorded(
+        &self,
+        result: ExecutionOperationResult,
+    ) -> Result<ControlRecord, SddExecutionError> {
+        if result.operation() != self.operation {
+            return Err(invalid(
+                "operation.result",
+                "the stored result must describe the requested operation",
+            ));
+        }
+        Ok(self.intent()?.recorded(result))
     }
 }
 

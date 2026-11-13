@@ -15,3 +15,9 @@ herness-html-sync = { path = "../../crates/herness-html-sync" }
 herness-sdd-execute = { path = "../../crates/herness-sdd-execute" }
 herness-supervision = { path = "../../crates/herness-supervision" }
 serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+rusqlite.workspace = true
+tempfile.workspace = true

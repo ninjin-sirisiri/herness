@@ -24,11 +24,14 @@
 
 pub mod approval;
 pub mod contract;
+pub mod durable;
 pub mod error;
+pub mod events;
 pub mod ids;
 pub mod journal;
 pub mod plan;
 pub mod ports;
+pub mod record;
 pub mod snapshot;
 pub mod state;
 pub mod version;
@@ -45,9 +48,15 @@ pub use contract::{
     ExecutionRequirements, HostExecutionContract, HtmlBarrier, ReadExecutionRequest,
     ensure_execution_project,
 };
+pub use durable::{BudgetIncrement, DispatchManifest, DurableExecutionStorePort, TaskReservation};
 pub use error::{
     ApprovalRejection, FailureCode, FailureDetails, H1DetailRef, H2DetailRef, H3DetailRef,
     SddExecutionError,
+};
+pub use events::{
+    SDD_DISPATCH_EVENT_KIND, SDD_EXECUTION_ACTIVITY_KIND, SDD_GIT_EVENT_KIND,
+    SDD_OPERATION_EVENT_KIND, SDD_PROGRESS_EVENT_KIND, SDD_SNAPSHOT_EVENT_KIND, dispatch_event,
+    execution_activity_id, git_event, operation_event, progress_event, revision_of, snapshot_event,
 };
 pub use herness_html_sync::H4Barrier;
 pub use ids::{
@@ -75,6 +84,7 @@ pub use ports::{
     ProgressLedgerPort, StoredControlResult, StoredExecution, SupervisionTargetId, WorkspacePort,
     WorkspacePreparation, WorkspaceState, unsupported,
 };
+pub use record::{RecordDecodeError, STORE_RECORD_FORMAT_VERSION, decode_record, encode_record};
 pub use snapshot::{
     BudgetConsumption, CommitRange, ExecutionSnapshot, NoChangeRecord, SnapshotBudget,
     SnapshotInput, SnapshotPlan, SnapshotWorkspace, TaskSnapshot,
