@@ -1422,6 +1422,7 @@ dependencies = [
  "herness-core",
  "herness-desktop",
  "herness-engine-pi",
+ "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
  "ring",

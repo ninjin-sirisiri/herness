@@ -16,7 +16,7 @@
 //! discovery is a Task 6 concern. The command inherits the host environment.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::contracts::errors::ShellFailure;
-use crate::contracts::ids::OperationId;
+use crate::contracts::ids::{HostActivityId, OperationId};
 use crate::contracts::path::AbsolutePath;
 use crate::contracts::shell::{ShellOutput, ShellStopStatus};
 
@@ -84,6 +84,196 @@ impl SpawnRequest {
     /// Frozen working directory.
     pub const fn cwd(&self) -> &AbsolutePath {
         &self.cwd
+    }
+}
+
+/// Request describing one host-owned command with a fixed argv.
+///
+/// Unlike [`SpawnRequest`], this never passes through a shell. The program and
+/// every argument stay separate argv entries, so no word splitting, globbing,
+/// variable expansion, or `sh -c` string is involved. `env` is a fixed list of
+/// variables the host sets for the child; the child still inherits the host
+/// environment.
+///
+/// Host Git uses this so that `git add -- <explicit paths>` and `git commit`
+/// can never be turned into a shell string by a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgvRequest {
+    program: String,
+    args: Vec<String>,
+    cwd: AbsolutePath,
+    env: Vec<(String, String)>,
+    env_remove: Vec<String>,
+    stdin: Option<Vec<u8>>,
+}
+
+impl ArgvRequest {
+    /// Creates a request for `program` with exactly `args`.
+    ///
+    /// The program must be an absolute path so that `PATH` lookup cannot
+    /// change which binary runs.
+    pub fn new(
+        program: impl Into<String>,
+        args: Vec<String>,
+        cwd: AbsolutePath,
+    ) -> Result<Self, io::Error> {
+        let program = program.into();
+        if program.is_empty() || !std::path::Path::new(&program).is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argv program must be an absolute path",
+            ));
+        }
+        Ok(Self {
+            program,
+            args,
+            cwd,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            stdin: None,
+        })
+    }
+
+    /// Adds one fixed environment variable for the child.
+    pub fn with_env(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, io::Error> {
+        let key = key.into();
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argv environment key must be one non-empty token",
+            ));
+        }
+        let value = value.into();
+        if value.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argv environment value must not contain NUL",
+            ));
+        }
+        self.env.push((key, value));
+        Ok(self)
+    }
+
+    /// Removes one inherited variable from the child environment.
+    pub fn without_env(mut self, key: impl Into<String>) -> Result<Self, io::Error> {
+        let key = key.into();
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argv environment key must be one non-empty token",
+            ));
+        }
+        self.env_remove.push(key);
+        Ok(self)
+    }
+
+    /// Sets the exact stdin bytes written to the child.
+    ///
+    /// The host Git boundary uses this instead of a `-m`/`--message` argv entry
+    /// so the commit message never appears in the process table.
+    pub fn with_stdin(mut self, bytes: Vec<u8>) -> Self {
+        self.stdin = Some(bytes);
+        self
+    }
+
+    /// Absolute program path.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// Fixed arguments, each one argv entry.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Frozen working directory.
+    pub const fn cwd(&self) -> &AbsolutePath {
+        &self.cwd
+    }
+
+    /// Fixed environment variables.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    /// Inherited variables removed from the child environment.
+    pub fn env_remove(&self) -> &[String] {
+        &self.env_remove
+    }
+
+    /// Exact stdin bytes, or `None` for a null stdin.
+    pub fn stdin(&self) -> Option<&[u8]> {
+        self.stdin.as_deref()
+    }
+}
+
+/// Injectable fixed-argv process creation for host-owned activity.
+///
+/// Production uses [`SystemArgvLauncher`]. Tests wrap it to count spawn attempts
+/// without changing the production contract.
+pub trait ArgvLauncher: Send {
+    /// Child type produced by this launcher.
+    type Child: ManagedChild;
+
+    /// Starts one fixed-argv command.
+    fn spawn_argv(&mut self, request: &ArgvRequest) -> io::Result<Self::Child>;
+}
+
+/// Real fixed-argv launcher.
+///
+/// stdout and stderr are piped, stdin is null, and the child becomes the leader
+/// of a new process group, exactly like [`SystemLauncher`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemArgvLauncher;
+
+impl ArgvLauncher for SystemArgvLauncher {
+    type Child = SystemChild;
+
+    fn spawn_argv(&mut self, request: &ArgvRequest) -> io::Result<Self::Child> {
+        let stdin = if request.stdin().is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+        let mut command = Command::new(request.program());
+        command
+            .args(request.args())
+            .envs(request.env().iter().map(|(key, value)| (key, value)))
+            .current_dir(request.cwd().as_path())
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        for key in request.env_remove() {
+            command.env_remove(key);
+        }
+        let mut child = command.spawn()?;
+        if let Some(bytes) = request.stdin() {
+            let Some(mut pipe) = child.stdin.take() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the argv child stdin pipe was unavailable",
+                ));
+            };
+            // Write on a dedicated thread so a child that produces more output
+            // than a pipe buffer before reading stdin cannot deadlock the host.
+            // A short write is normal when the child exits early; it does not
+            // change the process-group result.
+            let bytes = bytes.to_vec();
+            let spawned = thread::Builder::new()
+                .name("herness-argv-stdin".to_owned())
+                .spawn(move || {
+                    let _ = pipe.write_all(&bytes);
+                });
+            if spawned.is_err() {
+                return Err(io::Error::other("could not start the argv stdin writer"));
+            }
+        }
+        Ok(SystemChild { child })
     }
 }
 
@@ -189,18 +379,68 @@ pub fn process_group_exists(pgid: u32) -> bool {
     io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Who owns one managed process group.
+///
+/// A model-originated tool operation is owned by its [`OperationId`]. Host
+/// activity that is not a tool operation (for example the approved host Git
+/// boundary) is owned by a [`HostActivityId`] instead, so the host never
+/// invents an operation or a run to reach the shared supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedOwner {
+    /// One tool operation from a run.
+    Operation(OperationId),
+    /// One host activity that has no run.
+    HostActivity(HostActivityId),
+}
+
+impl ManagedOwner {
+    /// The tool operation, when this is an operation owner.
+    pub const fn operation_id(self) -> Option<OperationId> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            Self::HostActivity(_) => None,
+        }
+    }
+
+    /// The host activity, when this is an activity owner.
+    pub const fn activity_id(self) -> Option<HostActivityId> {
+        match self {
+            Self::Operation(_) => None,
+            Self::HostActivity(activity) => Some(activity),
+        }
+    }
+
+    /// Project that owns the group.
+    pub fn project_id(self) -> crate::contracts::ids::ProjectId {
+        match self {
+            Self::Operation(operation) => operation.project_id(),
+            Self::HostActivity(activity) => activity.project_id(),
+        }
+    }
+}
+
 /// One managed group registered with the supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManagedGroup {
-    operation: OperationId,
+    owner: ManagedOwner,
     pid: u32,
     pgid: u32,
 }
 
 impl ManagedGroup {
-    /// Operation that owns the group.
-    pub const fn operation_id(&self) -> OperationId {
-        self.operation
+    /// Owner of the group.
+    pub const fn owner(&self) -> ManagedOwner {
+        self.owner
+    }
+
+    /// Operation that owns the group, when the owner is an operation.
+    pub const fn operation_id(&self) -> Option<OperationId> {
+        self.owner.operation_id()
+    }
+
+    /// Host activity that owns the group, when the owner is an activity.
+    pub const fn host_activity_id(&self) -> Option<HostActivityId> {
+        self.owner.activity_id()
     }
 
     /// Direct child pid.
@@ -216,7 +456,7 @@ impl ManagedGroup {
 
 #[derive(Debug, Clone, Copy)]
 struct GroupEntry {
-    operation: OperationId,
+    owner: ManagedOwner,
     pid: u32,
     pgid: u32,
 }
@@ -224,7 +464,7 @@ struct GroupEntry {
 impl GroupEntry {
     const fn public(self) -> ManagedGroup {
         ManagedGroup {
-            operation: self.operation,
+            owner: self.owner,
             pid: self.pid,
             pgid: self.pgid,
         }
@@ -275,7 +515,7 @@ impl ProcessSupervisor {
     /// The caller must have already spawned the child. A `None` result means
     /// stop began during the spawn window; the caller must terminate the child
     /// immediately and must not treat it as newly accepted work.
-    pub fn register(&self, operation: OperationId, pid: u32, pgid: u32) -> Option<GroupLease> {
+    pub fn register(&self, owner: ManagedOwner, pid: u32, pgid: u32) -> Option<GroupLease> {
         let mut groups = self
             .inner
             .groups
@@ -284,14 +524,7 @@ impl ProcessSupervisor {
         if self.inner.stopping.load(Ordering::SeqCst) {
             return None;
         }
-        groups.insert(
-            pgid,
-            GroupEntry {
-                operation,
-                pid,
-                pgid,
-            },
-        );
+        groups.insert(pgid, GroupEntry { owner, pid, pgid });
         Some(GroupLease {
             supervisor: self.clone(),
             pgid,
