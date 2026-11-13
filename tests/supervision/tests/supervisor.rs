@@ -990,6 +990,7 @@ impl Harness {
             runtime: &mut self.runtime,
             checks: &mut self.checks,
             assessment: &mut self.assessment,
+            readiness: None,
             evidence: &mut self.evidence,
             store: &mut self.store,
             budget: &mut self.budget,

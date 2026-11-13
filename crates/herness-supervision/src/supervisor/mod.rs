@@ -18,11 +18,14 @@ pub mod state;
 pub use ports::{
     AssessmentProfileFacts, CheckExecution, CheckExecutionRequest, ChildRunContinuation,
     ChildRunStart, ConditionAssessmentPort, ContinuationDeficiency, FailedCheck,
-    OwnerNotificationPort, RequiredCheckPort, StopDisposition, SupervisionBudgetPort,
-    SupervisionRuntimePort, SupervisorNotification, SupervisorPorts, TargetSnapshotRequest,
-    capture_target_snapshot, target_read_set_from_manifest,
+    OwnerNotificationPort, ReadinessDecision, ReadinessRequest, RequiredCheckPort, StopDisposition,
+    SupervisionBudgetPort, SupervisionRuntimePort, SupervisorNotification, SupervisorPorts,
+    TargetSnapshotRequest, VerificationReadinessPort, capture_target_snapshot,
+    target_read_set_from_manifest,
 };
-pub use state::{PendingAssessment, SupervisorPhase, SupervisorState};
+pub use state::{
+    PendingAssessment, ReadinessWait, ReadinessWaitKind, SupervisorPhase, SupervisorState,
+};
 
 use std::collections::BTreeSet;
 
@@ -96,6 +99,8 @@ pub enum TickOutcome {
     /// A run/input pair was started and the controller now waits for input
     /// completion.
     AwaitingInput,
+    /// The input completed but the owner's required documents are not ready.
+    AwaitingReadiness,
     /// One assessment request was persisted or a result was applied.
     AwaitingAssessment,
     /// The compare-and-swap lost to a newer revision; nothing was written or
@@ -230,6 +235,7 @@ impl<'a> Supervisor<'a> {
             SupervisorPhase::Idle => self.phase_idle(&record, &request),
             SupervisorPhase::StartingRun => self.phase_starting_run(&record, &request),
             SupervisorPhase::AwaitingInput => self.phase_awaiting_input(&record, &request),
+            SupervisorPhase::AwaitingReadiness => self.phase_awaiting_readiness(&record, &request),
             SupervisorPhase::Evaluating => match record.state() {
                 SupervisionState::Verifying => self.phase_verifying(&record, &request),
                 SupervisionState::Assessing => self.phase_assessing(&record, &request),
@@ -436,6 +442,9 @@ impl<'a> Supervisor<'a> {
             if let Some(budget_request) = record.supervisor().current_budget_request() {
                 self.ports.budget.finish_run(budget_request)?;
             }
+            if self.ports.readiness.is_some() {
+                return self.enter_readiness_gate(record, request);
+            }
             let mut next = record.clone();
             next.begin_verification(record.required_checks().to_vec())?;
             let state = next.supervisor_mut();
@@ -474,6 +483,208 @@ impl<'a> Supervisor<'a> {
                 HumanAction::ReconcileRecovery,
             ),
             RunState::Running | RunState::Idle => Ok(TickReport::noop(record)),
+        }
+    }
+
+    // --- verification readiness gate -------------------------------------
+
+    /// Observes the owner readiness gate at the completed-input/idle boundary.
+    fn enter_readiness_gate(
+        &mut self,
+        record: &SupervisionRecord,
+        request: &TickRequest,
+    ) -> Result<TickReport, SupervisionError> {
+        if self.ports.budget.remaining_active_seconds()? == 0 {
+            return self.stop(
+                record,
+                record.clone(),
+                request,
+                StopCause::Budget(BudgetLimit::ActiveSeconds),
+            );
+        }
+        let Some(readiness_request) = self.readiness_request(record) else {
+            return self.wait_human(
+                record,
+                record.clone(),
+                request,
+                HumanAction::ReconcileRecovery,
+            );
+        };
+        let decision = self.observe_readiness(&readiness_request);
+        self.apply_readiness(record, request, decision)
+    }
+
+    fn phase_awaiting_readiness(
+        &mut self,
+        record: &SupervisionRecord,
+        request: &TickRequest,
+    ) -> Result<TickReport, SupervisionError> {
+        if record.state() != SupervisionState::Verifying {
+            return self.wait_human(
+                record,
+                record.clone(),
+                request,
+                HumanAction::ReconcileRecovery,
+            );
+        }
+        let contract = request.contract();
+        if contract.conditions().require_approval(self.now()).is_err()
+            || contract.validate_for_start(self.now()).is_err()
+        {
+            return self.wait_human(
+                record,
+                record.clone(),
+                request,
+                HumanAction::ConfirmConditions,
+            );
+        }
+        let Some(run) = record.supervisor().current_run() else {
+            return self.wait_human(
+                record,
+                record.clone(),
+                request,
+                HumanAction::ReconcileRecovery,
+            );
+        };
+        match self.ports.runtime.run_state(run)? {
+            RunState::Running | RunState::AwaitingApproval => {
+                return Ok(TickReport::noop(record));
+            }
+            RunState::Paused | RunState::Interrupted => {
+                return self.wait_human(
+                    record,
+                    record.clone(),
+                    request,
+                    HumanAction::ReconcileRecovery,
+                );
+            }
+            RunState::Failed => {
+                return self.fail(
+                    record,
+                    record.clone(),
+                    request,
+                    SupervisionFailure::TargetUnstable,
+                );
+            }
+            RunState::Idle => {}
+        }
+        if let Some(input) = record.supervisor().current_input() {
+            let progress = self.ports.runtime.input_progress(input)?;
+            if matches!(progress.phase(), InputPhase::Cancelled | InputPhase::Failed) {
+                return self.wait_human(
+                    record,
+                    record.clone(),
+                    request,
+                    HumanAction::ReconcileRecovery,
+                );
+            }
+            if !progress.phase().is_completed() {
+                return Ok(TickReport::noop(record));
+            }
+        }
+        if self.ports.budget.remaining_active_seconds()? == 0 {
+            return self.stop(
+                record,
+                record.clone(),
+                request,
+                StopCause::Budget(BudgetLimit::ActiveSeconds),
+            );
+        }
+        let Some(readiness_request) = self.readiness_request(record) else {
+            return self.wait_human(
+                record,
+                record.clone(),
+                request,
+                HumanAction::ReconcileRecovery,
+            );
+        };
+        let decision = self.observe_readiness(&readiness_request);
+        self.apply_readiness(record, request, decision)
+    }
+
+    fn readiness_request(&self, record: &SupervisionRecord) -> Option<ReadinessRequest> {
+        Some(ReadinessRequest::new(
+            record.project_id(),
+            record.supervision_id(),
+            record.supervisor().current_run()?,
+            record.supervisor().current_input()?,
+            record.condition_version(),
+            record.target_version(),
+            self.now(),
+        ))
+    }
+
+    /// One read-only observation. Any unavailable or undeterminable state is a
+    /// block; it is never treated as ready.
+    fn observe_readiness(&mut self, request: &ReadinessRequest) -> ReadinessDecision {
+        let Some(port) = self.ports.readiness.as_mut() else {
+            return blocked_readiness(
+                "the verification-readiness port is not available",
+                "confirm the required HTML synchronization and resume",
+            );
+        };
+        match port.readiness(request) {
+            Ok(decision) => decision,
+            Err(error) => blocked_readiness(
+                format!("the required HTML synchronization state could not be observed: {error}"),
+                "resolve the HTML synchronization state and resume",
+            ),
+        }
+    }
+
+    fn apply_readiness(
+        &mut self,
+        record: &SupervisionRecord,
+        request: &TickRequest,
+        decision: ReadinessDecision,
+    ) -> Result<TickReport, SupervisionError> {
+        if decision.is_ready() {
+            // Ready only starts the normal verification path. Required checks,
+            // condition assessment, and the freshness check are not skipped.
+            let mut next = record.clone();
+            next.begin_verification(record.required_checks().to_vec())?;
+            let state = next.supervisor_mut();
+            state.phase = SupervisorPhase::Evaluating;
+            state.cycle_checks_done.clear();
+            state.cycle_assessed.clear();
+            state.pending_assessment = None;
+            return self.persist(record, next, request, false, TickOutcome::Advanced);
+        }
+        let Some(wait) = ReadinessWait::from_decision(&decision, self.now()) else {
+            return Err(SupervisionError::InvalidValue {
+                field: "readiness.decision".to_owned(),
+                detail: "a non-ready decision must carry a pending or blocked wait".to_owned(),
+            });
+        };
+        match wait.kind() {
+            ReadinessWaitKind::Pending => {
+                if record
+                    .supervisor()
+                    .readiness()
+                    .is_some_and(|existing| existing.same_decision(&decision))
+                {
+                    return Ok(TickReport::noop(record));
+                }
+                let first_observation = record.supervisor().readiness().is_none();
+                let mut next = record.clone();
+                next.await_readiness(wait)?;
+                next.supervisor_mut().phase = SupervisorPhase::AwaitingReadiness;
+                self.persist(
+                    record,
+                    next,
+                    request,
+                    first_observation,
+                    TickOutcome::AwaitingReadiness,
+                )
+            }
+            ReadinessWaitKind::Blocked => {
+                let mut next = record.clone();
+                next.await_readiness(wait)?;
+                next.supervisor_mut().phase = SupervisorPhase::Finished;
+                next.supervisor_mut().pending_assessment = None;
+                self.ports.budget.wait_for_human()?;
+                self.persist(record, next, request, true, TickOutcome::WaitingHuman)
+            }
         }
     }
 
@@ -1441,6 +1652,27 @@ impl<'a> Supervisor<'a> {
 }
 
 // --- pure helpers ---------------------------------------------------------
+
+/// A block that never depends on owner-provided text being valid.
+fn blocked_readiness(
+    reason: impl Into<String>,
+    required_action: impl Into<String>,
+) -> ReadinessDecision {
+    ReadinessDecision::Blocked {
+        reason: bounded_label(reason, 2_000),
+        required_action: bounded_label(required_action, 1_000),
+        documents: Vec::new(),
+    }
+}
+
+fn bounded_label(value: impl Into<String>, max_chars: usize) -> String {
+    let value = value.into();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "unspecified".to_owned();
+    }
+    trimmed.chars().take(max_chars).collect()
+}
 
 fn contract_mismatch(
     record: &SupervisionRecord,

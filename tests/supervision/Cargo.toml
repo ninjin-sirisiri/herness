@@ -20,6 +20,7 @@ uuid.workspace = true
 base64 = "0.22.1"
 herness-desktop = { path = "../../src-tauri" }
 herness-engine-pi = { path = "../../crates/herness-engine-pi" }
+herness-html-sync = { path = "../../crates/herness-html-sync" }
 herness-sdd-execute = { path = "../../crates/herness-sdd-execute" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
 tempfile.workspace = true

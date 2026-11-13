@@ -36,7 +36,7 @@ use herness_supervision::ports::{
 use herness_supervision::recovery::RecoveryService;
 use herness_supervision::supervisor::{
     ConditionAssessmentPort, OwnerNotificationPort, RequiredCheckPort, Supervisor,
-    SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest,
+    SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest, VerificationReadinessPort,
 };
 use herness_supervision::{
     ApprovalActor, ApprovalBasis, BudgetUsage, ConditionApproval, ConditionVersion, ConsentBinding,
@@ -373,6 +373,7 @@ pub struct SupervisionHost {
     connections: AssessmentHost,
     assessment: Box<dyn ConditionAssessmentPort + Send>,
     checks: CheckMode,
+    readiness: Option<Box<dyn VerificationReadinessPort + Send>>,
     permission: PermissionRuntime,
     active: Mutex<BTreeSet<(ProjectId, SupervisionId)>>,
     last_tick: Mutex<BTreeMap<(ProjectId, SupervisionId), Instant>>,
@@ -445,6 +446,7 @@ impl SupervisionHost {
             connections,
             assessment,
             checks,
+            readiness: None,
             permission,
             active: Mutex::new(BTreeSet::new()),
             last_tick: Mutex::new(BTreeMap::new()),
@@ -497,6 +499,19 @@ impl SupervisionHost {
     /// Shared configuration registry.
     pub fn config(&self) -> ConfigStore {
         self.config.clone()
+    }
+
+    /// Installs the owner verification-readiness gate.
+    ///
+    /// `None` keeps the existing behaviour for Human, H3, and other owners that
+    /// do not require an HTML barrier. The H4 composition installs an adapter
+    /// over the real H3 barrier; the supervisor then consults it exactly at the
+    /// completed-input/idle boundary.
+    pub fn set_readiness_port(
+        &mut self,
+        readiness: Option<Box<dyn VerificationReadinessPort + Send>>,
+    ) {
+        self.readiness = readiness;
     }
 
     /// Shared dynamic permission evaluator installed into H1.
@@ -1789,6 +1804,10 @@ impl SupervisionHost {
         let mut notifications = HostNotifications {
             queue: Arc::clone(&self.notifications),
         };
+        let readiness: Option<&mut dyn VerificationReadinessPort> = self
+            .readiness
+            .as_deref_mut()
+            .map(|port| port as &mut dyn VerificationReadinessPort);
         let result = match &mut self.checks {
             CheckMode::Real => {
                 let root = runtime.project_path(project)?;
@@ -1805,6 +1824,7 @@ impl SupervisionHost {
                     runtime,
                     checks: &mut check_port,
                     assessment: &mut *self.assessment,
+                    readiness,
                     evidence: &mut evidence,
                     store: &mut store,
                     budget: &mut ledger,
@@ -1817,6 +1837,7 @@ impl SupervisionHost {
                 runtime,
                 checks: &mut **checks,
                 assessment: &mut *self.assessment,
+                readiness,
                 evidence: &mut evidence,
                 store: &mut store,
                 budget: &mut ledger,

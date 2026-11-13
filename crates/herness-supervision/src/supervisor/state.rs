@@ -7,14 +7,15 @@
 //! assessment request. Every field is serde-default so records written before
 //! Task 13 continue to load.
 
-use herness_core::contracts::{InputId, RunId};
+use herness_core::contracts::{InputId, RunId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::assessment::AssessmentRequest;
 use crate::consent::ConsentBinding;
 use crate::evidence::{ContentDigest, RequiredCheckResult};
 use crate::ids::{BudgetRequestId, CheckId, ConditionId};
-use crate::supervisor::ports::ContinuationDeficiency;
+use crate::state::SupervisionReason;
+use crate::supervisor::ports::{ContinuationDeficiency, ReadinessDecision};
 
 /// Deterministic controller phase stored with the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -29,6 +30,9 @@ pub enum SupervisorPhase {
     /// The H1 run is active or idle and the controller waits for the matching
     /// input to complete.
     AwaitingInput,
+    /// The input completed and the run is idle; the controller waits for the
+    /// owner's required documents to become ready before verification starts.
+    AwaitingReadiness,
     /// Required checks or condition assessments are being performed.
     Evaluating,
     /// The record reached a terminal or human-waiting state.
@@ -42,9 +46,139 @@ impl SupervisorPhase {
             Self::Idle => "idle",
             Self::StartingRun => "starting_run",
             Self::AwaitingInput => "awaiting_input",
+            Self::AwaitingReadiness => "awaiting_readiness",
             Self::Evaluating => "evaluating",
             Self::Finished => "finished",
         }
+    }
+}
+
+/// Kind of a persisted verification-readiness wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessWaitKind {
+    /// Normal synchronization is in progress; time and deadline keep advancing.
+    Pending,
+    /// A human action is required; active time is excluded as a human wait.
+    Blocked,
+}
+
+impl ReadinessWaitKind {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// One persisted readiness wait.
+///
+/// Only pending and blocked decisions are stored. A `ready` observation is never
+/// persisted as a wait or as completion evidence, so a restored record always
+/// re-observes the owner gate before verification continues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadinessWait {
+    kind: ReadinessWaitKind,
+    reason: String,
+    required_action: Option<String>,
+    documents: Vec<String>,
+    observed_at: Timestamp,
+}
+
+impl ReadinessWait {
+    /// Converts one non-ready decision into a persisted wait.
+    ///
+    /// A `Ready` decision returns `None` and is intentionally not stored.
+    pub fn from_decision(decision: &ReadinessDecision, observed_at: Timestamp) -> Option<Self> {
+        match decision {
+            ReadinessDecision::Ready => None,
+            ReadinessDecision::Pending { reason, awaiting } => Some(Self {
+                kind: ReadinessWaitKind::Pending,
+                reason: reason.clone(),
+                required_action: None,
+                documents: awaiting.clone(),
+                observed_at,
+            }),
+            ReadinessDecision::Blocked {
+                reason,
+                required_action,
+                documents,
+            } => Some(Self {
+                kind: ReadinessWaitKind::Blocked,
+                reason: reason.clone(),
+                required_action: Some(required_action.clone()),
+                documents: documents.clone(),
+                observed_at,
+            }),
+        }
+    }
+
+    /// Whether this stored wait already describes the same decision.
+    ///
+    /// The observation time is excluded so a repeated identical pending
+    /// observation does not rewrite the record on every tick.
+    pub fn same_decision(&self, decision: &ReadinessDecision) -> bool {
+        match (self.kind, decision) {
+            (ReadinessWaitKind::Pending, ReadinessDecision::Pending { reason, awaiting }) => {
+                &self.reason == reason && &self.documents == awaiting
+            }
+            (
+                ReadinessWaitKind::Blocked,
+                ReadinessDecision::Blocked {
+                    reason,
+                    required_action,
+                    documents,
+                },
+            ) => {
+                &self.reason == reason
+                    && self.required_action.as_deref() == Some(required_action.as_str())
+                    && &self.documents == documents
+            }
+            _ => false,
+        }
+    }
+
+    /// Structured reason for the matching supervision state.
+    pub fn reason(&self) -> SupervisionReason {
+        match self.kind {
+            ReadinessWaitKind::Pending => SupervisionReason::AwaitingReadiness {
+                reason: self.reason.clone(),
+                awaiting: self.documents.clone(),
+            },
+            ReadinessWaitKind::Blocked => SupervisionReason::ReadinessBlocked {
+                reason: self.reason.clone(),
+                required_action: self.required_action.clone().unwrap_or_default(),
+                documents: self.documents.clone(),
+            },
+        }
+    }
+
+    /// Wait kind.
+    pub const fn kind(&self) -> ReadinessWaitKind {
+        self.kind
+    }
+
+    /// Owner-provided reason.
+    pub fn reason_text(&self) -> &str {
+        &self.reason
+    }
+
+    /// Required human action for a blocked wait.
+    pub fn required_action(&self) -> Option<&str> {
+        self.required_action.as_deref()
+    }
+
+    /// Opaque document keys named by the wait.
+    pub fn documents(&self) -> &[String] {
+        &self.documents
+    }
+
+    /// When the wait was observed.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
     }
 }
 
@@ -98,6 +232,7 @@ pub struct SupervisorState {
     pub(crate) cycle_checks_done: Vec<CheckId>,
     pub(crate) cycle_assessed: Vec<ConditionId>,
     pub(crate) pending_assessment: Option<PendingAssessment>,
+    pub(crate) readiness: Option<ReadinessWait>,
 }
 
 impl SupervisorState {
@@ -174,6 +309,11 @@ impl SupervisorState {
     /// Persisted assessment request waiting for a result.
     pub const fn pending_assessment(&self) -> Option<&PendingAssessment> {
         self.pending_assessment.as_ref()
+    }
+
+    /// Persisted verification-readiness wait, if the gate is holding.
+    pub const fn readiness(&self) -> Option<&ReadinessWait> {
+        self.readiness.as_ref()
     }
 
     pub(crate) fn push_check_result(&mut self, result: RequiredCheckResult) {

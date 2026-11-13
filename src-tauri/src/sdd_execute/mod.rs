@@ -23,12 +23,14 @@
 //! and it never writes outside the selected checkout.
 
 pub mod git;
+pub mod readiness;
 pub mod workspace;
 
 pub use git::{
     GitProcessOutput, GitRunner, GitStatusEntry, GitWorktree, GitWorktreeStatus,
     WORKSPACE_GIT_TIMEOUT,
 };
+pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
 pub use workspace::{
     ApprovedDocument, ApprovedDocumentKind, BASE_BRANCH_FEATURE, BaselineRecord, GITIGNORE_PATH,
     HostGitPreparationCommit, ISOLATION_FEATURE, MemoryBaselineRecord, NoPreparationCommit,
