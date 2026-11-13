@@ -41,7 +41,9 @@ use herness_supervision::ids::{
     CheckId, ConditionId, ConsentId, DecisionId, EvidenceId, ProfileId, RunGroupId, SupervisionId,
     SupervisionRequestId,
 };
-use herness_supervision::owner_launch::{OwnerApproval, OwnerApprovalRegistryPort};
+use herness_supervision::owner_launch::{
+    H4OwnerApproval, H4OwnerApprovalRegistryPort, OwnerApproval, OwnerApprovalRegistryPort,
+};
 use herness_supervision::ports::{ClockPort, SupervisionStorePort};
 use herness_supervision::profiles::{
     AdapterVersion, AssessmentProfile, ProfileCatalog, ProfileEntry, ProfileInputs, ProfilePurpose,
@@ -118,6 +120,49 @@ impl OwnerApprovalRegistryPort for ScriptedOwnerApprovalRegistry {
         owner: &OwnerRef,
         _now: Timestamp,
     ) -> Result<Option<OwnerApproval>, SupervisionError> {
+        Ok(self.entries.get(&(project_id, owner.clone())).cloned())
+    }
+}
+
+/// A deliberately scripted, in-memory implementation of the H4 plan-approval
+/// registry port.
+///
+/// This exists only for the H4 owner-launch contract tests. It is not the H4
+/// registry and must never be used as production approval data: Task 13
+/// supplies the real approval registry. Tests insert, replace, or remove an
+/// entry explicitly so a missing, stale, or mismatched H4 entry is observable.
+/// It is a distinct type from [`ScriptedOwnerApprovalRegistry`] on purpose, so an
+/// H3-shaped registry can never clear `H4ApprovalUnavailable`.
+#[derive(Debug, Default)]
+pub struct ScriptedH4OwnerApprovalRegistry {
+    entries: BTreeMap<(ProjectId, OwnerRef), H4OwnerApproval>,
+}
+
+impl ScriptedH4OwnerApprovalRegistry {
+    /// Creates an empty H4 registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts or replaces the current H4 entry for one project and owner.
+    pub fn insert(&mut self, approval: H4OwnerApproval) {
+        self.entries
+            .insert((approval.project_id(), approval.owner().clone()), approval);
+    }
+
+    /// Removes the current H4 entry for one project and owner.
+    pub fn remove(&mut self, project_id: ProjectId, owner: &OwnerRef) -> Option<H4OwnerApproval> {
+        self.entries.remove(&(project_id, owner.clone()))
+    }
+}
+
+impl H4OwnerApprovalRegistryPort for ScriptedH4OwnerApprovalRegistry {
+    fn current_h4_owner_approval(
+        &self,
+        project_id: ProjectId,
+        owner: &OwnerRef,
+        _now: Timestamp,
+    ) -> Result<Option<H4OwnerApproval>, SupervisionError> {
         Ok(self.entries.get(&(project_id, owner.clone())).cloned())
     }
 }

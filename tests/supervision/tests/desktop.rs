@@ -1825,6 +1825,8 @@ fn model_actor_missing_confirmation_and_h4_never_start_a_run() {
         OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("H4 binding");
     let mut registry = ScriptedOwnerApprovalRegistry::new();
     registry.insert(h4_binding.approval().clone());
+    // The H3-shaped registry never authorizes an H4 owner, even with an entry;
+    // H4 approval is minted only from the dedicated H4 registry port.
     assert!(matches!(
         authorize_owner_launch(&registry, &h4_binding, Timestamp::now()),
         Err(SupervisionError::OwnerLaunchRejected {

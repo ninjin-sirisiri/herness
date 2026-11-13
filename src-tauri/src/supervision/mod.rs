@@ -9,6 +9,7 @@
 pub mod assessment;
 pub mod checks;
 pub mod gate;
+pub mod h4_launch;
 pub mod permission;
 pub mod plan;
 pub mod runtime;

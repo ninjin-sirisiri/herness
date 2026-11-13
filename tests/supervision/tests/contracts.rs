@@ -1384,6 +1384,9 @@ fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
     let h4_contract = owner_contract(project, h4_owner, OwnerApprovalSource::H4ApprovedPlan);
     let h4_binding =
         OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("binding");
+    // The H3-shaped registry never authorizes an H4 owner, even with an entry.
+    // H4 approval is minted only from the dedicated H4 registry port
+    // (`authorize_h4_owner_launch`), so this blanket refusal stays intact.
     assert_eq!(
         rejected_reason(&ScriptedOwnerApprovalRegistry::new(), &h4_binding),
         OwnerLaunchRejection::H4ApprovalUnavailable

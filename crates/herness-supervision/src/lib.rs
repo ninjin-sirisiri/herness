@@ -86,8 +86,10 @@ pub use operations::{
     ensure_owner_supersedable, execute_operation, execute_owner_supersession,
 };
 pub use owner_launch::{
+    H4CommitAuthorization, H4ExecutionRef, H4LaunchRequest, H4OwnerApproval,
+    H4OwnerApprovalRegistryPort, H4OwnerLaunchBinding, H4PacketBinding, H4TaskRef,
     HostOwnerAuthority, OwnerApproval, OwnerApprovalRegistryPort, OwnerLaunchBinding,
-    authorize_owner_launch,
+    UnconfiguredH4ApprovalRegistry, authorize_h4_owner_launch, authorize_owner_launch, h4_job_id,
 };
 pub use packet::{WORK_PACKET_FORMAT_VERSION, WorkPacket, read_set_digest};
 pub use ports::{
