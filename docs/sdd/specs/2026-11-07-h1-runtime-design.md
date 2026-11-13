@@ -223,6 +223,16 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 
 受入では実Piの候補toolと禁止対象、理由の保存、版競合、反映前後のfault、復元、通知重複、既存DB migrationを検証する。これはOS sandboxや外部processとの完全な排他の追加ではない。
 
+## H4 integration additions
+
+2026-11-13の[H4設計](2026-11-13-h4-sdd-execute-design.md)が必要とする追加契約案。保存済み文書はレビュー待ちで、既存H1の承認には含めない。本実装・実DB移行・実接続を開始しない。
+
+1. **host Git境界:** 人間の開始承認に結び付けたH4内部要求だけが、選択したcheckout・branch・期待HEAD・明示path/bytesに対してstage・commitできる。初回worktree・新branchの作成は別途の明示的な隔離選択に結び付け、commit許可から推定せず、削除も含めない。既存の許可優先順位・停止・副作用前の意図保存を維持し、host専用操作をmodel toolやpreviewへ公開しない。shell文字列の接頭辞照合で代替せず、Git argvとcwdを確定する。push・merge・履歴書換え・変更破棄をこの権限へ含めない。
+2. **Git監査と結果不明:** host activityとして要求ID・目的・期待parent/tree・対象・hook・実結果を記録し、架空runやagentの変更理由を作らない。H4がjournalとTask進行を所有する。Git成功後の保存失敗、hookによる変更、branch/index競合、停止未確認では自動rollback・再実行せず照合する。GitとDBが原子的とは主張しない。
+3. **対象単位の実行分離:** アプリ寿命のpumpは同じproject内のH4 TaskとH3候補を、それぞれの実grant・packet・tool集合で処理できる。H3のcandidate contextをnative Taskへ適用せず、project全体の除外でTaskの停止・deadline・進行を失わない。実装者の同時数やH3著作枠は各ownerが制御する。
+
+受入では実Gitの通常hook・共通HTML gate、stage対象限定、意図/結果保存fault・要求重複・復旧、同projectでの実Pi/loopback TaskとH3候補のtool分離を検証する。許可済み任意shellや外部processの強制隔離は追加しない。
+
 ## Open items and resolution
 
 - **実ChatGPT認証と利用条件:** spikeはmockだけである。H1の接続実装前に現行の公式認可フローを再確認し、実ログイン・実要求には別途利用者の許可を得る。満たせなければ当該接続は未確認・利用不可とし、方式を再検討する。

@@ -2,7 +2,7 @@
 
 **Classification:** architectural / multi-spec
 
-**Status:** 分割・依存関係、H1〜H3のspec、H1/H2の接続追加契約は承認済み。H1・H2の実装はmainへ統合済みだが受入未完了。H3の実装planを保存済み、H3は未実装。追加の本実装・実接続の許可ではない。
+**Status:** 分割・依存関係、H1〜H3のspec、H1/H2の接続追加契約は承認済み。H1〜H3の実装はmainへ統合済み。H1・H2は受入未完了、H3はtext-only reduced scopeでaccepted-with-exceptions。H4 specとH1/H2のH4接続追加案を保存済み・レビュー待ち。追加の本実装・実接続の許可ではない。
 
 ## 全体目標
 
@@ -51,7 +51,7 @@ SDDの正本は既存の`../sdd`とする。成果物・検証・承認の契約
 
 ## Specの分割
 
-H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定specであり、プレースホルダーのファイルは作らない。実際のspecを保存した時点で、この一覧にパスを追記する。
+H1〜H3は承認済み、H4は保存済み・レビュー待ちのspecである。H5は未作成の予定specであり、プレースホルダーのファイルは作らない。実際のspecを保存した時点で、この一覧にパスを追記する。
 
 ### H1 — 実行基盤と変更理由の記録
 
@@ -80,8 +80,8 @@ H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定spec�
 - **含めないもの:** Markdown正本・Target判定・digest・安全性の迂回、情報の欠落・意味の改変・根拠のない情報追加、Task全体の完了判定、汎用の文書変換サービス。
 - **観測可能な完了:** hernessのツール編集と外部編集のどちらからも自動起動し、最新の原文に対応するHTMLだけを同期済みと扱う。順序変更や図解を含む代表文書で全文情報の保持と理解のしやすさを確認し、対応する共通policyの必須検証とH2経由の評価が成立する。古い結果、危険なHTML、情報欠落、判定不能を成功として公開せず、既存成果物を壊さない失敗経路を確認できる。
 - **消費先:** H4・H5。
-- **Spec:** [H3: HTML companionの自動更新と視覚的再構成](2026-11-09-h3-html-sync-design.md)。2026-11-09にH3 specと各正本のH1/H2接続追加契約を承認済み。追加部分は未実装。
-- **Plan:** [H3 HTML Sync and Reconstruction Implementation Plan](../plans/2026-11-09-h3-html-sync.md)。pack側の共通契約とH1/H2前提補修を含む25 Taskを直列に計画済み。実装指示待ち。
+- **Spec:** [H3: HTML companionの自動更新と視覚的再構成](2026-11-09-h3-html-sync-design.md)。2026-11-09にH3 specと各正本のH1/H2接続追加契約を承認済み。接続追加を含む実装はmainへ統合済み。
+- **Plan:** [H3 HTML Sync and Reconstruction Implementation Plan](../plans/2026-11-09-h3-html-sync.md)。[受入記録](../../research/2026-11-09-h3-acceptance.md#受入決定2026-11-10text-only-reduced-scope)により、Phase Aと限定したtext-only information評価を2026-11-10に受入済み。Decisions・画像・残る品質条件・人間の読解観測などは未確認で、full Phase Bの完了や実行時の完了条件の緩和を意味しない。
 
 ### H4 — herness主導のsdd-execute
 
@@ -89,7 +89,9 @@ H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定spec�
 - **所有するもの:** planとTaskの対応、Taskの順序・進行台帳、制約・正本specの伝達、再開とplan変更の扱い、親モデルのdispatchと再開回数を置き換えるSDD連携差分。
 - **含めないもの:** 共通の判定モデルAPI、HTML著作手順の再定義、未承認のspec・plan変更、完了に伴う自動push・merge・公開。
 - **観測可能な完了:** 親モデルがsubagent toolを呼ばなくてもTaskが順番に実行され、Global Constraintsと正本specが引き継がれる。停止・再開・未完了を追跡でき、必要な検証やHTML同期が不成立なら先へ進まない。
-- **消費先:** H5。予定spec、パス未作成。
+- **初期範囲:** 新形式planだけを対象とし、1 planにつき1リポジトリ・1実装checkoutで直列実行する。plan変更で現在Taskも安全停止し、必要な検証・HTML同期の確認後にhernessがcommitする。詳細な契約はH4 specを正本とする。
+- **消費先:** H5。
+- **Spec:** [H4: herness主導のsdd-execute](2026-11-13-h4-sdd-execute-design.md)。2026-11-13にH1/H2のH4接続追加案とともに保存し、レビュー待ち。plan未作成・未実装。
 
 ### H5 — デスクトップ操作とmacOS配布
 
@@ -110,7 +112,7 @@ H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定spec�
 
 承認済みの設計順序はH1 → H2 → H3 → H4 → H5とする。これは個別specを自動で連続設計・実装する指示ではない。UIの実装を最後まで禁止せず、必要最小限の接続確認は各specの受入条件で扱う。
 
-**現在の対象は、plan保存済み・実装指示待ちのH3である。** H1・H2は実装を統合済みだが受入未完了。H3が必要とする追加・補修はH3 specと各正本の追加契約に記録し、既存コードで利用可能とはみなさない。sdd-executeの指示までは本実装を始めず、実接続には別途許可を必要とする。H4以降へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。
+**現在の対象は、保存済みspecとH1/H2追加案のレビュー待ちのH4である。** H1・H2の受入未完了とH3の限定受入・未確認範囲を引き継ぐ。H4の承認済みplan取込み、Task進行台帳、owner起動の承認接続は未実装であり、既存のH2監督機構やH3 barrierだけでH4が利用可能とはみなさない。H4 specと追加契約の承認後にsdd-planへ進み、sdd-executeの指示までは本実装を始めず、実接続には別途許可を必要とする。H5へは自動で進まない。5つのspecの分割・順序・契約所有者は変更しない。
 
 ## 共通契約の所有者
 
@@ -130,7 +132,7 @@ H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定spec�
 - **判定と継続の具体的規則:** 完了条件の作成・承認、証拠の鮮度、判定モデルの選択単位、閾値、予算の数値、停滞検知、API失敗時のfallbackはH2で決める。未定のまま無制限継続や成功扱いを実装しない。
 - **HTML同期の失敗と競合:** 失敗時にどの作業まで止めるか、外部からHTMLが編集された場合、移動・削除・bootstrapの扱いはH3で決める。破壊的操作を含める場合は、その可逆性・失敗・再実行の結果を実装前に明示的に確認する。
 - **H3面談での解消:** project単位で有効化し、同期失敗時は通常作業を続けて必要な完了だけ保留する。意味を保つ言い換え、履歴付きの自動反映、外部HTML競合での人間待ち、削除・移動時の旧成果物保持を合意した。意味評価はH2、offline CIは静的検証・証跡整合を担当する。詳細と残る有効化前検証は承認済みH3 specを正本とする。
-- **HTML再構成の検証と評価:** 現行SDDは原文の見出し・本文の順序保持を要求し、要約追加や再構成を認めていない。H3で、全文情報と意味の保持、図・グラフの根拠、認知負荷を下げる表現の評価方法、軽量LLM・Decisionモデルへ渡す証拠、共通policyとCIでの検証方法を定める。静的・安全な閲覧と鮮度の検証は維持し、意味や視覚表現の品質をdigest一致だけで保証したとは扱わない。このロードマップのHTMLには、まだ変更していない現行の検証契約を適用する。
+- **HTML再構成の検証と評価:** H3で全文情報と意味の保持、図・グラフの根拠、品質評価、共通policyとoffline CIの契約を定め、明示opt-inのsemantic-v1を実装した。既存のstrict契約も維持する。静的・安全な閲覧と鮮度の検証は維持し、意味や視覚表現の品質をdigest一致だけで保証したとは扱わない。実評価の受入範囲はH3受入記録を参照し、未確認の品質条件をH4で免除しない。このロードマップのHTMLにはstrict契約を適用する。
 - **planの機械的取込みとGit連携:** 現行planには完了条件等の散文があり、既存スクリプトだけでは実行契約が完結しない。取込み形式、変更時の再承認、worktree選択、commit境界、sdd-finishとの互換範囲をH4で決める。曖昧なplanを黙って解釈して実行しない。
 - **配布と製品UI:** macOSの最低対応版、署名・notarization・更新方式、画面構成は、H1の技術境界に影響する項目をH1で先に確認し、残りをH5で決める。
 
@@ -138,7 +140,7 @@ H1〜H3は承認済みのspecを保存した。H4・H5は未作成の予定spec�
 
 - 用語は[CONTEXT.md](../../../CONTEXT.md)を参照する。
 - SDDの現行規則は`../sdd/README.md`、`../sdd/skills/sdd-design/SKILL.md`、`../sdd/skills/sdd-execute/SKILL.md`、`../sdd/skills/sdd-goal/SKILL.md`、`../sdd/skills/sdd-plan/SKILL.md`と関連実装・テストを確認した。参照元の`../sdd`はhernessのプロジェクトルートからの相対パスである。
-- HTMLの既存契約は`../sdd/docs/sdd/specs/2026-09-01-agent-authored-html-design.md`、同packのADR 0002・0003、`scripts/sddlib/html_policy.py`を正本とする。既存仕様では自動著作は対象外で、原文の順序変更や要約も禁止されている。H3でherness固有の責務移管と視覚的再構成の適用範囲を明記し、共通policyと整合させる。
+- HTMLの共通契約は`../sdd/docs/sdd/specs/2026-09-01-agent-authored-html-design.md`、同packのADR 0002・0003、`scripts/sddlib/html_policy.py`を正本とする。H3設計開始時点では自動著作・再構成は対象外だったが、H3でherness限定の責務移管と明示opt-inのsemantic-v1を追加した。他ホストの既存動作とstrict契約は維持する。
 - 現行sdd-executeは親controllerのdispatchと限定回数の再開を要求する。H4でその差分を明示する一方、Taskの直列実行、承認境界、制約の引継ぎを維持する。
 - Piは[公式リポジトリ](https://github.com/earendil-works/pi)と[v1.5.0のSDK文書](https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/docs/sdk.md)・拡張文書を確認した。旧`badlogic/pi-mono`から移行している。SDKの実行終了通知は、hernessのタスク完了の証明とは扱わない。
 - Rust候補は[PiのRust移植](https://github.com/yannelli/pi-rust)、[Rig](https://github.com/0xPlaygrounds/rig)、[Goose](https://github.com/aaif-goose/goose)の文書・ソースを調査した。埋め込み用の境界と完成したcoding harnessの再利用は同じではなく、採用判断はH1が所有する。
@@ -170,3 +172,7 @@ H1正本へ追加契約を保存・検証した後、利用者が「追加契約
 2026-11-09、利用者がH3の設計を指示した。面談後、「この内容でspecを保存」を選択し、H3 spec、H1/H2接続追加案、用語とロードマップ、HTMLの保存・検証・設計文書だけのcommitを許可した。これは個別spec・追加契約の承認やsdd-plan・本実装・追加の実モデル送信・pushの許可ではない。
 
 続いて保存済みH3 specとH1/H2のH3 integration additionsへのレビュー依頼に、利用者が「ok」と回答した。H3 specと追加契約の承認として記録し、H3だけのsdd-planへ進む。本実装・pack変更・追加の実モデル送信・pushの許可ではない。
+
+その後H3の実装と検証がmainへ統合され、2026-11-10に利用者がtext-only reduced scopeでの受入を明示した。詳細と未確認範囲はH3受入記録を正本とし、過去の「実装指示待ち」「未実装」は当時の履歴として扱う。
+
+2026-11-13、利用者がロードマップのH4の設計開始を指示した。既存の分割・依存関係・契約所有者を再利用して面談を行い、新形式planのみ、1リポジトリ、plan変更時の現在Taskの安全停止、hernessによるcommitを選択した。設計要約への「ok」に基づきH4 specと各正本のH1/H2接続追加案を保存した。これは保存後のspec・追加契約の承認、sdd-plan・sdd-execute・本実装・実モデル送信・pushの許可ではない。
