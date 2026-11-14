@@ -35,12 +35,19 @@
 //!   [`an_externally_edited_ledger_is_refused`],
 //!   [`a_change_between_plan_and_replace_is_refused`].
 //! * The baseline and every recorded range survive a hold:
-//!   [`a_hold_never_changes_the_baseline_or_a_recorded_range`].
+//!   [`a_hold_never_changes_the_baseline_or_a_recorded_range`],
+//!   [`a_ledger_failure_at_finish_holds_the_execution_instead_of_finishing`],
+//!   [`a_terminal_failure_is_never_held`].
+//! * The compatibility brief is written atomically and never overwritten:
+//!   [`the_brief_file_is_written_atomically_and_never_overwritten`].
 //! * `ready_for_finish` needs current evidence and spec reflection:
 //!   [`ready_only_with_current_final_evidence_and_spec_reflection`],
+//!   [`an_execution_that_is_not_finished_is_not_ready`],
 //!   [`stale_full_suite_evidence_is_not_ready`],
 //!   [`a_post_commit_change_makes_the_evidence_stale`],
-//!   [`a_missing_spec_reflection_with_a_later_phase_is_not_ready`].
+//!   [`a_missing_spec_reflection_with_a_later_phase_is_not_ready`],
+//!   [`a_final_check_without_evidence_is_not_ready`],
+//!   [`an_incomplete_evidence_block_is_not_ready`].
 //! * The handoff carries every required field and grants no side effect:
 //!   [`the_handoff_carries_every_finish_field_and_no_side_effect`].
 
