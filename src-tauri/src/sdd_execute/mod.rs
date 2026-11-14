@@ -58,6 +58,7 @@
 //! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
 
 pub mod composition;
+pub mod coordinator;
 pub mod git;
 pub mod pack;
 pub mod packet;
@@ -70,6 +71,10 @@ pub use composition::{
     ApprovalOutcome, CurrentInputs, DesktopStartComposition, DesktopWorkspace, LiveStartFacts,
     StartApprovalRequest, UnavailableChildStart, approve_and_start, current_owner_approval,
     desktop_start_composition, ensure_human_start_confirmation, preview_facts,
+};
+pub use coordinator::{
+    ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
+    child_state_of, supervision_target_id,
 };
 pub use git::{
     GitProcessOutput, GitRunner, GitStatusEntry, GitWorktree, GitWorktreeStatus,

@@ -34,6 +34,21 @@
 //!   human waits, and an absent or unparseable report is never `DONE`. Reversible
 //!   `Ruling`s are retained for later packets.
 //!
+//! Task 15 adds the serial coordinator and the combined Task budget:
+//!
+//! * [`coordinator`] decides exactly one step per call over the ports: it selects
+//!   the first not-complete Task in plan order, verifies the current approval,
+//!   checkout claim, and plan revision before any side effect, persists the
+//!   dispatch intent and H2 binding before the one child exists, re-reads the
+//!   stored H2 result instead of trusting a notification, and never lets a Task
+//!   leave H2's completion unless the host barrier and commit are connected.
+//!   [`coordinator::TaskCoordinator::advance`] is the entry point and
+//!   [`coordinator::CoordinatorOutcome`] is the decision.
+//! * [`budget`] is the finite Task budget: H2 supervision consumption plus H4's
+//!   own host-side post-completion processing under 7,200 s, 30 additional runs,
+//!   and 3 consecutive stalls. It is monotonic across resume, restart, and plan
+//!   re-approval, and "met after the limit" is a typed refusal, not completion.
+//!
 //! The ten failure and refusal classes (`unsupported_plan_format`,
 //! `invalid_plan`, `unavailable`, `approval_required`, `conflict`,
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
@@ -44,7 +59,9 @@
 
 pub mod approval;
 pub mod approval_registry;
+pub mod budget;
 pub mod contract;
+pub mod coordinator;
 pub mod durable;
 pub mod error;
 pub mod events;
@@ -72,11 +89,19 @@ pub use approval_registry::{
     StartPhase, StartReceipt, StartRecord, StartRecordStorePort, ensure_budgets,
     start_record_format_version, task_budget,
 };
+pub use budget::{TaskBudget, TaskBudgetConsumption, TaskBudgetExhaustion};
 pub use contract::{
     ApprovalContract, CheckoutClaim, ContinuationLimits, ControlRecord, Delegation,
     DelegationRules, ExecutionOperation, ExecutionOperationRequest, ExecutionOperationResult,
     ExecutionRequirements, HostExecutionContract, HtmlBarrier, ReadExecutionRequest,
     ensure_execution_project,
+};
+pub use coordinator::{
+    ChildNotification, ChildState, ChildStatus, ChildStatusPort, ChildStopCause, CompletionFeature,
+    CompletionWiring, CoordinatorOutcome, CoordinatorPorts, CoordinatorRequest,
+    CoordinatorStorePort, LaunchRefusal, NotConnectedCompletion, SerialExecutionState,
+    TaskCompletion, TaskCompletionPort, TaskCompletionRequest, TaskCoordinator, TaskLaunch,
+    TaskLaunchPort, dispatch_request_id, step_request_id,
 };
 pub use durable::{BudgetIncrement, DispatchManifest, DurableExecutionStorePort, TaskReservation};
 pub use error::{
