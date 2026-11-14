@@ -7,11 +7,13 @@
 //! [`DesktopH4Barrier`]. It never reimplements H3 policy, writes a document,
 //! starts a Task, or decides completion.
 //!
-//! The required-document set is H4-owned. Task 15/16 supply it from the approved
-//! Task's `htmlTargets`, the discovered Target changes, and the referenced spec
-//! and plan through [`ReadinessDocumentSource`]. If the set cannot be produced,
-//! or the saved H3 state cannot be read, the gate is `blocked`; it is never
-//! `ready`.
+//! The required-document set is H4-owned. The production source is
+//! [`H4RequiredDocuments`](crate::sdd_execute::barrier::H4RequiredDocuments),
+//! which computes the union of the Task's `htmlTargets`, the plan, the project
+//! specs, the common-Target scan changes, and every H3 dependency-affected
+//! document. [`FixedReadinessDocuments`] remains only as an explicit test input.
+//! If the set cannot be produced, or the saved H3 state cannot be read, the gate
+//! is `blocked`; it is never `ready`.
 
 use herness_html_sync::{BarrierOutcome, BarrierRequest};
 use herness_supervision::SupervisionError;
@@ -36,8 +38,9 @@ pub trait ReadinessDocumentSource {
 
 /// A fixed required-document set.
 ///
-/// This is the explicit input the H4 coordinator supplies today; Task 16
-/// replaces it with Target discovery without changing this gate.
+/// This is an explicit test/gate input only. The production composition installs
+/// [`H4RequiredDocuments`](crate::sdd_execute::barrier::H4RequiredDocuments) so
+/// the gate waits on the real required union instead of a fixed list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FixedReadinessDocuments {
     requests: Vec<BarrierRequest>,

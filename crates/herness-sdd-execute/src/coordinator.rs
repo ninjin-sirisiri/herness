@@ -448,6 +448,29 @@ pub enum CompletionWiring {
         /// The missing capability.
         feature: CompletionFeature,
     },
+    /// The HTML barrier is connected and runs first; the host commit is still
+    /// missing, so a synced barrier is followed by an explicit refusal and never
+    /// a fabricated completion. Task 17 replaces this with [`Self::Connected`].
+    BarrierConnected {
+        /// The still-missing capability.
+        missing: CompletionFeature,
+    },
+}
+
+impl CompletionWiring {
+    /// The barrier is connected; only `missing` remains.
+    pub const fn barrier_connected(missing: CompletionFeature) -> Self {
+        Self::BarrierConnected { missing }
+    }
+
+    /// Whether the connected completion path may run.
+    ///
+    /// A fully connected seam and a barrier-connected seam both run; the
+    /// barrier-connected seam refuses inside the host completion after its
+    /// barrier, which the coordinator records as a durable human wait.
+    pub const fn may_run(self) -> bool {
+        !matches!(self, Self::NotConnected { .. })
+    }
 }
 
 /// One Task's connected host completion request.
@@ -541,6 +564,27 @@ pub trait TaskCompletionPort {
         &mut self,
         request: &TaskCompletionRequest,
     ) -> Result<TaskCompletion, SddExecutionError>;
+}
+
+/// Builds the completion wiring from the two host halves.
+///
+/// A missing barrier is [`CompletionWiring::NotConnected`]. A connected barrier
+/// with a missing commit is [`CompletionWiring::BarrierConnected`], which runs
+/// the HTML barrier and then refuses explicitly rather than completing.
+pub const fn completion_wiring(
+    barrier_connected: bool,
+    commit_connected: bool,
+    missing: CompletionFeature,
+) -> CompletionWiring {
+    if !barrier_connected {
+        return CompletionWiring::NotConnected {
+            feature: CompletionFeature::HtmlBarrier,
+        };
+    }
+    if !commit_connected {
+        return CompletionWiring::BarrierConnected { missing };
+    }
+    CompletionWiring::Connected
 }
 
 /// The explicit "not connected" completion seam.
@@ -1401,8 +1445,14 @@ fn complete_task(
     let target = task.task();
 
     // The host path must be wired before the Task may leave H2's completion. The
-    // missing capability is explicit; nothing is inferred.
-    if let CompletionWiring::NotConnected { feature } = ports.completion.wiring(target) {
+    // missing capability is explicit; nothing is inferred. A barrier-connected
+    // seam runs its HTML barrier first and refuses the still-missing commit
+    // inside the completion, so a non-synced result holds the Task with the
+    // right HTML reason instead of a blanket capability error.
+    let wiring = ports.completion.wiring(target);
+    if !wiring.may_run()
+        && let CompletionWiring::NotConnected { feature } = wiring
+    {
         let outcome = stop_execution(
             ports,
             snapshot,

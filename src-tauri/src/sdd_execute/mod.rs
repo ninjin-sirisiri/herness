@@ -57,6 +57,7 @@
 //! There is no fallback parser: an unusable exchange is an explicit
 //! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
 
+pub mod barrier;
 pub mod composition;
 pub mod coordinator;
 pub mod git;
@@ -67,6 +68,12 @@ pub mod registry;
 pub mod source;
 pub mod workspace;
 
+pub use barrier::{
+    BoundTask, DesktopH4BarrierGate, DesktopTaskCompletion, H4RequiredDocuments,
+    HtmlBarrierCompletion, NotConnectedCommit, SharedBarrierGate, TaskBarrierGate,
+    as_readiness_port, barrier_allows_finalization, bind_shared_gate, origins_of, readiness_port,
+    required_paths, shared_gate, shared_readiness_port,
+};
 pub use composition::{
     ApprovalOutcome, CurrentInputs, DesktopStartComposition, DesktopWorkspace, LiveStartFacts,
     StartApprovalRequest, UnavailableChildStart, approve_and_start, current_owner_approval,

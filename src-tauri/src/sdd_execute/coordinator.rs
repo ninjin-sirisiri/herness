@@ -2,11 +2,13 @@
 //!
 //! This module connects the deterministic coordinator in
 //! [`herness_sdd_execute::coordinator`] to the real H2 owner path, the real
-//! SQLite store, the app-wide pump scope, and the readiness gate. It deliberately
-//! does **not** connect the H3 barrier consumption or the host commit: those
-//! belong to Task 16 and Task 17, so the composition installs
-//! [`NotConnectedCompletion`], and a Task that H2 reports complete stops at
-//! `waiting_human` with a `capability_unavailable` reason instead of advancing.
+//! SQLite store, the app-wide pump scope, and the readiness gate. It connects the
+//! H3 barrier half (Task 16) and deliberately leaves the host commit half
+//! unconnected (Task 17): [`DesktopTaskCompletion`] starts as the explicit
+//! `not connected` seam and, after [`DesktopCoordinator::connect_html_barrier`],
+//! runs the real barrier and holds a non-synced Task. A synced barrier then
+//! holds at `waiting_human` with the still-missing commit reason instead of
+//! reporting a fabricated completion.
 //!
 //! # Wiring
 //!
@@ -16,7 +18,7 @@
 //! | launch | [`ApprovedTaskLaunch`] over the stored approval, the verified spec snapshots, and the stored handoffs |
 //! | dispatch | [`H2ChildDispatch`] over `SupervisionHost::start_h4_task` |
 //! | children | [`H2ChildStatus`], which re-reads the stored H2 record |
-//! | completion | `not connected` until Task 16/17 |
+//! | completion | [`DesktopTaskCompletion`]: the real HTML barrier, then an explicit missing-commit refusal until Task 17 |
 //! | pump scope | [`PumpScope::AllExcept`] excluding only the H3 candidate target |
 //!
 //! The composition performs no push, pull, merge, rebase, amend, reset, or clean,
@@ -26,13 +28,17 @@ use herness_core::contracts::ProjectId;
 use herness_sdd_execute::{
     ApprovalRequirement, ChildDispatchPlan, ChildDispatchPort, ChildState, ChildStatus,
     ChildStatusPort, DispatchRequestId, DispatchResult, ExecutionApproval, ExecutionId,
-    FailureDetails, LaunchRefusal, NotConnectedCompletion, SddExecutionError, Sha256Digest,
-    SnapshotSections, TaskHandoff, TaskRef,
+    FailureDetails, LaunchRefusal, SddExecutionError, Sha256Digest, SnapshotSections, TaskHandoff,
+    TaskRef,
 };
 use herness_supervision::{
     ExecutionScope, SupervisionError, SupervisionId, SupervisionState, TargetVersion,
 };
 
+use crate::sdd_execute::barrier::{
+    DesktopH4BarrierGate, DesktopTaskCompletion, SharedBarrierGate, bind_shared_gate, shared_gate,
+    shared_readiness_port,
+};
 use crate::sdd_execute::packet::{H4TaskPacket, TaskPacketOutcome, task_packet};
 use crate::sdd_execute::registry::{ApprovalDraft, H4StartApprovalRegistry};
 use crate::supervision::h4_launch::{
@@ -44,7 +50,7 @@ use crate::supervision::{PumpScope, SupervisionHost, SupervisionTarget};
 /// The desktop coordinator composition.
 pub struct DesktopCoordinator {
     host: SupervisionHost,
-    completion: NotConnectedCompletion,
+    completion: DesktopTaskCompletion,
 }
 
 impl DesktopCoordinator {
@@ -52,7 +58,7 @@ impl DesktopCoordinator {
     pub const fn new(host: SupervisionHost) -> Self {
         Self {
             host,
-            completion: NotConnectedCompletion::new(),
+            completion: DesktopTaskCompletion::not_connected(),
         }
     }
 
@@ -66,9 +72,48 @@ impl DesktopCoordinator {
         &mut self.host
     }
 
-    /// The host completion seam. It reports `not connected` until Task 16/17.
-    pub const fn completion(&self) -> &NotConnectedCompletion {
+    /// The host completion seam.
+    ///
+    /// Before [`Self::connect_html_barrier`] it reports `not connected`; after it
+    /// runs the real H3 barrier and holds a non-synced Task. The host commit half
+    /// stays explicitly missing until Task 17.
+    pub const fn completion(&self) -> &DesktopTaskCompletion {
         &self.completion
+    }
+
+    /// The mutable completion seam the coordinator drives.
+    pub const fn completion_mut(&mut self) -> &mut DesktopTaskCompletion {
+        &mut self.completion
+    }
+
+    /// Connects the HTML barrier half over one bound gate.
+    ///
+    /// The gate is bound to the Task by [`DesktopH4BarrierGate::bind_task`] before
+    /// the Task is dispatched; binding here keeps one gate for the readiness wait
+    /// and the final barrier, so both assert the same verified baseline.
+    pub fn connect_html_barrier(&mut self, gate: DesktopH4BarrierGate) {
+        self.completion = DesktopTaskCompletion::barrier(gate);
+    }
+
+    /// Installs the whole HTML barrier lane for one Task.
+    ///
+    /// It binds the Task on one shared gate, installs the real
+    /// [`H4RequiredDocuments`](crate::sdd_execute::barrier::H4RequiredDocuments)
+    /// source as H2's pre-verification readiness port, and connects the same gate
+    /// as the final barrier. Both therefore assert the same verified baseline
+    /// instead of a fixed document list.
+    pub fn install_html_barrier(
+        &mut self,
+        gate: DesktopH4BarrierGate,
+        approval: &ExecutionApproval,
+        task: TaskRef,
+    ) -> Result<SharedBarrierGate, SddExecutionError> {
+        let shared = shared_gate(gate);
+        bind_shared_gate(&shared, approval, task)?;
+        self.host
+            .set_readiness_port(Some(Box::new(shared_readiness_port(shared.clone()))));
+        self.completion = DesktopTaskCompletion::barrier_shared(shared.clone());
+        Ok(shared)
     }
 
     /// The native pump scope that excludes exactly one candidate target.

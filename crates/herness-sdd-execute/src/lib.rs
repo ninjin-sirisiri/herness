@@ -49,6 +49,17 @@
 //!   and 3 consecutive stalls. It is monotonic across resume, restart, and plan
 //!   re-approval, and "met after the limit" is a typed refusal, not completion.
 //!
+//! Task 16 adds [`barrier`]: the H3 required-document union and the completion
+//! barrier. The union is the Task's `htmlTargets`, the executing plan and the
+//! project specs, the documents the common-Target scan confirms changed, and
+//! every H3 document whose recorded dependency fingerprint changed. When the
+//! set or a dependency cannot be determined it widens to the declared Target
+//! scope or waits for a human; it never narrows silently. The barrier asserts
+//! the exact revision, bytes, and dependency fingerprints H4 captured before
+//! verification, so a saved `Synced` response or a repository receipt is never
+//! trusted on its own, and it keeps `NotApproved`, `Missing`, `Mismatch`,
+//! `Unsynced`, and `Orphaned` distinct.
+//!
 //! The ten failure and refusal classes (`unsupported_plan_format`,
 //! `invalid_plan`, `unavailable`, `approval_required`, `conflict`,
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
@@ -59,6 +70,7 @@
 
 pub mod approval;
 pub mod approval_registry;
+pub mod barrier;
 pub mod budget;
 pub mod contract;
 pub mod coordinator;
@@ -89,6 +101,12 @@ pub use approval_registry::{
     StartPhase, StartReceipt, StartRecord, StartRecordStorePort, ensure_budgets,
     start_record_format_version, task_budget,
 };
+pub use barrier::{
+    BarrierCapture, BarrierDecision, BarrierHold, BarrierReport, CapturedDocument, CheckedDocument,
+    DocumentBarrier, DocumentBaseline, DocumentOrigin, RequiredDocument, RequiredDocumentSet,
+    RequiredSetInputs, RequiredSetOutcome, SavedDocument, ScannedTarget, StoredTarget,
+    check_barrier, required_documents, verification_request,
+};
 pub use budget::{TaskBudget, TaskBudgetConsumption, TaskBudgetExhaustion};
 pub use contract::{
     ApprovalContract, CheckoutClaim, ContinuationLimits, ControlRecord, Delegation,
@@ -101,7 +119,7 @@ pub use coordinator::{
     CompletionWiring, CoordinatorOutcome, CoordinatorPorts, CoordinatorRequest,
     CoordinatorStorePort, LaunchRefusal, NotConnectedCompletion, SerialExecutionState,
     TaskCompletion, TaskCompletionPort, TaskCompletionRequest, TaskCoordinator, TaskLaunch,
-    TaskLaunchPort, dispatch_request_id, step_request_id,
+    TaskLaunchPort, completion_wiring, dispatch_request_id, step_request_id,
 };
 pub use durable::{BudgetIncrement, DispatchManifest, DurableExecutionStorePort, TaskReservation};
 pub use error::{
