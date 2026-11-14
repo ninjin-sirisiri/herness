@@ -562,6 +562,14 @@ impl HtmlSyncServices {
         &self.evidence_root
     }
 
+    /// The configured Common SDD pack root, when one is present.
+    ///
+    /// Its presence is not an approval; it only makes the pack inspection and the
+    /// policy bridge possible.
+    pub fn pack_root(&self) -> Option<&Path> {
+        self.pack_root.as_deref()
+    }
+
     /// Replaces the toolchain used for the verified Common SDD host-API
     /// connection. Production reads it from the host environment; acceptance
     /// tests pass the repository's explicit validator path.

@@ -120,12 +120,37 @@
 //!   [`recovery::confirm_resume`] is the only way the desktop mints the
 //!   confirmation it needs.
 //!
-//! Task 21 exposes these values over the trusted IPC; this module adds no
-//! window, command, or UI type, and it never pushes, merges, rebases, amends,
-//! resets, or cleans.
+//! Task 21 adds [`views`] and [`controller`], the trusted desktop surface:
+//!
+//! * [`views`] is the versioned, read-only projection H5 reuses: the execution
+//!   snapshot (version, project, execution ID and revision, plan digest and
+//!   approved revision, checkout/branch/baseline, current Task, every Task's
+//!   stable ID, number, progression, phase, H2 reference, commit range or
+//!   `no_change` record and evidence, stop reason and required action, consumed
+//!   and reserved budget, applied revision, and final project sequence), the
+//!   display states that keep `html_not_synced`, an undecidable human wait, a
+//!   plan change, an exhausted budget, a required recovery, and an unknown Git
+//!   result distinct, the start disclosure (scope, consents, host commit, the
+//!   per-Task finite limits, the multi-Task and separately approved H3 cost
+//!   warnings, and every unverified capability), the finish handoff, and the ten
+//!   failure classes. A view never carries a UI-only success flag and never
+//!   invents an unestablished reference.
+//! * [`controller::SddTaskController`] is the availability gate and the minimal
+//!   operations. It is available only when every required port and the current
+//!   saved approval are present, and it has no fallback: a missing capability is
+//!   reported explicitly. Its `approve_and_start` saves the human approval
+//!   revision and the `ready` snapshot (the start intent) and creates no child;
+//!   the coordinator dispatches the first incomplete Task from that snapshot.
+//!   `pause`/`cancel` write the durable hold before asking the child to stop, and
+//!   `resume` and `approve_plan_revision` require a confirmation this module
+//!   mints only after the command layer verified the trusted main webview.
+//!
+//! The module still contains no Tauri window, command, or UI type, and it never
+//! pushes, merges, rebases, amends, resets, or cleans.
 
 pub mod barrier;
 pub mod composition;
+pub mod controller;
 pub mod coordinator;
 pub mod finalize;
 pub mod git;
@@ -138,6 +163,7 @@ pub mod readiness;
 pub mod recovery;
 pub mod registry;
 pub mod source;
+pub mod views;
 pub mod workspace;
 
 pub use barrier::{
@@ -152,6 +178,11 @@ pub use composition::{
     PlanRevisionRequest, StartApprovalRequest, UnavailableChildStart, approve_and_start,
     approve_plan_revision_request, current_owner_approval, desktop_start_composition,
     ensure_human_plan_revision_confirmation, ensure_human_start_confirmation, preview_facts,
+};
+pub use controller::{
+    SddApproveStartRequest, SddFinishRequest, SddOperationRequest, SddPlanRevisionRequest,
+    SddPreviewRequest, SddResumeRequest, SddTaskController, SddTaskLimitRequest,
+    ensure_operation_confirmation, failure_of, failure_ref, live_inputs,
 };
 pub use coordinator::{
     ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
@@ -199,6 +230,14 @@ pub use registry::{
 };
 pub use source::{
     ConfinedRead, ConfinedReader, PlanFileSource, read_and_verify_specs, read_spec_snapshot,
+};
+pub use views::{
+    H3_CYCLE_COST_WARNING, MULTI_TASK_COST_WARNING, SDD_VIEW_VERSION, SddBudgetView,
+    SddCapabilityReportView, SddCommitRangeView, SddDisplayState, SddFailureView,
+    SddFinishBlockerView, SddFinishHandoffView, SddHandoffTaskView, SddLimitsView, SddNoChangeView,
+    SddOperationView, SddPort, SddPortStateView, SddPreviewTaskView, SddPreviewView, SddResumeView,
+    SddScopeView, SddSnapshotView, SddStartDisclosureView, SddStopView, SddSubscribeView,
+    SddTaskLimitView, SddTaskView, display_state,
 };
 pub use workspace::{
     ApprovedDocument, ApprovedDocumentKind, BASE_BRANCH_FEATURE, BaselineRecord, GITIGNORE_PATH,

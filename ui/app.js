@@ -810,6 +810,295 @@ async function pollProject() {
   }
 }
 
+// Minimal H4 SDD execution panel. It is not the finished H5 screen: it exists
+// only so the minimal connection can be exercised from the trusted window. Every
+// value shown comes from the saved snapshot; nothing here declares success.
+
+function sddId(kind) {
+  const project = ui.project || "";
+  const random =
+    window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${kind}:${project}:${random}`;
+}
+
+function sddExecutionId() {
+  const value = byId("sdd-execution").value.trim();
+  if (!value) {
+    throw new Error("enter an execution ID first");
+  }
+  return value;
+}
+
+function sddRequest(args) {
+  if (!ui.project) {
+    throw new Error("open a project first");
+  }
+  return Object.assign({ projectId: ui.project }, args);
+}
+
+function sddStartRequest() {
+  const limits = [
+    {
+      number: 1,
+      activeSeconds: Number(byId("sdd-active-seconds").value || 7200),
+      additionalRuns: Number(byId("sdd-additional-runs").value || 30),
+    },
+  ];
+  return sddRequest({
+    executionId: sddExecutionId(),
+    approvalId: sddId("execution_approval"),
+    requestId: sddId("control"),
+    expectedApprovalRevision: 1,
+    planPath: byId("sdd-plan-path").value.trim(),
+    checkoutRoot: byId("sdd-checkout").value.trim(),
+    branch: byId("sdd-branch").value.trim() || "h4-execute",
+    baseBranch: byId("sdd-base-branch").value.trim() || "main",
+    isolatedWorktree: false,
+    connection: ui.connection,
+    h3SettingsVersion: 1,
+    h3Capabilities: ["html-sync"],
+    h3ConsentIds: [],
+    taskLimits: limits,
+    gitName: "herness",
+    gitEmail: "host@example.invalid",
+  });
+}
+
+function renderSddState(state) {
+  if (!state) {
+    setText("sdd-state", "");
+    return;
+  }
+  const lines = [];
+  lines.push(
+    `Execution ${state.executionId} · revision ${state.revision} · ` +
+      `state ${state.state} · display ${state.displayState} · sequence ${state.projectSequence}`
+  );
+  if (state.failureCode) {
+    lines.push(`Classified failure: ${state.failureCode}`);
+  }
+  if (state.requiredAction) {
+    lines.push(`Required human action: ${state.requiredAction}`);
+  }
+  if (state.gitResultUnknown) {
+    lines.push(`Git result unknown: ${state.gitResultUnknown}`);
+  }
+  lines.push(
+    `Plan ${state.plan.path} · digest ${state.plan.digest} · ` +
+      `approved revision ${state.plan.approvedRevision}`
+  );
+  lines.push(
+    `Checkout ${state.workspace.checkout} · branch ${state.workspace.branch} · ` +
+      `base ${state.workspace.baseBranch} · baseline ${state.workspace.baseline || "not fixed"}`
+  );
+  lines.push(
+    `Budget consumed ${state.budget.consumed.activeSeconds}s / ` +
+      `${state.budget.consumed.additionalRuns} runs · ` +
+      `reserved ${state.budget.reserved.activeSeconds}s / ${state.budget.reserved.additionalRuns} runs`
+  );
+  for (const task of state.tasks || []) {
+    lines.push(
+      `Task ${task.number} (${task.stableId}) · ${task.progression}/${task.phase} · ` +
+        `h2 ${task.h2 || "none"} · ` +
+        (task.commitRange ? `range ${task.commitRange.short}` : "no range") +
+        (task.noChange ? ` · no_change (${task.noChange.sourceUnchanged})` : "")
+    );
+    if (task.stop) {
+      lines.push(`  stop ${task.stop.reason} · action ${task.stop.requiredAction || "none"}`);
+    }
+  }
+  setText("sdd-state", lines.join("\n"));
+}
+
+function renderSddDisclosure(disclosure) {
+  const lines = [];
+  lines.push(
+    `Approval ${disclosure.approvalId} revision ${disclosure.approvalRevision} · ` +
+      `${disclosure.taskCount} Task(s) · concurrency ${disclosure.limits.maxConcurrentTasks}`
+  );
+  lines.push(
+    `Scope: ${disclosure.scope.checkout} · branch ${disclosure.scope.branch} · ` +
+      `base ${disclosure.scope.baseBranch} · isolated ${disclosure.scope.isolatedWorktree}`
+  );
+  lines.push(
+    `Connection ${disclosure.scope.connectionId} · profile ${disclosure.scope.profileId} ` +
+      `(${disclosure.scope.profilePurpose}) · consents ${disclosure.scope.consents.join(", ")}`
+  );
+  lines.push(
+    `Host commit ${disclosure.scope.hostCommit} · run hooks ${disclosure.scope.runHooks}`
+  );
+  for (const task of disclosure.tasks) {
+    lines.push(
+      `Task ${task.number} ${task.title}: ${task.activeSeconds}s · ` +
+        `${task.additionalRuns} additional runs · checks ${task.checks} · ${task.commitPolicy}`
+    );
+  }
+  lines.push(`Cost: ${disclosure.multiTaskCostWarning}`);
+  lines.push(`H3 cost: ${disclosure.h3CycleCostWarning}`);
+  if (disclosure.unverifiedCapabilities.length > 0) {
+    for (const item of disclosure.unverifiedCapabilities) {
+      lines.push(`Unverified: ${item}`);
+    }
+  }
+  lines.push(`Consent: ${disclosure.confirmation}`);
+  setText("sdd-state", lines.join("\n"));
+}
+
+function renderSddCapabilities(report) {
+  const lines = [];
+  lines.push(
+    `SddTaskController: ${report.available ? "available" : "unavailable"} ` +
+      `(checked ${report.checked})`
+  );
+  for (const state of report.states || []) {
+    lines.push(
+      `  ${state.capability}: ${state.available ? "available" : "missing"} — ${state.detail}`
+    );
+  }
+  setText("sdd-state", lines.join("\n"));
+  setText(
+    "sdd-status",
+    report.available
+      ? "All required ports and the current approval are present."
+      : "The controller is unavailable; the missing ports are listed."
+  );
+}
+
+async function sddCapabilities() {
+  setText("sdd-failure", "");
+  const report = await call("sdd_capabilities");
+  renderSddCapabilities(report);
+}
+
+async function sddPreview() {
+  setText("sdd-failure", "");
+  const preview = await call("sdd_preview", {
+    request: {
+      projectId: ui.project,
+      planPath: byId("sdd-plan-path").value.trim(),
+    },
+  });
+  const lines = [];
+  lines.push(
+    `Preview ${preview.planPath} · digest ${preview.planDigest} · ` +
+      `${preview.byteLength} bytes · schema v${preview.schemaVersion}`
+  );
+  lines.push(`Pack ${preview.packFingerprint} (${preview.inspectorProtocol})`);
+  lines.push(`Side effects: ${preview.sideEffects}`);
+  lines.push(`Limits: ${preview.formatLastChecked}`);
+  for (const task of preview.tasks || []) {
+    lines.push(
+      `Task ${task.number} ${task.title}: checks ${task.checks.join(", ")} · ` +
+        `${task.commitPolicy}`
+    );
+  }
+  setText("sdd-state", lines.join("\n"));
+  setText("sdd-status", "Preview read the plan without side effects.");
+}
+
+async function sddDisclose() {
+  setText("sdd-failure", "");
+  const disclosure = await call("sdd_disclosure", { request: sddStartRequest() });
+  renderSddDisclosure(disclosure);
+  setText("sdd-status", "Review the disclosure before approving. Nothing has started.");
+}
+
+async function sddStart() {
+  setText("sdd-failure", "");
+  const started = await call("sdd_approve_and_start", { request: sddStartRequest() });
+  renderSddState(started.snapshot);
+  setText(
+    "sdd-status",
+    `Approval revision ${started.approvalRevision} saved` +
+      (started.replayed ? " (stored result returned)" : "") +
+      `. ${started.nextStep}. No child was created by this call.`
+  );
+}
+
+async function sddSubscribe() {
+  setText("sdd-failure", "");
+  const since = Number(byId("sdd-sequence").value || 0);
+  const view = await call("sdd_subscribe", {
+    project: ui.project,
+    execution: sddExecutionId(),
+    sequence: since,
+  });
+  renderSddState(view.snapshot);
+  byId("sdd-sequence").value = String(view.sequence);
+  setText(
+    "sdd-status",
+    view.changed
+      ? `Saved state advanced to sequence ${view.sequence}.`
+      : `No change since sequence ${view.sequence}.`
+  );
+}
+
+async function sddUpdate() {
+  setText("sdd-failure", "");
+  const action = byId("sdd-state-action").value;
+  const execution = sddExecutionId();
+  const state = await call("sdd_snapshot", { project: ui.project, execution });
+  const request = {
+    projectId: ui.project,
+    executionId: execution,
+    requestId: sddId("control"),
+    expectedRevision: state.revision,
+  };
+  let result;
+  if (action === "pause") {
+    result = await call("sdd_pause", { request });
+  } else if (action === "cancel") {
+    result = await call("sdd_cancel", { request });
+  } else {
+    result = await call("sdd_resume", {
+      request: Object.assign({}, request, {
+        approvalId: sddId("execution_approval"),
+        expectedApprovalRevision: 1,
+      }),
+    });
+  }
+  setText(
+    "sdd-status",
+    `${action}: ${result.displayState || result.outcome}` +
+      (result.replayed ? " (stored result returned)" : "")
+  );
+  if (result.blockers && result.blockers.length > 0) {
+    setText("sdd-failure", result.blockers.join("; "));
+  }
+  await sddSubscribe();
+}
+
+async function sddFinish() {
+  setText("sdd-failure", "");
+  const handoff = await call("sdd_finish_handoff", {
+    request: { projectId: ui.project, executionId: sddExecutionId() },
+  });
+  const lines = [];
+  lines.push(
+    `Handoff ${handoff.ready ? "ready" : "not ready"} · display ${handoff.displayState} · ` +
+      `baseline ${handoff.baseline || "not fixed"}`
+  );
+  lines.push(`Side effects: ${handoff.sideEffects}`);
+  for (const task of handoff.tasks || []) {
+    lines.push(task.line);
+  }
+  for (const blocker of handoff.blockers || []) {
+    lines.push(`Blocker ${blocker.kind}: ${blocker.detail}`);
+  }
+  if (handoff.stackedPrIncompatibility) {
+    lines.push(handoff.stackedPrIncompatibility);
+  }
+  setText("sdd-state", lines.join("\n"));
+  setText(
+    "sdd-status",
+    handoff.humanChoiceRequired
+      ? "The integration choice is yours; nothing was pushed, merged, or published."
+      : "Handoff loaded."
+  );
+}
+
 async function refreshAll() {
   showError("");
   await frontendState();
@@ -1127,6 +1416,62 @@ function bind() {
       await loadHtmlSync();
     } catch (error) {
       showError(errorText(error));
+    }
+  });
+
+  byId("sdd-capabilities").addEventListener("click", async () => {
+    try {
+      await sddCapabilities();
+    } catch (error) {
+      showError(errorText(error));
+    }
+  });
+
+  byId("sdd-preview").addEventListener("click", async () => {
+    try {
+      await sddPreview();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
+    }
+  });
+
+  byId("sdd-disclose").addEventListener("click", async () => {
+    try {
+      await sddDisclose();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
+    }
+  });
+
+  byId("sdd-start").addEventListener("click", async () => {
+    try {
+      await sddStart();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
+    }
+  });
+
+  byId("sdd-subscribe").addEventListener("click", async () => {
+    try {
+      await sddSubscribe();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
+    }
+  });
+
+  byId("sdd-update").addEventListener("click", async () => {
+    try {
+      await sddUpdate();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
+    }
+  });
+
+  byId("sdd-finish").addEventListener("click", async () => {
+    try {
+      await sddFinish();
+    } catch (error) {
+      setText("sdd-failure", errorText(error));
     }
   });
 
