@@ -817,6 +817,53 @@ impl ExecutionSnapshot {
         Ok(())
     }
 
+    /// Returns a copy of this snapshot held in `waiting_human` at `revision`.
+    ///
+    /// Nothing else changes: every Task progression, phase, commit range,
+    /// no-change record, baseline, and evidence reference is carried over. The
+    /// current Task stays current, so a resume targets the same Task instead of
+    /// skipping it. The stop record supplies the reason and the required human
+    /// action, which `waiting_human` demands.
+    pub fn held_waiting_human(
+        &self,
+        revision: ExecutionRevision,
+        stop: StopRecord,
+    ) -> Result<Self, SddExecutionError> {
+        if stop.required_action().is_none() {
+            return Err(invalid(
+                "snapshot.stop.requiredAction",
+                "a waiting_human hold must name the human action",
+            ));
+        }
+        let state = match self.state {
+            ExecutionState::WaitingHuman => ExecutionState::WaitingHuman,
+            // A `ready_for_finish` execution still needs its compatibility
+            // ledger. A failed ledger write must keep it short of finish, so the
+            // safety hold is allowed from that state as the one exception to the
+            // terminal rule. `failed` and `cancelled` remain refused: they are
+            // already unusable, and holding them would invent progress.
+            ExecutionState::ReadyForFinish => ExecutionState::WaitingHuman,
+            other => other.transition_to(ExecutionState::WaitingHuman)?,
+        };
+        let next = Self {
+            contract_version: self.contract_version,
+            project_id: self.project_id,
+            execution_id: self.execution_id,
+            revision,
+            state,
+            plan: self.plan.clone(),
+            workspace: self.workspace.clone(),
+            current_task: self.current_task,
+            tasks: self.tasks.clone(),
+            stop: Some(stop),
+            budget: self.budget,
+            applied_revision: self.applied_revision,
+            final_project_sequence: self.final_project_sequence,
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Rejects an execution that belongs to another project.
     pub fn ensure_project(&self, project: ProjectId) -> Result<(), SddExecutionError> {
         self.execution_id.validate_in(project)

@@ -965,6 +965,11 @@ pub struct ProgressContent {
     rulings: Vec<String>,
     #[serde(default)]
     final_project_sequence: Option<ProjectSequence>,
+    /// The recorded `Worktree:` decision, when it is more specific than
+    /// `worktree_path` alone (`created` vs `existing`). Absent in rows written
+    /// before this field existed, which then render `Worktree: existing <path>`.
+    #[serde(default)]
+    worktree: Option<crate::ledger::LedgerWorktree>,
     document_digest: Sha256Digest,
 }
 
@@ -1005,8 +1010,22 @@ impl ProgressContent {
             completed,
             rulings,
             final_project_sequence,
+            worktree: None,
             document_digest,
         })
+    }
+
+    /// Records the exact `Worktree:` decision, so a re-render preserves
+    /// `created`/`existing`/`in-place` instead of collapsing to a bare path.
+    #[must_use]
+    pub fn with_worktree(mut self, worktree: crate::ledger::LedgerWorktree) -> Self {
+        self.worktree = Some(worktree);
+        self
+    }
+
+    /// The recorded `Worktree:` decision, when the row carries one.
+    pub fn worktree(&self) -> Option<&crate::ledger::LedgerWorktree> {
+        self.worktree.as_ref()
     }
 
     /// ``.sdd/progress.md`` path.

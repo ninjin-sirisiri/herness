@@ -86,6 +86,7 @@ pub mod coordinator;
 pub mod finalize;
 pub mod git;
 pub mod host_commit;
+pub mod ledger;
 pub mod pack;
 pub mod packet;
 pub mod readiness;
@@ -119,6 +120,10 @@ pub use git::{
     WORKSPACE_GIT_TIMEOUT,
 };
 pub use host_commit::{DesktopHostCommit, TaskCommitExpectation};
+pub use ledger::{
+    DesktopProgressLedger, PROGRESS_LEDGER_FEATURE, ProgressWriteResult, hold_after_progress,
+    open_new, write_and_hold, write_task_brief,
+};
 pub use pack::{
     INSPECTOR_OUTPUT_LIMIT, INSPECTOR_SCRIPT, INSPECTOR_TIMEOUT, MINIMUM_PYTHON, PackBinding,
     PackInspector, PlanImporter, RootedPlanSource,

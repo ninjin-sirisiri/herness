@@ -512,10 +512,24 @@ pub trait HostGitPort {
 
 /// Writes the compatibility progress ledger from durable state.
 pub trait ProgressLedgerPort {
+    /// Reads the current document bytes, or `None` when it does not exist.
+    ///
+    /// The host reads before every write so an external edit is compared with
+    /// durable state instead of being overwritten.
+    fn read(&mut self, output_path: &str) -> Result<Option<Vec<u8>>, SddExecutionError>;
+
     /// Writes the recorded content with a temporary file and replacement.
+    ///
+    /// `expected` is the digest of the document the host read when it planned
+    /// this write, or `None` when the document did not exist. A destination that
+    /// no longer carries that digest is
+    /// [`ProgressWriteOutcome::Failed`] with
+    /// [`ProgressFailure::ExternalModification`]; the writer never replaces an
+    /// unknown document.
     fn write(
         &mut self,
         entry: &ProgressJournalEntry,
+        expected: Option<&crate::version::Sha256Digest>,
     ) -> Result<ProgressWriteOutcome, SddExecutionError>;
 }
 

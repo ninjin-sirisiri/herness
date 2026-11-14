@@ -90,10 +90,12 @@ pub mod coordinator;
 pub mod durable;
 pub mod error;
 pub mod events;
+pub mod finish;
 pub mod git;
 pub mod ids;
 pub mod import;
 pub mod journal;
+pub mod ledger;
 pub mod packet;
 pub mod plan;
 pub mod ports;
@@ -145,6 +147,11 @@ pub use events::{
     SDD_OPERATION_EVENT_KIND, SDD_PROGRESS_EVENT_KIND, SDD_SNAPSHOT_EVENT_KIND, dispatch_event,
     execution_activity_id, git_event, operation_event, progress_event, revision_of, snapshot_event,
 };
+pub use finish::{
+    FinalCheckEvidence, FinalStateObservation, FinishBlocker, FinishDecision, FinishHandoff,
+    FinishInputs, HandoffSideEffectPolicy, TaskCompletionEntry, decide, final_task,
+    handoff_task_lines, not_ready_stop, task_artifacts,
+};
 pub use git::{
     ChangedPath, CommitObservation, CommitObservationPort, CommitRecovery, CommitTarget,
     FinalizePorts, FinalizeStop, ObservationRequest, ObservedPath, TargetOrigin, TargetRefusal,
@@ -176,6 +183,12 @@ pub use journal::{
     GitJournalState, GitRejection, JournalContent, JournalEntryState, PreHookState,
     ProgressContent, ProgressFailure, ProgressJournalEntry, ProgressJournalState, ProgressTaskLine,
     ProgressWriteOutcome, RequestDecision, RequestIdentity, RequestRecord, decide_request,
+};
+pub use ledger::{
+    LedgerConflict, LedgerInput, LedgerWorktree, LedgerWrite, PROGRESS_HEADING,
+    PROGRESS_LEDGER_PATH, ProgressHoldReason, ProgressLedgerOutcome, ProgressWriteRequest,
+    RenderedLedger, TaskArtifacts, execution_brief_path, hold_next_task, plan_write, render,
+    render_content, write_progress,
 };
 pub use packet::{
     MAX_CONTEXT_ENTRY_CHARS, MAX_PACKET_BYTES, MAX_PACKET_CONTEXT_ENTRIES,
