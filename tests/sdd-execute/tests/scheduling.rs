@@ -1081,7 +1081,7 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
             .get(project, deadline_task)
             .expect("view")
             .budget
-            .and_then(|budget| Some(budget.remaining_active_seconds));
+            .map(|budget| budget.remaining_active_seconds);
         if remaining == Some(0) {
             break;
         }

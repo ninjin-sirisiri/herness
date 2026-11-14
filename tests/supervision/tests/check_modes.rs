@@ -283,6 +283,7 @@ fn save_record_with_run(
         .expect("save record");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_request(
     project: &TestProject,
     condition_id: ConditionId,
