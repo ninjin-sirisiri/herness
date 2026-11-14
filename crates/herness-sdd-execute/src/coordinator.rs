@@ -56,6 +56,7 @@ use crate::ids::{
 use crate::journal::{
     DispatchContent, DispatchJournalEntry, DispatchRequest, DispatchResult, RequestIdentity,
 };
+use crate::plan_changes::PlanChangeGatePort;
 use crate::ports::{ChildDispatchPlan, ChildDispatchPort, ExecutionStorePort};
 use crate::snapshot::{
     BudgetConsumption, CommitRange, ExecutionSnapshot, NoChangeRecord, SnapshotBudget,
@@ -766,6 +767,27 @@ impl SerialExecutionState {
 // Ports and request
 // ---------------------------------------------------------------------------
 
+/// Requests the cooperative stop of the one current child.
+///
+/// A plan change stops new dispatch and commit and asks the current Task to
+/// stop. The durable stop record is written by the coordinator; this port is how
+/// the host asks H2/H1 for the cooperative stop itself. It is a separate port so
+/// the core crate still owns no H2 dependency, and it is optional so a
+/// composition without a child (a preview, or a Task that never dispatched)
+/// needs none.
+pub trait ChildStopPort {
+    /// Asks the current Task's child and H2 target to stop.
+    ///
+    /// A returned error is reported to the caller and never treated as a
+    /// confirmed stop; the durable latch still holds the execution.
+    fn request_stop(
+        &mut self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task: Option<TaskRef>,
+    ) -> Result<(), SddExecutionError>;
+}
+
 /// The ports one advance uses.
 pub struct CoordinatorPorts<'a> {
     /// Snapshots, journals, and the transactional operation commit.
@@ -780,6 +802,20 @@ pub struct CoordinatorPorts<'a> {
     pub completion: &'a mut dyn TaskCompletionPort,
     /// The app-wide slot and checkout claims.
     pub serial: &'a mut SerialExecutionState,
+    /// The pre-side-effect plan check.
+    ///
+    /// When a gate is wired, every dispatch, every verification acceptance, and
+    /// the moment immediately before the host commit re-observe the plan. A
+    /// change engages the durable safety latch and stops before the side effect.
+    /// `None` means no gate is wired for this composition; the coordinator then
+    /// performs no plan check at all, so a build that needs the guard must wire
+    /// one.
+    pub plan_change: Option<&'a mut dyn PlanChangeGatePort>,
+    /// Asks the current child to stop after a plan change.
+    ///
+    /// `None` means this composition cannot signal the child: the durable stop is
+    /// still recorded and the human must confirm it before a resume.
+    pub child_stop: Option<&'a mut dyn ChildStopPort>,
 }
 
 /// One durable store that supports both the execution port and the supporting
@@ -911,6 +947,17 @@ pub enum CoordinatorOutcome {
         /// Revision after the durable stop.
         revision: ExecutionRevision,
     },
+    /// The plan changed, disappeared, moved, or was observed unstably. New
+    /// dispatch and commit are stopped, the current Task gets a safe stop, and
+    /// the latch holds until a human approves a plan revision.
+    PlanChanged {
+        /// The recorded change.
+        change: Box<crate::plan_changes::PlanChange>,
+        /// Whether the approved bytes are back. The latch stays open either way.
+        restored: bool,
+        /// Revision after the durable stop.
+        revision: ExecutionRevision,
+    },
     /// Every Task is complete and the finish handoff is pending.
     ReadyForFinish {
         /// Revision of the finished snapshot.
@@ -968,6 +1015,17 @@ impl TaskCoordinator {
             });
         }
         if snapshot.state().is_terminal() {
+            // A completed execution may still be affected by a plan change. The
+            // recorded history and consumed budget stay, the applied revision
+            // becomes stale, and the finish handoff waits for a human plan
+            // revision instead of presenting a stale completion.
+            if snapshot.state() == ExecutionState::ReadyForFinish && ports.plan_change.is_some() {
+                let approval = current_approval(ports.store, request)?;
+                snapshot.ensure_approval_applies(&approval)?;
+                if let Some(outcome) = plan_change_stop(ports, &snapshot, request, &approval)? {
+                    return Ok(outcome);
+                }
+            }
             return Ok(CoordinatorOutcome::Finished {
                 state: snapshot.state(),
             });
@@ -1003,6 +1061,13 @@ impl TaskCoordinator {
         // The approval must still describe this exact plan digest and revision,
         // checkout, branch, baseline, and Task list.
         snapshot.ensure_approval_applies(&approval)?;
+
+        // The plan is re-observed before this advance's side effect. A change
+        // stops new dispatch and commit and asks the current Task to stop; it
+        // never resumes on its own.
+        if let Some(outcome) = plan_change_stop(ports, &snapshot, request, &approval)? {
+            return Ok(outcome);
+        }
 
         match selected {
             None => finish(ports, &snapshot, request),
@@ -1078,6 +1143,79 @@ fn verify_workspace(snapshot: &ExecutionSnapshot) -> Result<(), SddExecutionErro
         });
     }
     Ok(())
+}
+
+/// Asks the plan gate before a side effect and records the safety stop.
+///
+/// It returns `Some(outcome)` only when the gate blocks; `None` means the caller
+/// may continue. With no gate wired nothing is observed, so a composition that
+/// needs the guard must supply one.
+fn plan_change_stop(
+    ports: &mut CoordinatorPorts<'_>,
+    snapshot: &ExecutionSnapshot,
+    request: &CoordinatorRequest,
+    approval: &crate::approval::ExecutionApproval,
+) -> Result<Option<CoordinatorOutcome>, SddExecutionError> {
+    let Some(gate) = ports.plan_change.as_mut() else {
+        return Ok(None);
+    };
+    let decision = gate.check_before_side_effect(
+        snapshot.execution_id(),
+        request.approval_id(),
+        approval.plan(),
+    )?;
+    let Some(latch) = decision.latch() else {
+        return Ok(None);
+    };
+    let change = latch.change().clone();
+    let next =
+        crate::plan_changes::stale_application(snapshot, snapshot.revision().next(), &change)?;
+    let revision = write_final(
+        ports,
+        request,
+        snapshot.revision(),
+        ExecutionOperation::Pause,
+        &next,
+    )?;
+    // The child is asked to stop only after the durable stop exists, so a crash
+    // between the two leaves a recorded stop instead of an unrecorded signal.
+    if let Some(child_stop) = ports.child_stop.as_mut() {
+        child_stop.request_stop(
+            request.identity().project_id(),
+            request.identity().execution_id(),
+            snapshot.current_task(),
+        )?;
+    }
+    ports.serial.release_slot(request.identity().execution_id());
+    ports
+        .serial
+        .release_checkout(request.identity().execution_id());
+    Ok(Some(CoordinatorOutcome::PlanChanged {
+        change: Box::new(change),
+        restored: latch_state_restored(&decision),
+        revision,
+    }))
+}
+
+fn latch_state_restored(decision: &crate::plan_changes::PlanGateDecision) -> bool {
+    matches!(
+        decision,
+        crate::plan_changes::PlanGateDecision::Blocked { restored: true, .. }
+    )
+}
+
+/// Asks the plan gate immediately before the host commit.
+///
+/// A change detected here blocks the commit even though H2 already reported the
+/// Task complete: no commit is created, the Task gets the plan-change stop, and a
+/// human approves a plan revision before anything else runs.
+fn ensure_plan_unchanged_before_commit(
+    ports: &mut CoordinatorPorts<'_>,
+    snapshot: &ExecutionSnapshot,
+    request: &CoordinatorRequest,
+    approval: &crate::approval::ExecutionApproval,
+) -> Result<Option<CoordinatorOutcome>, SddExecutionError> {
+    plan_change_stop(ports, snapshot, request, approval)
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1531,13 @@ fn observe_task(
                     HumanAction::ResolveHumanDecision,
                 );
             }
+            // H2 reports the conditions met, so this is the verification
+            // acceptance point. The plan is re-observed here as well: a change
+            // detected between the top of this advance and this acceptance holds
+            // the Task before any host completion work starts.
+            if let Some(outcome) = plan_change_stop(ports, snapshot, request, approval)? {
+                return Ok(outcome);
+            }
             complete_task(ports, snapshot, request, approval, task, &status, budget)
         }
         ChildState::WaitingHuman => stop_execution(
@@ -1548,6 +1693,13 @@ fn complete_task(
         status.evidence().to_vec(),
         budget.remaining_seconds(),
     );
+    // The last plan check runs immediately before the irreversible side effect.
+    // A change detected here creates no commit and no completion.
+    if let Some(outcome) =
+        ensure_plan_unchanged_before_commit(ports, &committing, request, approval)?
+    {
+        return Ok(outcome);
+    }
     let completion = ports.completion.complete(&completion_request)?;
     match completion {
         TaskCompletion::HumanWait { stop } => {

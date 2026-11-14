@@ -78,6 +78,34 @@
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
 //! `budget_exhausted`, `git_result_unknown`) are distinct typed errors and can
 //! carry H1, H2, or H3 detail references.
+//!
+//! Task 19 adds [`plan_changes`]: the typed plan-change detection, the durable
+//! safety-stop latch, and the limited re-approval.
+//!
+//! * [`plan_changes::PlanChange`] reports `BytesChanged`, `Missing`, `Moved`, or
+//!   `UnstableObservation` with the observed digest and length, the candidate
+//!   path, the changed byte ranges, and whether the fenced execution JSON block
+//!   is byte-identical. A JSON-identical change is never ignored: the parsed
+//!   result compares the exact Global Constraints text and every Task body, so
+//!   a prose-only edit is still a change.
+//! * [`plan_changes::PlanChangeGate`] performs the observation, persists the
+//!   latch, and answers whether a side effect may run. The coordinator asks it
+//!   before dispatch, before it accepts H2's verification, and immediately
+//!   before the host commit; the host also ticks it once per
+//!   [`version::PLAN_RECONCILE_INTERVAL_MILLIS`], so a lost watcher
+//!   notification is still caught.
+//! * [`plan_changes::PlanChangeLatch`] is the durable stop. Returning to the
+//!   previously approved bytes never clears it; only a human-approved plan
+//!   revision does. A post-completion change keeps every recorded completion and
+//!   the consumed budget and marks only the applied revision stale.
+//! * [`plan_changes::evaluate_inheritance`] allows a new version only when the
+//!   plan path, the Global Constraints, the root spec references, the connection
+//!   and profile, and every completed or started Task's body and contract are
+//!   unchanged and only not-yet-started Tasks differ. Everything else is
+//!   `Incompatible` and requires a new plan and human work-state cleanup.
+//! * [`plan_changes::approve_plan_revision`] saves that human revision after a
+//!   confirmed stop, keeps the consumed budget and commit history, clears the
+//!   latch, and is idempotent: a re-delivered request returns its stored result.
 
 #![doc = "The H4 numeric defaults are the approved spec values. This crate does not add a plan-wide budget, raise the finite H2 limits, or turn a saved `Synced`/receipt into evidence."]
 
@@ -98,6 +126,7 @@ pub mod journal;
 pub mod ledger;
 pub mod packet;
 pub mod plan;
+pub mod plan_changes;
 pub mod ports;
 pub mod record;
 pub mod report;
@@ -131,8 +160,8 @@ pub use contract::{
     ensure_execution_project,
 };
 pub use coordinator::{
-    ChildNotification, ChildState, ChildStatus, ChildStatusPort, ChildStopCause, CompletionFeature,
-    CompletionWiring, CoordinatorOutcome, CoordinatorPorts, CoordinatorRequest,
+    ChildNotification, ChildState, ChildStatus, ChildStatusPort, ChildStopCause, ChildStopPort,
+    CompletionFeature, CompletionWiring, CoordinatorOutcome, CoordinatorPorts, CoordinatorRequest,
     CoordinatorStorePort, LaunchRefusal, NotConnectedCompletion, SerialExecutionState,
     TaskCompletion, TaskCompletionPort, TaskCompletionRequest, TaskCoordinator, TaskLaunch,
     TaskLaunchPort, completion_wiring, dispatch_request_id, step_request_id,
@@ -203,6 +232,16 @@ pub use plan::{
     ExactPlanBytes, ExactPlanText, InspectRequest, InspectedPlan, InspectorCapabilities,
     InspectorProtocol, ParsedPlanSummary, ParsedPlanTask, PlanByteRange, PlanDiagnostic,
     PlanDiagnosticCode, PlanPath, validate_check_cwd, validate_project_path,
+};
+pub use plan_changes::{
+    ContractPart, InheritableRevision, JsonBlockState, LatchState, MAX_MOVE_CANDIDATES,
+    MemoryPlanChangeLatchStore, PLAN_CHANGE_LATCH_FORMAT_VERSION, PlanChange, PlanChangeGate,
+    PlanChangeGatePort, PlanChangeLatch, PlanChangeLatchStorePort, PlanExpectation,
+    PlanGateDecision, PlanInheritance, PlanInheritanceBlocker, PlanRevisionApproval,
+    PlanRevisionIdentity, PlanRevisionOutcome, PlanRevisionStorePort, ReconcileSchedule,
+    TaskProgress, approval_task, approval_task_ref, approve_plan_revision,
+    confirm_plan_change_stop, confirm_plan_stop, evaluate_inheritance, hold_stale_application,
+    plan_change_stop, stale_application,
 };
 pub use ports::{
     ChildDispatchPlan, ChildDispatchPort, ClockPort, ExecutionFeature, ExecutionStorePort,

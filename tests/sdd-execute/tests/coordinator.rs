@@ -637,6 +637,8 @@ impl Harness {
             children: &mut self.children,
             completion: &mut self.completion,
             serial: &mut self.serial,
+            plan_change: None,
+            child_stop: None,
         };
         herness_sdd_execute::TaskCoordinator::advance(&mut ports, request)
     }
@@ -1071,6 +1073,8 @@ fn a_completion_notification_delivered_twice_completes_the_task_once() {
             children: &mut harness.children,
             completion: &mut harness.completion,
             serial: &mut harness.serial,
+            plan_change: None,
+            child_stop: None,
         };
         herness_sdd_execute::TaskCoordinator::on_notification(&mut ports, &request, notification)
             .expect("the first delivery")
@@ -1092,6 +1096,8 @@ fn a_completion_notification_delivered_twice_completes_the_task_once() {
             children: &mut harness.children,
             completion: &mut harness.completion,
             serial: &mut harness.serial,
+            plan_change: None,
+            child_stop: None,
         };
         herness_sdd_execute::TaskCoordinator::on_notification(&mut ports, &request, notification)
             .expect("the duplicate delivery")
@@ -1166,6 +1172,8 @@ fn duplicate_completion_notifications_do_not_advance_the_next_task() {
         children: &mut harness.children,
         completion: &mut harness.completion,
         serial: &mut harness.serial,
+        plan_change: None,
+        child_stop: None,
     };
     // The selection is Task 2 (Task 1 is complete), so the notification path
     // dispatches Task 2 only because the state genuinely advanced — never because
@@ -1192,6 +1200,8 @@ fn duplicate_completion_notifications_do_not_advance_the_next_task() {
             children: &mut harness.children,
             completion: &mut harness.completion,
             serial: &mut harness.serial,
+            plan_change: None,
+            child_stop: None,
         };
         herness_sdd_execute::TaskCoordinator::advance(&mut ports, &request).expect("the replay")
     };
@@ -1749,6 +1759,8 @@ fn a_missing_approval_is_refused() {
         children: &mut children,
         completion: &mut completion,
         serial: &mut serial,
+        plan_change: None,
+        child_stop: None,
     };
     let error = herness_sdd_execute::TaskCoordinator::advance(&mut ports, &request)
         .expect_err("a missing approval is refused");

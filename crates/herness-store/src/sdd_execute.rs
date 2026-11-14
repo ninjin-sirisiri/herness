@@ -20,10 +20,11 @@ use herness_sdd_execute::{
     ControlRequestId, DispatchJournalEntry, DispatchManifest, DispatchRequestId,
     DurableExecutionStorePort, ExecutionApproval, ExecutionId, ExecutionOperationResult,
     ExecutionRevision, ExecutionSnapshot, ExecutionStorePort, GitCommitOutcome, GitJournalEntry,
-    GitJournalState, JournalEntryState, ProgressJournalEntry, ProgressJournalId,
-    ProgressJournalState, RecordDecodeError, SddExecutionError, StartRecord, StartRecordStorePort,
-    StoredExecution, TaskReservation, decode_record, dispatch_event, encode_record, git_event,
-    operation_event, progress_event, snapshot_event,
+    GitJournalState, JournalEntryState, PlanChangeLatch, PlanChangeLatchStorePort,
+    ProgressJournalEntry, ProgressJournalId, ProgressJournalState, RecordDecodeError,
+    SddExecutionError, StartRecord, StartRecordStorePort, StoredExecution, TaskReservation,
+    decode_record, dispatch_event, encode_record, git_event, operation_event, progress_event,
+    snapshot_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -42,6 +43,7 @@ const GIT_RECORD: &str = "git journal";
 const PROGRESS_RECORD: &str = "progress journal";
 const CONTROL_RECORD: &str = "control record";
 const BUDGET_RECORD: &str = "budget increment";
+const PLAN_CHANGE_LATCH_RECORD: &str = "plan change latch";
 
 fn positive(value: i64, field: &str) -> Result<u64, StoreError> {
     if value <= 0 {
@@ -1512,6 +1514,118 @@ impl Store {
         }
         Ok(increments)
     }
+
+    /// Loads the plan-change latch of one execution, when one exists.
+    pub fn sdd_plan_change_latch(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Option<PlanChangeLatch>, StoreError> {
+        load_plan_change_latch(&self.conn, project_id, execution_id)
+    }
+
+    /// Records one plan-change latch state.
+    ///
+    /// The first open latch of an execution is the history of the stop, so an
+    /// existing open row is only rewritten when it is identical or when a
+    /// human-approved plan revision clears it. A cleared row never moves back to
+    /// a different clearance.
+    pub fn record_sdd_plan_change_latch(
+        &mut self,
+        latch: &PlanChangeLatch,
+    ) -> Result<(), StoreError> {
+        latch.validate().map_err(StoreError::from)?;
+        let project = latch.project_id();
+        let execution = latch.execution_id();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        let stored = load_plan_change_latch(&transaction, project, execution)?;
+        if let Some(stored) = &stored {
+            PlanChangeLatch::ensure_advance(stored, latch).map_err(StoreError::from)?;
+            if stored == latch {
+                return Ok(());
+            }
+        }
+        let payload = encode_row(latch, PLAN_CHANGE_LATCH_RECORD)?;
+        let state = match latch.state() {
+            herness_sdd_execute::LatchState::Open => "open",
+            herness_sdd_execute::LatchState::Cleared { .. } => "cleared",
+        };
+        let approval_revision = match latch.state() {
+            herness_sdd_execute::LatchState::Open => None,
+            herness_sdd_execute::LatchState::Cleared {
+                approval_revision, ..
+            } => Some(sequence_to_sql(approval_revision)?),
+        };
+        transaction.execute(
+            "INSERT INTO sdd_plan_change_latches
+                 (project_id, execution_id, approval_id, state, approval_revision,
+                  plan_revision, observed_digest, payload, opened_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(project_id, execution_id) DO UPDATE SET
+                 approval_id = excluded.approval_id,
+                 state = excluded.state,
+                 approval_revision = excluded.approval_revision,
+                 plan_revision = excluded.plan_revision,
+                 observed_digest = excluded.observed_digest,
+                 payload = excluded.payload,
+                 updated_at = excluded.updated_at",
+            params![
+                project.to_string(),
+                execution.to_string(),
+                latch.approval_id().to_string(),
+                state,
+                approval_revision,
+                sequence_to_sql(latch.expectation().plan_revision().get())?,
+                latch
+                    .change()
+                    .observed_digest()
+                    .map(|digest| digest.as_str().to_owned()),
+                payload,
+                now_sql()?,
+            ],
+        )?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(())
+    }
+}
+
+fn load_plan_change_latch(
+    conn: &Connection,
+    project: ProjectId,
+    execution: ExecutionId,
+) -> Result<Option<PlanChangeLatch>, StoreError> {
+    ensure_execution(project, execution)?;
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM sdd_plan_change_latches
+             WHERE project_id = ?1 AND execution_id = ?2",
+            params![project.to_string(), execution.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let latch: PlanChangeLatch = decode_row(&payload, PLAN_CHANGE_LATCH_RECORD)?;
+    latch.validate().map_err(StoreError::from)?;
+    if latch.project_id() != project || latch.execution_id() != execution {
+        return Err(StoreError::corrupt(
+            "plan change latch row does not match its recorded identifiers",
+        ));
+    }
+    Ok(Some(latch))
 }
 
 fn load_start_record(
@@ -2050,6 +2164,24 @@ impl DurableExecutionStorePort for Store {
     ) -> Result<Vec<BudgetIncrement>, SddExecutionError> {
         Store::sdd_budget_increments(self, project_id, execution_id)
             .map_err(SddExecutionError::from)
+    }
+}
+
+impl PlanChangeLatchStorePort for Store {
+    fn plan_change_latch(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Option<PlanChangeLatch>, SddExecutionError> {
+        Store::sdd_plan_change_latch(self, project_id, execution_id)
+            .map_err(SddExecutionError::from)
+    }
+
+    fn record_plan_change_latch(
+        &mut self,
+        latch: &PlanChangeLatch,
+    ) -> Result<(), SddExecutionError> {
+        Store::record_sdd_plan_change_latch(self, latch).map_err(SddExecutionError::from)
     }
 }
 

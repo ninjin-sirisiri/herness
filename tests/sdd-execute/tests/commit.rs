@@ -2300,6 +2300,8 @@ fn the_next_task_never_starts_before_the_completion_is_durable() {
             children: &mut children,
             completion: &mut completion,
             serial: &mut serial,
+            plan_change: None,
+            child_stop: None,
         };
         let outcome = TaskCoordinator::advance(&mut ports, &request).expect("dispatch");
         assert!(matches!(outcome, CoordinatorOutcome::Dispatched { .. }));
@@ -2344,6 +2346,8 @@ fn the_next_task_never_starts_before_the_completion_is_durable() {
             children: &mut children,
             completion: &mut completion,
             serial: &mut serial,
+            plan_change: None,
+            child_stop: None,
         };
         let error = TaskCoordinator::advance(&mut ports, &completion_request)
             .expect_err("the completion write fails");

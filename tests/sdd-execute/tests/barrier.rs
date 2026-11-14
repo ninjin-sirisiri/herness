@@ -1275,6 +1275,8 @@ fn a_barrier_connected_completion_holds_instead_of_completing_the_task() {
         children: &mut children,
         completion: &mut completion,
         serial: &mut serial,
+        plan_change: None,
+        child_stop: None,
     };
     TaskCoordinator::advance(&mut ports, &request).expect("dispatch");
 
@@ -1309,6 +1311,8 @@ fn a_barrier_connected_completion_holds_instead_of_completing_the_task() {
         children: &mut children,
         completion: &mut completion,
         serial: &mut serial,
+        plan_change: None,
+        child_stop: None,
     };
     let outcome = TaskCoordinator::advance(&mut ports, &request).expect("advance");
     assert!(matches!(

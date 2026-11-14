@@ -123,6 +123,7 @@ const H4_TABLES: &[&str] = &[
     "sdd_progress_journal",
     "sdd_control_records",
     "sdd_execution_budget_increments",
+    "sdd_plan_change_latches",
 ];
 
 fn legacy_snapshot(conn: &Connection) -> BTreeMap<&'static str, Vec<String>> {
@@ -335,7 +336,7 @@ fn schema_nine_history_and_h2_h3_state_survive_the_migration_to_ten() {
     let before = seed_schema_nine(&harness.config);
 
     let store = harness.open();
-    assert_eq!(store.schema_version().expect("version"), 10);
+    assert_eq!(store.schema_version().expect("version"), 11);
     // H2 and H3 keep working through their own store APIs after the migration.
     let state = store
         .supervised_state(&project(), "h2.fixture")
@@ -361,9 +362,9 @@ fn schema_nine_history_and_h2_h3_state_survive_the_migration_to_ten() {
     drop(store);
 
     let conn = raw(&harness.database_path());
-    assert_eq!(schema_version(&conn), 10);
+    assert_eq!(schema_version(&conn), 11);
     assert_eq!(legacy_snapshot(&conn), before);
-    assert_eq!(h4_table_count(&conn), 9);
+    assert_eq!(h4_table_count(&conn), 10);
     for table in H4_TABLES {
         assert_eq!(table_count(&conn, table), 0, "{table} must start empty");
     }
@@ -400,11 +401,11 @@ fn migration_fault_leaves_the_schema_nine_database_intact() {
     // A later open with no fault completes the migration without repairing
     // anything by restoring.
     let store = harness.open();
-    assert_eq!(store.schema_version().expect("version"), 10);
+    assert_eq!(store.schema_version().expect("version"), 11);
     drop(store);
     let conn = raw(&harness.database_path());
     assert_eq!(legacy_snapshot(&conn), before);
-    assert_eq!(h4_table_count(&conn), 9);
+    assert_eq!(h4_table_count(&conn), 10);
 }
 
 #[test]
@@ -413,7 +414,7 @@ fn an_unknown_newer_schema_is_rejected_before_any_write() {
     let before = seed_schema_nine(&harness.config);
     {
         let conn = raw(&harness.database_path());
-        conn.execute("UPDATE schema_version SET version = 11", [])
+        conn.execute("UPDATE schema_version SET version = 12", [])
             .expect("bump schema");
     }
 
@@ -421,13 +422,13 @@ fn an_unknown_newer_schema_is_rejected_before_any_write() {
     assert!(matches!(
         error,
         StoreError::UnsupportedSchemaVersion {
-            found: 11,
-            supported: 10
+            found: 12,
+            supported: 11
         }
     ));
 
     let conn = raw(&harness.database_path());
-    assert_eq!(schema_version(&conn), 11);
+    assert_eq!(schema_version(&conn), 12);
     assert_eq!(h4_table_count(&conn), 0);
     // Every pre-H4 row is untouched.
     assert_eq!(legacy_snapshot(&conn), before);

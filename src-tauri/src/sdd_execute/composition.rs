@@ -28,7 +28,7 @@ use herness_core::contracts::{ProjectId, Timestamp};
 use herness_sdd_execute::{
     ApprovalId, ApprovalInputs, ApprovalRequirement, Baseline, CommitAuthorization,
     ExecutionApproval, ExecutionId, FailureDetails, H3ApprovalBinding, ObservedConnection,
-    SddExecutionError, WorkspaceApproval,
+    PlanRevisionIdentity, SddExecutionError, StartApprovalPost, WorkspaceApproval,
 };
 use herness_supervision::{ConsentBinding, ProfileBinding};
 
@@ -329,3 +329,81 @@ pub type DesktopWorkspace<
     C = crate::sdd_execute::workspace::NoPreparationCommit,
     B = crate::sdd_execute::workspace::MemoryBaselineRecord,
 > = WorkspaceAdapter<L, C, B>;
+
+// ---------------------------------------------------------------------------
+// Plan revision approval
+// ---------------------------------------------------------------------------
+
+/// One human request to approve a changed plan after a confirmed stop.
+///
+/// It carries the [`HumanConfirmation`] of kind
+/// [`ConfirmationKind::PlanRevision`]; only the trusted main-window path mints
+/// one, so a model tool, a repository string, an environment variable, or a
+/// preview cannot re-approve a changed plan. Every value the human confirmed —
+/// the new plan bytes, parsed result, Global Constraints, references,
+/// connection, consents, permissions, send range, and every Task's finite
+/// budget — is re-observed by [`CurrentInputs`] before the registry writes.
+pub struct PlanRevisionRequest<'a> {
+    post: &'a StartApprovalPost,
+    identity: PlanRevisionIdentity,
+    confirmation: Option<HumanConfirmation>,
+}
+
+impl<'a> PlanRevisionRequest<'a> {
+    /// Creates one re-approval request from the trusted human path.
+    pub fn new(
+        post: &'a StartApprovalPost,
+        identity: PlanRevisionIdentity,
+        confirmation: Option<HumanConfirmation>,
+    ) -> Self {
+        Self {
+            post,
+            identity,
+            confirmation,
+        }
+    }
+
+    /// The human-approved content and observation.
+    pub const fn post(&self) -> &StartApprovalPost {
+        self.post
+    }
+
+    /// Project, execution, request, revision, and approval guards.
+    pub const fn identity(&self) -> PlanRevisionIdentity {
+        self.identity
+    }
+
+    /// The required human confirmation.
+    pub const fn confirmation(&self) -> Option<&HumanConfirmation> {
+        self.confirmation.as_ref()
+    }
+}
+
+/// Refuses a plan revision approval that the trusted human path did not confirm.
+pub fn ensure_human_plan_revision_confirmation(
+    confirmation: Option<&HumanConfirmation>,
+) -> Result<(), SddExecutionError> {
+    match confirmation {
+        Some(confirmation) if confirmation.kind() == ConfirmationKind::PlanRevision => Ok(()),
+        Some(_) | None => Err(SddExecutionError::ApprovalRequired {
+            reason: ApprovalRequirement::PlanRevisionApproval,
+            details: FailureDetails::none().boxed(),
+        }),
+    }
+}
+
+/// Approves one changed plan revision after a confirmed stop.
+///
+/// The composition refuses without a human `PlanRevision` confirmation, then
+/// delegates to [`herness_sdd_execute::approve_plan_revision`], which checks the
+/// confirmed stop, the open latch, the observed inputs, and the inheritance rule
+/// before it writes anything. A re-delivered request returns its stored result.
+pub fn approve_plan_revision_request(
+    store: &mut dyn herness_sdd_execute::PlanRevisionStorePort,
+    request: &PlanRevisionRequest<'_>,
+) -> Result<herness_sdd_execute::PlanRevisionOutcome, SddExecutionError> {
+    ensure_human_plan_revision_confirmation(request.confirmation())?;
+    let approval =
+        herness_sdd_execute::PlanRevisionApproval::from_identity(request.identity, request.post)?;
+    herness_sdd_execute::approve_plan_revision(store, &approval, request.post.inputs())
+}

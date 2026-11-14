@@ -864,6 +864,37 @@ impl ExecutionSnapshot {
         Ok(next)
     }
 
+    /// Returns a copy of this snapshot at `revision` with another applied
+    /// revision state.
+    ///
+    /// It is what a post-completion plan change uses: every Task progression,
+    /// commit range, no-change record, evidence reference, baseline, and the
+    /// consumed budget stay exactly as recorded, and only the applied revision
+    /// becomes `stale`.
+    pub fn with_applied_revision(
+        &self,
+        revision: ExecutionRevision,
+        applied_revision: AppliedRevision,
+    ) -> Result<Self, SddExecutionError> {
+        let next = Self {
+            contract_version: self.contract_version,
+            project_id: self.project_id,
+            execution_id: self.execution_id,
+            revision,
+            state: self.state,
+            plan: self.plan.clone(),
+            workspace: self.workspace.clone(),
+            current_task: self.current_task,
+            tasks: self.tasks.clone(),
+            stop: self.stop,
+            budget: self.budget,
+            applied_revision,
+            final_project_sequence: self.final_project_sequence,
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Rejects an execution that belongs to another project.
     pub fn ensure_project(&self, project: ProjectId) -> Result<(), SddExecutionError> {
         self.execution_id.validate_in(project)

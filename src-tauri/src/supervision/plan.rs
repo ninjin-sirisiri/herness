@@ -74,6 +74,8 @@ pub enum ConfirmationKind {
     ApproveHtmlSync,
     /// Apply one explicit H3 document operation.
     H3DocumentOperation,
+    /// Approve a changed plan revision after a confirmed stop.
+    PlanRevision,
 }
 
 impl HumanConfirmation {

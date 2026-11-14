@@ -79,6 +79,27 @@
 //!
 //! Nothing in this module pushes, pulls, merges, rebases, amends, resets, cleans,
 //! or checks out a change, and no path discards a human's uncommitted work.
+//!
+//! Task 19 adds [`plan_changes`], the desktop plan-change detection:
+//!
+//! * [`plan_changes::PlanFileWatcher`] is the one `notify` watcher over the exact
+//!   approved plan path. It watches the parent directory non-recursively so an
+//!   atomic save (`write temp` + `rename`) is still observed.
+//! * [`plan_changes::DesktopPlanChangeGate`] is the real
+//!   [`herness_sdd_execute::PlanChangeGate`] over [`source::PlanFileSource`], the
+//!   durable latch row (`LatchStore` over the shared SQLite store), and the
+//!   wall clock. Its `tick` is the host's 1 s periodic reconciliation and its
+//!   `check_before_side_effect` is the pre-dispatch/pre-verification/pre-commit
+//!   guard.
+//! * [`plan_changes::PlanChangeWiring`] owns the gate and the
+//!   [`plan_changes::QueuedChildStop`] together, so one
+//!   [`herness_sdd_execute::CoordinatorPorts`] can borrow both.
+//! * [`composition::approve_plan_revision_request`] is the trusted UI path: it
+//!   requires a `PlanRevision` human confirmation and then saves the revision
+//!   through [`herness_sdd_execute::approve_plan_revision`].
+//!
+//! The watcher is a latency optimization, not the guard: the periodic and
+//! pre-side-effect checks still catch a change when `notify` drops an event.
 
 pub mod barrier;
 pub mod composition;
@@ -89,6 +110,7 @@ pub mod host_commit;
 pub mod ledger;
 pub mod pack;
 pub mod packet;
+pub mod plan_changes;
 pub mod readiness;
 pub mod registry;
 pub mod source;
@@ -103,8 +125,9 @@ pub use barrier::{
 };
 pub use composition::{
     ApprovalOutcome, CurrentInputs, DesktopStartComposition, DesktopWorkspace, LiveStartFacts,
-    StartApprovalRequest, UnavailableChildStart, approve_and_start, current_owner_approval,
-    desktop_start_composition, ensure_human_start_confirmation, preview_facts,
+    PlanRevisionRequest, StartApprovalRequest, UnavailableChildStart, approve_and_start,
+    approve_plan_revision_request, current_owner_approval, desktop_start_composition,
+    ensure_human_plan_revision_confirmation, ensure_human_start_confirmation, preview_facts,
 };
 pub use coordinator::{
     ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
@@ -132,6 +155,10 @@ pub use packet::{
     H4TaskPacket, MAX_PACKET_BYTES, TaskDispatchSeam, TaskPacketOutcome, TaskPacketRefusal,
     packet_binding, packet_scope, prior_context, read_report, report_expectations, report_path,
     snapshot_sections, spec_section, task_handoff, task_packet,
+};
+pub use plan_changes::{
+    ChildStopRequest, DesktopPlanChangeGate, LatchStore, PlanChangeWiring, PlanFileWatcher,
+    PlanReconcileClock, PlanWatchError, PlanWatchNotice, QueuedChildStop, reconcile_schedule,
 };
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
 pub use registry::{
