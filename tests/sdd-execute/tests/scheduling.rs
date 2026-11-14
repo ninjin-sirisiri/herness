@@ -977,7 +977,9 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
     harness.configure_completion(project);
     let h3 = harness.create_h3_target(project, "h3-job-1");
     harness.start_h3_target(project, h3, "h3-job-1");
-    let task = harness.start_h4_task(project, BudgetPolicy::new(1, 30, None).expect("budget"));
+    // This target only proves that an explicit H1 stop lands; its budget must
+    // not double as the deadline test (see `deadline_task` below).
+    let task = harness.start_h4_task(project, BudgetPolicy::h2_default());
     let h3_target = SupervisionTarget::new(project, h3);
     let task_target = SupervisionTarget::new(project, task);
 
@@ -988,8 +990,6 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
 
     // An explicit H1 stop of the Task run still lands while H3 holds its slot
     // in the same project.
-    std::thread::sleep(interval());
-    harness.runtime.complete_all_inputs();
     let running = harness.host.get(project, task).expect("view");
     let request = SupervisionOperationRequest::new(
         SupervisionRequestId::new(project),
@@ -1035,7 +1035,9 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
         "the stopped Task target is not pumped again: {after_stop:?}"
     );
 
-    // The H3 target still advances with its candidate adapter.
+    // The H3 target still advances with its candidate adapter once the
+    // bounded pump interval has elapsed.
+    std::thread::sleep(interval());
     harness.runtime.use_candidate_for(h3_target);
     let h3_again = harness
         .host
@@ -1044,10 +1046,11 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
     assert_eq!(h3_again.processed(), &[h3_target]);
     harness.runtime.use_native();
 
-    // Budget deadline: a second Task target with a tiny finite budget stops on
-    // the bounded pump even while the H3 slot is active.
-    std::thread::sleep(interval());
-    let deadline_task = harness.start_h4_task(project, BudgetPolicy::new(4, 30, None).expect("b"));
+    // Budget deadline: a separate Task target with a finite budget stops on
+    // the bounded pump even while the H3 slot is active. The run stays Running
+    // while the budget is drained, so verification cannot complete first; only
+    // the deadline can stop the target once the turn is finished.
+    let deadline_task = harness.start_h4_task(project, BudgetPolicy::new(3, 30, None).expect("b"));
     let deadline_target = SupervisionTarget::new(project, deadline_task);
     harness.runtime.use_native();
     harness
@@ -1060,20 +1063,44 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
             },
         )
         .expect("deadline start pump");
-    assert!(
-        matches!(
-            harness.state(project, deadline_task).as_str(),
-            "running" | "stopped"
-        ),
-        "the one-second target either runs or is already at its deadline"
+    assert_eq!(
+        harness.state(project, deadline_task),
+        "running",
+        "the finite target starts before its deadline"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut reason = serde_json::Value::Null;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-        if harness.runtime.run_for(deadline_target).is_some() {
-            harness.runtime.finish_turn_for(deadline_target);
+    assert_eq!(
+        harness.runtime.starts_for(deadline_target),
+        1,
+        "the deadline target starts exactly one run"
+    );
+
+    let drained = Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = harness
+            .host
+            .get(project, deadline_task)
+            .expect("view")
+            .budget
+            .and_then(|budget| Some(budget.remaining_active_seconds));
+        if remaining == Some(0) {
+            break;
         }
+        assert!(
+            Instant::now() < drained,
+            "the finite active-seconds budget must be consumed: {remaining:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The turn is finished only after the budget is already 0, so the next
+    // ticks deterministically reach the deadline stop instead of completion.
+    harness.runtime.finish_turn_for(deadline_target);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let reason = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the finite budget deadline must land"
+        );
         harness
             .host
             .pump_scoped(
@@ -1086,23 +1113,20 @@ fn h1_stop_and_deadline_land_while_the_h3_target_is_authoring() {
             .expect("deadline pump");
         let view = harness.host.get(project, deadline_task).expect("view");
         if view.state == "stopped" {
-            reason = view.reason;
-            break;
+            break view.reason;
         }
-    }
-    assert_eq!(
-        harness.state(project, deadline_task),
-        "stopped",
-        "the finite budget deadline must land: {reason}"
-    );
+        // Respect the bounded pump interval between ticks.
+        std::thread::sleep(interval());
+    };
     let reason = reason.to_string().to_lowercase();
     assert!(
         reason.contains("active_seconds") || reason.contains("activeseconds"),
         "the stop reason must name the active-seconds budget: {reason}"
     );
-    assert!(
-        harness.runtime.starts_for(deadline_target) >= 1,
-        "the deadline target still ran before stopping"
+    assert_eq!(
+        harness.state(project, deadline_task),
+        "stopped",
+        "the finite budget deadline must land: {reason}"
     );
 }
 
