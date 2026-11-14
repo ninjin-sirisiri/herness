@@ -134,6 +134,15 @@ impl PlanDiagnosticCode {
             Self::InvalidPlan => "invalid_plan",
         }
     }
+
+    /// Parses a stable wire code. An unknown code returns `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unsupported_plan_format" => Some(Self::UnsupportedPlanFormat),
+            "invalid_plan" => Some(Self::InvalidPlan),
+            _ => None,
+        }
+    }
 }
 
 /// One deterministic plan diagnostic with a byte range into the exact input.
@@ -713,7 +722,8 @@ impl<'de> Deserialize<'de> for ExactPlanBytes {
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(bytes: &[u8]) -> String {
+/// Canonical base64 of exact bytes, as the inspector's `sourceBase64`.
+pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = u32::from(chunk[0]);
@@ -736,7 +746,8 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
+/// Decodes canonical base64, refusing padding and character defects.
+pub fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
     let bytes = value.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return Err("base64 length must be a multiple of four".to_owned());

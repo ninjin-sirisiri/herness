@@ -21,16 +21,46 @@
 //! Stage, gate, and commit stay in `herness_core::runtime::host_git`; this module
 //! never stages, commits, amends, rebases, resets, cleans, or checks out a change,
 //! and it never writes outside the selected checkout.
+//!
+//! Task 12 adds the real pack inspector bridge and the side-effect-free preview:
+//!
+//! * [`pack::PackInspector`] is the only process caller that starts the pack. It
+//!   runs `python3 <pack>/scripts/plan-inspect` as one fixed argv through the
+//!   shared supervisor, with the project root as cwd, the exact request bytes on
+//!   stdin, a bounded capture, and a 30 second (or shorter remaining Task) budget.
+//!   It verifies every claimed execution-contract input against the pack root and
+//!   returns a [`pack::PackBinding`]; a stale or different fingerprint is
+//!   `unavailable`, never a partial parse.
+//! * [`pack::PlanImporter`] ties that bridge to a plan source and the approved
+//!   alias roots. Its `import` reads the exact plan bytes, sends them to
+//!   `inspect`, revalidates the response, and reads and verifies one snapshot per
+//!   declared spec/source. It holds no H2, model, H3, store, or Git port, so the
+//!   type system makes those side effects unreachable from a preview.
+//! * [`source::ConfinedReader`] and [`source::PlanFileSource`] are the bounded,
+//!   read-only readers. Every read is confined to a canonical root, refuses a
+//!   symlink escape, a directory, or an oversize file, and never truncates.
+//!
+//! There is no fallback parser: an unusable exchange is an explicit
+//! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
 
 pub mod git;
+pub mod pack;
 pub mod readiness;
+pub mod source;
 pub mod workspace;
 
 pub use git::{
     GitProcessOutput, GitRunner, GitStatusEntry, GitWorktree, GitWorktreeStatus,
     WORKSPACE_GIT_TIMEOUT,
 };
+pub use pack::{
+    INSPECTOR_OUTPUT_LIMIT, INSPECTOR_SCRIPT, INSPECTOR_TIMEOUT, MINIMUM_PYTHON, PackBinding,
+    PackInspector, PlanImporter, RootedPlanSource,
+};
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
+pub use source::{
+    ConfinedRead, ConfinedReader, PlanFileSource, read_and_verify_specs, read_spec_snapshot,
+};
 pub use workspace::{
     ApprovedDocument, ApprovedDocumentKind, BASE_BRANCH_FEATURE, BaselineRecord, GITIGNORE_PATH,
     HostGitPreparationCommit, ISOLATION_FEATURE, MemoryBaselineRecord, NoPreparationCommit,

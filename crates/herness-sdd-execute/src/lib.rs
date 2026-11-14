@@ -14,6 +14,11 @@
 //! H4's own verification, HTML barrier, host commit, and durable write make a
 //! Task `complete`.
 //!
+//! Task 12 adds the pure import side of the pack inspector: [`import`] decodes
+//! the `sdd-plan-inspect` response into a validated [`PlanPreview`], maps every
+//! inspector failure onto an H4 class, and verifies the spec/source snapshots a
+//! preview binds. It performs no I/O; the desktop bridge supplies the bytes.
+//!
 //! The ten failure and refusal classes (`unsupported_plan_format`,
 //! `invalid_plan`, `unavailable`, `approval_required`, `conflict`,
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
@@ -28,6 +33,7 @@ pub mod durable;
 pub mod error;
 pub mod events;
 pub mod ids;
+pub mod import;
 pub mod journal;
 pub mod plan;
 pub mod ports;
@@ -66,6 +72,16 @@ pub use ids::{
     ProgressJournalId, ProgressKind, ProjectSequence, RunInputRef, TaskKind, TaskNumber, TaskRef,
     TaskStableId, TreeSha,
 };
+pub use import::{
+    AliasRoot, CONTRACT_FEATURE, CONTRACT_INPUT_FEATURE, CapabilitiesReport, ContractInput,
+    EXIT_FEATURE, ExecutionBlockFacts, InspectorFailure, InspectorFailureCode, InspectorOperation,
+    MAX_SPEC_SNAPSHOT_BYTES, OVERSIZE_PLAN_FEATURE, OVERSIZE_RESPONSE_FEATURE,
+    OVERSIZE_SNAPSHOT_FEATURE, PACK_FEATURE, PROTOCOL_FEATURE, PlanHeaderFacts, PlanPreview,
+    PreviewSpecRef, PreviewTask, REQUIRED_CONTRACT_INPUTS, RESPONSE_FEATURE, ResolvedSource,
+    SectionSnapshot, SourceLayout, SourceSnapshot, SpecSnapshotSet, TIMEOUT_FEATURE,
+    VerifiedSpecSnapshot, decode_capabilities_response, inspect_request_envelope,
+    inspector_failure_error, validate_source_alias, verify_spec_snapshots,
+};
 pub use journal::{
     CommitMessage, CommitTrailer, CommittedPath, DispatchContent, DispatchJournalEntry,
     DispatchRequest, DispatchResult, GitCommitIntent, GitCommitOutcome, GitJournalEntry,
@@ -79,10 +95,10 @@ pub use plan::{
     PlanDiagnosticCode, PlanPath, validate_check_cwd, validate_project_path,
 };
 pub use ports::{
-    ChildDispatchPort, ClockPort, ExecutionFeature, ExecutionStorePort, HostGitPort,
-    HtmlBarrierPort, PlanInspectorPort, PlanObservation, PlanSourcePort, PlanSourceRead,
-    ProgressLedgerPort, StoredControlResult, StoredExecution, SupervisionTargetId, WorkspacePort,
-    WorkspacePreparation, WorkspaceState, unsupported,
+    ChildDispatchPlan, ChildDispatchPort, ClockPort, ExecutionFeature, ExecutionStorePort,
+    HostGitPort, HtmlBarrierPort, PlanInspectorPort, PlanObservation, PlanSourcePort,
+    PlanSourceRead, ProgressLedgerPort, StoredControlResult, StoredExecution, SupervisionTargetId,
+    WorkspacePort, WorkspacePreparation, WorkspaceState, unsupported,
 };
 pub use record::{RecordDecodeError, STORE_RECORD_FORMAT_VERSION, decode_record, encode_record};
 pub use snapshot::{
