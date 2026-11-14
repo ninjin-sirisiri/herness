@@ -1453,6 +1453,7 @@ dependencies = [
  "herness-assessment",
  "herness-core",
  "herness-desktop",
+ "herness-engine-pi",
  "herness-html-sync",
  "herness-sdd-execute",
  "herness-store",

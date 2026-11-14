@@ -40,12 +40,27 @@
 //!   read-only readers. Every read is confined to a canonical root, refuses a
 //!   symlink escape, a directory, or an oversize file, and never truncates.
 //!
+//! Task 14 adds [`packet`]: it turns one approved Task, the verified spec
+//! snapshots, and the stored earlier-Task handoffs into the immutable packet the
+//! child receives, plus the H2 [`H4PacketBinding`](herness_supervision::H4PacketBinding)
+//! built from the packet's own digests. Task 15's coordinator calls
+//! [`packet::task_packet`] before it creates the H2 target, passes
+//! [`packet::H4TaskPacket::prompt`] as `H4TaskLaunch::instructions`, and passes
+//! [`packet::H4TaskPacket::h2_binding`] as the launch's packet binding. H2 stores
+//! the prompt in the target's immutable `WorkPacket`, so the first run, every
+//! continuation, and a restore all render the same constraints and spec context;
+//! the H4 path never needs `bind_owner_instruction`, which exists for H3
+//! generation supersession and refuses an H4 owner kind. After the host commit,
+//! [`packet::task_handoff`] turns the accepted report into the handoff the next
+//! Task's packet carries.
+//!
 //! There is no fallback parser: an unusable exchange is an explicit
 //! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
 
 pub mod composition;
 pub mod git;
 pub mod pack;
+pub mod packet;
 pub mod readiness;
 pub mod registry;
 pub mod source;
@@ -63,6 +78,11 @@ pub use git::{
 pub use pack::{
     INSPECTOR_OUTPUT_LIMIT, INSPECTOR_SCRIPT, INSPECTOR_TIMEOUT, MINIMUM_PYTHON, PackBinding,
     PackInspector, PlanImporter, RootedPlanSource,
+};
+pub use packet::{
+    H4TaskPacket, MAX_PACKET_BYTES, TaskDispatchSeam, TaskPacketOutcome, TaskPacketRefusal,
+    packet_binding, packet_scope, prior_context, read_report, report_expectations, report_path,
+    snapshot_sections, spec_section, task_handoff, task_packet,
 };
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
 pub use registry::{

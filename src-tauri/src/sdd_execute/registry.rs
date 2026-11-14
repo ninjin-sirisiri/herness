@@ -157,6 +157,11 @@ impl PreviewTaskFacts {
         &self.title
     }
 
+    /// Exact Task body.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
     /// Declared HTML targets.
     pub fn html_targets(&self) -> &[String] {
         &self.html_targets
@@ -686,8 +691,10 @@ impl ApprovalDraft {
     /// Immutable packet binding of one approved Task.
     ///
     /// The three digests are the exact approved Task body, the verbatim Global
-    /// Constraints, and the composite of the approved spec snapshots, so the H2
-    /// comparison covers the same text H4 hands to the child.
+    /// Constraints, and the composite of the Task's approved spec references.
+    /// They are the same three digests `ApprovalDraft::packet_binding` binds, so
+    /// the owner launch and the Task packet can never disagree about what the
+    /// child received.
     pub fn packet_binding(
         &self,
         approval: &ExecutionApproval,
@@ -706,7 +713,8 @@ impl ApprovalDraft {
         let task_body = Sha256Digest::sha256(body.as_bytes());
         let constraints = approval.plan().parsed().global_constraints();
         let global_constraints = Sha256Digest::sha256(constraints.text().as_bytes());
-        let spec_snapshot = spec_snapshot_digest(approval.plan().spec_refs());
+        let spec_snapshot =
+            herness_sdd_execute::approved_spec_snapshot_digest(approval.plan().spec_refs());
         crate::supervision::h4_launch::h4_packet_binding(
             &task_body,
             &global_constraints,
@@ -1618,19 +1626,6 @@ pub fn derivation_uuid(label: &str, parts: &str) -> Uuid {
 /// The H2 owner reference of one H4 Task.
 pub fn h4_owner_ref(execution: ExecutionId, task: TaskRef) -> Result<OwnerRef, SddExecutionError> {
     crate::supervision::h4_launch::h4_owner_ref(execution, task).map_err(supervision_error)
-}
-
-fn spec_snapshot_digest(refs: &[herness_sdd_execute::ApprovedSpecRef]) -> Sha256Digest {
-    let mut buffer = b"herness.h4.spec-snapshot\0".to_vec();
-    for spec_ref in refs {
-        buffer.extend_from_slice(spec_ref.source().as_bytes());
-        buffer.push(0);
-        buffer.extend_from_slice(spec_ref.path().as_bytes());
-        buffer.push(0);
-        buffer.extend_from_slice(spec_ref.digest().as_str().as_bytes());
-        buffer.push(0);
-    }
-    Sha256Digest::sha256(&buffer)
 }
 
 /// Re-wraps one role digest as the generic digest a launch compares.

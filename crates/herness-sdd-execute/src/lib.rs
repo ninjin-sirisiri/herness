@@ -19,6 +19,21 @@
 //! inspector failure onto an H4 class, and verifies the spec/source snapshots a
 //! preview binds. It performs no I/O; the desktop bridge supplies the bytes.
 //!
+//! Task 14 adds the two values one Task's child work depends on:
+//!
+//! * [`packet`] composes the immutable, fingerprinted [`TaskPacket`] — the exact
+//!   Task body, the verbatim Global Constraints, the applied spec sections with
+//!   their approved snapshot text, prior interfaces and Rulings and unresolved
+//!   items, the approved scope and checks, and the report requirements. It never
+//!   pastes the whole plan or a diff, it is byte-deterministic for the same
+//!   inputs, and a context over capacity is an explicit human wait instead of a
+//!   truncation.
+//! * [`report`] parses the child's report and interprets it: `DONE` alone is not
+//!   completion, a missing evidence field is an explicit gap, `BLOCKED`,
+//!   `NEEDS_CONTEXT`, an important unagreed item, and a claimed host commit are
+//!   human waits, and an absent or unparseable report is never `DONE`. Reversible
+//!   `Ruling`s are retained for later packets.
+//!
 //! The ten failure and refusal classes (`unsupported_plan_format`,
 //! `invalid_plan`, `unavailable`, `approval_required`, `conflict`,
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
@@ -36,9 +51,11 @@ pub mod events;
 pub mod ids;
 pub mod import;
 pub mod journal;
+pub mod packet;
 pub mod plan;
 pub mod ports;
 pub mod record;
+pub mod report;
 pub mod snapshot;
 pub mod state;
 pub mod version;
@@ -96,6 +113,15 @@ pub use journal::{
     ProgressContent, ProgressFailure, ProgressJournalEntry, ProgressJournalState, ProgressTaskLine,
     ProgressWriteOutcome, RequestDecision, RequestIdentity, RequestRecord, decide_request,
 };
+pub use packet::{
+    MAX_CONTEXT_ENTRY_CHARS, MAX_PACKET_BYTES, MAX_PACKET_CONTEXT_ENTRIES,
+    MAX_PACKET_SECTION_BYTES, MAX_PACKET_SECTIONS, NO_GIT_RULE, PacketComposition,
+    PacketContextEntry, PacketInputs, PacketOutcome, PacketPriorResult, PacketScope,
+    PacketSpecSection, PacketWaitReason, PriorTaskContext, SnapshotSectionPart, SnapshotSections,
+    TASK_PACKET_FORMAT_VERSION, TaskHandoff, TaskPacket, TaskPacketBinding,
+    approved_spec_snapshot_digest, execution_report_path, prior_context_for,
+    required_evidence_fields,
+};
 pub use plan::{
     ExactPlanBytes, ExactPlanText, InspectRequest, InspectedPlan, InspectorCapabilities,
     InspectorProtocol, ParsedPlanSummary, ParsedPlanTask, PlanByteRange, PlanDiagnostic,
@@ -108,6 +134,11 @@ pub use ports::{
     WorkspacePort, WorkspacePreparation, WorkspaceState, unsupported,
 };
 pub use record::{RecordDecodeError, STORE_RECORD_FORMAT_VERSION, decode_record, encode_record};
+pub use report::{
+    CheckEvidence, EvidenceField, EvidenceItem, MAX_REPORT_BYTES, MAX_REPORT_EVIDENCE_BLOCKS,
+    Report, ReportExpectations, ReportGap, ReportOutcome, ReportParseError, ReportStatus,
+    ReportWaitReason, Ruling, SpecReflection, interpret_unparseable,
+};
 pub use snapshot::{
     BudgetConsumption, CommitRange, ExecutionSnapshot, NoChangeRecord, SnapshotBudget,
     SnapshotInput, SnapshotPlan, SnapshotWorkspace, TaskSnapshot,
