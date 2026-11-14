@@ -305,6 +305,15 @@ pub enum ApprovalRejection {
         /// Supplied approval revision.
         supplied: u64,
     },
+    /// One current input no longer matches the approved value.
+    ///
+    /// The field names the exact part (for example `plan.specRefs`,
+    /// `task.2.scope`, or `connection.profile`) so a start refusal points at
+    /// what a human must re-approve instead of re-approving silently.
+    CurrentInputsChanged {
+        /// Field that differs.
+        field: String,
+    },
 }
 
 /// Structured H4 contract error.

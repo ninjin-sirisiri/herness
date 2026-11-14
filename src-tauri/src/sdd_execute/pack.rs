@@ -705,6 +705,7 @@ fn unavailable(feature: &str, detail: impl std::fmt::Display) -> SddExecutionErr
 /// snapshots out.
 #[derive(Debug, Clone)]
 pub struct ImportPreview {
+    project_root: String,
     source: ExactPlanBytes,
     preview: PlanPreview,
     specs: SpecSnapshotSet,
@@ -712,6 +713,11 @@ pub struct ImportPreview {
 }
 
 impl ImportPreview {
+    /// Canonical project root the plan and spec snapshots were read from.
+    pub fn project_root(&self) -> &str {
+        &self.project_root
+    }
+
     /// The exact plan bytes the human would approve.
     pub fn source(&self) -> &ExactPlanBytes {
         &self.source
@@ -834,6 +840,7 @@ impl<L: ArgvLauncher, S: RootedPlanSource> PlanImporter<L, S> {
         }
         let specs = read_and_verify_specs(&self.layout, preview.spec_refs())?;
         Ok(ImportPreview {
+            project_root,
             source: exact,
             preview,
             specs,

@@ -16,13 +16,14 @@
 
 use herness_core::{Event, ProjectId, Timestamp};
 use herness_sdd_execute::{
-    ApprovalId, BudgetIncrement, CommitRequestId, ControlRecord, ControlRequestId,
-    DispatchJournalEntry, DispatchManifest, DispatchRequestId, DurableExecutionStorePort,
-    ExecutionApproval, ExecutionId, ExecutionOperationResult, ExecutionRevision, ExecutionSnapshot,
-    ExecutionStorePort, GitCommitOutcome, GitJournalEntry, GitJournalState, JournalEntryState,
-    ProgressJournalEntry, ProgressJournalId, ProgressJournalState, RecordDecodeError,
-    SddExecutionError, StoredExecution, TaskReservation, decode_record, dispatch_event,
-    encode_record, git_event, operation_event, progress_event, snapshot_event,
+    ApprovalId, ApprovalRevisionStorePort, BudgetIncrement, CommitRequestId, ControlRecord,
+    ControlRequestId, DispatchJournalEntry, DispatchManifest, DispatchRequestId,
+    DurableExecutionStorePort, ExecutionApproval, ExecutionId, ExecutionOperationResult,
+    ExecutionRevision, ExecutionSnapshot, ExecutionStorePort, GitCommitOutcome, GitJournalEntry,
+    GitJournalState, JournalEntryState, ProgressJournalEntry, ProgressJournalId,
+    ProgressJournalState, RecordDecodeError, SddExecutionError, StartRecord, StartRecordStorePort,
+    StoredExecution, TaskReservation, decode_record, dispatch_event, encode_record, git_event,
+    operation_event, progress_event, snapshot_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -1114,6 +1115,152 @@ impl Store {
         load_approval(&self.conn, project_id, approval_id, revision)
     }
 
+    /// Loads every recorded approval revision in ascending order.
+    pub fn sdd_approval_revisions(
+        &self,
+        project_id: ProjectId,
+        approval_id: ApprovalId,
+    ) -> Result<Vec<ExecutionApproval>, StoreError> {
+        approval_id
+            .validate_in(project_id)
+            .map_err(|_| StoreError::SddExecutionCrossProject {
+                expected: project_id,
+                found: approval_id.project_id(),
+            })?;
+        let mut statement = self.conn.prepare(
+            "SELECT revision FROM sdd_execution_approvals
+             WHERE project_id = ?1 AND approval_id = ?2
+             ORDER BY revision ASC",
+        )?;
+        let revisions = statement
+            .query_map(
+                params![project_id.to_string(), approval_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut approvals = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let revision = positive(revision, "approval revision")?;
+            let approval = load_approval(&self.conn, project_id, approval_id, revision)?
+                .ok_or_else(|| {
+                    StoreError::corrupt("approval row disappeared during the listing")
+                })?;
+            approvals.push(approval);
+        }
+        Ok(approvals)
+    }
+
+    /// Loads the start record for one request.
+    pub fn sdd_start_record(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        request_id: ControlRequestId,
+    ) -> Result<Option<StartRecord>, StoreError> {
+        ensure_execution(project_id, execution_id)?;
+        request_id
+            .validate_in(project_id)
+            .map_err(|_| StoreError::SddExecutionCrossProject {
+                expected: project_id,
+                found: request_id.project_id(),
+            })?;
+        let key = start_record_key(project_id, execution_id, request_id);
+        let Some(bytes) = Store::load_host_state(self, &key)? else {
+            return Ok(None);
+        };
+        let record: StartRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            StoreError::corrupt(format!("stored H4 start record is invalid: {error}"))
+        })?;
+        if record.project_id() != project_id
+            || record.execution_id() != execution_id
+            || record.request_id() != request_id
+        {
+            return Err(StoreError::corrupt(
+                "H4 start record does not match its recorded identifiers",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Loads the one start record written for one Task, if any.
+    ///
+    /// The start-record host-state key ends with the request identity, so the
+    /// SQLite port cannot index by Task directly. It reads every start-record key
+    /// of the execution and returns the record whose Task matches. An
+    /// unreadable row is an error, never `None`.
+    pub fn sdd_start_record_for_task(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task: herness_sdd_execute::TaskRef,
+    ) -> Result<Option<StartRecord>, StoreError> {
+        ensure_execution(project_id, execution_id)?;
+        task.ensure_project(project_id)
+            .map_err(|_| StoreError::SddExecutionCrossProject {
+                expected: project_id,
+                found: task.project_id(),
+            })?;
+        let prefix = start_record_prefix(project_id, execution_id);
+        let mut statement = self
+            .conn
+            .prepare("SELECT key FROM host_state WHERE key LIKE ?1 ORDER BY key ASC")?;
+        let keys = statement
+            .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in keys {
+            let Some(bytes) = Store::load_host_state(self, &key)? else {
+                continue;
+            };
+            let record: StartRecord = serde_json::from_slice(&bytes).map_err(|error| {
+                StoreError::corrupt(format!("stored H4 start record is invalid: {error}"))
+            })?;
+            if record.project_id() != project_id || record.execution_id() != execution_id {
+                return Err(StoreError::corrupt(
+                    "H4 start record does not match its recorded identifiers",
+                ));
+            }
+            if record.task() == task {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Writes the start record for one request.
+    ///
+    /// A record that would move the phase backwards or replace the stored start
+    /// result is refused before any write.
+    pub fn record_sdd_start_record(&mut self, record: &StartRecord) -> Result<(), StoreError> {
+        let project = record.project_id();
+        let execution = record.execution_id();
+        let request = record.request_id();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+        if let Some(stored) = load_start_record(&transaction, project, execution, request)? {
+            stored.ensure_advance(record).map_err(StoreError::from)?;
+            if stored == *record {
+                return Ok(());
+            }
+        }
+        let key = start_record_key(project, execution, request);
+        let bytes: Vec<u8> = serde_json::to_vec(record).map_err(|error| StoreError::Codec {
+            detail: format!("could not encode the H4 start record: {error}"),
+        })?;
+        crate::store::write_host_state(&transaction, &key, &bytes)?;
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+        transaction.commit().map_err(StoreError::database)
+    }
+
     /// Records the one reservation for a dispatch request.
     ///
     /// A re-delivered identical reservation returns the stored value without a
@@ -1365,6 +1512,49 @@ impl Store {
         }
         Ok(increments)
     }
+}
+
+fn load_start_record(
+    conn: &Connection,
+    project: ProjectId,
+    execution: ExecutionId,
+    request: ControlRequestId,
+) -> Result<Option<StartRecord>, StoreError> {
+    let key = start_record_key(project, execution, request);
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM host_state WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let record: StartRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::corrupt(format!("stored H4 start record is invalid: {error}"))
+    })?;
+    if record.project_id() != project
+        || record.execution_id() != execution
+        || record.request_id() != request
+    {
+        return Err(StoreError::corrupt(
+            "H4 start record does not match its recorded identifiers",
+        ));
+    }
+    Ok(Some(record))
+}
+
+fn start_record_key(
+    project: ProjectId,
+    execution: ExecutionId,
+    request: ControlRequestId,
+) -> String {
+    format!("{}{request}", start_record_prefix(project, execution))
+}
+
+fn start_record_prefix(project: ProjectId, execution: ExecutionId) -> String {
+    format!("h4.start.record:{project}:{execution}:")
 }
 
 fn load_approval(
@@ -1860,5 +2050,67 @@ impl DurableExecutionStorePort for Store {
     ) -> Result<Vec<BudgetIncrement>, SddExecutionError> {
         Store::sdd_budget_increments(self, project_id, execution_id)
             .map_err(SddExecutionError::from)
+    }
+}
+
+impl ApprovalRevisionStorePort for Store {
+    fn record_approval_revision(
+        &mut self,
+        approval: &ExecutionApproval,
+    ) -> Result<(), SddExecutionError> {
+        Store::record_sdd_approval(self, approval).map_err(SddExecutionError::from)
+    }
+
+    fn approval_revision(
+        &self,
+        project_id: ProjectId,
+        approval_id: ApprovalId,
+        revision: u64,
+    ) -> Result<Option<ExecutionApproval>, SddExecutionError> {
+        Store::sdd_approval(self, project_id, approval_id, revision)
+            .map_err(SddExecutionError::from)
+    }
+
+    fn latest_approval_revision(
+        &self,
+        project_id: ProjectId,
+        approval_id: ApprovalId,
+    ) -> Result<Option<ExecutionApproval>, SddExecutionError> {
+        Store::latest_sdd_approval(self, project_id, approval_id).map_err(SddExecutionError::from)
+    }
+
+    fn approval_revisions(
+        &self,
+        project_id: ProjectId,
+        approval_id: ApprovalId,
+    ) -> Result<Vec<ExecutionApproval>, SddExecutionError> {
+        Store::sdd_approval_revisions(self, project_id, approval_id)
+            .map_err(SddExecutionError::from)
+    }
+}
+
+impl StartRecordStorePort for Store {
+    fn start_record(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        request_id: ControlRequestId,
+    ) -> Result<Option<StartRecord>, SddExecutionError> {
+        Store::sdd_start_record(self, project_id, execution_id, request_id)
+            .map_err(SddExecutionError::from)
+    }
+
+    fn start_record_for_task(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task: herness_sdd_execute::TaskRef,
+    ) -> Result<Option<StartRecord>, SddExecutionError> {
+        Store::sdd_start_record_for_task(self, project_id, execution_id, task)
+            .map_err(SddExecutionError::from)
+    }
+
+    fn record_start(&mut self, record: &StartRecord) -> Result<(), SddExecutionError> {
+        Store::record_sdd_start_record(self, record).map_err(SddExecutionError::from)
     }
 }

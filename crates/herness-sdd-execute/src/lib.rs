@@ -28,6 +28,7 @@
 #![doc = "The H4 numeric defaults are the approved spec values. This crate does not add a plan-wide budget, raise the finite H2 limits, or turn a saved `Synced`/receipt into evidence."]
 
 pub mod approval;
+pub mod approval_registry;
 pub mod contract;
 pub mod durable;
 pub mod error;
@@ -47,6 +48,12 @@ pub use approval::{
     ApprovedDeliverable, ApprovedSpecRef, CommitAuthorization, CommitPolicy, ConditionMode,
     DeliverableKind, ExecutionApproval, ExecutionConnection, ExternalSourceApproval, GitIdentity,
     H3ApprovalBinding, PackApproval, PlanApproval, TaskApproval, WorkspaceApproval,
+};
+pub use approval_registry::{
+    ApprovalInputs, ApprovalRevisionStorePort, MemoryApprovalRevisionStore, MemoryStartRecordStore,
+    ObservedConnection, START_RECORD_FORMAT_VERSION, StartApprovalPost, StartApprovalRegistry,
+    StartPhase, StartReceipt, StartRecord, StartRecordStorePort, ensure_budgets,
+    start_record_format_version, task_budget,
 };
 pub use contract::{
     ApprovalContract, CheckoutClaim, ContinuationLimits, ControlRecord, Delegation,

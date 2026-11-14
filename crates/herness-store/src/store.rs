@@ -1920,7 +1920,7 @@ fn commit_command_atomically(
     Ok(revision)
 }
 
-fn write_host_state(
+pub(crate) fn write_host_state(
     transaction: &Transaction<'_>,
     key: &str,
     value: &[u8],

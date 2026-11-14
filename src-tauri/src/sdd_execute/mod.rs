@@ -43,12 +43,19 @@
 //! There is no fallback parser: an unusable exchange is an explicit
 //! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
 
+pub mod composition;
 pub mod git;
 pub mod pack;
 pub mod readiness;
+pub mod registry;
 pub mod source;
 pub mod workspace;
 
+pub use composition::{
+    ApprovalOutcome, CurrentInputs, DesktopStartComposition, DesktopWorkspace, LiveStartFacts,
+    StartApprovalRequest, UnavailableChildStart, approve_and_start, current_owner_approval,
+    desktop_start_composition, ensure_human_start_confirmation, preview_facts,
+};
 pub use git::{
     GitProcessOutput, GitRunner, GitStatusEntry, GitWorktree, GitWorktreeStatus,
     WORKSPACE_GIT_TIMEOUT,
@@ -58,6 +65,12 @@ pub use pack::{
     PackInspector, PlanImporter, RootedPlanSource,
 };
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
+pub use registry::{
+    ApprovalBuild, ApprovalDraft, H4_BUDGET_POLICY_VERSION, H4_CONDITION_VERSION,
+    H4StartApprovalRegistry, MemoryStartStore, PreviewFacts, PreviewTaskFacts, StartChildPort,
+    StartComposition, StartHtmlPort, StartHtmlRequest, StartOutcome, StartRequest,
+    StartWorkspacePort, UnsyncedStartHtml, derivation_uuid, h4_owner_ref,
+};
 pub use source::{
     ConfinedRead, ConfinedReader, PlanFileSource, read_and_verify_specs, read_spec_snapshot,
 };

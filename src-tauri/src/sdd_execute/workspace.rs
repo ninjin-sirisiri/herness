@@ -400,6 +400,36 @@ impl ApprovedDocument {
         Self::new(path, ApprovedDocumentKind::Spec, source)
     }
 
+    /// Records the approved plan from the digest an approval already bound.
+    ///
+    /// The approval layer uses this after the preview captured the exact bytes,
+    /// so the expectation compares the checkout against the approved digest
+    /// instead of re-reading a document that may have moved.
+    pub fn plan_at_digest(
+        path: impl Into<String>,
+        digest: Sha256Digest,
+    ) -> Result<Self, SddExecutionError> {
+        Self::from_digest(path, ApprovedDocumentKind::Plan, digest)
+    }
+
+    /// Records a referenced specification from its approved digest.
+    pub fn spec_at_digest(
+        path: impl Into<String>,
+        digest: Sha256Digest,
+    ) -> Result<Self, SddExecutionError> {
+        Self::from_digest(path, ApprovedDocumentKind::Spec, digest)
+    }
+
+    fn from_digest(
+        path: impl Into<String>,
+        kind: ApprovedDocumentKind,
+        digest: Sha256Digest,
+    ) -> Result<Self, SddExecutionError> {
+        let path = path.into();
+        herness_sdd_execute::validate_project_path("workspace.document.path", &path)?;
+        Ok(Self { path, kind, digest })
+    }
+
     fn new(
         path: impl Into<String>,
         kind: ApprovedDocumentKind,
