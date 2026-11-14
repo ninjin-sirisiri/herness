@@ -1866,7 +1866,10 @@ fn the_desktop_composition_keeps_the_barrier_and_commit_explicitly_not_connected
     let mut completion = completion;
     let request = TaskCompletionRequest::new(
         task_ref(project, 1),
+        execution(project),
+        ExecutionRevision::INITIAL,
         supervision(project, 0x5000),
+        CommitAuthorization::new(true, true).expect("commit authorization"),
         CommitPolicy::Required,
         Vec::new(),
         7_000,

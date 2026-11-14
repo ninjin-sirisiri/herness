@@ -477,7 +477,10 @@ impl CompletionWiring {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompletionRequest {
     task: TaskRef,
+    execution_id: ExecutionId,
+    expected_revision: ExecutionRevision,
     supervision_id: SupervisionId,
+    commit_authorization: crate::approval::CommitAuthorization,
     commit_policy: crate::approval::CommitPolicy,
     evidence: Vec<herness_supervision::EvidenceId>,
     remaining_seconds: u64,
@@ -485,16 +488,28 @@ pub struct TaskCompletionRequest {
 
 impl TaskCompletionRequest {
     /// Records one completion request.
+    ///
+    /// The execution identity, the stored revision, and the approved commit
+    /// authorization travel with the request, so the host commit is authorized
+    /// only by the approval the human already gave — never by a value the
+    /// completion seam could invent.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task: TaskRef,
+        execution_id: ExecutionId,
+        expected_revision: ExecutionRevision,
         supervision_id: SupervisionId,
+        commit_authorization: crate::approval::CommitAuthorization,
         commit_policy: crate::approval::CommitPolicy,
         evidence: Vec<herness_supervision::EvidenceId>,
         remaining_seconds: u64,
     ) -> Self {
         Self {
             task,
+            execution_id,
+            expected_revision,
             supervision_id,
+            commit_authorization,
             commit_policy,
             evidence,
             remaining_seconds,
@@ -506,9 +521,24 @@ impl TaskCompletionRequest {
         self.task
     }
 
+    /// Execution that owns the Task.
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    /// Execution revision the completion writes against.
+    pub const fn expected_revision(&self) -> ExecutionRevision {
+        self.expected_revision
+    }
+
     /// The H2 target that met the conditions.
     pub const fn supervision_id(&self) -> SupervisionId {
         self.supervision_id
+    }
+
+    /// The approved host commit and hook authorization.
+    pub const fn commit_authorization(&self) -> crate::approval::CommitAuthorization {
+        self.commit_authorization
     }
 
     /// The approved commit policy.
@@ -978,7 +1008,7 @@ impl TaskCoordinator {
             None => finish(ports, &snapshot, request),
             Some(task) => match task.progression() {
                 TaskProgression::Pending => dispatch_task(ports, &snapshot, request, task),
-                TaskProgression::Active => observe_task(ports, &snapshot, request, task),
+                TaskProgression::Active => observe_task(ports, &snapshot, request, &approval, task),
                 TaskProgression::Complete => unreachable!("a complete Task is never selected"),
             },
         }
@@ -1300,6 +1330,7 @@ fn observe_task(
     ports: &mut CoordinatorPorts<'_>,
     snapshot: &ExecutionSnapshot,
     request: &CoordinatorRequest,
+    approval: &crate::approval::ExecutionApproval,
     task: &TaskSnapshot,
 ) -> Result<CoordinatorOutcome, SddExecutionError> {
     let identity = *request.identity();
@@ -1362,7 +1393,7 @@ fn observe_task(
                     HumanAction::ResolveHumanDecision,
                 );
             }
-            complete_task(ports, snapshot, request, task, &status, budget)
+            complete_task(ports, snapshot, request, approval, task, &status, budget)
         }
         ChildState::WaitingHuman => stop_execution(
             ports,
@@ -1438,11 +1469,13 @@ fn complete_task(
     ports: &mut CoordinatorPorts<'_>,
     snapshot: &ExecutionSnapshot,
     request: &CoordinatorRequest,
+    approval: &crate::approval::ExecutionApproval,
     task: &TaskSnapshot,
     status: &ChildStatus,
     budget: TaskBudget,
 ) -> Result<CoordinatorOutcome, SddExecutionError> {
     let target = task.task();
+    let identity = *request.identity();
 
     // The host path must be wired before the Task may leave H2's completion. The
     // missing capability is explicit; nothing is inferred. A barrier-connected
@@ -1507,7 +1540,10 @@ fn complete_task(
 
     let completion_request = TaskCompletionRequest::new(
         target,
+        identity.execution_id(),
+        committing.revision(),
         status.supervision_id(),
+        approval.commit(),
         task.commit_policy(),
         status.evidence().to_vec(),
         budget.remaining_seconds(),

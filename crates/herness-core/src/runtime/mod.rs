@@ -30,7 +30,7 @@ pub use host_git::{
     HostGitError, HostGitGate, HostGitGateOutcome, HostGitIndexState, HostGitIntent,
     HostGitMessage, HostGitOutcome, HostGitPath, HostGitRefusal, HostGitReport, HostGitStage,
     HostGitTermination, HostGitTrailer, HostGitUnknown, MAX_HOST_GIT_GATE_ARG_BYTES,
-    MAX_HOST_GIT_PATHS, RecordingHostGitAudit, StoreHostGitAudit,
+    MAX_HOST_GIT_PATHS, RecordingHostGitAudit, StoreHostGitAudit, hooks_configuration_digest,
 };
 pub use publication::{PrivateAppArchive, PublicationWriter};
 pub use reconcile::{

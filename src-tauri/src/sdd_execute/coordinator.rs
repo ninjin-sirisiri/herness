@@ -3,12 +3,13 @@
 //! This module connects the deterministic coordinator in
 //! [`herness_sdd_execute::coordinator`] to the real H2 owner path, the real
 //! SQLite store, the app-wide pump scope, and the readiness gate. It connects the
-//! H3 barrier half (Task 16) and deliberately leaves the host commit half
-//! unconnected (Task 17): [`DesktopTaskCompletion`] starts as the explicit
-//! `not connected` seam and, after [`DesktopCoordinator::connect_html_barrier`],
-//! runs the real barrier and holds a non-synced Task. A synced barrier then
-//! holds at `waiting_human` with the still-missing commit reason instead of
-//! reporting a fabricated completion.
+//! H3 barrier half (Task 16) and the host commit half (Task 17):
+//! [`DesktopTaskCompletion`] starts as the explicit `not connected` seam, and
+//! after [`DesktopCoordinator::connect_html_barrier`] it runs the real barrier and
+//! holds a non-synced Task. A synced barrier then reaches the bound commit half:
+//! Task 17's [`DesktopHostCommit`](crate::sdd_execute::DesktopHostCommit) records
+//! the intent, commits, and re-reads the checkout, so a synced Task with a
+//! connected commit completes with its real range.
 //!
 //! # Wiring
 //!
@@ -18,7 +19,7 @@
 //! | launch | [`ApprovedTaskLaunch`] over the stored approval, the verified spec snapshots, and the stored handoffs |
 //! | dispatch | [`H2ChildDispatch`] over `SupervisionHost::start_h4_task` |
 //! | children | [`H2ChildStatus`], which re-reads the stored H2 record |
-//! | completion | [`DesktopTaskCompletion`]: the real HTML barrier, then an explicit missing-commit refusal until Task 17 |
+//! | completion | [`DesktopTaskCompletion`]: the real HTML barrier, then the real host commit |
 //! | pump scope | [`PumpScope::AllExcept`] excluding only the H3 candidate target |
 //!
 //! The composition performs no push, pull, merge, rebase, amend, reset, or clean,
@@ -75,8 +76,9 @@ impl DesktopCoordinator {
     /// The host completion seam.
     ///
     /// Before [`Self::connect_html_barrier`] it reports `not connected`; after it
-    /// runs the real H3 barrier and holds a non-synced Task. The host commit half
-    /// stays explicitly missing until Task 17.
+    /// runs the real H3 barrier and holds a non-synced Task. A synced barrier
+    /// reaches the bound host commit half, and an unbound one still refuses
+    /// explicitly.
     pub const fn completion(&self) -> &DesktopTaskCompletion {
         &self.completion
     }

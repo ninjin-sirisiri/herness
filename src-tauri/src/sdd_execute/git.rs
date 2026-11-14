@@ -10,9 +10,11 @@
 //! carries `GIT_OPTIONAL_LOCKS=0`), so `git status` never refreshes — and
 //! therefore never rewrites — the index. The only mutating helpers are the
 //! three used by explicit isolation and its own failed-creation cleanup:
-//! `worktree add --detach`, `switch -c`, and `worktree remove`. Stage, gate,
-//! and commit are deliberately absent: the one permitted preparation commit
-//! runs through `herness_core`'s host Git boundary, not through this module.
+//! `worktree add --detach`, `switch -c`, and `worktree remove`. Stage, gate, and
+//! commit are deliberately absent: both the one permitted preparation commit and
+//! every Task commit run through `herness_core`'s host Git boundary, never
+//! through this module. The change and read helpers here are read-only queries
+//! the commit half uses to fix and re-read the target set.
 
 use std::time::Duration;
 
@@ -23,7 +25,7 @@ use herness_core::tools::process::{
     SystemArgvLauncher, supervise,
 };
 use herness_core::{AbsolutePath, ShellStopStatus};
-use herness_sdd_execute::{CommitSha, FailureDetails, RecoveryReason, SddExecutionError};
+use herness_sdd_execute::{CommitSha, FailureDetails, RecoveryReason, SddExecutionError, TreeSha};
 use sha2::Digest as _;
 use uuid::Uuid;
 
@@ -134,6 +136,44 @@ impl GitStatusEntry {
     pub fn path(&self) -> &str {
         &self.path
     }
+}
+
+/// One changed path observed against a base revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitChange {
+    path: String,
+    kind: GitChangeKind,
+}
+
+impl GitChange {
+    /// Records one changed path and what happened to it.
+    pub fn new(path: impl Into<String>, kind: GitChangeKind) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+        }
+    }
+
+    /// Project-relative path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// What changed.
+    pub const fn kind(&self) -> GitChangeKind {
+        self.kind
+    }
+}
+
+/// What happened to one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitChangeKind {
+    /// The path is new.
+    Added,
+    /// The path exists at both revisions with different bytes.
+    Modified,
+    /// The path exists at the base and not in the worktree.
+    Deleted,
 }
 
 /// Parsed `git status --porcelain` state of one checkout.
@@ -334,6 +374,154 @@ impl<L: ArgvLauncher> GitRunner<L> {
         }
         let branch = output.stdout().trim();
         Ok((!branch.is_empty()).then(|| branch.to_owned()))
+    }
+
+    /// Reads one revision to a full tree SHA, or `None` when it does not exist.
+    pub fn rev_parse_tree(
+        &mut self,
+        cwd: &str,
+        revision: &str,
+    ) -> Result<Option<TreeSha>, SddExecutionError> {
+        let specification = format!("{revision}^{{tree}}");
+        let output = self.run(
+            cwd,
+            &["rev-parse", "--verify", "--quiet", &specification],
+            true,
+        )?;
+        if !output.succeeded() {
+            return Ok(None);
+        }
+        let value = output.stdout().trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        TreeSha::parse(value).map(Some)
+    }
+
+    /// Reads the full commit message of `HEAD`, without the trailing newline.
+    pub fn commit_message(&mut self, cwd: &str) -> Result<String, SddExecutionError> {
+        let output = self.run(cwd, &["log", "-1", "--pretty=%B", "HEAD"], true)?;
+        if !output.succeeded() {
+            return Err(unavailable("workspace.git", output.detail()));
+        }
+        Ok(output.stdout().trim_end().to_owned())
+    }
+
+    /// Lists the paths whose index entry differs from HEAD.
+    pub fn staged_paths(&mut self, cwd: &str) -> Result<Vec<String>, SddExecutionError> {
+        let output = self.run(
+            cwd,
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                "HEAD",
+            ],
+            true,
+        )?;
+        // An unborn branch has no HEAD to diff against; nothing is staged.
+        if output.exit_code() == Some(128) {
+            return Ok(Vec::new());
+        }
+        if !output.succeeded() {
+            return Err(unavailable("workspace.git", output.detail()));
+        }
+        Ok(output
+            .stdout()
+            .split('\0')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Lists every path that differs from `base`, including deletions.
+    ///
+    /// The result is the worktree/index state against `base`, so it covers both
+    /// committed and still-uncommitted work. It never refreshes the index.
+    pub fn changes_since(
+        &mut self,
+        cwd: &str,
+        base: &str,
+    ) -> Result<Vec<GitChange>, SddExecutionError> {
+        let output = self.run(
+            cwd,
+            &["diff", "--name-status", "--no-renames", "-z", base],
+            true,
+        )?;
+        if !output.succeeded() {
+            return Err(unavailable("workspace.git", output.detail()));
+        }
+        let mut changes = Vec::new();
+        let mut fields = output
+            .stdout()
+            .split('\0')
+            .filter(|value| !value.is_empty());
+        while let Some(status) = fields.next() {
+            let Some(path) = fields.next() else {
+                return Err(unavailable(
+                    "workspace.git",
+                    "git diff returned a status without a path".to_owned(),
+                ));
+            };
+            let kind = match status.trim() {
+                "D" => GitChangeKind::Deleted,
+                "A" => GitChangeKind::Added,
+                _ => GitChangeKind::Modified,
+            };
+            changes.push(GitChange {
+                path: path.to_owned(),
+                kind,
+            });
+        }
+        Ok(changes)
+    }
+
+    /// Lists the untracked, non-ignored paths.
+    ///
+    /// `--untracked-files=all` expands a wholly untracked directory into its
+    /// files, so a new document inside a new directory is one explicit target
+    /// rather than a directory entry the host would have to expand itself.
+    pub fn untracked_paths(&mut self, cwd: &str) -> Result<Vec<String>, SddExecutionError> {
+        let output = self.run(
+            cwd,
+            &[
+                "status",
+                "--porcelain",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+            true,
+        )?;
+        if !output.succeeded() {
+            return Err(unavailable("workspace.git", output.detail()));
+        }
+        let mut paths = Vec::new();
+        for record in output
+            .stdout()
+            .split('\0')
+            .filter(|value| !value.is_empty())
+        {
+            let mut characters = record.chars();
+            let Some(index) = characters.next() else {
+                continue;
+            };
+            let Some(worktree) = characters.next() else {
+                continue;
+            };
+            if index != '?' || worktree != '?' {
+                continue;
+            }
+            let rest: String = characters.collect();
+            let path = rest.strip_prefix(' ').unwrap_or(&rest);
+            if !path.is_empty() {
+                paths.push(path.to_owned());
+            }
+        }
+        Ok(paths)
     }
 
     /// Whether Git would ignore `path`.

@@ -253,6 +253,50 @@ fn dependency_kind_of(kind: FingerprintKind) -> Option<DependencyKind> {
     }
 }
 
+/// The verified derived artifacts and tracked source documents of one Task.
+///
+/// `derived` is every H3-produced companion and receipt the final barrier just
+/// verified at its recorded revision and digest. `tracked` is every required
+/// source document with the exact digest the barrier asserted, or `None` when
+/// its source is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifiedDocuments {
+    derived: Vec<(String, Vec<u8>)>,
+    tracked: Vec<(String, Option<ContentDigest>)>,
+}
+
+impl VerifiedDocuments {
+    /// The verified HTML companions and receipts, with their exact bytes.
+    pub fn derived(&self) -> &[(String, Vec<u8>)] {
+        &self.derived
+    }
+
+    /// The verified source documents and their exact digests.
+    pub fn tracked(&self) -> &[(String, Option<ContentDigest>)] {
+        &self.tracked
+    }
+
+    /// Builds one value from an already verified derived set.
+    ///
+    /// A test composition and a re-checking adapter both use this; the bytes are
+    /// only ever the barrier's own verified bytes.
+    pub fn from_derived(derived: Vec<(String, Vec<u8>)>) -> Self {
+        Self {
+            derived,
+            tracked: Vec::new(),
+        }
+    }
+}
+
+/// A barrier gate that can also report what its last final check verified.
+///
+/// The commit half uses this instead of re-reading the checkout for document
+/// bytes: the barrier already asserted them at the recorded revision.
+pub trait VerifiedDocumentSource {
+    /// The documents the last final barrier verified.
+    fn verified_documents(&self) -> VerifiedDocuments;
+}
+
 /// The desktop H4 barrier gate: required-set union, readiness, and final check.
 pub struct DesktopH4BarrierGate {
     store: StoreHandle,
@@ -266,6 +310,8 @@ pub struct DesktopH4BarrierGate {
     pre_scan: Vec<ScannedTarget>,
     /// Whether a pre-verification capture ever ran.
     verified: bool,
+    /// The capture the last final barrier checked.
+    final_capture: Option<VerifiedDocuments>,
 }
 
 impl DesktopH4BarrierGate {
@@ -287,6 +333,7 @@ impl DesktopH4BarrierGate {
             baselines: std::collections::BTreeMap::new(),
             pre_scan: Vec::new(),
             verified: false,
+            final_capture: None,
         })
     }
 
@@ -307,6 +354,7 @@ impl DesktopH4BarrierGate {
         self.baselines.clear();
         self.pre_scan.clear();
         self.verified = false;
+        self.final_capture = None;
         Ok(())
     }
 
@@ -554,7 +602,53 @@ impl DesktopH4BarrierGate {
                 return Ok(BarrierReport::hold_decision(hold));
             }
         };
-        check_barrier(&mut self.barrier, self.project, &required, &capture, now)
+        let report = check_barrier(&mut self.barrier, self.project, &required, &capture, now)?;
+        self.final_capture = if report.decision().is_synced() {
+            Some(self.capture_verified(&required, &capture))
+        } else {
+            None
+        };
+        Ok(report)
+    }
+
+    /// Collects the exact bytes and digests the final barrier verified.
+    ///
+    /// Only a synced document contributes: its companion must be the bytes the
+    /// saved candidate fingerprint covers, and its receipt the file H3 wrote
+    /// for that target. A document outside the synced set contributes nothing.
+    fn capture_verified(
+        &self,
+        required: &RequiredDocumentSet,
+        capture: &BarrierCapture,
+    ) -> VerifiedDocuments {
+        let mut derived = Vec::new();
+        let mut tracked = Vec::new();
+        for document in required.documents() {
+            let path = document.path();
+            let Some(captured) = capture.document(path) else {
+                continue;
+            };
+            tracked.push((path.to_owned(), captured.real_digest().cloned()));
+            if captured
+                .saved()
+                .and_then(SavedDocument::html_digest)
+                .is_none()
+            {
+                continue;
+            }
+            let companion = captured.document().companion_path();
+            if let Some(bytes) = self.reader.read(&companion).ok().flatten() {
+                derived.push((companion, bytes));
+            }
+            let receipt = herness_html_sync::observer::html_evidence_path(captured.document());
+            if let Some(bytes) = self.reader.read(&receipt).ok().flatten() {
+                derived.push((receipt, bytes));
+            }
+        }
+        derived.sort_by(|left, right| left.0.cmp(&right.0));
+        derived.dedup_by(|left, right| left.0 == right.0);
+        tracked.sort_by(|left, right| left.0.cmp(&right.0));
+        VerifiedDocuments { derived, tracked }
     }
 }
 
@@ -698,11 +792,35 @@ impl ReadinessDocumentSource for H4RequiredDocuments {
 // Completion seam
 // ---------------------------------------------------------------------------
 
+/// The commit half of one connected Task completion.
+///
+/// [`NotConnectedCommit`] is the explicit refusal used when no host commit
+/// adapter is bound. The desktop host-commit adapter implements it over H4's
+/// `finalize_task`, so a synced barrier reaches a real host commit.
+pub trait HostCommitCompletion {
+    /// Whether the real host commit is connected.
+    fn commit_connected(&self) -> bool;
+
+    /// The capability reported missing when the commit half is unconnected.
+    fn feature(&self) -> herness_sdd_execute::CompletionFeature {
+        herness_sdd_execute::CompletionFeature::HostCommit
+    }
+
+    /// Runs the host commit for a Task whose HTML barrier is synced.
+    ///
+    /// `verified` is what the final barrier just asserted, so the commit half
+    /// stages only documents at their verified revision.
+    fn commit(
+        &mut self,
+        request: &TaskCompletionRequest,
+        verified: &VerifiedDocuments,
+    ) -> Result<TaskCompletion, SddExecutionError>;
+}
+
 /// A host commit seam that is deliberately still unconnected.
 ///
-/// Task 17 replaces this with the real stage/hook/commit path. Until then a
-/// connected HTML barrier still never reports a Task complete: the commit half
-/// refuses explicitly.
+/// A connected HTML barrier with this half still never reports a Task complete:
+/// the commit half refuses explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NotConnectedCommit;
 
@@ -713,24 +831,51 @@ impl NotConnectedCommit {
     }
 }
 
+impl HostCommitCompletion for NotConnectedCommit {
+    fn commit_connected(&self) -> bool {
+        false
+    }
+
+    fn commit(
+        &mut self,
+        _request: &TaskCompletionRequest,
+        _verified: &VerifiedDocuments,
+    ) -> Result<TaskCompletion, SddExecutionError> {
+        // The HTML barrier is satisfied. The commit half is still explicitly
+        // missing and never becomes a fabricated completion.
+        Ok(TaskCompletion::HumanWait {
+            stop: herness_sdd_execute::StopRecord::new(
+                herness_sdd_execute::StopReason::CapabilityUnavailable,
+                Some(herness_sdd_execute::HumanAction::ProvideCapability),
+            )?,
+        })
+    }
+}
+
 /// The HTML half of a connected Task completion.
 ///
 /// The barrier runs first and a hold becomes a durable `waiting_human` stop. Only
-/// a synced barrier reaches the commit half, which is still explicitly
-/// unconnected here and holds with `capability_unavailable` rather than
-/// fabricating completion.
-pub struct HtmlBarrierCompletion<G> {
+/// a synced barrier reaches the bound commit half, which either commits and
+/// reports the range or holds with its own reason.
+pub struct HtmlBarrierCompletion<G, C = NotConnectedCommit> {
     gate: G,
-    commit: NotConnectedCommit,
+    commit: C,
 }
 
-impl<G> HtmlBarrierCompletion<G> {
-    /// Creates the completion seam over one barrier gate.
+impl<G> HtmlBarrierCompletion<G, NotConnectedCommit> {
+    /// Creates the completion seam over one barrier gate with no commit half.
     pub const fn new(gate: G) -> Self {
         Self {
             gate,
             commit: NotConnectedCommit,
         }
+    }
+}
+
+impl<G, C> HtmlBarrierCompletion<G, C> {
+    /// Creates the completion seam over one barrier gate and commit half.
+    pub const fn with_commit(gate: G, commit: C) -> Self {
+        Self { gate, commit }
     }
 
     /// The barrier gate.
@@ -742,14 +887,25 @@ impl<G> HtmlBarrierCompletion<G> {
     pub const fn gate_mut(&mut self) -> &mut G {
         &mut self.gate
     }
+
+    /// The commit half.
+    pub const fn commit_half(&self) -> &C {
+        &self.commit
+    }
+
+    /// The commit half, mutably.
+    pub const fn commit_half_mut(&mut self) -> &mut C {
+        &mut self.commit
+    }
 }
 
-impl<G> TaskCompletionPort for HtmlBarrierCompletion<G>
+impl<G, C> TaskCompletionPort for HtmlBarrierCompletion<G, C>
 where
-    G: TaskBarrierGate,
+    G: TaskBarrierGate + VerifiedDocumentSource,
+    C: HostCommitCompletion,
 {
     fn wiring(&self, _task: TaskRef) -> herness_sdd_execute::CompletionWiring {
-        completion_wiring(true, false, self.commit.feature())
+        completion_wiring(true, self.commit.commit_connected(), self.commit.feature())
     }
 
     fn complete(
@@ -760,15 +916,8 @@ where
         if let Some(hold) = report.decision().hold() {
             return Ok(TaskCompletion::HumanWait { stop: hold.stop()? });
         }
-        // The HTML barrier is satisfied. The commit half is still explicitly
-        // missing and never becomes a fabricated completion: the Task holds at
-        // `waiting_human` with the missing-capability reason Task 17 replaces.
-        Ok(TaskCompletion::HumanWait {
-            stop: herness_sdd_execute::StopRecord::new(
-                herness_sdd_execute::StopReason::CapabilityUnavailable,
-                Some(herness_sdd_execute::HumanAction::ProvideCapability),
-            )?,
-        })
+        let verified = self.gate.verified_documents();
+        self.commit.commit(request, &verified)
     }
 }
 
@@ -864,6 +1013,24 @@ impl TaskBarrierGate for SharedBarrierGate {
         now: Timestamp,
     ) -> Result<BarrierReport, SddExecutionError> {
         lock_gate(self).final_barrier(task, now)
+    }
+}
+
+impl VerifiedDocumentSource for DesktopH4BarrierGate {
+    fn verified_documents(&self) -> VerifiedDocuments {
+        self.final_capture.clone().unwrap_or_default()
+    }
+}
+
+impl VerifiedDocumentSource for SharedBarrierGate {
+    fn verified_documents(&self) -> VerifiedDocuments {
+        lock_gate(self).verified_documents()
+    }
+}
+
+impl<T: VerifiedDocumentSource> VerifiedDocumentSource for Box<T> {
+    fn verified_documents(&self) -> VerifiedDocuments {
+        (**self).verified_documents()
     }
 }
 

@@ -3034,6 +3034,17 @@ fn verify_worktree(intent: &HostGitIntent) -> Result<WorktreeVerification, HostG
 // Git ref reading
 // ---------------------------------------------------------------------------
 
+/// Digest of the hook configuration the next commit in `checkout_root` would
+/// run.
+///
+/// The H4 execution journal records this value before it stages anything, so a
+/// hook that changed between the recorded intent and the commit is a refusal
+/// rather than a silently different validation. It reads only the repository
+/// configuration and the `pre-commit` hook bytes; it spawns nothing.
+pub fn hooks_configuration_digest(checkout_root: &AbsolutePath) -> Result<String, HostGitRefusal> {
+    Repository::locate(checkout_root.as_path())?.hooks_digest()
+}
+
 /// The per-worktree and common Git directories of one checkout.
 #[derive(Debug, Clone)]
 struct Repository {

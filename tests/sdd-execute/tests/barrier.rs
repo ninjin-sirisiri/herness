@@ -591,6 +591,19 @@ fn approval(project_id: ProjectId, html_targets: &[&str]) -> ExecutionApproval {
     .expect("approval")
 }
 
+fn completion_request(project_id: ProjectId, number: u32) -> TaskCompletionRequest {
+    TaskCompletionRequest::new(
+        task_ref(project_id, number),
+        execution(project_id),
+        ExecutionRevision::INITIAL,
+        SupervisionId::new(project_id),
+        CommitAuthorization::new(true, true).expect("commit authorization"),
+        CommitPolicy::Required,
+        Vec::new(),
+        7_000,
+    )
+}
+
 fn readiness_request(project: ProjectId) -> ReadinessRequest {
     ReadinessRequest::new(
         project,
@@ -995,13 +1008,7 @@ fn one_shared_gate_serves_the_readiness_wait_and_the_final_barrier() {
     );
 
     // The final barrier on the same gate asserts that baseline.
-    let request = TaskCompletionRequest::new(
-        task_ref(fixture.project, 1),
-        SupervisionId::new(fixture.project),
-        CommitPolicy::Required,
-        Vec::new(),
-        7_000,
-    );
+    let request = completion_request(fixture.project, 1);
     let mut completion =
         herness_desktop::sdd_execute::barrier::HtmlBarrierCompletion::new(gate.clone());
     match TaskCompletionPort::complete(&mut completion, &request).expect("completion") {
@@ -1070,13 +1077,7 @@ fn the_html_barrier_holds_the_task_and_the_commit_half_stays_explicit() {
     fixture.seed_synced(TARGET);
     let mut gate = fixture.gate(&[TARGET]);
     gate.capture_verification().expect("capture");
-    let request = TaskCompletionRequest::new(
-        task_ref(fixture.project, 1),
-        SupervisionId::new(fixture.project),
-        CommitPolicy::Required,
-        Vec::new(),
-        7_000,
-    );
+    let request = completion_request(fixture.project, 1);
 
     // A synced barrier reaches the still-missing commit and holds explicitly.
     let mut completion = DesktopTaskCompletion::barrier(gate);
@@ -1223,6 +1224,11 @@ fn a_barrier_connected_completion_holds_instead_of_completing_the_task() {
                 "the document is not synced",
                 vec!["resume_cycle".to_owned()],
             )))
+        }
+    }
+    impl herness_desktop::sdd_execute::barrier::VerifiedDocumentSource for HeldGate {
+        fn verified_documents(&self) -> herness_desktop::sdd_execute::barrier::VerifiedDocuments {
+            herness_desktop::sdd_execute::barrier::VerifiedDocuments::default()
         }
     }
 

@@ -807,6 +807,18 @@ impl BarrierReport {
         }
     }
 
+    /// A report whose required set is synced.
+    ///
+    /// Adapters that already verified the set build this from their own
+    /// observed values; it carries no document detail, only the decision.
+    pub fn synced(documents: usize, widened: bool) -> Self {
+        Self {
+            decision: BarrierDecision::Synced { documents, widened },
+            required: Vec::new(),
+            unrelated: Vec::new(),
+        }
+    }
+
     /// The Task decision.
     pub const fn decision(&self) -> &BarrierDecision {
         &self.decision

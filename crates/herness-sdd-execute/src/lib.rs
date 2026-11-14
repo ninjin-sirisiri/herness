@@ -60,6 +60,19 @@
 //! trusted on its own, and it keeps `NotApproved`, `Missing`, `Mismatch`,
 //! `Unsynced`, and `Orphaned` distinct.
 //!
+//! Task 17 adds [`git`]: the host commit finalization and the Git recovery
+//! classification. [`git::finalize_task`] fixes the target set
+//! (`git::select_targets`), records the intent, runs the approved host boundary,
+//! records the result, and re-reads HEAD, tree, parent, trailers, index, and the
+//! tracked bytes before it reports completion. A `required` Task must advance
+//! HEAD from BASE; a `no_change` Task records unchanged-source evidence and
+//! creates no commit. A replayed request returns the stored result, and any
+//! hook failure, changed hook, unrelated index entry, external edit, unconfirmed
+//! process, or failed durable write is an explicit hold that is never retried.
+//! [`git::classify_commit`] classifies a saved intent as `Established`,
+//! `NotRun`, or `Unknown` without mutating anything, so a human recovery can
+//! link only a clearly established commit.
+//!
 //! The ten failure and refusal classes (`unsupported_plan_format`,
 //! `invalid_plan`, `unavailable`, `approval_required`, `conflict`,
 //! `plan_changed`, `html_not_synced`, `recovery_required`,
@@ -77,6 +90,7 @@ pub mod coordinator;
 pub mod durable;
 pub mod error;
 pub mod events;
+pub mod git;
 pub mod ids;
 pub mod import;
 pub mod journal;
@@ -130,6 +144,13 @@ pub use events::{
     SDD_DISPATCH_EVENT_KIND, SDD_EXECUTION_ACTIVITY_KIND, SDD_GIT_EVENT_KIND,
     SDD_OPERATION_EVENT_KIND, SDD_PROGRESS_EVENT_KIND, SDD_SNAPSHOT_EVENT_KIND, dispatch_event,
     execution_activity_id, git_event, operation_event, progress_event, revision_of, snapshot_event,
+};
+pub use git::{
+    ChangedPath, CommitObservation, CommitObservationPort, CommitRecovery, CommitTarget,
+    FinalizePorts, FinalizeStop, ObservationRequest, ObservedPath, TargetOrigin, TargetRefusal,
+    TargetSelection, TaskCommitRequest, TaskFinalizeOutcome, VerifiedPath, classify_commit,
+    classify_recorded, commit_request_id, commit_request_id_with_attempt, finalize_task,
+    path_within, select_targets,
 };
 pub use herness_html_sync::H4Barrier;
 pub use ids::{

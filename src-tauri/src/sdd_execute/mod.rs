@@ -56,11 +56,36 @@
 //!
 //! There is no fallback parser: an unusable exchange is an explicit
 //! `unavailable`, never a `task-brief` scratch parse or a Rust guess.
+//!
+//! Task 17 adds the commit half of the Task completion:
+//!
+//! * [`finalize::HostGitCommitBoundary`] is the one [`herness_sdd_execute::HostGitPort`]
+//!   over `herness_core`'s host Git boundary. It converts a recorded
+//!   [`herness_sdd_execute::GitJournalEntry`] into the boundary's intent with the
+//!   same explicit paths, bytes, digests, message, trailers, expected
+//!   parent/tree, gate, and hook digest, and turns the report back into a
+//!   [`herness_sdd_execute::GitCommitOutcome`]. The boundary's
+//!   [`herness_core::HostGitAuthorization`] is minted only from the approved
+//!   [`herness_sdd_execute::CommitAuthorization`].
+//! * [`finalize::GitCheckoutObserver`] is the read-only
+//!   [`herness_sdd_execute::CommitObservationPort`]: fixed argv for branch, HEAD,
+//!   tree, parent, message, and index, plus one confined read per tracked path.
+//! * [`host_commit::DesktopHostCommit`] implements
+//!   [`barrier::HostCommitCompletion`]: it fixes the target set from the
+//!   changes against BASE plus the barrier's verified companions and receipts,
+//!   builds the intent, and runs [`herness_sdd_execute::finalize_task`].
+//!   [`barrier::HtmlBarrierCompletion`] runs the final HTML barrier first, so a
+//!   non-synced Task never reaches the commit.
+//!
+//! Nothing in this module pushes, pulls, merges, rebases, amends, resets, cleans,
+//! or checks out a change, and no path discards a human's uncommitted work.
 
 pub mod barrier;
 pub mod composition;
 pub mod coordinator;
+pub mod finalize;
 pub mod git;
+pub mod host_commit;
 pub mod pack;
 pub mod packet;
 pub mod readiness;
@@ -70,9 +95,10 @@ pub mod workspace;
 
 pub use barrier::{
     BoundTask, DesktopH4BarrierGate, DesktopTaskCompletion, H4RequiredDocuments,
-    HtmlBarrierCompletion, NotConnectedCommit, SharedBarrierGate, TaskBarrierGate,
-    as_readiness_port, barrier_allows_finalization, bind_shared_gate, origins_of, readiness_port,
-    required_paths, shared_gate, shared_readiness_port,
+    HostCommitCompletion, HtmlBarrierCompletion, NotConnectedCommit, SharedBarrierGate,
+    TaskBarrierGate, VerifiedDocumentSource, VerifiedDocuments, as_readiness_port,
+    barrier_allows_finalization, bind_shared_gate, origins_of, readiness_port, required_paths,
+    shared_gate, shared_readiness_port,
 };
 pub use composition::{
     ApprovalOutcome, CurrentInputs, DesktopStartComposition, DesktopWorkspace, LiveStartFacts,
@@ -83,10 +109,16 @@ pub use coordinator::{
     ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
     child_state_of, supervision_target_id,
 };
+pub use finalize::{
+    ApprovedCommitIdentity, GitCheckoutObserver, HOST_COMMIT_FEATURE, HOST_COMMIT_OBSERVE_FEATURE,
+    HostGitCommitBoundary, checkout_hooks_digest, outcome_from_report, recovery_of, rejection_of,
+    unknown_of, verified_derived_targets,
+};
 pub use git::{
     GitProcessOutput, GitRunner, GitStatusEntry, GitWorktree, GitWorktreeStatus,
     WORKSPACE_GIT_TIMEOUT,
 };
+pub use host_commit::{DesktopHostCommit, TaskCommitExpectation};
 pub use pack::{
     INSPECTOR_OUTPUT_LIMIT, INSPECTOR_SCRIPT, INSPECTOR_TIMEOUT, MINIMUM_PYTHON, PackBinding,
     PackInspector, PlanImporter, RootedPlanSource,
