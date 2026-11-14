@@ -543,6 +543,12 @@ impl SddTaskController {
         ensure_live_start_inputs(host, request.project_id)?;
 
         let (_, draft) = draft_for(host, request)?;
+        // The branch baseline is fixed here, once, as the full SHA of the
+        // verified checkout. The approval and the `ready` snapshot carry the same
+        // value, so the coordinator's workspace comparison and the host commit
+        // describe one BASE.
+        let baseline = current_head_baseline(request.project_id, &request.checkout_root)?;
+        let draft = draft.with_baseline(baseline);
         let build = draft.build().map_err(failure_of)?;
         let content = build.content().clone();
         let fingerprint = start_fingerprint(request, &content)?;
@@ -1576,6 +1582,42 @@ fn ensure_start_html(
         }
     }
     Ok(())
+}
+
+fn current_head_baseline(
+    project: ProjectId,
+    checkout_root: &str,
+) -> Result<Option<herness_sdd_execute::Baseline>, SddFailureView> {
+    if !Path::new(checkout_root.trim()).exists() {
+        return Ok(None);
+    }
+    let git = git_executable()
+        .ok_or_else(|| SddFailureView::unavailable("workspace", "no Git executable was found"))?;
+    let mut runner = crate::sdd_execute::GitRunner::new(
+        git,
+        SystemArgvLauncher,
+        ProcessSupervisor::new(),
+        project,
+    )
+    .map_err(failure_of)?;
+    let root = Path::new(checkout_root)
+        .canonicalize()
+        .map_err(|error| {
+            SddFailureView::unavailable(
+                "workspace",
+                format!("the checkout is unreadable: {}", error.kind()),
+            )
+        })?
+        .to_str()
+        .ok_or_else(|| SddFailureView::unavailable("workspace", "the checkout is not valid UTF-8"))?
+        .to_owned();
+    let head = runner.head(&root).map_err(failure_of)?;
+    match head {
+        Some(head) => herness_sdd_execute::Baseline::parse(head.as_str())
+            .map(Some)
+            .map_err(failure_of),
+        None => Ok(None),
+    }
 }
 
 fn ensure_checkout_clean(project: ProjectId, checkout_root: &str) -> Result<(), SddFailureView> {

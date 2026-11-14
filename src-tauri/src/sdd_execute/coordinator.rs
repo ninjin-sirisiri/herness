@@ -296,101 +296,144 @@ impl<'a> H2ChildDispatch<'a> {
             launch,
         }
     }
+}
 
-    /// Builds one H2 launch from the approved Task and its immutable packet.
-    fn h2_launch(&mut self, plan: &ChildDispatchPlan) -> Result<H4TaskLaunch, SddExecutionError> {
-        let request = plan.request();
-        let task = request.content().task();
-        let approval = self.launch.approval;
-        let packet = self
-            .launch
-            .packet(task)
-            .map_err(|refusal| launch_refusal_error(&refusal))?;
-        let task_approval = self
-            .launch
-            .task_approval(task)
-            .map_err(|refusal| launch_refusal_error(&refusal))?;
-        let now = herness_core::Timestamp::now();
-        let owner = h4_owner_ref(self.draft.execution(), task).map_err(supervision_value)?;
-        let condition_version =
-            herness_supervision::ConditionVersion::new(1).map_err(supervision_value)?;
-        let conditions = h4_approved_conditions(&owner, condition_version, task_approval, now)?;
-        let approval_entry = self
-            .draft
-            .owner_approval(approval, task, now)
-            .map_err(sdd_value)?;
-        let launch_request = herness_supervision::H4LaunchRequest::new(
-            approval_entry.execution().clone(),
-            approval_entry.task().clone(),
-            approval_entry.plan_revision(),
-            approval_entry.plan_digest().clone(),
-            packet.h2_binding()?,
-            approval_entry.pack_fingerprint().clone(),
-            h4_commit_authorization(
-                approval.commit().host_commit(),
-                approval.commit().run_hooks(),
-            )
-            .map_err(supervision_value)?,
+/// Builds one H2 launch from the approved Task and its immutable packet.
+///
+/// It is shared by the desktop adapter and by the app-lifetime pump, so a
+/// dispatch issued from either path names the same owner, packet, pack
+/// fingerprint, commit authorization, scope, and budget.
+pub fn h2_task_launch(
+    registry: &H4StartApprovalRegistry,
+    draft: &ApprovalDraft,
+    launch: &mut ApprovedTaskLaunch<'_>,
+    plan: &ChildDispatchPlan,
+) -> Result<H4TaskLaunch, SddExecutionError> {
+    let request = plan.request();
+    let task = request.content().task();
+    let approval = launch.approval;
+    let packet = launch
+        .packet(task)
+        .map_err(|refusal| launch_refusal_error(&refusal))?;
+    let task_approval = launch
+        .task_approval(task)
+        .map_err(|refusal| launch_refusal_error(&refusal))?;
+    let now = herness_core::Timestamp::now();
+    let owner = h4_owner_ref(draft.execution(), task).map_err(supervision_value)?;
+    let condition_version =
+        herness_supervision::ConditionVersion::new(1).map_err(supervision_value)?;
+    let conditions = h4_approved_conditions(&owner, condition_version, task_approval, now)?;
+    let approval_entry = draft
+        .owner_approval(approval, task, now)
+        .map_err(sdd_value)?;
+    let launch_request = herness_supervision::H4LaunchRequest::new(
+        approval_entry.execution().clone(),
+        approval_entry.task().clone(),
+        approval_entry.plan_revision(),
+        approval_entry.plan_digest().clone(),
+        packet.h2_binding()?,
+        approval_entry.pack_fingerprint().clone(),
+        h4_commit_authorization(
+            approval.commit().host_commit(),
+            approval.commit().run_hooks(),
         )
-        .map_err(supervision_value)?;
-        let dispatch = request.identity().request_id();
-        let supervision = supervision_target_id(dispatch);
-        H4TaskLaunch::new(
-            self.draft.execution(),
-            task,
-            dispatch,
-            supervision,
-            approval.connection().connection_id(),
-            packet.prompt(),
-            conditions,
-            task_approval.scope().clone(),
-            TargetVersion::new(1).map_err(supervision_value)?,
-            task_approval.budget().clone(),
-            1,
-            launch_request,
-        )
-        .map_err(supervision_value)
+        .map_err(supervision_value)?,
+    )
+    .map_err(supervision_value)?;
+    let dispatch = request.identity().request_id();
+    let supervision = supervision_target_id(dispatch);
+    let _ = registry;
+    H4TaskLaunch::new(
+        draft.execution(),
+        task,
+        dispatch,
+        supervision,
+        approval.connection().connection_id(),
+        packet.prompt(),
+        conditions,
+        task_approval.scope().clone(),
+        TargetVersion::new(1).map_err(supervision_value)?,
+        task_approval.budget().clone(),
+        1,
+        launch_request,
+    )
+    .map_err(supervision_value)
+}
+
+/// Dispatches one planned H2 Task through the real approved-owner path.
+pub fn dispatch_h2_task(
+    host: &mut SupervisionHost,
+    runtime: &mut dyn DesktopSupervisionRuntime,
+    registry: &H4StartApprovalRegistry,
+    draft: &ApprovalDraft,
+    launch: &mut ApprovedTaskLaunch<'_>,
+    plan: &ChildDispatchPlan,
+) -> Result<DispatchResult, SddExecutionError> {
+    let launch = h2_task_launch(registry, draft, launch, plan)?;
+    let project = launch.project_id();
+    let dispatch = launch.dispatch();
+    let supervision = launch.supervision_id();
+    let outcome = host
+        .start_h4_task(runtime, registry, &launch)
+        .map_err(supervision_error)?;
+    match outcome {
+        H4TaskStartOutcome::Ready { view, .. } => {
+            let reservation = host
+                .h4_task_reservation(project, draft.execution(), dispatch)
+                .map_err(supervision_error)?
+                .ok_or_else(|| SddExecutionError::RecoveryRequired {
+                    reason: herness_sdd_execute::RecoveryReason::UnknownRequest,
+                    details: FailureDetails::none().boxed(),
+                })?;
+            if view.supervision_id != supervision {
+                return Err(SddExecutionError::Conflict {
+                    reason: herness_sdd_execute::ConflictReason::OwnershipConflict,
+                    details: FailureDetails::none().boxed(),
+                });
+            }
+            DispatchResult::new(reservation.supervision_id(), reservation.child())
+        }
+        H4TaskStartOutcome::Reconcile { reason, .. } => {
+            // The reserved mapping cannot be observed. Nothing was created
+            // and nothing was started; a human reconciles it.
+            eprintln!("H4_DISPATCH_RECONCILE: {}", reason.as_str());
+            Err(SddExecutionError::RecoveryRequired {
+                reason: herness_sdd_execute::RecoveryReason::UnknownRequest,
+                details: FailureDetails::none().boxed(),
+            })
+        }
+    }
+}
+
+/// Reconciles one dispatch request without creating a child.
+pub fn reconcile_h2_task(
+    host: &SupervisionHost,
+    project_id: ProjectId,
+    execution_id: ExecutionId,
+    request_id: DispatchRequestId,
+) -> Result<Option<DispatchResult>, SddExecutionError> {
+    let reservation = host
+        .h4_task_reservation(project_id, execution_id, request_id)
+        .map_err(supervision_error)?;
+    match reservation {
+        Some(reservation) => Ok(Some(DispatchResult::new(
+            reservation.supervision_id(),
+            reservation.child(),
+        )?)),
+        None => Ok(None),
     }
 }
 
 impl ChildDispatchPort for H2ChildDispatch<'_> {
     fn dispatch(&mut self, plan: &ChildDispatchPlan) -> Result<DispatchResult, SddExecutionError> {
-        let launch = self.h2_launch(plan)?;
-        let project = launch.project_id();
-        let dispatch = launch.dispatch();
-        let supervision = launch.supervision_id();
-        let outcome = self
-            .host
-            .start_h4_task(self.runtime, self.registry, &launch)
-            .map_err(supervision_error)?;
-        match outcome {
-            H4TaskStartOutcome::Ready { view, .. } => {
-                let reservation = self
-                    .host
-                    .h4_task_reservation(project, self.draft.execution(), dispatch)
-                    .map_err(supervision_error)?
-                    .ok_or_else(|| SddExecutionError::RecoveryRequired {
-                        reason: herness_sdd_execute::RecoveryReason::UnknownRequest,
-                        details: FailureDetails::none().boxed(),
-                    })?;
-                if view.supervision_id != supervision {
-                    return Err(SddExecutionError::Conflict {
-                        reason: herness_sdd_execute::ConflictReason::OwnershipConflict,
-                        details: FailureDetails::none().boxed(),
-                    });
-                }
-                DispatchResult::new(reservation.supervision_id(), reservation.child())
-            }
-            H4TaskStartOutcome::Reconcile { reason, .. } => {
-                // The reserved mapping cannot be observed. Nothing was created
-                // and nothing was started; a human reconciles it.
-                eprintln!("H4_DISPATCH_RECONCILE: {}", reason.as_str());
-                Err(SddExecutionError::RecoveryRequired {
-                    reason: herness_sdd_execute::RecoveryReason::UnknownRequest,
-                    details: FailureDetails::none().boxed(),
-                })
-            }
-        }
+        dispatch_h2_task(
+            self.host,
+            self.runtime,
+            self.registry,
+            self.draft,
+            self.launch,
+            plan,
+        )
     }
 
     fn reconcile(
@@ -399,17 +442,7 @@ impl ChildDispatchPort for H2ChildDispatch<'_> {
         execution_id: ExecutionId,
         request_id: DispatchRequestId,
     ) -> Result<Option<DispatchResult>, SddExecutionError> {
-        let reservation = self
-            .host
-            .h4_task_reservation(project_id, execution_id, request_id)
-            .map_err(supervision_error)?;
-        match reservation {
-            Some(reservation) => Ok(Some(DispatchResult::new(
-                reservation.supervision_id(),
-                reservation.child(),
-            )?)),
-            None => Ok(None),
-        }
+        reconcile_h2_task(self.host, project_id, execution_id, request_id)
     }
 }
 

@@ -65,6 +65,8 @@ pub struct DesktopHost {
     app_data_root: PathBuf,
     endpoints: ProviderEndpoints,
     sdd_recovery: DesktopRecoveryHost,
+    sdd_pump: crate::sdd_execute::SddExecuteState,
+    last_sdd_pump: crate::sdd_execute::SddPumpReport,
 }
 
 impl DesktopHost {
@@ -195,6 +197,43 @@ impl DesktopHost {
             evaluator,
             Some((assessment, checks)),
             None,
+        )
+    }
+
+    /// Test-only composition seam for the H4 cross-phase acceptance test.
+    ///
+    /// It combines the real pack root with the scripted required-check and
+    /// condition-assessment ports and an optional permission evaluator, so the
+    /// real plan inspector, SQLite store, Git checkout, H2 supervision path, and
+    /// Pi engine run against loopback only. This is never selected by the desktop
+    /// shell and is not an IPC command.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_sdd_test_boundaries(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        pack_root: Option<PathBuf>,
+        evaluator: Option<SharedPermissionEvaluator>,
+        assessment: Option<
+            Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+        >,
+        checks: Option<Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>>,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        let test_ports = match (assessment, checks) {
+            (Some(assessment), Some(checks)) => Some((assessment, checks)),
+            _ => None,
+        };
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            AssessmentEndpoints::official(),
+            evaluator,
+            test_ports,
+            pack_root,
         )
     }
 
@@ -348,6 +387,8 @@ impl DesktopHost {
                 StoreHandle::new(Arc::clone(&store)),
                 git_executable(),
             ),
+            sdd_pump: crate::sdd_execute::SddExecuteState::new(),
+            last_sdd_pump: crate::sdd_execute::SddPumpReport::default(),
         };
         // The H4 restore is read-only: it reconciles the saved dispatch, child,
         // Git, progress, and control records and issues no external request.
@@ -470,6 +511,13 @@ impl DesktopHost {
         if self.runtime.is_shutting_down() {
             return Ok(report);
         }
+        // The H4 pump runs before the H2 pump so a newly dispatched Task's
+        // readiness gate and bound commit half are installed for the same tick.
+        let sdd = self.pump_sdd_execute();
+        self.last_sdd_pump = sdd.clone();
+        for error in &sdd.errors {
+            eprintln!("SDD_PUMP_ERROR: {error}");
+        }
         let projects = self
             .runtime
             .projects()
@@ -581,6 +629,53 @@ impl DesktopHost {
             }
         }
         Ok(report)
+    }
+
+    /// The H4 pass `pump` ran most recently.
+    ///
+    /// `pump` already runs the H4 pass; exposing its report keeps a caller from
+    /// running a second pass just to read the counts.
+    pub const fn last_sdd_pump(&self) -> &crate::sdd_execute::SddPumpReport {
+        &self.last_sdd_pump
+    }
+
+    /// Runs one H4 pass and returns its report.
+    ///
+    /// It advances at most the execution holding the app-wide implementer slot,
+    /// independent of any window or selected project. During explicit shutdown it
+    /// does nothing and reports `skipped`. `pump` calls this too, so a caller
+    /// that only wants the counts reads [`Self::last_sdd_pump`] instead of
+    /// running a second pass.
+    pub fn pump_sdd_execute(&mut self) -> crate::sdd_execute::SddPumpReport {
+        let pack_root = self.html_sync_services.pack_root().map(Path::to_path_buf);
+        let shutting_down = self.runtime.is_shutting_down();
+        let test_gate = self.sdd_pump.test_gate();
+        let Self {
+            runtime,
+            supervision,
+            store,
+            sdd_pump,
+            ..
+        } = self;
+        let mut context = crate::sdd_execute::SddPumpContext {
+            runtime,
+            supervision,
+            store,
+            pack_root,
+            shutting_down,
+            test_gate,
+        };
+        crate::sdd_execute::run_sdd_pump(sdd_pump, &mut context)
+    }
+
+    /// Installs the common staged-document gate for a test composition.
+    ///
+    /// This is a `#[doc(hidden)]` seam for the cross-phase target. The desktop
+    /// shell never calls it, and the production pump always runs the approved
+    /// pack's `scripts/sdd-html-pre-commit`.
+    #[doc(hidden)]
+    pub fn set_sdd_test_commit_gate(&mut self, gate: herness_core::HostGitGate) {
+        self.sdd_pump.set_test_commit_gate(gate);
     }
 
     /// Marks active supervision records for quit using the real H1 stop report.
@@ -1828,7 +1923,7 @@ impl DesktopHost {
 /// Task 22 registers the canonical shared stylesheet only. Referenced images and
 /// other resources are added by later acceptance work; an unsupplied path is
 /// never treated as a dependency change.
-fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
+pub(crate) fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
     let mut dependencies = Vec::new();
     let css = "docs/sdd/assets/sdd.css";
     if root.join(css).is_file()

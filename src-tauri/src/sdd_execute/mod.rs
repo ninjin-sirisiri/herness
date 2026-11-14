@@ -120,6 +120,21 @@
 //!   [`recovery::confirm_resume`] is the only way the desktop mints the
 //!   confirmation it needs.
 //!
+//! Task 22 adds [`pump`], the app-lifetime execution pass:
+//!
+//! * [`pump::run`] reads the durable H4 executions, rebuilds the exact approved
+//!   context of the one that may hold the app-wide implementer slot, and calls
+//!   [`herness_sdd_execute::TaskCoordinator::advance`] once with the real H2
+//!   dispatch, the stored H2 status, the pre-side-effect plan-change gate, and
+//!   the real HTML barrier + host commit completion. It creates no child for a
+//!   second execution, drains the cooperative child-stop queue, and performs no
+//!   work while the runtime is shutting down.
+//! * [`pump::approved_snapshot_sections`] re-reads the approved spec sections and
+//!   refuses a section whose bytes no longer match the approval, so a packet is
+//!   never assembled from an unreviewed document.
+//! * [`pump::SddPumpReport`] is what the host and the cross-phase target read;
+//!   a refusal is recorded as an error and never as progress.
+//!
 //! Task 21 adds [`views`] and [`controller`], the trusted desktop surface:
 //!
 //! * [`views`] is the versioned, read-only projection H5 reuses: the execution
@@ -159,6 +174,7 @@ pub mod ledger;
 pub mod pack;
 pub mod packet;
 pub mod plan_changes;
+pub mod pump;
 pub mod readiness;
 pub mod recovery;
 pub mod registry;
@@ -186,7 +202,8 @@ pub use controller::{
 };
 pub use coordinator::{
     ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
-    child_state_of, child_status_from_view, supervision_target_id,
+    child_state_of, child_status_from_view, dispatch_h2_task, h2_task_launch, reconcile_h2_task,
+    supervision_target_id,
 };
 pub use finalize::{
     ApprovedCommitIdentity, GitCheckoutObserver, HOST_COMMIT_FEATURE, HOST_COMMIT_OBSERVE_FEATURE,
@@ -214,6 +231,9 @@ pub use packet::{
 pub use plan_changes::{
     ChildStopRequest, DesktopPlanChangeGate, LatchStore, PlanChangeWiring, PlanFileWatcher,
     PlanReconcileClock, PlanWatchError, PlanWatchNotice, QueuedChildStop, reconcile_schedule,
+};
+pub use pump::{
+    SddExecuteState, SddPumpContext, SddPumpReport, approved_snapshot_sections, run as run_sdd_pump,
 };
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
 pub use recovery::{

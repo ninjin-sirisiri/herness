@@ -364,6 +364,7 @@ pub struct ApprovalDraft {
     commit: CommitAuthorization,
     h3: H3ApprovalBinding,
     task_budgets: Vec<BudgetPolicy>,
+    baseline: Option<herness_sdd_execute::Baseline>,
 }
 
 impl ApprovalDraft {
@@ -417,7 +418,99 @@ impl ApprovalDraft {
             commit,
             h3,
             task_budgets,
+            baseline: None,
         })
+    }
+
+    /// Attaches the branch baseline that was observed once when the checkout was
+    /// verified.
+    ///
+    /// The start path fixes the full SHA here so the approval and the `ready`
+    /// snapshot carry the same value; a later resume re-observes it and never
+    /// replaces it.
+    #[must_use]
+    pub fn with_baseline(mut self, baseline: Option<herness_sdd_execute::Baseline>) -> Self {
+        self.baseline = baseline;
+        self
+    }
+
+    /// The observed branch baseline, when one was fixed.
+    pub const fn baseline(&self) -> Option<&herness_sdd_execute::Baseline> {
+        self.baseline.as_ref()
+    }
+
+    /// Rebuilds the draft of one stored approval.
+    ///
+    /// A periodic host pump only has the durable approval, the parsed plan, and
+    /// the approved Task contracts. Everything the H2 owner-launch entry needs is
+    /// re-derived from those values; the preview is not re-run and no file is
+    /// read. The caller is still required to hold the current approval revision.
+    pub fn from_approval(
+        execution: ExecutionId,
+        approval: &ExecutionApproval,
+    ) -> Result<Self, SddExecutionError> {
+        let content = approval.content();
+        let plan = content.plan();
+        let workspace = content.workspace();
+        let project_root = workspace.canonical_checkout_root().to_owned();
+        let parsed = plan.parsed().clone();
+        let mut tasks = Vec::with_capacity(content.tasks().len());
+        for task in content.tasks() {
+            let number = task.task().number().get();
+            let parsed_task = parsed
+                .tasks()
+                .iter()
+                .find(|parsed| parsed.number() == number)
+                .ok_or_else(|| SddExecutionError::InvalidValue {
+                    field: "approval.tasks".to_owned(),
+                    detail: "the approved Task has no parsed plan body".to_owned(),
+                })?;
+            tasks.push(PreviewTaskFacts {
+                number,
+                title: parsed_task.title().to_owned(),
+                body: parsed_task.body().text().to_owned(),
+                conditions: task.conditions().to_vec(),
+                read_paths: task.scope().read_paths().to_vec(),
+                write_paths: task.scope().write_paths().to_vec(),
+                allow_shell: task.scope().allow_shell(),
+                checks: task.checks().to_vec(),
+                html_targets: task.html_targets().to_vec(),
+                deliverables: task.deliverables().to_vec(),
+                commit_policy: task.commit_policy(),
+            });
+        }
+        let facts = PreviewFacts::new(
+            project_root.clone(),
+            plan.plan_path().clone(),
+            plan.source().clone(),
+            parsed,
+            tasks,
+            plan.spec_refs().to_vec(),
+            plan.sources().to_vec(),
+            plan.pack().clone(),
+        )?;
+        let layout = SourceLayout::from_approvals(&project_root, plan.sources())?;
+        let budgets = content
+            .tasks()
+            .iter()
+            .map(|task| task.budget().clone())
+            .collect();
+        Self::new(
+            execution,
+            approval.approval_id(),
+            facts,
+            layout,
+            plan.plan_revision(),
+            project_root,
+            workspace.git_identity().clone(),
+            workspace.branch().to_owned(),
+            workspace.base_branch().to_owned(),
+            workspace.isolated_worktree(),
+            content.connection().clone(),
+            content.commit(),
+            content.h3().clone(),
+            budgets,
+        )
     }
 
     /// Execution identity the approval belongs to.
@@ -517,7 +610,7 @@ impl ApprovalDraft {
             self.branch.clone(),
             self.base_branch.clone(),
             self.isolated_worktree,
-            None,
+            self.baseline.clone(),
         )?;
 
         let mut tasks = Vec::with_capacity(self.preview.tasks().len());
