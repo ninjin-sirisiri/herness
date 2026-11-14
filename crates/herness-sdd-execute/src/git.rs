@@ -653,6 +653,34 @@ pub struct ObservationRequest {
 }
 
 impl ObservationRequest {
+    /// Creates one read-only observation request.
+    ///
+    /// The recovery path uses it for a saved intent whose original request is
+    /// gone: it names the same project, branch, and explicit paths.
+    pub fn new(
+        project_id: ProjectId,
+        branch: impl Into<String>,
+        mut paths: Vec<String>,
+    ) -> Result<Self, SddExecutionError> {
+        let branch = branch.into();
+        if branch.trim().is_empty() {
+            return Err(SddExecutionError::InvalidValue {
+                field: "observation.branch".to_owned(),
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        for path in &paths {
+            validate_project_path("observation.path", path)?;
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(Self {
+            project_id,
+            branch,
+            paths,
+        })
+    }
+
     /// Project that owns the checkout.
     pub const fn project_id(&self) -> ProjectId {
         self.project_id

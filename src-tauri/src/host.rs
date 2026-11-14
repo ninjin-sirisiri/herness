@@ -30,6 +30,9 @@ use herness_store::{Store, StoreConfig};
 use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::composition::HtmlSyncServices;
 use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
+use crate::sdd_execute::recovery::{
+    DesktopRecoveryHost, H4QuitReport, H4StartupReport, SupervisionChildren,
+};
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -61,6 +64,7 @@ pub struct DesktopHost {
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
     app_data_root: PathBuf,
     endpoints: ProviderEndpoints,
+    sdd_recovery: DesktopRecoveryHost,
 }
 
 impl DesktopHost {
@@ -340,7 +344,14 @@ impl DesktopHost {
             credentials,
             app_data_root: app_data_root.as_ref().to_path_buf(),
             endpoints,
+            sdd_recovery: DesktopRecoveryHost::new(
+                StoreHandle::new(Arc::clone(&store)),
+                git_executable(),
+            ),
         };
+        // The H4 restore is read-only: it reconciles the saved dispatch, child,
+        // Git, progress, and control records and issues no external request.
+        host.restore_sdd_execute();
         let reconciliation = host.restore_connection_settings(report)?;
         Ok((host, reconciliation))
     }
@@ -637,6 +648,91 @@ impl DesktopHost {
     /// Last H3 startup reconciliation report, when startup ran.
     pub const fn html_sync_startup(&self) -> Option<&HtmlSyncStartupReport> {
         self.html_sync.last_startup()
+    }
+
+    /// Last H4 startup reconciliation. It is read-only: nothing was re-sent.
+    pub const fn sdd_startup(&self) -> &H4StartupReport {
+        self.sdd_recovery.startup()
+    }
+
+    /// Last H4 quit result.
+    pub const fn sdd_quit(&self) -> &H4QuitReport {
+        self.sdd_recovery.quit()
+    }
+
+    /// The reconciled H4 report of one execution.
+    pub fn sdd_recovery_report(
+        &self,
+        execution_id: herness_sdd_execute::ExecutionId,
+    ) -> Option<&herness_sdd_execute::RecoveryReport> {
+        self.sdd_recovery.report(execution_id)
+    }
+
+    /// App-lifetime H4 recovery composition.
+    ///
+    /// This is not an IPC surface; Task 21 owns the trusted command wiring. It is
+    /// exposed so the quit path and the tests drive the same instance.
+    pub const fn sdd_recovery(&self) -> &DesktopRecoveryHost {
+        &self.sdd_recovery
+    }
+
+    /// Mutable H4 recovery composition for the trusted command layer.
+    pub fn sdd_recovery_mut(&mut self) -> &mut DesktopRecoveryHost {
+        &mut self.sdd_recovery
+    }
+
+    /// Restores the H4 state after a restart without any external request.
+    ///
+    /// It reconciles the saved dispatch, child, Git, progress, and control records
+    /// and keeps the report. It starts no child, sends no request, stages nothing,
+    /// and commits nothing.
+    pub fn restore_sdd_execute(&mut self) -> H4StartupReport {
+        let mut children = SupervisionChildren::new(&self.supervision);
+        self.sdd_recovery.restore(&mut children)
+    }
+
+    /// Closes new H4 dispatch, sends, and commits before the coordinated stops.
+    ///
+    /// A failed H4 save is reported in the returned report so the quit flow can
+    /// treat it as a reason quit did not complete. It never starts or resumes
+    /// anything.
+    pub fn begin_sdd_quit(&mut self) -> H4QuitReport {
+        self.sdd_recovery.begin_quit()
+    }
+
+    /// Writes the confirmed or unconfirmed H4 stop after the H1 stops.
+    ///
+    /// A stop H1 did not confirm is recorded as unconfirmed; it is never reported
+    /// as a confirmed stop.
+    pub fn mark_sdd_for_quit(
+        &mut self,
+        report: &herness_core::runtime::ShutdownReport,
+    ) -> H4QuitReport {
+        self.sdd_recovery.mark_quit(report)
+    }
+
+    /// Resumes one H4 execution after a human confirmation.
+    ///
+    /// This is the human-resume entry point Task 21 exposes. The confirmation is
+    /// the type [`crate::sdd_execute::recovery::confirm_resume`] mints from the
+    /// trusted main window; a plan, a preview, or a request payload cannot make
+    /// one. `inputs` is the live observation of every approved input the command
+    /// layer rebuilds before it calls; `gate` is the 1 s plan-change gate when the
+    /// composition wired one.
+    ///
+    /// The call re-observes Git, the unresolved operations, the current plan and
+    /// spec snapshots, permissions, consents, and the remaining budget, then links
+    /// at most one clearly established commit or records the durable hold.
+    pub fn resume_sdd_execute(
+        &mut self,
+        request: &herness_sdd_execute::ResumeRequest,
+        inputs: &herness_sdd_execute::ApprovalInputs,
+        gate: Option<&mut dyn herness_sdd_execute::PlanChangeGatePort>,
+    ) -> Result<herness_sdd_execute::ResumeOutcome, String> {
+        let mut children = SupervisionChildren::new(&self.supervision);
+        self.sdd_recovery
+            .resume(request, &mut children, gate, inputs)
+            .map_err(|error| error.to_string())
     }
 
     /// App-lifetime H3 recovery host.
@@ -1975,6 +2071,25 @@ impl StorePort for SharedStore {
 // ---------------------------------------------------------------------------
 // Runtime executor for adapter-reported awaiting-approval operations.
 // ---------------------------------------------------------------------------
+
+/// The absolute Git executable the read-only H4 recovery observation uses.
+///
+/// The committed path is preferred so no `PATH` lookup decides which binary runs;
+/// a build without it falls back to the local Git installation and, when neither
+/// exists, to `None` so a commit classification stays `unknown` instead of being
+/// guessed.
+fn git_executable() -> Option<herness_core::AbsolutePath> {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return herness_core::AbsolutePath::new(candidate).ok();
+        }
+    }
+    None
+}
 
 /// Executes only the frozen operations the trusted engine adapter refused to run
 /// because a human decision was required.

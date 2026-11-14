@@ -106,6 +106,31 @@
 //! * [`plan_changes::approve_plan_revision`] saves that human revision after a
 //!   confirmed stop, keeps the consumed budget and commit history, clears the
 //!   latch, and is idempotent: a re-delivered request returns its stored result.
+//!
+//! Task 20 adds [`recovery`]: post-crash reconciliation and the human resume.
+//!
+//! * [`recovery::reconcile`] is a pure function over already-read values. It
+//!   classifies every saved dispatch, H2 child, Git, progress, and control record
+//!   as `Established`, `NotRun`, or `Unknown` from the saved intent, the saved
+//!   manifest, the current repository, and the stored journal state. A recorded
+//!   intent, an unknown result, and an unconfirmed process stop are never
+//!   `NotRun`, so nothing unknown is reset to "not executed". It issues no
+//!   request and reports `external_requests() == 0`.
+//! * [`recovery::quit_requested_snapshot`] and
+//!   [`recovery::quit_confirmed_snapshot`] are the quit writes: the first closes
+//!   new dispatch, send, and commit by holding the execution in `waiting_human`;
+//!   the second records a confirmed or unconfirmed stop after the H1 facts.
+//! * [`recovery::resume`] requires a [`recovery::HumanResume`] minted only by the
+//!   trusted desktop path, re-verifies the current approval inputs (plan, specs,
+//!   checkout, branch, baseline, connection, profile, consent, H3 boundary, and
+//!   every Task's scope and budget), re-observes the plan, links at most one
+//!   clearly established commit into the ledger and marks that Task `complete`,
+//!   and otherwise records the durable hold. Nothing is retried.
+//!
+//! [`recovery::RecoveryEnumerationPort`] is the read side a crashed process
+//! cannot know how to ask for by request ID: every saved journal row of one
+//! execution. The SQLite store implements it over the same tables and payload
+//! validation.
 
 #![doc = "The H4 numeric defaults are the approved spec values. This crate does not add a plan-wide budget, raise the finite H2 limits, or turn a saved `Synced`/receipt into evidence."]
 
@@ -129,6 +154,7 @@ pub mod plan;
 pub mod plan_changes;
 pub mod ports;
 pub mod record;
+pub mod recovery;
 pub mod report;
 pub mod snapshot;
 pub mod state;
@@ -250,6 +276,13 @@ pub use ports::{
     WorkspacePort, WorkspacePreparation, WorkspaceState, unsupported,
 };
 pub use record::{RecordDecodeError, STORE_RECORD_FORMAT_VERSION, decode_record, encode_record};
+pub use recovery::{
+    HumanResume, PendingCommit, RecoveryClass, RecoveryContext, RecoveryEnumerationPort,
+    RecoveryFacts, RecoveryItem, RecoveryRecordKind, RecoveryReport, RecoveryStorePort,
+    RecoveryTaskState, ResumeBlocker, ResumeOutcome, ResumeRequest, observation_paths,
+    observation_request, observed_branch, quit_confirmed_snapshot, quit_requested_snapshot,
+    quit_skips, quit_stop_recorded, quit_stop_requested, reconcile, resume, resume_may_continue,
+};
 pub use report::{
     CheckEvidence, EvidenceField, EvidenceItem, MAX_REPORT_BYTES, MAX_REPORT_EVIDENCE_BLOCKS,
     Report, ReportExpectations, ReportGap, ReportOutcome, ReportParseError, ReportStatus,

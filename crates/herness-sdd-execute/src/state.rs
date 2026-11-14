@@ -735,6 +735,8 @@ pub enum ApprovalRequirement {
     H3Settings,
     /// Host commit and hook authorization is required.
     HostCommit,
+    /// A human resume confirmation is required.
+    Resume,
 }
 
 /// The stop reason and the human action it requires.

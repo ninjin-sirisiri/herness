@@ -22,9 +22,9 @@ use herness_sdd_execute::{
     ExecutionRevision, ExecutionSnapshot, ExecutionStorePort, GitCommitOutcome, GitJournalEntry,
     GitJournalState, JournalEntryState, PlanChangeLatch, PlanChangeLatchStorePort,
     ProgressJournalEntry, ProgressJournalId, ProgressJournalState, RecordDecodeError,
-    SddExecutionError, StartRecord, StartRecordStorePort, StoredExecution, TaskReservation,
-    decode_record, dispatch_event, encode_record, git_event, operation_event, progress_event,
-    snapshot_event,
+    RecoveryEnumerationPort, SddExecutionError, StartRecord, StartRecordStorePort, StoredExecution,
+    TaskReservation, decode_record, dispatch_event, encode_record, git_event, operation_event,
+    progress_event, snapshot_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -1152,6 +1152,36 @@ impl Store {
         Ok(approvals)
     }
 
+    /// Every distinct approval identity recorded for one project.
+    ///
+    /// The recovery binding needs it because a snapshot records the plan identity
+    /// (path, digest, plan revision) rather than the approval identity.
+    pub fn sdd_approval_ids(&self, project_id: ProjectId) -> Result<Vec<ApprovalId>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT approval_id FROM sdd_execution_approvals
+             WHERE project_id = ?1 ORDER BY approval_id ASC",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut approvals = Vec::with_capacity(ids.len());
+        for id in ids {
+            let approval_id: ApprovalId = id
+                .parse()
+                .map_err(|_| StoreError::corrupt("stored approval id is invalid"))?;
+            approval_id.validate_in(project_id).map_err(|_| {
+                StoreError::SddExecutionCrossProject {
+                    expected: project_id,
+                    found: approval_id.project_id(),
+                }
+            })?;
+            approvals.push(approval_id);
+        }
+        Ok(approvals)
+    }
+
     /// Loads the start record for one request.
     pub fn sdd_start_record(
         &self,
@@ -2244,5 +2274,210 @@ impl StartRecordStorePort for Store {
 
     fn record_start(&mut self, record: &StartRecord) -> Result<(), SddExecutionError> {
         Store::record_sdd_start_record(self, record).map_err(SddExecutionError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash-recovery enumeration
+// ---------------------------------------------------------------------------
+
+/// Every row of one journal table of one execution, decoded and checked exactly
+/// like the single-request loaders.
+fn payloads(
+    conn: &Connection,
+    table: &str,
+    project: ProjectId,
+    execution: ExecutionId,
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    ensure_execution(project, execution)?;
+    let sql = format!(
+        "SELECT payload FROM {table} WHERE project_id = ?1 AND execution_id = ?2 ORDER BY created_at ASC, request_id ASC"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(params![project.to_string(), execution.to_string()])?;
+    let mut payloads = Vec::new();
+    while let Some(row) = rows.next()? {
+        payloads.push(row.get::<_, Vec<u8>>(0)?);
+    }
+    Ok(payloads)
+}
+
+impl Store {
+    /// Every stored execution snapshot, in project and execution order.
+    pub fn sdd_stored_executions(&self) -> Result<Vec<StoredExecution>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT project_id, execution_id FROM sdd_execution_snapshots
+             ORDER BY project_id ASC, execution_id ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next()? {
+            keys.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+        }
+        let mut executions = Vec::with_capacity(keys.len());
+        for (project, execution) in keys {
+            let project: ProjectId = project
+                .parse()
+                .map_err(|_| StoreError::corrupt("stored execution project id is invalid"))?;
+            let execution: ExecutionId = execution
+                .parse()
+                .map_err(|_| StoreError::corrupt("stored execution id is invalid"))?;
+            if let Some(stored) = load_snapshot(&self.conn, project, execution)? {
+                executions.push(stored);
+            }
+        }
+        Ok(executions)
+    }
+
+    /// Every saved dispatch journal row of one execution.
+    pub fn sdd_dispatch_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<DispatchJournalEntry>, StoreError> {
+        let mut entries = Vec::new();
+        for payload in payloads(&self.conn, "sdd_dispatch_journal", project_id, execution_id)? {
+            let entry: DispatchJournalEntry = decode_row(&payload, DISPATCH_RECORD)?;
+            let identity = entry.identity();
+            if identity.project_id() != project_id || identity.execution_id() != execution_id {
+                return Err(StoreError::corrupt(
+                    "dispatch journal row does not match its recorded identifiers",
+                ));
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Every saved Git journal row of one execution.
+    pub fn sdd_git_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<GitJournalEntry>, StoreError> {
+        let mut entries = Vec::new();
+        for payload in payloads(&self.conn, "sdd_git_journal", project_id, execution_id)? {
+            let entry: GitJournalEntry = decode_row(&payload, GIT_RECORD)?;
+            let identity = entry.identity();
+            if identity.project_id() != project_id || identity.execution_id() != execution_id {
+                return Err(StoreError::corrupt(
+                    "git journal row does not match its recorded identifiers",
+                ));
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Every saved progress journal row of one execution.
+    pub fn sdd_progress_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ProgressJournalEntry>, StoreError> {
+        let mut entries = Vec::new();
+        for payload in payloads(&self.conn, "sdd_progress_journal", project_id, execution_id)? {
+            let entry: ProgressJournalEntry = decode_row(&payload, PROGRESS_RECORD)?;
+            let identity = entry.identity();
+            if identity.project_id() != project_id || identity.execution_id() != execution_id {
+                return Err(StoreError::corrupt(
+                    "progress journal row does not match its recorded identifiers",
+                ));
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Every saved control-operation row of one execution.
+    pub fn sdd_control_records(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ControlRecord>, StoreError> {
+        let mut records = Vec::new();
+        for payload in payloads(&self.conn, "sdd_control_records", project_id, execution_id)? {
+            let record: ControlRecord = decode_row(&payload, CONTROL_RECORD)?;
+            let identity = record.identity();
+            if identity.project_id() != project_id || identity.execution_id() != execution_id {
+                return Err(StoreError::corrupt(
+                    "control record row does not match its recorded identifiers",
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Every saved Task reservation of one execution.
+    pub fn sdd_task_reservations(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<TaskReservation>, StoreError> {
+        let mut reservations = Vec::new();
+        for payload in payloads(
+            &self.conn,
+            "sdd_task_reservations",
+            project_id,
+            execution_id,
+        )? {
+            let reservation: TaskReservation = decode_row(&payload, RESERVATION_RECORD)?;
+            if reservation.project_id() != project_id || reservation.execution_id() != execution_id
+            {
+                return Err(StoreError::corrupt(
+                    "task reservation row does not match its recorded identifiers",
+                ));
+            }
+            reservations.push(reservation);
+        }
+        Ok(reservations)
+    }
+}
+
+impl RecoveryEnumerationPort for Store {
+    fn stored_executions(&self) -> Result<Vec<StoredExecution>, SddExecutionError> {
+        Store::sdd_stored_executions(self).map_err(SddExecutionError::from)
+    }
+
+    fn dispatch_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<DispatchJournalEntry>, SddExecutionError> {
+        Store::sdd_dispatch_entries(self, project_id, execution_id).map_err(SddExecutionError::from)
+    }
+
+    fn git_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<GitJournalEntry>, SddExecutionError> {
+        Store::sdd_git_entries(self, project_id, execution_id).map_err(SddExecutionError::from)
+    }
+
+    fn progress_entries(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ProgressJournalEntry>, SddExecutionError> {
+        Store::sdd_progress_entries(self, project_id, execution_id).map_err(SddExecutionError::from)
+    }
+
+    fn control_records(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ControlRecord>, SddExecutionError> {
+        Store::sdd_control_records(self, project_id, execution_id).map_err(SddExecutionError::from)
+    }
+
+    fn task_reservations(
+        &self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<TaskReservation>, SddExecutionError> {
+        Store::sdd_task_reservations(self, project_id, execution_id)
+            .map_err(SddExecutionError::from)
     }
 }

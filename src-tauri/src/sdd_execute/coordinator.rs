@@ -46,7 +46,7 @@ use crate::supervision::h4_launch::{
     H4TaskLaunch, H4TaskStartOutcome, h4_commit_authorization, h4_owner_ref,
 };
 use crate::supervision::runtime::DesktopSupervisionRuntime;
-use crate::supervision::{PumpScope, SupervisionHost, SupervisionTarget};
+use crate::supervision::{PumpScope, SupervisionHost, SupervisionTarget, SupervisionView};
 
 /// The desktop coordinator composition.
 pub struct DesktopCoordinator {
@@ -476,41 +476,53 @@ impl ChildStatusPort for H2ChildStatus<'_> {
             .host
             .get(project_id, reservation.supervision_id())
             .map_err(supervision_error)?;
-        let state = child_state(&view.state);
-        let consulted = view.budget.as_ref();
-        let active_seconds = consulted
-            .map(|budget| budget.usage.active_seconds_consumed())
-            .unwrap_or(0);
-        // `runs_started` includes the first run; the additional-run cap counts
-        // the runs after it.
-        let additional_runs = consulted
-            .map(|budget| budget.usage.runs_started().saturating_sub(1))
-            .unwrap_or(0);
-        // H2 owns the consecutive-stall counter and stops at its own three
-        // cycles, which arrives here as the stored `stagnation` stop cause. The
-        // mirror counter therefore starts from the durable value H2 recorded;
-        // this composition reads it only through the stop reason, so a running
-        // target reports zero rather than a guessed count.
-        let stalls = 0;
-        let evidence = view
-            .evidence
-            .iter()
-            .filter_map(|evidence| evidence.evidence_id.parse().ok())
-            .collect();
-        let mut status = ChildStatus::new(
-            reservation.supervision_id(),
-            state,
-            active_seconds,
-            additional_runs,
-            stalls,
-            view.completion_stale.is_some(),
-            evidence,
-        );
-        if let Some(cause) = stop_cause(&view.reason) {
-            status = status.with_stop_cause(cause);
-        }
-        Ok(Some(status))
+        Ok(Some(child_status_from_view(&reservation, &view)))
     }
+}
+
+/// Builds the H4 stored-child status from one reserved task and its H2 view.
+///
+/// The crash reconciliation reads the same value through the same derivation, so
+/// a restored process and a running coordinator never disagree about the stored
+/// H2 state. It starts nothing.
+pub fn child_status_from_view(
+    reservation: &herness_sdd_execute::TaskReservation,
+    view: &SupervisionView,
+) -> ChildStatus {
+    let state = child_state(&view.state);
+    let consulted = view.budget.as_ref();
+    let active_seconds = consulted
+        .map(|budget| budget.usage.active_seconds_consumed())
+        .unwrap_or(0);
+    // `runs_started` includes the first run; the additional-run cap counts the
+    // runs after it.
+    let additional_runs = consulted
+        .map(|budget| budget.usage.runs_started().saturating_sub(1))
+        .unwrap_or(0);
+    // H2 owns the consecutive-stall counter and stops at its own three cycles,
+    // which arrives here as the stored `stagnation` stop cause. The mirror
+    // counter therefore starts from the durable value H2 recorded; this
+    // composition reads it only through the stop reason, so a running target
+    // reports zero rather than a guessed count.
+    let stalls = 0;
+    let evidence = view
+        .evidence
+        .iter()
+        .filter_map(|evidence| evidence.evidence_id.parse().ok())
+        .collect();
+    let mut status = ChildStatus::new(
+        reservation.supervision_id(),
+        state,
+        active_seconds,
+        additional_runs,
+        stalls,
+        view.completion_stale.is_some(),
+        evidence,
+    );
+    if let Some(cause) = stop_cause(&view.reason) {
+        status = status.with_stop_cause(cause);
+    }
+    status
 }
 
 /// Maps the stored H2 reason onto H4's stop cause.

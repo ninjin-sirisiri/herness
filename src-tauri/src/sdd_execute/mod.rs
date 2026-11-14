@@ -100,6 +100,29 @@
 //!
 //! The watcher is a latency optimization, not the guard: the periodic and
 //! pre-side-effect checks still catch a change when `notify` drops an event.
+//!
+//! Task 20 adds [`recovery`]: the desktop quit, the startup reconciliation, and
+//! the human-resume entry point over [`herness_sdd_execute::recovery`].
+//!
+//! * [`recovery::DesktopRecoveryHost::begin_quit`] writes the durable stop that
+//!   closes new dispatch, sends, and commits before the coordinated stops, and
+//!   [`recovery::DesktopRecoveryHost::mark_quit`] writes the confirmed or
+//!   unconfirmed stop from the real H1 report. A failed H4 save appears in
+//!   [`recovery::H4QuitReport::failures`], and `obstacle` turns it into the
+//!   reason quit did not complete.
+//! * [`recovery::DesktopRecoveryHost::restore`] reconciles every stored execution
+//!   through the real store, the read-only H2 child reader, the read-only checkout
+//!   observation, and the exact progress-document bytes. It starts no child,
+//!   sends no request, stages nothing, and commits nothing, and its report always
+//!   says `request_count() == 0`.
+//! * [`recovery::DesktopRecoveryHost::resume`] is the human resume: it links at
+//!   most one clearly established commit and records the durable hold otherwise.
+//!   [`recovery::confirm_resume`] is the only way the desktop mints the
+//!   confirmation it needs.
+//!
+//! Task 21 exposes these values over the trusted IPC; this module adds no
+//! window, command, or UI type, and it never pushes, merges, rebases, amends,
+//! resets, or cleans.
 
 pub mod barrier;
 pub mod composition;
@@ -112,6 +135,7 @@ pub mod pack;
 pub mod packet;
 pub mod plan_changes;
 pub mod readiness;
+pub mod recovery;
 pub mod registry;
 pub mod source;
 pub mod workspace;
@@ -131,7 +155,7 @@ pub use composition::{
 };
 pub use coordinator::{
     ApprovedTaskLaunch, DesktopCoordinator, H2ChildDispatch, H2ChildStatus, child_state,
-    child_state_of, supervision_target_id,
+    child_state_of, child_status_from_view, supervision_target_id,
 };
 pub use finalize::{
     ApprovedCommitIdentity, GitCheckoutObserver, HOST_COMMIT_FEATURE, HOST_COMMIT_OBSERVE_FEATURE,
@@ -161,6 +185,12 @@ pub use plan_changes::{
     PlanReconcileClock, PlanWatchError, PlanWatchNotice, QueuedChildStop, reconcile_schedule,
 };
 pub use readiness::{DesktopH4Readiness, FixedReadinessDocuments, ReadinessDocumentSource};
+pub use recovery::{
+    DesktopRecoveryHost, FilesystemDocuments, H4QuitMark, H4QuitReport, H4StartupReport,
+    NoChildren, NoDocuments, RecoveryChildSource, RecoveryDocumentSource, RecoveryFailure,
+    SupervisionChildren, blocker_lines, canonical_root, confirm_resume, item_line,
+    newest_git_class, observation_actor, report_lines,
+};
 pub use registry::{
     ApprovalBuild, ApprovalDraft, H4_BUDGET_POLICY_VERSION, H4_CONDITION_VERSION,
     H4StartApprovalRegistry, MemoryStartStore, PreviewFacts, PreviewTaskFacts, StartChildPort,
