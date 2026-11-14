@@ -37,7 +37,7 @@ use crate::supervision::runtime::DesktopH1;
 use crate::supervision::store::StoreHandle;
 use crate::supervision::{
     ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, HumanConfirmation,
-    PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
+    PlanRequestActor, PumpScope, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
 };
 use herness_html_sync::observer::{DependencyKind, DependencyPath};
 use herness_html_sync::{H3StorePort, PublicationFileReadPort};
@@ -466,21 +466,18 @@ impl DesktopHost {
             .into_iter()
             .map(|view| view.project_id())
             .collect::<Vec<_>>();
-        // An active H3 target must be pumped with its candidate handle installed;
-        // otherwise the H2 start tick could start a child with native tools. The
-        // H3 worker owns that tick. The generic H2 pump therefore skips exactly
-        // the project with the active H3 slot and still advances every other
-        // project independently of a window or UI selection.
-        let h3_active_project = self.html_sync.active_project();
-        let h2_projects = projects
-            .iter()
-            .copied()
-            .filter(|project| Some(*project) != h3_active_project)
-            .collect::<Vec<_>>();
+        // An active H3 target must be pumped with its candidate handle
+        // installed; otherwise the H2 start tick could start a child with
+        // native tools. The H3 worker owns exactly that one target. Every
+        // other target in the same project — including an H4 Task target —
+        // keeps advancing here with the native adapter, independently of a
+        // window or UI selection.
+        let h3_target = self.html_sync.active_target();
         let plans = self.supervision.plans();
         let store = self.store_handle();
         let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
-        if let Err(error) = self.supervision.pump(&mut adapter, &h2_projects) {
+        let scope = PumpScope::for_active_candidate(projects, h3_target);
+        if let Err(error) = self.supervision.pump_scoped(&mut adapter, scope) {
             // Supervision progress is independent from the H1 pump. A single
             // H2 failure must not stop H1 event delivery; it is retried on the
             // next bounded interval.

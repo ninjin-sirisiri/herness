@@ -28,6 +28,7 @@ use herness_supervision::{
 };
 
 use crate::host::DesktopRuntime;
+use crate::supervision::SupervisionTarget;
 use crate::supervision::plan::StoredPlan;
 use crate::supervision::store::StoreHandle;
 use crate::supervision::workspace::ProjectWorkspace;
@@ -50,7 +51,7 @@ pub struct DesktopH1<'a> {
     runtime: &'a mut DesktopRuntime,
     store: StoreHandle,
     plans: PlanMap,
-    candidate_artifact: Option<ArtifactHandle>,
+    candidate: Option<(SupervisionTarget, ArtifactHandle)>,
 }
 
 impl<'a> DesktopH1<'a> {
@@ -60,19 +61,21 @@ impl<'a> DesktopH1<'a> {
             runtime,
             store,
             plans,
-            candidate_artifact: None,
+            candidate: None,
         }
     }
 
-    /// Installs the host-issued candidate handle for the H3 generation this
-    /// adapter is about to start or continue.
+    /// Binds the host-issued candidate handle to the exact H3 target and
+    /// generation this adapter is about to start or continue.
     ///
-    /// With a handle installed, the H1 run receives only the candidate tools
+    /// With a binding installed, the H1 run receives only the candidate tools
     /// and the run grant is the candidate allowlist even though H2 created the
     /// child agent from the approved execution scope. Without one, the normal
-    /// native supervision path is unchanged.
-    pub fn set_candidate_artifact(&mut self, handle: Option<ArtifactHandle>) {
-        self.candidate_artifact = handle;
+    /// native supervision path is unchanged. The target is stored with the
+    /// handle so [`SupervisionHost::pump_scoped`] can refuse any scope that is
+    /// not exactly this target.
+    pub fn bind_candidate(&mut self, target: SupervisionTarget, handle: ArtifactHandle) {
+        self.candidate = Some((target, handle));
     }
 
     fn plan(
@@ -124,14 +127,36 @@ impl<'a> DesktopH1<'a> {
             detail: error.to_string(),
         }
     }
+
+    /// Refuses a run whose target is not the exact target the candidate handle
+    /// was bound to.
+    fn ensure_candidate_boundary(
+        &self,
+        project: ProjectId,
+        supervision: SupervisionId,
+    ) -> Result<(), SupervisionError> {
+        let Some((target, _)) = &self.candidate else {
+            return Ok(());
+        };
+        if *target == SupervisionTarget::new(project, supervision) {
+            return Ok(());
+        }
+        Err(SupervisionError::InvalidValue {
+            field: "h1.candidateTarget".to_owned(),
+            detail: format!(
+                "candidate tools for {target} cannot start or continue {project}:{supervision}"
+            ),
+        })
+    }
 }
 
 impl SupervisionRuntimePort for DesktopH1<'_> {
     fn start_child(&mut self, request: &ChildRunStart) -> Result<(), SupervisionError> {
+        self.ensure_candidate_boundary(request.project_id(), request.supervision_id())?;
         let plan = self.plan(request.project_id(), request.supervision_id())?;
         let text = self.verified_packet(&plan, request.packet())?.prompt();
-        match &self.candidate_artifact {
-            Some(handle) => self
+        match &self.candidate {
+            Some((_, handle)) => self
                 .runtime
                 .start_candidate_run_with_id(
                     request.project_id(),
@@ -163,6 +188,7 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
     }
 
     fn continue_child(&mut self, request: &ChildRunContinuation) -> Result<(), SupervisionError> {
+        self.ensure_candidate_boundary(request.project_id(), request.supervision_id())?;
         let plan = self.plan(request.project_id(), request.supervision_id())?;
         let text = self.continuation_input(&plan, request)?;
         let policy = self.runtime.policy();
@@ -177,8 +203,8 @@ impl SupervisionRuntimePort for DesktopH1<'_> {
             policy.version(),
         )
         .map_err(Self::runtime_error)?;
-        match &self.candidate_artifact {
-            Some(handle) => {
+        match &self.candidate {
+            Some((_, handle)) => {
                 self.runtime
                     .continue_run_with_artifact(
                         request.project_id(),
@@ -470,6 +496,15 @@ pub trait DesktopSupervisionRuntime:
         project: ProjectId,
         supervision: SupervisionId,
     ) -> Result<Option<herness_supervision::SupervisionRecord>, SupervisionError>;
+
+    /// Exact target whose candidate tools are installed on this adapter.
+    ///
+    /// `None` is the native supervision boundary. The pump refuses a candidate
+    /// boundary for any scope that is not exactly this target, so the pairing
+    /// between the candidate handle and the H3 target cannot silently widen.
+    fn candidate_target(&self) -> Option<SupervisionTarget> {
+        None
+    }
 }
 
 impl DesktopSupervisionRuntime for DesktopH1<'_> {
@@ -522,6 +557,10 @@ impl DesktopSupervisionRuntime for DesktopH1<'_> {
             .store
             .lock()
             .load_supervision_record(project, supervision)?)
+    }
+
+    fn candidate_target(&self) -> Option<SupervisionTarget> {
+        self.candidate.as_ref().map(|(target, _)| *target)
     }
 }
 

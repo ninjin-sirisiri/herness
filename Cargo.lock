@@ -1450,12 +1450,14 @@ dependencies = [
 name = "herness-sdd-execute-tests"
 version = "0.1.0"
 dependencies = [
+ "herness-assessment",
  "herness-core",
  "herness-desktop",
  "herness-html-sync",
  "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
+ "herness-supervision-tests",
  "rusqlite",
  "serde_json",
  "tempfile",

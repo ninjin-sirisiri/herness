@@ -18,7 +18,9 @@ serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+herness-assessment = { path = "../../crates/herness-assessment" }
 herness-desktop = { path = "../../src-tauri" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+herness-supervision-tests = { path = "../supervision" }
 rusqlite.workspace = true
 tempfile.workspace = true
