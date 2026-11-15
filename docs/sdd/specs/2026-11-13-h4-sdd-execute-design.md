@@ -116,7 +116,7 @@ H3によるcompanion不足のbootstrap・著作・評価・反映はH3へ委譲�
 
 hostはBASEからの変更と新規ファイル、H3が反映したcompanion・receiptを内容manifestで照合する。承認済みwrite scopeと派生HTML成果物に限定し、無関係な変更、外部編集競合、不明なindex変更があれば人間待ちにする。`git add .`や`git add -A`で一括stageせず、確定したパスをargvで渡す。外部processとの完全排他や、許可範囲内の変更の作者を完全に特定することは保証しない。
 
-commit意図には要求ID、execution・Task、branch、期待parent、対象pathとbytes、期待tree、message、hook前状態を保存する。commit messageは`Task N: title`と要求を識別する`Herness-Execution`・`Herness-Task`・`Herness-Request` trailerを持ち、秘密を入れない。通常hookと共通staged HTML検証を省略せず、hook失敗・変更・timeout・停止・保存失敗は成功にしない。commit後の記録に失敗してもreset・同じcommitの自動再実行はしない。
+commit意図には要求ID、execution・Task、branch、期待parent、対象pathとbytes、message、hook前状態を保存する。期待treeはindexへのstageが済んだ後にしか確定できず、stageは意図保存より後の副作用であるため、意図ではなくcommit結果へ実treeを保存し、commit後のHEAD・tree・index再確認と全journal境界の照合で突き合わせる。commit messageは`Task N: title`と要求を識別する`Herness-Execution`・`Herness-Task`・`Herness-Request` trailerを持ち、秘密を入れない。通常hookと共通staged HTML検証を省略せず、hook失敗・変更・timeout・停止・保存失敗は成功にしない。commit後の記録に失敗してもreset・同じcommitの自動再実行はしない。
 
 復旧ではbranch・parent・tree・要求trailerと保存manifestから、成立済み・未実行・不明を照合する。明確に成立しているcommitは人間の復旧確認後に台帳へ結び付け、同じTaskを再dispatchしない。照合不能なら人間待ちに残す。GitとSQLiteを原子的な一つのtransactionと偽らない。
 
@@ -139,7 +139,7 @@ planのbytesが変わる、消える、移動する、または観測が不安�
 
 初期の再承認は、Global Constraints、rootのspecRefs、完了済みと着手済みTaskの本文・構造化契約が不変で、未着手Taskだけを変更する場合に継承可能とする。着手済みTaskの条件・scopeを変える場合や完了済みTaskを改変する場合は既存executionへ自動移行せず、新planと人間による作業状態の整理を必要とする。継承可能な新版でも差分・新しい参照・権限・送信範囲・上限を人間が承認し、同じTaskの消費済み予算とcommit履歴を維持する。
 
-`.sdd/progress.md`、Task brief・reportは互換用の出力とする。Worktree、full SHAのBranch baseline、`Task N: complete (commits base7..head7)`、Rulingを既存形式で出力し、DBではfull SHAを保持する。出力は一時ファイルと置換を用い、失敗時は次Taskを保留する。外部からのprogress改変を承認や完了として取り込まず、既存の別台帳を黙って上書きしない。通常ホストで開始した旧executionの履歴移行は初期範囲外。
+`.sdd/progress.md`、Task brief・reportは互換用の出力とする。Worktree、full SHAのBranch baseline、`Task N: complete (commits base7..head7)`、no_change Taskの`Task N: complete (no_change)`、Rulingを既存形式で出力し、DBではfull SHAを保持する。`no_change`行は空のcommit範囲を捏造しないための明示形式であり、既存packの台帳parserはこの行を解釈しない。したがってstacked PR preflightはTask数不一致として互換なしを返し、H4はfinish前にその制約を提示する。出力は一時ファイルと置換を用い、失敗時は次Taskを保留する。外部からのprogress改変を承認や完了として取り込まず、既存の別台帳を黙って上書きしない。通常ホストで開始した旧executionの履歴移行は初期範囲外。
 
 最後のTaskに属するfinalChecksの証拠が最終内容を覆い、関連spec反映も成立すればready_for_finishとする。失敗はそのTaskを未完了としてH2の範囲内で扱い、範囲外の修正や上限は人間待ちにする。host commit後のhookによる変更等で証拠が古くなった場合もready_for_finishにしない。
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:329921208338a4a609bbe4034ae2e30447ffdb9861dec9c13b80bf0c891a0c8b">
+<meta name="sdd-source-digest" content="sha256:9ccd0a06ebb0540d7f86ed01f5130e0b82421a7c45d6eda2ecef8707e3a94a50">
 <title>H4: herness主導のsdd-execute</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -139,7 +139,7 @@
 <h2 id="host-commits-and-git-recovery">Host commits and Git recovery</h2>
 <p>子の担当は実装・検証・報告までで、Gitのstage・commit・branch変更・履歴書換えを行わない。hostもpush・pull・merge・rebase・amend・reset・cleanを実行フローへ追加しない。シェル許可はOS sandboxではなく、任意scriptの副作用を完全に防げるとは保証しない。予期しないGit操作を検知した場合は停止する。</p>
 <p>hostはBASEからの変更と新規ファイル、H3が反映したcompanion・receiptを内容manifestで照合する。承認済みwrite scopeと派生HTML成果物に限定し、無関係な変更、外部編集競合、不明なindex変更があれば人間待ちにする。<code>git add .</code>や<code>git add -A</code>で一括stageせず、確定したパスをargvで渡す。外部processとの完全排他や、許可範囲内の変更の作者を完全に特定することは保証しない。</p>
-<p>commit意図には要求ID、execution・Task、branch、期待parent、対象pathとbytes、期待tree、message、hook前状態を保存する。commit messageは<code>Task N: title</code>と要求を識別する<code>Herness-Execution</code>・<code>Herness-Task</code>・<code>Herness-Request</code> trailerを持ち、秘密を入れない。通常hookと共通staged HTML検証を省略せず、hook失敗・変更・timeout・停止・保存失敗は成功にしない。commit後の記録に失敗してもreset・同じcommitの自動再実行はしない。</p>
+<p>commit意図には要求ID、execution・Task、branch、期待parent、対象pathとbytes、message、hook前状態を保存する。期待treeはindexへのstageが済んだ後にしか確定できず、stageは意図保存より後の副作用であるため、意図ではなくcommit結果へ実treeを保存し、commit後のHEAD・tree・index再確認と全journal境界の照合で突き合わせる。commit messageは<code>Task N: title</code>と要求を識別する<code>Herness-Execution</code>・<code>Herness-Task</code>・<code>Herness-Request</code> trailerを持ち、秘密を入れない。通常hookと共通staged HTML検証を省略せず、hook失敗・変更・timeout・停止・保存失敗は成功にしない。commit後の記録に失敗してもreset・同じcommitの自動再実行はしない。</p>
 <p>復旧ではbranch・parent・tree・要求trailerと保存manifestから、成立済み・未実行・不明を照合する。明確に成立しているcommitは人間の復旧確認後に台帳へ結び付け、同じTaskを再dispatchしない。照合不能なら人間待ちに残す。GitとSQLiteを原子的な一つのtransactionと偽らない。</p>
 <p>required Taskは承認対象の成果物をcommitしてBASEからHEADが進む必要がある。no_change Taskは変更なしの証拠を記録し、空commitを作らない。完了範囲は実際のBASE..HEADとして保持する。過去に完了した範囲を後の正本補修で書き換えない。</p>
 </section>
@@ -160,7 +160,7 @@
 <p>executionと各Taskの状態を別に保持し、Taskにはpending・active・completeの進行と上記のphase・停止理由・現在への適用を持たせる。H2 completedはH4 Task completeではない。DBの保存状態が正本で、project sequence付きeventは保存後に通知する。通知queueの配達を進行条件にせず、復旧時はH2/H3の保存結果から照合する。</p>
 <p>planのbytesが変わる、消える、移動する、または観測が不安定になると、新規dispatch・commitを止めて現在のTaskへ安全停止を要求する。JSONが同じでも本文・Global Constraintsの変更を無視しない。同じbytesへ戻しても停止latchは解除しない。監視は通知に加えて定期照合を行い、各副作用直前にも確認する。完了後の変更は履歴を消さず現在への適用をstaleにする。</p>
 <p>初期の再承認は、Global Constraints、rootのspecRefs、完了済みと着手済みTaskの本文・構造化契約が不変で、未着手Taskだけを変更する場合に継承可能とする。着手済みTaskの条件・scopeを変える場合や完了済みTaskを改変する場合は既存executionへ自動移行せず、新planと人間による作業状態の整理を必要とする。継承可能な新版でも差分・新しい参照・権限・送信範囲・上限を人間が承認し、同じTaskの消費済み予算とcommit履歴を維持する。</p>
-<p><code>.sdd/progress.md</code>、Task brief・reportは互換用の出力とする。Worktree、full SHAのBranch baseline、<code>Task N: complete (commits base7..head7)</code>、Rulingを既存形式で出力し、DBではfull SHAを保持する。出力は一時ファイルと置換を用い、失敗時は次Taskを保留する。外部からのprogress改変を承認や完了として取り込まず、既存の別台帳を黙って上書きしない。通常ホストで開始した旧executionの履歴移行は初期範囲外。</p>
+<p><code>.sdd/progress.md</code>、Task brief・reportは互換用の出力とする。Worktree、full SHAのBranch baseline、<code>Task N: complete (commits base7..head7)</code>、no_change Taskの<code>Task N: complete (no_change)</code>、Rulingを既存形式で出力し、DBではfull SHAを保持する。<code>no_change</code>行は空のcommit範囲を捏造しないための明示形式であり、既存packの台帳parserはこの行を解釈しない。したがってstacked PR preflightはTask数不一致として互換なしを返し、H4はfinish前にその制約を提示する。出力は一時ファイルと置換を用い、失敗時は次Taskを保留する。外部からのprogress改変を承認や完了として取り込まず、既存の別台帳を黙って上書きしない。通常ホストで開始した旧executionの履歴移行は初期範囲外。</p>
 <p>最後のTaskに属するfinalChecksの証拠が最終内容を覆い、関連spec反映も成立すればready_for_finishとする。失敗はそのTaskを未完了としてH2の範囲内で扱い、範囲外の修正や上限は人間待ちにする。host commit後のhookによる変更等で証拠が古くなった場合もready_for_finishにしない。</p>
 <p>finish引継ぎはcheckout・base branch・Branch baseline・plan版・台帳・各Taskの範囲・最終証拠・未確認を渡す。既存sdd-finishの全体検証と正本反映確認を満たしたうえで、人間がlocal merge・single PR・branch保持・stacked PRを選ぶ。H4は統合の実行機構を新設せず、既存skillへ引き継ぐ。空のcommit範囲を持つno_change Taskは既存stack-prsの非空範囲要件を満たさないため、stacked PR互換なしと明示する。範囲を捏造せず、finish前にこの制約を提示する。</p>
 </section>
