@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:21ca77d634605fe85d63c6a4c07c3f5b09461db9da50dcae7bada6a48200fa72">
+<meta name="sdd-source-digest" content="sha256:16fd4a4242c236fae448d13228879a79eb2c18b836fc5416689466cbad9dad73">
 <title>H5: チャット中心のデスクトップ操作と個人用macOS導入</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -32,7 +32,7 @@
 <main id="content" tabindex="-1">
 <h1 id="h5-チャット中心のデスクトップ操作と個人用macos導入">H5: チャット中心のデスクトップ操作と個人用macOS導入</h1>
 <p class="metadata"><strong>Classification:</strong> architectural</p>
-<p class="metadata"><strong>Status:</strong> 設計文書の保存範囲を2026-11-15に確認済み。保存後の本specとH1/H4追加契約はレビュー待ちであり、実装・別repo編集・実モデル送信・pushは開始しない。</p>
+<p class="metadata"><strong>Status:</strong> 2026-11-15、commit 9256cc5の設計書とH1/H4追加契約案へのレビュー依頼に利用者が「ok」と回答し、本specと追加契約を承認済み。H5だけのsdd-planへ進む。実装・別repo編集・実モデル送信・pushは開始しない。</p>
 <p class="metadata"><strong>Chosen approach:</strong> アプリ寿命のRust hostを維持し、既存の静的Web UIをチャット中心の画面へ分割する。本体と固定版SDD packを一つの個人用.appに含め、外部ツールは診断と導入案内で扱う。</p>
 <p>本specは<a href="2026-11-07-herness-roadmap.md">ロードマップ</a>のH5を扱う。実行・会話・履歴・権限・認証・配布資源の読込みは<a href="2026-11-07-h1-runtime-design.md">H1</a>、監督・証拠・判定は<a href="2026-11-08-h2-supervision-design.md">H2</a>、HTML同期は<a href="2026-11-09-h3-html-sync-design.md">H3</a>、Task進行・停止確認・finish引継ぎは<a href="2026-11-13-h4-sdd-execute-design.md">H4</a>を正本とする。追加契約は各正本のH5 integration additionsに置き、用語は<a href="../../../CONTEXT.md">CONTEXT.md</a>に従う。</p>
 <section>
@@ -158,6 +158,7 @@
 <h2 id="open-items-and-approval">Open items and approval</h2>
 <p>未解決なのは、release実測に基づく軽さの数値基準（H5受入前）、実provider受入の接続・送信範囲・料金等の許可（実送信前）、公開へ進む場合の利用条件・ライセンス・署名・OS対応（今回の範囲外）である。これらを未合意のまま性能達成・実接続確認済み・公開可能と扱わない。画面の色・余白等は安全契約を変えない範囲で実装時に調整し、実表示で確認する。</p>
 <p>利用者は自分用、チャット中心、設計からの利用、本体とSDD packの同梱・他ツールの導入案内、Task実行中の読取り専用相談を選んだ。上記の範囲・前提補修・未解決項目を示した保存確認へ「この範囲で保存」と回答し、specとH1/H4追加契約案、ロードマップ、HTMLの保存・検証・設計文書だけのcommitを許可した。保存後の設計・追加契約のレビュー承認、sdd-plan・実装・別repo編集・実モデル送信・pushの許可ではない。</p>
+<p>続いてcommit 9256cc5の設計書とH1/H4追加契約案へのレビュー依頼に、利用者が「ok」と回答した。2026-11-15の設計・追加契約の承認として記録し、H5だけの実装planを作成する。軽さの数値基準と実provider受入の許可は記載した解消時点まで未解決のまま保持し、本実装・別repo編集・実送信・pushを許可しない。</p>
 </section>
 </main>
 </div>

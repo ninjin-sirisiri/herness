@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:c1d305e8d69ba8f7ddcd0c6e32d13c228dde8a80966000301a14ad9d69c158ef">
+<meta name="sdd-source-digest" content="sha256:14406c1abc1e867ec72bb1707395e16634bd55d78e85af8739d72a094d2e0860">
 <title>herness Spec roadmap</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -44,7 +44,7 @@
 <main id="content" tabindex="-1">
 <h1 id="herness-spec-roadmap">herness Spec roadmap</h1>
 <p class="metadata"><strong>Classification:</strong> architectural / multi-spec</p>
-<p class="metadata"><strong>Status:</strong> 分割・依存関係、H1〜H4のspecとH1/H2の接続追加契約は承認済み。H1〜H4の実装はmainへ統合済み。H1・H2は受入未完了、H3はtext-only reduced scopeでaccepted-with-exceptions、H4はPhase Aのみ確認し全体受入は未完了。H5 specとH1/H4のH5追加契約案を保存しレビュー待ち。追加の本実装・実接続の許可ではない。</p>
+<p class="metadata"><strong>Status:</strong> 分割・依存関係、H1〜H5のspecと各正本の接続追加契約は承認済み。H1〜H4の実装はmainへ統合済み。H1・H2は受入未完了、H3はtext-only reduced scopeでaccepted-with-exceptions、H4はPhase Aのみ確認し全体受入は未完了。H5の実装planを作成する。追加の本実装・実接続の許可ではない。</p>
 <section>
 <h2 id="全体目標">全体目標</h2>
 <p>Piを出発点に、SDDによる開発を進めるデスクトップ型エージェントハーネス「herness」を作る。最初の対象はmacOSとする。軽さを重視してTauriとRust中心の構成を優先し、PiのRust移植や他のエージェント基盤もH1で比較する。CLIの操作をGUIに置き換えるだけでなく、子エージェントの起動・継続・完了判定をhernessが制御する。</p>
@@ -95,7 +95,7 @@
 </section>
 <section>
 <h2 id="specの分割">Specの分割</h2>
-<p>H1〜H4は承認済みのspecである。H5は設計案を保存済みでレビュー待ちとする。個別specの承認と本実装の許可は区別する。</p>
+<p>H1〜H5は承認済みのspecである。個別specの承認と本実装の許可は区別する。</p>
 <section>
 <h3 id="h1--実行基盤と変更理由の記録">H1 — 実行基盤と変更理由の記録</h3>
 <ul>
@@ -141,7 +141,7 @@
 <li><strong>観測可能な完了:</strong> 親モデルがsubagent toolを呼ばなくてもTaskが順番に実行され、Global Constraintsと正本specが引き継がれる。停止・再開・未完了を追跡でき、必要な検証やHTML同期が不成立なら先へ進まない。</li>
 <li><strong>初期範囲:</strong> 新形式planだけを対象とし、1 planにつき1リポジトリ・1実装checkoutで直列実行する。plan変更で現在Taskも安全停止し、必要な検証・HTML同期の確認後にhernessがcommitする。詳細な契約はH4 specを正本とする。</li>
 <li><strong>消費先:</strong> H5。</li>
-<li><strong>Spec:</strong> <a href="2026-11-13-h4-sdd-execute-design.md">H4: herness主導のsdd-execute</a>。2026-11-13にH1/H2のH4接続追加契約とともに承認済み。実装はmainへ統合済み。H5で必要な一覧・停止照合・finish接続の追加案はレビュー待ち。</li>
+<li><strong>Spec:</strong> <a href="2026-11-13-h4-sdd-execute-design.md">H4: herness主導のsdd-execute</a>。2026-11-13にH1/H2のH4接続追加契約とともに承認済み。実装はmainへ統合済み。H5で必要な一覧・停止照合・finish接続の追加契約も2026-11-15に承認済みで、追加部分は未実装。</li>
 <li><strong>Plan:</strong> <a href="../plans/2026-11-13-h4-sdd-execute.md">H4 Host-owned SDD Execution Implementation Plan</a>。25 Taskの実装をmainへ統合済み。<a href="../../research/2026-11-13-h4-acceptance.md">受入記録</a>ではPhase Aを確認し、実providerのPhase BとH4全体の受入は未完了。検証済みpackは別checkoutの版固定であり、../sddのmainへ統合済みとは扱わない。</li>
 </ul>
 </section>
@@ -154,7 +154,7 @@
 <li><strong>観測可能な完了:</strong> macOS上のデスクトップアプリで全体の完成条件を通して確認できる。変更理由をチャット以外から閲覧でき、未同期・判定不能・停止状態を成功と見誤らず、人間が必要な操作を行える。</li>
 <li><strong>初回導入:</strong> 自分用のApple Silicon Mac向け。本体と固定版SDD packを同梱し、Git・Python等は診断して導入を案内する。一般公開・自動更新は初期範囲外とし、全体完成条件と上流受入の未確認を免除しない。</li>
 <li><strong>消費先:</strong> 利用者。</li>
-<li><strong>Spec:</strong> <a href="2026-11-15-h5-desktop-design.md">H5: チャット中心のデスクトップ操作と個人用macOS導入</a>。チャット中心で設計から利用し、Task中も読取り専用相談を許可する設計案。H1/H4の追加契約案とともにレビュー待ち。</li>
+<li><strong>Spec:</strong> <a href="2026-11-15-h5-desktop-design.md">H5: チャット中心のデスクトップ操作と個人用macOS導入</a>。チャット中心で設計から利用し、Task中も読取り専用相談を許可する。H1/H4の追加契約とともに2026-11-15に承認済み。未実装。</li>
 </ul>
 </section>
 </section>
@@ -168,7 +168,7 @@
 <li>H5の依存する操作の詳細設計は、その操作が利用するH1〜H4の契約確定後に行う。見た目の検討や試作まで禁止するものではない。</li>
 </ul>
 <p>承認済みの設計順序はH1 → H2 → H3 → H4 → H5とする。これは個別specを自動で連続設計・実装する指示ではない。UIの実装を最後まで禁止せず、必要最小限の接続確認は各specの受入条件で扱う。</p>
-<p><strong>現在の対象は、利用者が設計を指示したH5であり、保存した設計案のレビュー待ちである。</strong> H1・H2の受入未完了、H3の限定受入、H4のPhase B未確認とdesktop接続不足を引き継ぐ。H5は会話と配布資源のH1追加契約、一覧・停止照合・finishのH4追加契約を正本へ提案し、UIで不足を成功に置き換えない。個別設計・追加契約の承認とsdd-plan・本実装・別repo書込み・実接続は別の許可とする。5つのspecの分割・順序・契約所有者は変更しない。</p>
+<p><strong>現在の対象は、設計と追加契約を承認済みのH5であり、実装planを作成する。</strong> H1・H2の受入未完了、H3の限定受入、H4のPhase B未確認とdesktop接続不足を引き継ぐ。H5は承認済みの会話と配布資源のH1追加契約、一覧・停止照合・finishのH4追加契約を先行補修に含め、UIで不足を成功に置き換えない。本実装・別repo書込み・実接続は別の許可とする。5つのspecの分割・順序・契約所有者は変更しない。</p>
 </section>
 <section>
 <h2 id="共通契約の所有者">共通契約の所有者</h2>
@@ -228,6 +228,7 @@
 <p>続いてcommit <code>2d53146</code>のH4 specとH1/H2のH4 integration additionsへのレビュー依頼に、利用者が「ok」と回答した。設計と追加契約を承認し、H4だけのsdd-planへ進む。本実装・別repo編集・実接続・pushの許可ではない。</p>
 <p>この承認に基づきH4の25 Taskの実装planを保存した。既存検証経路のroot/60秒固定とH3-active project除外などを先行補修に含め、H1/H2/H3未確認とPhase Bの別途許可を維持する。plan保存は本実装開始ではない。</p>
 <p>その後H4実装をmainへ統合した。2026-11-15、利用者がH5の設計開始を指示し、自分用・チャット中心・設計からの利用・本体とSDD packの同梱・他ツールの導入案内・Task中の読取り専用相談を選んだ。範囲と前提補修・未解決項目の確認へ「この範囲で保存」と回答し、H5 spec、H1/H4追加契約案、ロードマップとHTMLの保存・検証・設計文書だけのcommitを許可した。保存後のspec・追加契約の承認、sdd-plan・本実装・別repo編集・実送信・pushはまだ許可しない。</p>
+<p>続いてcommit 9256cc5のH5設計書とH1/H4のH5 integration additionsへのレビュー依頼に、利用者が「ok」と回答した。設計と追加契約を承認し、H5だけのsdd-planへ進む。性能の数値基準・実provider受入の別途許可・上流の未確認を維持し、本実装・別repo編集・実送信・pushは許可しない。</p>
 </section>
 </main>
 </div>

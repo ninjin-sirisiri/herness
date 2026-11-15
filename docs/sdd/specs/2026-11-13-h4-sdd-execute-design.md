@@ -196,7 +196,7 @@ packとherness両方の開発変更を必要とするが、このspec保存は�
 
 ## H5 integration additions
 
-2026-11-15の[H5設計案](2026-11-15-h5-desktop-design.md)に必要なdesktop接続の追加契約。保存範囲は確認済みだが本節のレビュー承認・実装は未了である。既存のTask進行・権限・再承認・停止・予算・finish条件を緩めない。
+2026-11-15の[H5設計](2026-11-15-h5-desktop-design.md)に必要なdesktop接続の追加契約。同日、commit 9256cc5の設計書と追加契約案へのレビュー依頼に利用者が「ok」と回答し、本節を承認済み。H5実装planへ含めるが本実装・実接続は開始しない。既存のTask進行・権限・再承認・停止・予算・finish条件を緩めない。
 
 1. **保存済み実行の発見:** 信頼されたmainへproject指定のexecution一覧と、再接続に必要な非secretの承認ID/版を返す。version付きviewでexecution ID・現在revision・plan・checkout・状態・理由・最終sequenceを返し、一覧は更新sequence降順の安定cursor、既定100件・上限500件とする。別projectの承認を流用せず、UIでIDを記憶していないことを新規開始の理由にしない。
 2. **停止照合の操作:** project・execution ID・request ID・expected revisionを指定する人間操作から、保存済み停止要求、H1/H2の子・管理下process、未確定Git等を照合できるようにする。結果はstopped・pending・recovery_requiredを区別する。人間の入力だけで停止済みを設定せず、未確認のままreadyへ遷移しない。pause後のconfirm_stopをこの操作へ接続し、取消し後も子の停止確認とは別に表示する。照合は新しい子・送信・commitの許可ではなく、再開は既存承認ID/版と残予算を使う別操作とする。

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';">
-<meta name="sdd-source-digest" content="sha256:b1adfeff57637b2b607f2fb2c0d114cea516e268362b4598cad045d14b3872a8">
+<meta name="sdd-source-digest" content="sha256:bb3a433394d83c97718cc71c957b8860f9bdf750d5087355026087225781b5cd">
 <title>H1: 実行基盤と変更理由の記録</title>
 <link rel="stylesheet" href="../assets/sdd.css">
 </head>
@@ -299,7 +299,7 @@
 </section>
 <section>
 <h2 id="h5-integration-additions">H5 integration additions</h2>
-<p>2026-11-15の<a href="2026-11-15-h5-desktop-design.md">H5設計案</a>に必要な追加契約。利用者は保存範囲を確認したが、本節の契約承認と実装はレビュー待ちである。H1のrun状態・許可優先順位・secret境界・復旧規則は変更しない。</p>
+<p>2026-11-15の<a href="2026-11-15-h5-desktop-design.md">H5設計</a>に必要な追加契約。同日、commit 9256cc5の設計書と追加契約案へのレビュー依頼に利用者が「ok」と回答し、本節を承認済み。H5実装planへ含めるが、本実装・実DB移行・実接続は開始しない。H1のrun状態・許可優先順位・secret境界・復旧規則は変更しない。</p>
 <ol>
 <li><strong>通常会話と入力:</strong> projectに束縛した通常会話の一覧・取得・作成・明示追加入力を公開する。会話は既存agent/sessionとrun群へ対応し、H2/H3/H4所有の子を通常会話への入力対象にしない。安定した前runからの続行は同じ会話で新run/inputを作り、既存continue_runの停止・許可・入力完結gateを使う。応答中の入力を自動queueせず、停止未確認・復旧待ちは再開照合を先に行う。接続/model変更は新しい通常会話とし、旧会話を別providerへ無断転送しない。</li>
 <li><strong>正規化本文と送信の永続化:</strong> SDK型を漏らさないversion 1の会話viewを提供する。message ID、project、会話、agent/session、run/input参照、role、本文、確定/未完了、順序、最終sequenceを返し、user本文は送信意図とともに送信前に保存する。assistantの公開本文は既存完結eventと対応付け、重複記録・表示を防ぐ。操作はrequest IDと現在revisionへ束縛し、同じID・別内容は拒否、同じ要求は保存結果を返す。送信結果不明を未送信へ戻して自動再送しない。入力は空白だけを拒否し、UTF-8で256 KiBを上限に切り捨てず拒否する。</li>
