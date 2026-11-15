@@ -143,6 +143,113 @@ progress境界だけは、H4 Task完了snapshotが既に `ready_for_finish` で�
 
 progress境界の再起動factsは `tasks_completed=1 commits=1 progress=absent request_count=0 ... states=...=WaitingHuman pump_errors=1`。`pump_errors=1` は未確認ledgerをerror行として報告し、進捗として扱わないことを示す。
 
+## 評価fixtureと実接続opt-in gate（Task 24）
+
+Task 24は、将来の「実providerでの実装・完了評価・HTML評価」を再現するための合成fixtureと、接続・送信bytes・要求数・料金/枠が明示許可されるまで送信前に拒否するgateを追加した。**このTask自身は実送信を行わない。** 既定の外部要求数は0である。
+
+### fixtureの配置
+
+| path | 内容 |
+| --- | --- |
+| `tests/sdd-execute/fixtures/acceptance/plans/valid-two-task.md` | 2 Task・依存ありの正常系。実packがacceptする |
+| `tests/sdd-execute/fixtures/acceptance/plans/valid-single-task.md` | 1 Taskの正常系。実packがacceptする |
+| `.../plans/invalid-unknown-field.md` | 未知root field |
+| `.../plans/invalid-unknown-version.md` | 未知schema version |
+| `.../plans/invalid-broken-fence.md` | 閉じない `sdd-execution-v1` fence |
+| `.../plans/invalid-path-escape.md` | `..` を含むwrite path |
+| `.../plans/invalid-forward-dependency.md` | 後続Taskへの依存 |
+| `.../plans/invalid-non-contiguous-numbering.md` | 欠番のTask heading |
+| `.../plans/legacy-prose.md` | 旧free-prose形式 |
+| `.../spec.md` | 正常系planが参照するfixture spec |
+| `.../acceptance.manifest.json` | 実接続受入manifestの**not_authorizedテンプレート**。承認ではない |
+| `.../metrics.template.json` | 誤完了・誤commit・誤dispatch・保留・継承未確認の出力形 |
+
+targetは `tests/sdd-execute/tests/acceptance.rs` と、その中のtest-only module `acceptance_gate/mod.rs` である。planは各caseでfreshな一時checkout（`docs/sdd/plans/`、`docs/sdd/specs/`、`src/lib.rs`）へ書き、実pack inspector（`scripts/plan-inspect`）でimportする。正常系2件のaccept、負例7件の拒否理由（diagnostic code、pointer、message）、import前後のcheckout bytes不変、socket接続0をassertする。
+
+```sh
+SDD_PACK_ROOT=/Users/h-uma/Documents/sdd/.worktrees/h4-exec \
+  cargo test -p herness-sdd-execute-tests --test acceptance --locked -- --nocapture
+```
+
+`SDD_PACK_ROOT` を省略すると `/Users/h-uma/Documents/sdd/.worktrees/h4-exec` を使う。packがない場合はfallbackせず明示的に失敗する。`--nocapture` を付けると、どのfixtureがどの理由で拒否されたか（`H4_ACCEPTANCE_PLAN_REFUSED:` 行）と、計画・gateの証拠行が表示される。
+
+### 既定拒否（default deny）
+
+`AcceptanceGate::authorize(opt_in, manifest, now_millis, request)` は、次のすべてが揃わなければ `GateRefusal` を返す。runの入口 `run_acceptance` はgateを最初に評価し、拒否時はtransportを一度も呼ばない。
+
+| 条件 | 拒否 |
+| --- | --- |
+| `H4_ACCEPTANCE_OPT_IN` が厳密に `"1"` | 未設定は `OptInMissing`、`"0"`/`"true"`/`"yes"`/空/`" 1"` は `OptInNotExplicit` |
+| `H4_ACCEPTANCE_MANIFEST` が読めるmanifestを指す | `ManifestMissing` / `ManifestUnreadable` |
+| `schema=h4-real-connection-acceptance-v1`、`status=approved`、`approvedBy`/`approvedAt` が非空 | `UnsupportedManifestSchema` / `NotAuthorized` / `ManifestFieldMissing` |
+| `expiresAtMillis` が観測時刻より未来（同時刻は拒否） | `Expired` |
+| `credentialAccess=none` で、manifest全体にcredential様keyがない | `CredentialAccessWidened` / `CredentialMaterialPresent` |
+| 接続の `provider`/`connectionId`/`endpointClass`/`model`/`purpose=assessment` が要求と一致 | `ConnectionMismatch` |
+| 要求fixtureが承認fixtureの部分集合 | `FixtureOutOfScope` |
+| `sendByteKinds` が4種（`plan_packet` / `task_report` / `assessment_prompt` / `h3_render_evidence`）をすべて含み、要求と完全一致 | `RequiredSendByteKindMissing` / `UnknownSendByteKind` / `SendByteKindsMismatch` |
+| 要求数・fixture当たり要求数・retryが正の有限値で承認以内 | `RequestCountNotFinite` / `RequestCountOverrun` / `PerFixtureOverrun` / `RetryOverrun` |
+| retry理由が `timeout` / `connection-reset` / `server-error` / `rate-limited` の範囲 | `RetryReasonNotApproved` |
+| 料金上限（有限・非負）または確認済みquota referenceがある | `PricedRequestWithoutMoneyCap` / `CostOrQuotaMissing` / `CostNotFinite` |
+| H3の `image`/`support`/`usability`/`render`/`humanReadingObservation` が `unconfirmed` | `UnconfirmedCapabilityClaimed` |
+| H1/H2/H3/H4の継承未確認6項目がすべて `unconfirmed` で存在 | `InheritedUnconfirmedMissing` / `InheritedUnconfirmedClaimed` |
+
+run中も承認済みの総要求数・fixture当たり要求数・retry数を数え、超える前に停止する（`RequestBudgetExceeded` / `PerFixtureOverrun` / `RetryBudgetExceeded`）。retryは同じ接続・同じ申請範囲だけで、別接続・別modelへのfallbackはgateにもrunnerにも存在しない。
+
+`authorize` は環境を読まない。環境を読むのは `from_environment` だけで、opt-inとmanifest pathを一箇所に閉じ込める。testは環境変数を書き換えない。
+
+### 人間が実接続runを許可する手順
+
+このTaskのmanifestはテンプレートであり、承認ではない。実接続runを行う前に、controllerは人間へ次を**送信前に**提示し、別途の明示許可を得る。
+
+1. 接続identity: provider、connectionId、endpointClass、model、purpose=assessment。現在 `verified` でconsent済みであること。ChatGPT loginやAPI keyの値をmanifestへ書かない。
+2. fixture名と、送信するbytes種別（plan packet / Task report / assessment prompt / H3 render evidence）。1種でも欠けるmanifestは拒否する。
+3. 有限の総要求数、fixture当たり要求数、retry回数、retry理由。無制限・自動再試行・別接続fallbackを承認しない。
+4. 料金上限（USD、有限）またはquota reference。priced requestに金額上限がなければ拒否する。
+5. 有効期限。
+6. H1/H2受入未完了、H3の画像・support/usability/render・人間読解観測が未確認であること。これらを「確認済み」に変える承認はgateが拒否する。
+7. `credentialAccess=none`。承認を実login・credential探索・Keychain読取りへ拡張しない。
+
+手順は、テンプレートを複製し、`status=approved`、`approvedBy`、`approvedAt`、`expiresAtMillis`、connection、fixtures、sendByteKinds、requestBudget、retryPolicy、costを人間の判断で埋め、別途の許可記録を残すこと。そのうえで
+
+```sh
+H4_ACCEPTANCE_OPT_IN=1 \
+H4_ACCEPTANCE_MANIFEST=/absolute/path/to/approved.manifest.json \
+  <実接続runner>
+```
+
+を実行する。実接続runnerはこのTaskには含まれない。このTaskのtestが持つtransportはin-memoryの記録用だけで、`H4_ACCEPTANCE_OPT_IN=1` と有効manifestを与えてもnetworkへは出ない。したがって**real provider欄は `not_executed` / 未確認**である。
+
+### 集計の分離
+
+`AcceptanceMetrics` は次を別fieldで持つ。
+
+| 分類 | field |
+| --- | --- |
+| 誤完了 | `counts.wrongCompletion` |
+| 誤commit | `counts.wrongCommit` |
+| 誤dispatch | `counts.wrongDispatch` |
+| 保留（pending） | `holds.pending` |
+| 人間待ち | `holds.humanWait` |
+| 外部要求 | `externalRequests` |
+| 実provider | `realProvider.status` / `realProvider.confirmed` |
+
+保留は誤りとして数えない。誤完了・誤commit・誤dispatchは相互に合算しない。`metrics.template.json` はこの形のnot_run出力で、`wrong_results_and_holds_are_counted_separately` が分離を、`the_metrics_template_keeps_defects_holds_and_inherited_items_apart` がtemplateの形を確認する。
+
+### 継承する未確認項目
+
+次の6項目は `inheritedUnconfirmed` としてmanifestとmetricsの両方に明示され、`status=unconfirmed` / `confirmed=false` のまま継承する。gateは欠落も「confirmed」への書換えも拒否する。
+
+| id | 内容 |
+| --- | --- |
+| `h1-acceptance` | H1 runtime受入は未完了。H4 integration additionsも未確認 |
+| `h2-acceptance` | H2 supervision受入は未完了。H4 integration additionsも未確認 |
+| `h3-image` | H3の画像条件は限定text-only受入で未実行 |
+| `h3-residual-conditions` | H3のsupport/usability/render条件は未実行 |
+| `h3-human-reading-observation` | H3の人間読解観測は未実行 |
+| `h4-real-provider-acceptance` | 実providerの実装・完了評価・HTML評価・render証拠は未受入 |
+
+限定受入は実行時gateの迂回ではない。必要能力を確認できなければ実運用の受入は保留する。
+
 ## 変更点
 
 - `src-tauri/src/sdd_execute/crash.rs`: test-onlyの4境界hook。armはH4 launcherだけ。
@@ -153,6 +260,8 @@ progress境界の再起動factsは `tasks_completed=1 commits=1 progress=absent 
 - `src-tauri/src/lifecycle/h4.rs`: windowless launcher、fake credential、facts出力、実quit。
 - `src-tauri/src/app.rs`: `LaunchMode::H4Lifecycle` とflag parse。
 - `tests/sdd-execute/tests/native_lifecycle.rs` と `native_fixture/`: 実process fixture。
+- `tests/sdd-execute/fixtures/acceptance/`: 新形式planの正負fixture、spec、not_authorizedのmanifestテンプレート、metricsテンプレート（Task 24）。
+- `tests/sdd-execute/tests/acceptance.rs` と `acceptance_gate/mod.rs`: 実packによるplan受入と、既定拒否の実接続gate・runner・metrics（Task 24、test-only）。
 
 既存 `tests/sdd-execute/tests/support/mod.rs`（store fixture）は変更していない。
 
@@ -167,6 +276,18 @@ progress境界の再起動factsは `tasks_completed=1 commits=1 progress=absent 
 | `cargo check --workspace --locked` | success、warningなし |
 | `cargo clippy --workspace --all-targets --locked` | warningなし |
 
+## 実行結果（Task 24）
+
+| command | result |
+| --- | --- |
+| `cargo test -p herness-sdd-execute-tests --test acceptance --locked` | 12 passed, 0 failed |
+| `cargo test -p herness-sdd-execute-tests --locked` | 全target pass |
+| `cargo check --workspace --locked` | success、warningなし |
+| `cargo fmt --all -- --check` | format差分なし |
+| `cargo clippy --workspace --all-targets --locked` | warningなし |
+
+`acceptance` の既定実行は外部要求0、socket接続0。期限切れ、範囲外、要求/retry上限、料金/枠欠落、credential拡張、継承未確認の改変は送信前に拒否する。実provider欄は `not_executed` / `confirmed=false` である。
+
 ## 未確認範囲
 
 - crashはtest modeの明示的境界での `std::process::exit(70)` であり、SIGKILL、power loss、filesystem全体の破損を再現しない。
@@ -175,3 +296,7 @@ progress境界の再起動factsは `tasks_completed=1 commits=1 progress=absent 
 - progress出力の外部改変は、このtargetではcrash境界（replace前）だけを実processで扱う。改変そのものの拒否はTask 18のledger targetが担う。
 - GUI windowの表示・人間操作・macOSのCmd+Qは確認していない。実quitはRustの `request_quit` pathをwindowlessで駆動した。
 - crash後の人間resume（`confirm_resume` を伴う `resume_sdd_execute`）はこのtargetでは実行しない。成立済みcommitが `pending_link` として残り、resumeなしに結び付かないことだけを確認する。
+- Task 24の実接続受入は**未実行**である。gateとrunnerはtest-onlyで、transportはin-memory記録用だけ。実provider、実account、実Keychain、実login、実model送信の証拠はない。
+- Task 24のplan fixtureは合成planであり、実planの意味・品質・仕様適合を証明しない。実pack inspectorの構文・schema受入だけを確認する。
+- Task 24の変換は、gateが受入可能なmanifestを作るための形式と拒否条件を定めるが、実接続の人間承認そのものではない。`acceptance.manifest.json` はテンプレートのまま保持する。
+- 有限要求数・retry・料金/枠の表示はmanifestのfieldで表すが、実provider request数・実料金は未計測である。
