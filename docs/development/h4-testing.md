@@ -1,6 +1,6 @@
 # H4 SDD execution: 実Tauri lifecycle テスト手順
 
-H4の正本仕様は [H4 design](../sdd/specs/2026-11-13-h4-sdd-execute-design.md)、H1/H2の追加契約は [H1 design](../sdd/specs/2026-11-07-h1-runtime-design.md) と [H2 design](../sdd/specs/2026-11-08-h2-supervision-design.md)。この文書はTask 23で追加した、実 `herness-desktop` processによるwindow非依存進行・実quit・再起動・host commit境界crashの再現手順を記録する。
+H4の正本仕様は [H4 design](../sdd/specs/2026-11-13-h4-sdd-execute-design.md)、H1/H2の追加契約は [H1 design](../sdd/specs/2026-11-07-h1-runtime-design.md) と [H2 design](../sdd/specs/2026-11-08-h2-supervision-design.md)。この文書はTask 23で追加した、実 `herness-desktop` processによるwindow非依存進行・実quit・再起動・host commit境界crashの再現手順を記録する。Task 24が評価fixtureと実接続gateを、Task 25が受入runbook（下記「受入runbook」）とPhase A実行結果を追加した。受入の判定と未確認一覧は [2026-11-13-h4-acceptance.md](../research/2026-11-13-h4-acceptance.md)。
 
 ## 結論
 
@@ -287,6 +287,126 @@ H4_ACCEPTANCE_MANIFEST=/absolute/path/to/approved.manifest.json \
 | `cargo clippy --workspace --all-targets --locked` | warningなし |
 
 `acceptance` の既定実行は外部要求0、socket接続0。期限切れ、範囲外、要求/retry上限、料金/枠欠落、credential拡張、継承未確認の改変は送信前に拒否する。実provider欄は `not_executed` / `confirmed=false` である。
+
+## 実行結果（Task 25、Phase A受入）
+
+herness HEAD `3d6245cbf1a9422e5324de1c1c0bbca65c814a0c`（clean）、pack `b210b3aac3faf84c5ad201aa6502dface8c4cdf2`。
+
+| command | result |
+| --- | --- |
+| `cargo fmt --all -- --check` | 差分なし |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | warning 0 |
+| `cargo test --workspace --locked` | 1回目 1206 passed / 1 failed / 2 ignored（既知flakeで中断）→ 再実行 **1300 passed / 0 failed / 5 ignored**（78 test target + 11 doc-test target） |
+| `cargo build -p herness-desktop --locked` | success |
+| smoke / close-reopen / quit（fresh絶対root） | 各exit 0、`SMOKE_OK` / `CLOSE_REOPEN_OK` / `QUIT_OK save=confirmed stop=confirmed` |
+| `--test native_lifecycle`（H4、`--test-threads=1`） | 2 passed |
+| `--test native_lifecycle`（H3） | 1 passed |
+| `--test render`（実WKWebView） | 3 passed |
+| `--test acceptance`（H4、実pack） | 12 passed、`accepted=2 refused=7 connections=0` |
+| `--test cross_phase`（H4） | 11 passed、`commits=4 loopback_requests=4` |
+| `--test acceptance`（H3、実pack＋実WKWebView） | 14 passed |
+| pack `uvx pytest -q` | 620 passed |
+| `python3 -m pytest -q` | pytestなし（exit 1）。隠さず記録 |
+
+`docs/sdd/plans` と `docs/sdd/specs` は両repoで無変更（`git diff --stat <baseline>..HEAD` が空）。したがってchanged Targetは0件で、HTML検証の対象はない。`docs/research/` と `docs/development/` はpolicy Targetではない。
+
+Phase Bは未実行（人間の許可なし）。詳細と未確認一覧は [受入記録](../research/2026-11-13-h4-acceptance.md)。
+
+## 受入runbook（Task 25で追加）
+
+H4のPhase A受入を再現する手順。実行結果は [2026-11-13-h4-acceptance.md](../research/2026-11-13-h4-acceptance.md)。すべてworktree root、debug profile。
+
+### 前提
+
+```sh
+git rev-parse HEAD                      # herness revisionを記録する
+git status --porcelain                  # 空であることを確認する
+git -C "$SDD_PACK_ROOT" rev-parse HEAD  # pack revisionを記録する
+git -C "$SDD_PACK_ROOT" status --porcelain
+rustc --version && cargo --version && sw_vers
+```
+
+`SDD_PACK_ROOT=/Users/h-uma/Documents/sdd/.worktrees/h4-exec` を絶対パスで固定する。packを変更しない。system Pythonにpytestがない場合は `uvx pytest` を使う（`python3 -m pytest` は `No module named pytest` で失敗する）。
+
+### 1. 静的なgate
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build -p herness-desktop --locked
+```
+
+`cargo build -p herness-desktop` はnative fixtureより先に実行する。`target/debug/herness-desktop` がないとnative fixtureはfakeへfallbackせず失敗する（`HERNESS_DESKTOP_BIN` で差し替え可能）。
+
+### 2. 既存Tauri launcher（fresh絶対root）
+
+rootは実行ごとに新規作成する。相対パスは `HERNESS_APP_DATA_ROOT must be an absolute path` でexit 134になる。
+
+```sh
+ROOT="/private/var/folders/.../herness-h4-acceptance.$$"
+mkdir -p "$ROOT/smoke" "$ROOT/close-reopen" "$ROOT/quit"
+HERNESS_APP_DATA_ROOT="$ROOT/smoke"          target/debug/herness-desktop --smoke-test
+HERNESS_APP_DATA_ROOT="$ROOT/close-reopen"   target/debug/herness-desktop --close-reopen-test
+HERNESS_APP_DATA_ROOT="$ROOT/quit"           target/debug/herness-desktop --quit-test
+```
+
+期待: `SMOKE_OK`、`CLOSE_REOPEN_OK ... previous_generation=1 generation=2`、`QUIT_OK ... save=confirmed stop=confirmed`。各rootには新規 `herness.sqlite3` とWAL/SHMだけができる。これら3 launcherはproviderを選択せず（`tests/runtime/tests/acceptance.rs` が4 flagでassert）、payload送信の計器を持たない。
+
+### 3. native lifecycle fixture
+
+```sh
+cargo test -p herness-sdd-execute-tests --test native_lifecycle --locked -- --test-threads=1 --nocapture
+cargo test -p herness-html-sync-tests --test native_lifecycle --locked
+cargo test -p herness-html-sync-tests --test render --locked
+```
+
+H4は2 passed（`windowless_commit_progress_and_restart_send_nothing`、`each_crash_boundary_...`）、H3は1 passed、renderは3 passed。`--nocapture` を付けると `H4_NATIVE_EVIDENCE`（head/baseline/commits/connections/class）と `H4_LIFECYCLE_OK` 行が出る。caseは独立したfresh rootを使い、static mutexで直列実行する。
+
+### 4. 実packとloopbackの受入
+
+```sh
+SDD_PACK_ROOT="$SDD_PACK_ROOT" cargo test -p herness-sdd-execute-tests --test acceptance --locked -- --nocapture
+SDD_PACK_ROOT="$SDD_PACK_ROOT" cargo test -p herness-sdd-execute-tests --test cross_phase --locked -- --nocapture
+SDD_PACK_ROOT="$SDD_PACK_ROOT" cargo test -p herness-html-sync-tests --test acceptance --locked -- --nocapture
+```
+
+期待: `H4_ACCEPTANCE_PLANS: accepted=2 refused=7 connections=0`、`CROSS_PHASE_EVIDENCE ... commits=4 loopback_requests=4`、H3 acceptance 14 passed。`--nocapture` で拒否理由（`H4_ACCEPTANCE_PLAN_REFUSED:`）とcommit範囲が読める。H3 acceptanceは実WKWebView childを使うため1 targetあたり2分程度かかる。
+
+### 5. pack
+
+```sh
+cd "$SDD_PACK_ROOT" && uvx pytest -q
+```
+
+期待: 620 passed。`python3 -m pytest -q` はpytestがないため失敗する。失敗した事実は隠さず記録し、`uvx` の結果と併記する。
+
+### 6. HTML Target
+
+```sh
+git diff --stat <baseline>..HEAD -- docs/sdd/plans docs/sdd/specs
+git -C "$SDD_PACK_ROOT" diff --stat <pack-baseline>..HEAD -- docs/sdd/plans docs/sdd/specs
+```
+
+両方空なら変更Targetはなく、`html-docs check --paths` の対象はない。空であることを報告し、未変更pathへ `validate` を当てた結果を「Target検証」と称さない。`docs/research/` と `docs/development/` はHTML policyのTargetではない（対象は `CONTEXT.md`、`docs/adr/**.md`、`docs/sdd/{plans,specs}/*.md`）。
+
+### holdの読み方
+
+| 表示 | 意味 | 扱い |
+| --- | --- | --- |
+| `H4_LIFECYCLE_OK: ... request_count=0` | 起動・pump・quitが外部要求0 | pass |
+| `states=...=WaitingHuman pump_errors=1` | 未確認ledgerをerror行として報告 | hold（進捗ではない）。成功として集計しない |
+| `git=[Unknown]` / `progress=[Unknown]` | 結果不明で人間のresume確認待ち | hold。再dispatchも再commitもしない |
+| `REFUSAL ... completed=0 commits=0` | 負例が正しく停止 | pass（誤進行0の証拠） |
+| `H4_ACCEPTANCE_DEFAULT_DENY: ... template_status=not_authorized` | 実接続gateの既定拒否 | pass。実provider欄は `not_executed` |
+| `Unsupported { feature: "assessment request failed: ..." }` や20秒pump timeout | 既知のH2 loopback flake | 単独再実行し、flakeと単独結果の両方を記録する。assertを弱めない |
+
+### 既知のflake（この環境で観測）
+
+- `herness-supervision-tests/tests/desktop.rs` の `permission_composition::html_assessment_uses_its_own_profile_consent_origin_and_the_same_cycle_ledger` が並列負荷で `assessment request is invalid` になる。単独再実行でpass。
+- `permission_composition::real_pi_uses_the_owner_packet_scope_and_conversation_for_two_runs` が `timed out waiting for 5 requests and 2 runs ... target_unstable` で20秒timeoutになる（Task 9/11/19のreportに既記載）。単独再実行でpass。
+
+どちらもTask 25のcode変更に起因しない（working tree cleanのBASEで観測）。flakeを「修正」するために無関係なcodeを触らない。
 
 ## 未確認範囲
 
