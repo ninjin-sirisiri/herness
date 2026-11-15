@@ -12,7 +12,11 @@ use herness_core::tools::{
     BashArgs, BashExecutor, BashOutput, NonEmptyText, ProcessSupervisor, Purpose, SystemLauncher,
     ToolArguments, ToolExecutor, ToolGateway,
 };
-use herness_core::{AbsolutePath, OperationId, OperationOutcome, RunId, Timestamp, ToolName};
+use herness_core::{
+    AbsolutePath, Checkpoint, CheckpointCommit, CommitReceipt, CoreError, EventDraft, HistoryPage,
+    HistoryQuery, OperationId, OperationIntent, OperationOutcome, OperationRecord, OperationResult,
+    ProjectId, RequestGateIntent, RunId, StorePort, Timestamp, ToolName,
+};
 use herness_supervision::freshness::{ManifestCoverage, TargetReadSet};
 use herness_supervision::supervisor::{CheckExecution, CheckExecutionRequest, RequiredCheckPort};
 use herness_supervision::verification::{
@@ -196,7 +200,7 @@ impl RequiredCheckPort for HostCheckPort {
         let bash = BashExecutor::new(
             self.agent,
             self.session,
-            self.store.clone(),
+            CheckAuditStore::new(self.store.clone(), operation.operation_id(), run),
             SystemLauncher,
             ProcessSupervisor::new(),
         )
@@ -227,7 +231,135 @@ impl RequiredCheckPort for HostCheckPort {
 }
 
 struct CheckExecutor {
-    bash: BashExecutor<StoreHandle, SystemLauncher>,
+    bash: BashExecutor<CheckAuditStore, SystemLauncher>,
+}
+
+/// Audit-only [`StorePort`] adapter for a host-run required check.
+///
+/// The H1 `bash` executor persists an audit checkpoint, an operation intent
+/// and events before spawning, and again when the process group is created and
+/// resolved. For a check the host runs on behalf of a supervised child, that
+/// audit data must not land in the child run's checkpoint slot: the slot holds
+/// the engine conversation checkpoint that `start_continuation` validates.
+///
+/// This adapter keeps the durability contract and changes only the destination:
+///
+/// * the operation row, the audit checkpoint body, and the events commit in one
+///   immediate transaction through [`Store::commit_operation_audit`], so a
+///   crashed check still leaves a visible intent and its audit payload;
+/// * the audit checkpoint body is stored under a host-state key namespaced by
+///   the check operation, never in the `checkpoints` table;
+/// * [`StorePort::load_checkpoint`] never reports a conversation checkpoint, so
+///   the executor cannot mistake audit data for an engine snapshot.
+pub(crate) struct CheckAuditStore {
+    store: StoreHandle,
+    operation: OperationId,
+    run: RunId,
+}
+
+impl CheckAuditStore {
+    /// Creates an audit sink bound to one check operation and its run.
+    pub(crate) const fn new(store: StoreHandle, operation: OperationId, run: RunId) -> Self {
+        Self {
+            store,
+            operation,
+            run,
+        }
+    }
+
+    fn state_key(&self) -> String {
+        format!("h2.supervision.check.audit:{}", self.operation)
+    }
+}
+
+impl StorePort for CheckAuditStore {
+    fn commit_checkpoint(&mut self, commit: CheckpointCommit) -> Result<CommitReceipt, CoreError> {
+        if commit.checkpoint().run_id() != self.run {
+            return Err(CoreError::MismatchedRun {
+                expected: self.run,
+                found: commit.checkpoint().run_id(),
+            });
+        }
+        if let Some(intent) = commit.operation()
+            && intent.operation().operation_id() != self.operation
+        {
+            return Err(CoreError::InvalidValue {
+                field: "checkAuditOperation".to_owned(),
+                violation: herness_core::ArgumentViolation::Invalid {
+                    detail: "the audit commit belongs to another operation".to_owned(),
+                },
+            });
+        }
+        let bytes =
+            serde_json::to_vec(commit.checkpoint()).map_err(|error| CoreError::InvalidValue {
+                field: "checkAuditCheckpoint".to_owned(),
+                violation: herness_core::ArgumentViolation::Invalid {
+                    detail: error.to_string(),
+                },
+            })?;
+        self.store
+            .lock()
+            .commit_operation_audit(
+                &self.state_key(),
+                &bytes,
+                commit.operation(),
+                commit.events().to_vec(),
+            )
+            .map_err(Into::into)
+    }
+
+    fn load_checkpoint(&self, _run: &RunId) -> Result<Option<Checkpoint>, CoreError> {
+        // A check has no conversation. Reporting the audit payload here would
+        // let a caller treat it as an engine snapshot.
+        Ok(None)
+    }
+
+    fn history(&self, query: HistoryQuery) -> Result<HistoryPage, CoreError> {
+        self.store.history(query)
+    }
+
+    fn pending_operations(&self, project: &ProjectId) -> Result<Vec<OperationIntent>, CoreError> {
+        self.store.pending_operations(project)
+    }
+
+    fn operation(&self, operation: &OperationId) -> Result<Option<OperationRecord>, CoreError> {
+        self.store.operation(operation)
+    }
+
+    fn record_operation_result(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+    ) -> Result<(), CoreError> {
+        self.store.record_operation_result(operation, result)
+    }
+
+    fn record_operation_result_with_events(
+        &mut self,
+        operation: &OperationId,
+        result: OperationResult,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, CoreError> {
+        self.store
+            .record_operation_result_with_events(operation, result, events)
+    }
+
+    fn record_model_request(
+        &mut self,
+        intent: RequestGateIntent,
+        recorded_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        self.store.record_model_request(intent, recorded_at)
+    }
+
+    fn record_model_request_observation(
+        &mut self,
+        observation: herness_core::ModelRequestObservation,
+        observed_at: Timestamp,
+    ) -> Result<(), CoreError> {
+        self.store
+            .record_model_request_observation(observation, observed_at)
+    }
 }
 
 impl ToolExecutor for CheckExecutor {
