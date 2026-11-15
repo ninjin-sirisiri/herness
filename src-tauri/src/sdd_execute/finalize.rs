@@ -52,6 +52,7 @@ use herness_sdd_execute::{
     TreeSha, classify_commit,
 };
 
+use crate::sdd_execute::crash::{self, CrashPoint};
 use crate::sdd_execute::git::GitRunner;
 
 /// `unavailable` feature prefix used for a failed host commit.
@@ -304,6 +305,9 @@ where
     ) -> Result<GitCommitOutcome, herness_sdd_execute::SddExecutionError> {
         let authorization = self.authorization(authorization)?;
         let intent = self.intent(entry)?;
+        // The journal intent is durable before this call. A crash here leaves a
+        // recorded intent and no Git process, which recovery reports as unknown.
+        crash::hit(CrashPoint::BeforeHostCommit);
         let report = self
             .boundary()
             .commit(&intent, &authorization)
@@ -312,6 +316,10 @@ where
                 // persisted, and then it started no Git process at all.
                 unavailable(HOST_COMMIT_FEATURE, &error.to_string())
             })?;
+        // The real commit exists here. The H4 journal result is recorded by the
+        // caller after this returns, so a crash at this point leaves an
+        // established commit with no result to attach to it.
+        crash::hit(CrashPoint::AfterHostCommit);
         Ok(outcome_from_report(&report))
     }
 

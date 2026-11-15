@@ -46,10 +46,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use herness_sdd_execute::{
-    ExecutionRevision, ExecutionSnapshot, ExecutionStorePort, FailureDetails, ProgressJournalEntry,
-    ProgressLedgerOutcome, ProgressLedgerPort, ProgressWriteOutcome, SddExecutionError, StopRecord,
-    write_progress,
+    ExecutionRevision, ExecutionSnapshot, ExecutionStorePort, FailureDetails, LedgerInput,
+    LedgerWorktree, PROGRESS_LEDGER_PATH, ProgressJournalEntry, ProgressJournalId,
+    ProgressLedgerOutcome, ProgressLedgerPort, ProgressWriteOutcome, ProgressWriteRequest,
+    RequestIdentity, SddExecutionError, StopRecord, write_progress,
 };
+
+use crate::sdd_execute::crash::{self, CrashPoint};
+use crate::sdd_execute::host_commit::StoreExecutionPort;
+use crate::supervision::store::StoreHandle;
 
 /// `unavailable` feature prefix used for a failed progress write.
 pub const PROGRESS_LEDGER_FEATURE: &str = "sdd_execute.progressLedger";
@@ -195,6 +200,9 @@ impl DesktopProgressLedger {
                 reason: herness_sdd_execute::ProgressFailure::TemporaryFileFailed,
             });
         }
+        // The ledger intent is already durable here and the destination has not
+        // been replaced. A crash leaves the recorded intent without a result.
+        crash::hit(CrashPoint::BeforeProgressReplace);
         if fs::rename(&temporary, &destination).is_err() {
             let _ = fs::remove_file(&temporary);
             return Ok(ProgressWriteOutcome::Failed {
@@ -321,6 +329,90 @@ pub fn hold_after_progress(
     stop: StopRecord,
 ) -> Result<ExecutionRevision, SddExecutionError> {
     herness_sdd_execute::hold_next_task(store, snapshot, stop)
+}
+
+/// Writes the compatibility ledger after a Task completion.
+///
+/// The request identity is derived from the execution and its current revision,
+/// so a retry of the same completion re-reads the recorded intent instead of
+/// writing again. Any failure — including one that happens before a write
+/// result exists — becomes a durable `waiting_human` hold, so the pump can never
+/// start the next Task past an unreconciled ledger. This is the production
+/// caller of [`write_and_hold`] that the app-lifetime pump uses.
+pub fn write_compatibility_ledger(
+    store: StoreHandle,
+    snapshot: &ExecutionSnapshot,
+) -> Result<ProgressWriteResult, SddExecutionError> {
+    let project = snapshot.project_id();
+    let execution = snapshot.execution_id();
+    let mut port = StoreExecutionPort::new(store);
+    let mut ledger =
+        match DesktopProgressLedger::new(snapshot.workspace().canonical_checkout_root()) {
+            Ok(ledger) => ledger,
+            Err(error) => return hold_for_ledger_error(&mut port, snapshot, error.to_string()),
+        };
+    let input = match LedgerInput::from_snapshot(snapshot, LedgerWorktree::InPlace, Vec::new()) {
+        Ok(input) => input,
+        Err(error) => return hold_for_ledger_error(&mut port, snapshot, error.to_string()),
+    };
+    let identity = match RequestIdentity::new(
+        project,
+        execution,
+        progress_request_id(execution, snapshot.revision()),
+        snapshot.revision(),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => return hold_for_ledger_error(&mut port, snapshot, error.to_string()),
+    };
+    let request = match ProgressWriteRequest::new(identity, input, PROGRESS_LEDGER_PATH) {
+        Ok(request) => request,
+        Err(error) => return hold_for_ledger_error(&mut port, snapshot, error.to_string()),
+    };
+    match write_and_hold(&mut port, &mut ledger, &request, snapshot) {
+        Ok(result) => Ok(result),
+        Err(error) => hold_for_ledger_error(&mut port, snapshot, error.to_string()),
+    }
+}
+
+/// Converts a ledger planning failure into the durable hold the next Task needs.
+fn hold_for_ledger_error(
+    store: &mut StoreExecutionPort,
+    snapshot: &ExecutionSnapshot,
+    detail: String,
+) -> Result<ProgressWriteResult, SddExecutionError> {
+    let reason = herness_sdd_execute::ProgressHoldReason::ResultUnknown;
+    let stop = reason.stop();
+    let revision = hold_after_progress(store, snapshot, stop)?;
+    Ok(ProgressWriteResult {
+        outcome: ProgressLedgerOutcome::HumanWait { reason, stop },
+        revision,
+        held: true,
+        stop: Some(stop),
+        detail: Some(detail),
+    })
+}
+
+/// The deterministic progress request of one completion revision.
+///
+/// The same execution and revision always yield the same request, so a crash
+/// before the replacement re-reads the recorded intent and reconciles it by the
+/// document digest instead of writing a second document.
+fn progress_request_id(
+    execution: herness_sdd_execute::ExecutionId,
+    revision: ExecutionRevision,
+) -> ProgressJournalId {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"h4.task.progress\0");
+    hasher.update(execution.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(revision.get().to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ProgressJournalId::from_parts(execution.project_id(), uuid::Uuid::from_bytes(bytes))
 }
 
 /// Writes one Task's compatibility brief file from the approved plan body.

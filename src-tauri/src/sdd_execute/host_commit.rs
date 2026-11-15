@@ -289,7 +289,16 @@ impl<G> DesktopHostCommit<G> {
     ) -> Result<Vec<ChangedPath>, SddExecutionError> {
         let mut runner = self.checkout.runner();
         let mut changes = runner.changes_since(root, base.as_str())?;
+        // The compatibility ledger, briefs, and reports are host outputs under
+        // `.sdd`, not Task deliverables. They are never staged, and an untracked
+        // `.sdd/progress.md` must not look like an unrelated change. This mirrors
+        // the workspace comparison, which already ignores `.sdd` when it checks
+        // for dirt outside the compatibility tree.
+        changes.retain(|change| !is_compatibility_output(change.path()));
         for path in runner.untracked_paths(root)? {
+            if is_compatibility_output(&path) {
+                continue;
+            }
             if !changes.iter().any(|change| change.path() == path) {
                 changes.push(GitChange::new(path, GitChangeKind::Added));
             }
@@ -358,8 +367,14 @@ where
 ///
 /// H4's finalize flow needs only the Git journal and the snapshot revision, so
 /// this adapter forwards exactly the port's methods to the real store.
-struct StoreExecutionPort {
+pub(crate) struct StoreExecutionPort {
     store: StoreHandle,
+}
+
+impl StoreExecutionPort {
+    pub(crate) const fn new(store: StoreHandle) -> Self {
+        Self { store }
+    }
 }
 
 impl ExecutionStorePort for StoreExecutionPort {
@@ -493,6 +508,15 @@ fn read_checkout_file(root: &str, path: &str) -> Result<Vec<u8>, SddExecutionErr
             ),
         )
     })
+}
+
+/// Whether one project-relative path belongs to the compatibility outputs.
+///
+/// The host writes `.sdd/progress.md`, Task briefs, and (through the implementer)
+/// Task reports there. They are never part of an approved Task commit, so the
+/// change and untracked enumerations skip the whole `.sdd` tree.
+fn is_compatibility_output(path: &str) -> bool {
+    path == ".sdd" || path.starts_with(".sdd/")
 }
 
 fn not_ready() -> SddExecutionError {

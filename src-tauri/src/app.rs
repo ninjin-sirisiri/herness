@@ -21,6 +21,24 @@ use crate::host::DesktopHost;
 use crate::html_sync::RenderTestLaunch;
 use crate::lifecycle;
 use crate::login::LoginManager;
+use crate::sdd_execute::crash::CrashPoint;
+
+/// The explicit windowless H4 lifecycle launch.
+///
+/// It is a native test mode, not a production surface. It creates no main
+/// window, selects no project, and drives the same app-lifetime host pump the
+/// production shell runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H4LifecycleLaunch {
+    /// The durable boundary to crash at, when this process must die there.
+    pub crash_point: Option<CrashPoint>,
+    /// Whether to finish through the real explicit-quit path after reporting.
+    ///
+    /// `false` is for a recovery observation: the launcher reports the
+    /// reconciled state and exits without the quit hooks writing another stop
+    /// over it.
+    pub quit: bool,
+}
 
 /// How this desktop process was launched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +56,8 @@ pub enum LaunchMode {
     },
     /// Desktop child-process render evidence launcher.
     RenderTest(RenderTestLaunch),
+    /// Windowless H4 lifecycle launcher (native test mode).
+    H4Lifecycle(H4LifecycleLaunch),
 }
 
 impl Default for LaunchMode {
@@ -55,7 +75,9 @@ impl Default for LaunchMode {
 ///
 /// Unknown flags are ignored, matching the existing launchers. `--h3-render-test`
 /// requires a fixture directory and an output directory and cannot be combined
-/// with the normal window launchers.
+/// with the normal window launchers. `--h4-lifecycle-test` is the explicit
+/// windowless H4 test mode; its crash selector and no-quit sub-flag are rejected
+/// without it, so a production launch cannot arm the crash hook.
 pub fn parse_launch_mode<I>(args: I) -> Result<LaunchMode, String>
 where
     I: IntoIterator<Item = String>,
@@ -64,6 +86,9 @@ where
     let mut quit_test = false;
     let mut close_reopen_test = false;
     let mut h3_lifecycle_test = false;
+    let mut h4_lifecycle_test = false;
+    let mut h4_crash_point = None;
+    let mut h4_quit = true;
     let mut render: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
     let mut budget_ms = 30_000u64;
     let mut cancel_after_ms = None;
@@ -74,6 +99,24 @@ where
             "--quit-test" => quit_test = true,
             "--close-reopen-test" => close_reopen_test = true,
             "--h3-lifecycle-test" => h3_lifecycle_test = true,
+            "--h4-lifecycle-test" => h4_lifecycle_test = true,
+            "--h4-crash-point" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--h4-crash-point requires a boundary name".to_owned())?;
+                let point = CrashPoint::parse(&value).ok_or_else(|| {
+                    format!(
+                        "--h4-crash-point {value} is not one of: {}",
+                        CrashPoint::ALL
+                            .iter()
+                            .map(|point| point.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+                h4_crash_point = Some(point);
+            }
+            "--h4-lifecycle-no-quit" => h4_quit = false,
             "--h3-render-test" => {
                 let fixture = arguments
                     .next()
@@ -111,6 +154,16 @@ where
     if h3_lifecycle_test && (smoke_test || quit_test || close_reopen_test) {
         return Err("--h3-lifecycle-test cannot be combined with the window launchers".to_owned());
     }
+    if (h4_crash_point.is_some() || !h4_quit) && !h4_lifecycle_test {
+        return Err(
+            "--h4-crash-point and --h4-lifecycle-no-quit require --h4-lifecycle-test".to_owned(),
+        );
+    }
+    if h4_lifecycle_test
+        && (smoke_test || quit_test || close_reopen_test || h3_lifecycle_test || render.is_some())
+    {
+        return Err("--h4-lifecycle-test cannot be combined with other launchers".to_owned());
+    }
     if let Some((fixture_dir, output_dir)) = render {
         if smoke_test || quit_test || close_reopen_test || h3_lifecycle_test {
             return Err("--h3-render-test cannot be combined with the window launchers".to_owned());
@@ -120,6 +173,12 @@ where
             output_dir,
             budget_ms,
             cancel_after_ms,
+        }));
+    }
+    if h4_lifecycle_test {
+        return Ok(LaunchMode::H4Lifecycle(H4LifecycleLaunch {
+            crash_point: h4_crash_point,
+            quit: h4_quit,
         }));
     }
     Ok(LaunchMode::Normal {
@@ -157,6 +216,55 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                 start_render_test(app, launch.clone());
                 return Ok(());
             }
+            if let LaunchMode::H4Lifecycle(launch) = &mode {
+                // This is an explicit native test mode. It refuses to fall back
+                // to the real application-data directory or to a real provider,
+                // and it installs a fake credential port so no Keychain item is
+                // read. The pack root is still the real approved pack.
+                let root = std::env::var("HERNESS_APP_DATA_ROOT")
+                    .map(PathBuf::from)
+                    .map_err(|_| "--h4-lifecycle-test requires HERNESS_APP_DATA_ROOT")?;
+                if !root.is_absolute() {
+                    return Err("HERNESS_APP_DATA_ROOT must be an absolute path".into());
+                }
+                std::fs::create_dir_all(&root)?;
+                let pack_root = std::env::var_os("SDD_PACK_ROOT")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or("--h4-lifecycle-test requires an absolute SDD_PACK_ROOT")?;
+                let endpoint = std::env::var("HERNESS_H4_TEST_ENDPOINT")
+                    .map_err(|_| "--h4-lifecycle-test requires HERNESS_H4_TEST_ENDPOINT")?;
+                let endpoints =
+                    ProviderEndpoints::for_loopback(endpoint.clone(), endpoint.clone())?;
+                let assessment = herness_assessment::AssessmentEndpoints::for_loopback(
+                    endpoint.clone(),
+                    endpoint.clone(),
+                    endpoint,
+                )?;
+                let connections = ConnectionAdmin::new();
+                let credential_admin =
+                    CredentialService::new(connections.directory(), MacKeychainVault::default())
+                        .admin();
+                let (host, reconciliation) = DesktopHost::open_with_html_sync_test_boundaries(
+                    &root,
+                    connections,
+                    Arc::new(lifecycle::h4::H4TestCredentials),
+                    endpoints,
+                    Some(pack_root),
+                    assessment,
+                )?;
+                app.manage(AppState {
+                    host: Mutex::new(host),
+                    credential_admin,
+                    login: Mutex::new(None),
+                    selected_project: Mutex::new(None),
+                    reconciliation: Mutex::new(reconciliation),
+                });
+                // The launcher pumps the host itself, so no generic host-pump
+                // thread competes with it and the counts stay deterministic.
+                lifecycle::h4::start(app, launch.clone());
+                return Ok(());
+            }
             let (smoke_test, quit_test, close_reopen_test, h3_lifecycle_test) = match &mode {
                 LaunchMode::Normal {
                     smoke_test,
@@ -169,7 +277,9 @@ pub fn run(mode: LaunchMode) -> Result<(), Box<dyn std::error::Error>> {
                     *close_reopen_test,
                     *h3_lifecycle_test,
                 ),
-                LaunchMode::RenderTest(_) => unreachable!("render mode returned above"),
+                LaunchMode::RenderTest(_) | LaunchMode::H4Lifecycle(_) => {
+                    unreachable!("test launchers returned above")
+                }
             };
 
             let root = application_data_root(app)?;
@@ -410,6 +520,56 @@ mod tests {
         assert!(
             parse_launch_mode(args(&["--h3-lifecycle-test", "--smoke-test"])).is_err(),
             "the windowless lifecycle launcher cannot also create a window"
+        );
+    }
+
+    #[test]
+    fn h4_lifecycle_launch_is_explicit_and_its_sub_flags_are_bounded() {
+        assert_eq!(
+            parse_launch_mode(args(&["--h4-lifecycle-test"])).expect("h4 lifecycle"),
+            LaunchMode::H4Lifecycle(H4LifecycleLaunch {
+                crash_point: None,
+                quit: true,
+            })
+        );
+        assert_eq!(
+            parse_launch_mode(args(&[
+                "--h4-lifecycle-test",
+                "--h4-crash-point",
+                "after-host-commit",
+                "--h4-lifecycle-no-quit",
+            ]))
+            .expect("h4 crash"),
+            LaunchMode::H4Lifecycle(H4LifecycleLaunch {
+                crash_point: Some(CrashPoint::AfterHostCommit),
+                quit: false,
+            })
+        );
+        assert!(
+            parse_launch_mode(args(&["--h4-crash-point", "after-host-commit"])).is_err(),
+            "a crash point without the test mode must be rejected"
+        );
+        assert!(
+            parse_launch_mode(args(&["--h4-lifecycle-no-quit"])).is_err(),
+            "the no-quit sub-flag without the test mode must be rejected"
+        );
+        assert!(
+            parse_launch_mode(args(&[
+                "--h4-lifecycle-test",
+                "--h4-crash-point",
+                "sometimes"
+            ]))
+            .is_err(),
+            "an unknown boundary is refused"
+        );
+        assert!(
+            parse_launch_mode(args(&["--h4-lifecycle-test", "--smoke-test"])).is_err(),
+            "the H4 launcher cannot also create a window"
+        );
+        assert!(
+            parse_launch_mode(args(&["--h4-lifecycle-test", "--h3-render-test", "a", "b"]))
+                .is_err(),
+            "the H4 launcher cannot also be the render child"
         );
     }
 }

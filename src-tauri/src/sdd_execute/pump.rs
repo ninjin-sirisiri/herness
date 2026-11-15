@@ -58,11 +58,13 @@ use crate::sdd_execute::barrier::{
 use crate::sdd_execute::coordinator::{
     ApprovedTaskLaunch, child_status_from_view, dispatch_h2_task, reconcile_h2_task,
 };
+use crate::sdd_execute::crash::{self, CrashPoint};
 use crate::sdd_execute::finalize::{
     ApprovedCommitIdentity, GitCheckoutObserver, HostGitCommitBoundary,
 };
 use crate::sdd_execute::git::GitRunner;
 use crate::sdd_execute::host_commit::{DesktopHostCommit, TaskCommitExpectation};
+use crate::sdd_execute::ledger::write_compatibility_ledger;
 use crate::sdd_execute::plan_changes::{ChildStopRequest, PlanChangeWiring};
 use crate::sdd_execute::registry::{ApprovalDraft, H4StartApprovalRegistry};
 use crate::sdd_execute::source::read_and_verify_specs;
@@ -225,6 +227,19 @@ pub fn run(state: &mut SddExecuteState, context: &mut SddPumpContext<'_>) -> Sdd
         match advance_one(state, context, stored) {
             Ok(outcome) => {
                 report.advanced += 1;
+                // A completion writes the compatibility ledger. A restarted
+                // `ready_for_finish` execution is terminal, so the coordinator
+                // reports `Finished`; its ledger intent may still be unresolved
+                // from a crash and must be reconciled before the restart is
+                // treated as complete.
+                let completed = match &outcome {
+                    CoordinatorOutcome::TaskCompleted { .. }
+                    | CoordinatorOutcome::ReadyForFinish { .. } => true,
+                    CoordinatorOutcome::Finished { state } => {
+                        *state == ExecutionState::ReadyForFinish
+                    }
+                    _ => false,
+                };
                 match outcome {
                     CoordinatorOutcome::Dispatched { .. } => report.dispatched += 1,
                     CoordinatorOutcome::AwaitingChild { .. } => report.awaiting += 1,
@@ -241,6 +256,13 @@ pub fn run(state: &mut SddExecuteState, context: &mut SddPumpContext<'_>) -> Sdd
                     | CoordinatorOutcome::Replayed { .. }
                     | CoordinatorOutcome::Finished { .. } => {}
                 }
+                if completed {
+                    // The compatibility ledger is written after the durable
+                    // completion and before the next Task may be dispatched. A
+                    // failure, an external edit, or an unconfirmed result holds
+                    // the execution in `waiting_human` instead of advancing.
+                    write_ledger_after_completion(context, snapshot, &mut report);
+                }
             }
             Err(error) => report
                 .errors
@@ -250,7 +272,56 @@ pub fn run(state: &mut SddExecuteState, context: &mut SddPumpContext<'_>) -> Sdd
     report
 }
 
+/// Writes the compatibility ledger for a just-completed Task.
+///
+/// The current snapshot is re-read from the store so the document reflects the
+/// durable completion (the Task's range included). A hold is not reported as
+/// progress: it is recorded as an error line and the execution is already
+/// `waiting_human`, so the next pass cannot dispatch another Task.
+fn write_ledger_after_completion(
+    context: &SddPumpContext<'_>,
+    snapshot: &ExecutionSnapshot,
+    report: &mut SddPumpReport,
+) {
+    let project = snapshot.project_id();
+    let execution = snapshot.execution_id();
+    let current = match lock_store(context.store).load_sdd_execution(project, execution) {
+        Ok(Some(stored)) => stored.snapshot().clone(),
+        Ok(None) => {
+            report
+                .errors
+                .push(format!("{execution}: the completion snapshot is gone"));
+            return;
+        }
+        Err(error) => {
+            report.errors.push(format!(
+                "{execution}: the completion snapshot is unreadable: {error}"
+            ));
+            return;
+        }
+    };
+    match write_compatibility_ledger(StoreHandle::new(Arc::clone(context.store)), &current) {
+        Ok(result) if result.held() => {
+            report.stopped += 1;
+            report.errors.push(format!(
+                "{execution}: the compatibility ledger held the next Task: {}",
+                result.detail().unwrap_or("the write was not confirmed")
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => report.errors.push(format!(
+            "{execution}: the compatibility ledger failed: {error}"
+        )),
+    }
+}
+
 /// A state the pump may advance. Waiting/stopped/terminal states need a human.
+///
+/// `committing` is deliberately excluded. Within one process the coordinator
+/// writes that state and completes synchronously, so the pump never observes it
+/// between passes. A stored `committing` therefore means the previous process
+/// died at the host-commit boundary: the saved intent/result must be reconciled
+/// by a human resume, and the pump must never re-enter a commit for it.
 const fn pump_eligible(state: ExecutionState) -> bool {
     matches!(
         state,
@@ -258,7 +329,6 @@ const fn pump_eligible(state: ExecutionState) -> bool {
             | ExecutionState::Running
             | ExecutionState::WaitingHtml
             | ExecutionState::Verifying
-            | ExecutionState::Committing
             | ExecutionState::ReadyForFinish
     )
 }
@@ -1024,6 +1094,13 @@ impl herness_sdd_execute::TaskCompletionPort for LaneCompletion<'_> {
         if let Some(hold) = report.decision().hold() {
             return Ok(TaskCompletion::HumanWait { stop: hold.stop()? });
         }
-        HostCommitCompletion::commit(&mut *self.commit, request, &verified)
+        let completion = HostCommitCompletion::commit(&mut *self.commit, request, &verified)?;
+        // The real commit result is durable here, and the coordinator has not yet
+        // stored the Task completion snapshot. A crash leaves the established
+        // result for recovery to attach, never a second commit.
+        if matches!(completion, TaskCompletion::Complete { .. }) {
+            crash::hit(CrashPoint::BeforeDbResult);
+        }
+        Ok(completion)
     }
 }

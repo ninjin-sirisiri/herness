@@ -167,6 +167,7 @@ pub mod barrier;
 pub mod composition;
 pub mod controller;
 pub mod coordinator;
+pub mod crash;
 pub mod finalize;
 pub mod git;
 pub mod host_commit;
