@@ -30,6 +30,9 @@ use herness_store::{Store, StoreConfig};
 use crate::html_sync::assessment::HtmlAssessmentHost;
 use crate::html_sync::composition::HtmlSyncServices;
 use crate::html_sync::recovery::{HtmlSyncRecoveryHost, HtmlSyncStartupReport};
+use crate::sdd_execute::recovery::{
+    DesktopRecoveryHost, H4QuitReport, H4StartupReport, SupervisionChildren,
+};
 use crate::supervision::assessment::{AssessmentHost, HostAssessmentPort};
 use crate::supervision::permission::PermissionRuntime;
 use crate::supervision::plan::ConfigStore;
@@ -37,7 +40,7 @@ use crate::supervision::runtime::DesktopH1;
 use crate::supervision::store::StoreHandle;
 use crate::supervision::{
     ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, HumanConfirmation,
-    PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
+    PlanRequestActor, PumpScope, PurposeStatusView, RecoveryView, SupervisionHost, SupervisionView,
 };
 use herness_html_sync::observer::{DependencyKind, DependencyPath};
 use herness_html_sync::{H3StorePort, PublicationFileReadPort};
@@ -61,6 +64,9 @@ pub struct DesktopHost {
     credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
     app_data_root: PathBuf,
     endpoints: ProviderEndpoints,
+    sdd_recovery: DesktopRecoveryHost,
+    sdd_pump: crate::sdd_execute::SddExecuteState,
+    last_sdd_pump: crate::sdd_execute::SddPumpReport,
 }
 
 impl DesktopHost {
@@ -191,6 +197,43 @@ impl DesktopHost {
             evaluator,
             Some((assessment, checks)),
             None,
+        )
+    }
+
+    /// Test-only composition seam for the H4 cross-phase acceptance test.
+    ///
+    /// It combines the real pack root with the scripted required-check and
+    /// condition-assessment ports and an optional permission evaluator, so the
+    /// real plan inspector, SQLite store, Git checkout, H2 supervision path, and
+    /// Pi engine run against loopback only. This is never selected by the desktop
+    /// shell and is not an IPC command.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_sdd_test_boundaries(
+        app_data_root: impl AsRef<Path>,
+        connections: ConnectionAdmin,
+        credentials: Arc<dyn herness_core::CredentialPort + Send + Sync>,
+        endpoints: ProviderEndpoints,
+        pack_root: Option<PathBuf>,
+        evaluator: Option<SharedPermissionEvaluator>,
+        assessment: Option<
+            Box<dyn herness_supervision::supervisor::ConditionAssessmentPort + Send>,
+        >,
+        checks: Option<Box<dyn herness_supervision::supervisor::RequiredCheckPort + Send>>,
+    ) -> Result<(Self, ReconciliationReport), String> {
+        let test_ports = match (assessment, checks) {
+            (Some(assessment), Some(checks)) => Some((assessment, checks)),
+            _ => None,
+        };
+        Self::open_inner(
+            app_data_root,
+            connections,
+            credentials,
+            endpoints,
+            AssessmentEndpoints::official(),
+            evaluator,
+            test_ports,
+            pack_root,
         )
     }
 
@@ -340,7 +383,16 @@ impl DesktopHost {
             credentials,
             app_data_root: app_data_root.as_ref().to_path_buf(),
             endpoints,
+            sdd_recovery: DesktopRecoveryHost::new(
+                StoreHandle::new(Arc::clone(&store)),
+                git_executable(),
+            ),
+            sdd_pump: crate::sdd_execute::SddExecuteState::new(),
+            last_sdd_pump: crate::sdd_execute::SddPumpReport::default(),
         };
+        // The H4 restore is read-only: it reconciles the saved dispatch, child,
+        // Git, progress, and control records and issues no external request.
+        host.restore_sdd_execute();
         let reconciliation = host.restore_connection_settings(report)?;
         Ok((host, reconciliation))
     }
@@ -459,6 +511,13 @@ impl DesktopHost {
         if self.runtime.is_shutting_down() {
             return Ok(report);
         }
+        // The H4 pump runs before the H2 pump so a newly dispatched Task's
+        // readiness gate and bound commit half are installed for the same tick.
+        let sdd = self.pump_sdd_execute();
+        self.last_sdd_pump = sdd.clone();
+        for error in &sdd.errors {
+            eprintln!("SDD_PUMP_ERROR: {error}");
+        }
         let projects = self
             .runtime
             .projects()
@@ -466,21 +525,18 @@ impl DesktopHost {
             .into_iter()
             .map(|view| view.project_id())
             .collect::<Vec<_>>();
-        // An active H3 target must be pumped with its candidate handle installed;
-        // otherwise the H2 start tick could start a child with native tools. The
-        // H3 worker owns that tick. The generic H2 pump therefore skips exactly
-        // the project with the active H3 slot and still advances every other
-        // project independently of a window or UI selection.
-        let h3_active_project = self.html_sync.active_project();
-        let h2_projects = projects
-            .iter()
-            .copied()
-            .filter(|project| Some(*project) != h3_active_project)
-            .collect::<Vec<_>>();
+        // An active H3 target must be pumped with its candidate handle
+        // installed; otherwise the H2 start tick could start a child with
+        // native tools. The H3 worker owns exactly that one target. Every
+        // other target in the same project — including an H4 Task target —
+        // keeps advancing here with the native adapter, independently of a
+        // window or UI selection.
+        let h3_target = self.html_sync.active_target();
         let plans = self.supervision.plans();
         let store = self.store_handle();
         let mut adapter = DesktopH1::new(&mut self.runtime, store, plans);
-        if let Err(error) = self.supervision.pump(&mut adapter, &h2_projects) {
+        let scope = PumpScope::for_active_candidate(projects, h3_target);
+        if let Err(error) = self.supervision.pump_scoped(&mut adapter, scope) {
             // Supervision progress is independent from the H1 pump. A single
             // H2 failure must not stop H1 event delivery; it is retried on the
             // next bounded interval.
@@ -575,6 +631,53 @@ impl DesktopHost {
         Ok(report)
     }
 
+    /// The H4 pass `pump` ran most recently.
+    ///
+    /// `pump` already runs the H4 pass; exposing its report keeps a caller from
+    /// running a second pass just to read the counts.
+    pub const fn last_sdd_pump(&self) -> &crate::sdd_execute::SddPumpReport {
+        &self.last_sdd_pump
+    }
+
+    /// Runs one H4 pass and returns its report.
+    ///
+    /// It advances at most the execution holding the app-wide implementer slot,
+    /// independent of any window or selected project. During explicit shutdown it
+    /// does nothing and reports `skipped`. `pump` calls this too, so a caller
+    /// that only wants the counts reads [`Self::last_sdd_pump`] instead of
+    /// running a second pass.
+    pub fn pump_sdd_execute(&mut self) -> crate::sdd_execute::SddPumpReport {
+        let pack_root = self.html_sync_services.pack_root().map(Path::to_path_buf);
+        let shutting_down = self.runtime.is_shutting_down();
+        let test_gate = self.sdd_pump.test_gate();
+        let Self {
+            runtime,
+            supervision,
+            store,
+            sdd_pump,
+            ..
+        } = self;
+        let mut context = crate::sdd_execute::SddPumpContext {
+            runtime,
+            supervision,
+            store,
+            pack_root,
+            shutting_down,
+            test_gate,
+        };
+        crate::sdd_execute::run_sdd_pump(sdd_pump, &mut context)
+    }
+
+    /// Installs the common staged-document gate for a test composition.
+    ///
+    /// This is a `#[doc(hidden)]` seam for the cross-phase target. The desktop
+    /// shell never calls it, and the production pump always runs the approved
+    /// pack's `scripts/sdd-html-pre-commit`.
+    #[doc(hidden)]
+    pub fn set_sdd_test_commit_gate(&mut self, gate: herness_core::HostGitGate) {
+        self.sdd_pump.set_test_commit_gate(gate);
+    }
+
     /// Marks active supervision records for quit using the real H1 stop report.
     ///
     /// This is called after H1 coordinated stops and before finish_shutdown. It
@@ -640,6 +743,91 @@ impl DesktopHost {
     /// Last H3 startup reconciliation report, when startup ran.
     pub const fn html_sync_startup(&self) -> Option<&HtmlSyncStartupReport> {
         self.html_sync.last_startup()
+    }
+
+    /// Last H4 startup reconciliation. It is read-only: nothing was re-sent.
+    pub const fn sdd_startup(&self) -> &H4StartupReport {
+        self.sdd_recovery.startup()
+    }
+
+    /// Last H4 quit result.
+    pub const fn sdd_quit(&self) -> &H4QuitReport {
+        self.sdd_recovery.quit()
+    }
+
+    /// The reconciled H4 report of one execution.
+    pub fn sdd_recovery_report(
+        &self,
+        execution_id: herness_sdd_execute::ExecutionId,
+    ) -> Option<&herness_sdd_execute::RecoveryReport> {
+        self.sdd_recovery.report(execution_id)
+    }
+
+    /// App-lifetime H4 recovery composition.
+    ///
+    /// This is not an IPC surface; Task 21 owns the trusted command wiring. It is
+    /// exposed so the quit path and the tests drive the same instance.
+    pub const fn sdd_recovery(&self) -> &DesktopRecoveryHost {
+        &self.sdd_recovery
+    }
+
+    /// Mutable H4 recovery composition for the trusted command layer.
+    pub fn sdd_recovery_mut(&mut self) -> &mut DesktopRecoveryHost {
+        &mut self.sdd_recovery
+    }
+
+    /// Restores the H4 state after a restart without any external request.
+    ///
+    /// It reconciles the saved dispatch, child, Git, progress, and control records
+    /// and keeps the report. It starts no child, sends no request, stages nothing,
+    /// and commits nothing.
+    pub fn restore_sdd_execute(&mut self) -> H4StartupReport {
+        let mut children = SupervisionChildren::new(&self.supervision);
+        self.sdd_recovery.restore(&mut children)
+    }
+
+    /// Closes new H4 dispatch, sends, and commits before the coordinated stops.
+    ///
+    /// A failed H4 save is reported in the returned report so the quit flow can
+    /// treat it as a reason quit did not complete. It never starts or resumes
+    /// anything.
+    pub fn begin_sdd_quit(&mut self) -> H4QuitReport {
+        self.sdd_recovery.begin_quit()
+    }
+
+    /// Writes the confirmed or unconfirmed H4 stop after the H1 stops.
+    ///
+    /// A stop H1 did not confirm is recorded as unconfirmed; it is never reported
+    /// as a confirmed stop.
+    pub fn mark_sdd_for_quit(
+        &mut self,
+        report: &herness_core::runtime::ShutdownReport,
+    ) -> H4QuitReport {
+        self.sdd_recovery.mark_quit(report)
+    }
+
+    /// Resumes one H4 execution after a human confirmation.
+    ///
+    /// This is the human-resume entry point Task 21 exposes. The confirmation is
+    /// the type [`crate::sdd_execute::recovery::confirm_resume`] mints from the
+    /// trusted main window; a plan, a preview, or a request payload cannot make
+    /// one. `inputs` is the live observation of every approved input the command
+    /// layer rebuilds before it calls; `gate` is the 1 s plan-change gate when the
+    /// composition wired one.
+    ///
+    /// The call re-observes Git, the unresolved operations, the current plan and
+    /// spec snapshots, permissions, consents, and the remaining budget, then links
+    /// at most one clearly established commit or records the durable hold.
+    pub fn resume_sdd_execute(
+        &mut self,
+        request: &herness_sdd_execute::ResumeRequest,
+        inputs: &herness_sdd_execute::ApprovalInputs,
+        gate: Option<&mut dyn herness_sdd_execute::PlanChangeGatePort>,
+    ) -> Result<herness_sdd_execute::ResumeOutcome, String> {
+        let mut children = SupervisionChildren::new(&self.supervision);
+        self.sdd_recovery
+            .resume(request, &mut children, gate, inputs)
+            .map_err(|error| error.to_string())
     }
 
     /// App-lifetime H3 recovery host.
@@ -1735,7 +1923,7 @@ impl DesktopHost {
 /// Task 22 registers the canonical shared stylesheet only. Referenced images and
 /// other resources are added by later acceptance work; an unsupplied path is
 /// never treated as a dependency change.
-fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
+pub(crate) fn default_dependencies(root: &Path) -> Vec<DependencyPath> {
     let mut dependencies = Vec::new();
     let css = "docs/sdd/assets/sdd.css";
     if root.join(css).is_file()
@@ -1978,6 +2166,25 @@ impl StorePort for SharedStore {
 // ---------------------------------------------------------------------------
 // Runtime executor for adapter-reported awaiting-approval operations.
 // ---------------------------------------------------------------------------
+
+/// The absolute Git executable the read-only H4 recovery observation uses.
+///
+/// The committed path is preferred so no `PATH` lookup decides which binary runs;
+/// a build without it falls back to the local Git installation and, when neither
+/// exists, to `None` so a commit classification stays `unknown` instead of being
+/// guessed.
+fn git_executable() -> Option<herness_core::AbsolutePath> {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return herness_core::AbsolutePath::new(candidate).ok();
+        }
+    }
+    None
+}
 
 /// Executes only the frozen operations the trusted engine adapter refused to run
 /// because a human decision was required.

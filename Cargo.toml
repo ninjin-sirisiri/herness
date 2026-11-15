@@ -6,8 +6,10 @@ members = [
     "crates/herness-supervision",
     "crates/herness-html-sync",
     "crates/herness-assessment",
+    "crates/herness-sdd-execute",
     "tests/supervision",
     "tests/html-sync",
+    "tests/sdd-execute",
     "src-tauri",
     "tests/runtime",
 ]

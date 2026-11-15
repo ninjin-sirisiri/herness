@@ -23,7 +23,9 @@ use herness_supervision::evidence::{
     CheckStatus, EvidenceAcquirer, EvidenceOutcome, EvidenceRecord, EvidenceScope,
     RequiredCheckResult, TargetVersion, VerificationOperation,
 };
-use herness_supervision::freshness::{InputOrigin, WorkspaceInput, WorkspaceSnapshotPort};
+use herness_supervision::freshness::{
+    InputOrigin, WorkspaceInput, WorkspaceSnapshotPort, input_manifest_digest,
+};
 use herness_supervision::ids::{
     BudgetRequestId, CheckId, ConditionId, EvidenceId, SupervisionId, SupervisionRequestId,
 };
@@ -40,8 +42,8 @@ use herness_supervision::supervisor::{
     capture_target_snapshot,
 };
 use herness_supervision_tests::{
-    assessment_result, completion_profile, contract, contract_succeeding, ids, now, project,
-    record, target_scope,
+    approved_checks_mode_condition_set, assessment_result, completion_profile, contract,
+    contract_succeeding, contract_with_conditions, ids, now, project, target_scope,
 };
 use uuid::Uuid;
 
@@ -630,21 +632,28 @@ impl RequiredCheckPort for FakeChecks {
             CheckStatus::NotRun => (None, "synthetic check was not run"),
             CheckStatus::Unavailable => (None, "synthetic check was unavailable"),
         };
+        let mut read_set = request.read_set().to_vec();
+        for path in request.invocation().input_paths() {
+            if !read_set.contains(path) {
+                read_set.push(path.clone());
+            }
+        }
         let snapshot = capture_target_snapshot(
             &self.workspace,
             &TargetSnapshotRequest::new(
                 self.project,
                 self.supervision,
                 request.target_version(),
-                request.read_set().to_vec(),
+                read_set,
             ),
         )?;
+        let input_digest = input_manifest_digest(&snapshot, request.invocation().input_paths())?;
         let evidence = EvidenceRecord::new(
             request.evidence_id(),
             self.supervision,
             Some(request.condition_id()),
             Some(request.check_id()),
-            EvidenceAcquirer::ChildAgent,
+            EvidenceAcquirer::Host,
             request.operation().clone(),
             EvidenceOutcome::new(exit_code, None, false, false, detail).expect("outcome"),
             snapshot.target_scope()?,
@@ -657,7 +666,11 @@ impl RequiredCheckPort for FakeChecks {
             request.sequence(),
             now(),
         )
-        .expect("evidence");
+        .expect("evidence")
+        .with_invocation(herness_supervision::EvidenceInvocation::new(
+            request.invocation().clone(),
+            input_digest,
+        ));
         let result = RequiredCheckResult::new(
             request.check_id(),
             request.condition_id(),
@@ -680,7 +693,6 @@ struct FakeAssessment {
     default_verdict: ConditionVerdict,
     calls: Vec<AssessmentRequest>,
     hook: Option<Box<dyn FnMut()>>,
-    requires_assessment: bool,
 }
 
 impl FakeAssessment {
@@ -691,12 +703,7 @@ impl FakeAssessment {
             default_verdict: ConditionVerdict::Met,
             calls: Vec::new(),
             hook: None,
-            requires_assessment: true,
         }
-    }
-
-    fn disable_semantic_assessment(&mut self) {
-        self.requires_assessment = false;
     }
 
     fn push_verdict(&mut self, condition: ConditionId, verdict: ConditionVerdict) {
@@ -723,10 +730,6 @@ impl FakeAssessment {
 }
 
 impl ConditionAssessmentPort for FakeAssessment {
-    fn requires_assessment(&self, _condition: &herness_supervision::conditions::Condition) -> bool {
-        self.requires_assessment
-    }
-
     fn profile(
         &self,
         binding: herness_supervision::profiles::ProfileBinding,
@@ -889,10 +892,25 @@ impl Harness {
 
     fn with_policy(policy: BudgetPolicy) -> Self {
         let project = project();
+        Self::with_contract(policy, contract(project))
+    }
+
+    fn with_checks_mode() -> Self {
+        let project = project();
+        Self::with_contract(
+            BudgetPolicy::h2_default(),
+            contract_with_conditions(project, approved_checks_mode_condition_set(project)),
+        )
+    }
+
+    fn with_contract(
+        policy: BudgetPolicy,
+        contract: herness_supervision::SupervisionContract,
+    ) -> Self {
+        let project = project();
         let supervision = ids(project).supervision;
-        let contract = contract(project);
         let order = OrderLog::default();
-        let store = TestStore::new(record(project), order.clone());
+        let store = TestStore::new(SupervisionRecord::new(&contract), order.clone());
         let workspace = FakeWorkspace::fixture();
         let evidence = FakeEvidenceStore::default();
         let runtime = FakeRuntime::new(
@@ -972,6 +990,7 @@ impl Harness {
             runtime: &mut self.runtime,
             checks: &mut self.checks,
             assessment: &mut self.assessment,
+            readiness: None,
             evidence: &mut self.evidence,
             store: &mut self.store,
             budget: &mut self.budget,
@@ -1741,8 +1760,7 @@ fn complete_normally_with_last_event(h: &mut Harness) -> (SupervisionRequestId, 
 
 #[test]
 fn deterministic_conditions_complete_from_required_checks_without_model_assessment() {
-    let mut h = Harness::new();
-    h.assessment.disable_semantic_assessment();
+    let mut h = Harness::with_checks_mode();
     let _ = start_and_complete_first_input(&mut h);
     let report = h.evaluate_until_blocked(80);
     assert_eq!(report.outcome(), TickOutcome::Completed);
@@ -1935,6 +1953,12 @@ fn seed_check_evidence(
         now(),
     )
     .expect("seeded evidence");
+    let input_digest =
+        input_manifest_digest(&snapshot, check.invocation().input_paths()).expect("input digest");
+    record = record.with_invocation(herness_supervision::EvidenceInvocation::new(
+        check.invocation().clone(),
+        input_digest,
+    ));
     if let Some(observer) = observer {
         record = record.with_observer(observer);
     }

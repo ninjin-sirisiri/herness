@@ -326,6 +326,105 @@ impl Store {
         Ok(CommitReceipt::new(events, max_sequence))
     }
 
+    /// Commits an operation intent, its audit events, and private host state
+    /// without writing a run checkpoint row.
+    ///
+    /// This is the host-only path for work that must not own a conversation's
+    /// checkpoint slot, such as a required check the host runs for a supervised
+    /// child. The operation row, the events, and the host-state record still
+    /// commit in one immediate transaction, so intent-before-side-effect and
+    /// result-after hold exactly as on [`Store::commit`]. No checkpoint row is
+    /// created or replaced, and the checkpoint body is kept only in host state.
+    pub fn commit_operation_audit(
+        &mut self,
+        state_key: &str,
+        state_value: &[u8],
+        intent: Option<&OperationIntent>,
+        events: Vec<EventDraft>,
+    ) -> Result<CommitReceipt, StoreError> {
+        if state_key.trim().is_empty() {
+            return Err(StoreError::corrupt(
+                "an audit commit needs a host-state key",
+            ));
+        }
+        let Some(project) = intent
+            .map(|intent| intent.operation().project_id())
+            .or_else(|| events.first().map(EventDraft::project_id))
+        else {
+            return Err(StoreError::corrupt(
+                "an audit commit needs an operation intent or an event",
+            ));
+        };
+        for event in &events {
+            if event.project_id() != project {
+                return Err(StoreError::CrossProjectReference {
+                    expected: project,
+                    found: event.project_id(),
+                });
+            }
+            let Some(run) = event.run_id() else {
+                return Err(StoreError::UnsupportedHostActivityEvent);
+            };
+            let Some(intent) = intent else {
+                continue;
+            };
+            if run != intent.operation().run_id() {
+                return Err(StoreError::corrupt(
+                    "audit event belongs to another run than its operation",
+                ));
+            }
+            if event
+                .operation_id()
+                .is_some_and(|id| id != intent.operation().operation_id())
+            {
+                return Err(StoreError::corrupt(
+                    "audit event belongs to another operation",
+                ));
+            }
+        }
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if self.fault.commit == Some(CommitPoint::BeforeRows) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeRows.as_str(),
+            });
+        }
+
+        if let Some(intent) = intent {
+            let operation_id = intent.operation().operation_id();
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id = ?1)",
+                [operation_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Err(StoreError::DuplicateOperation {
+                    operation: operation_id,
+                });
+            }
+        }
+
+        let (events, _) = append_event_drafts(&transaction, &project, &events)?;
+        let max_sequence = events.last().map_or(0, Event::sequence);
+
+        if let Some(intent) = intent {
+            insert_operation(&transaction, intent)?;
+        }
+        write_host_state(&transaction, state_key, state_value)?;
+
+        if self.fault.commit == Some(CommitPoint::BeforeCommit) {
+            return Err(StoreError::InjectedFault {
+                point: CommitPoint::BeforeCommit.as_str(),
+            });
+        }
+
+        transaction.commit().map_err(StoreError::database)?;
+        Ok(CommitReceipt::new(events, max_sequence))
+    }
+
     /// Loads the latest checkpoint for a run, including the sequence observed at
     /// checkpoint commit.
     pub fn load_checkpoint_record(
@@ -1920,7 +2019,7 @@ fn commit_command_atomically(
     Ok(revision)
 }
 
-fn write_host_state(
+pub(crate) fn write_host_state(
     transaction: &Transaction<'_>,
     key: &str,
     value: &[u8],

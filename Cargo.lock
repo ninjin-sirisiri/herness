@@ -1341,6 +1341,7 @@ dependencies = [
  "herness-core",
  "herness-engine-pi",
  "herness-html-sync",
+ "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
  "notify",
@@ -1422,6 +1423,7 @@ dependencies = [
  "herness-core",
  "herness-desktop",
  "herness-engine-pi",
+ "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
  "ring",
@@ -1432,11 +1434,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "herness-sdd-execute"
+version = "0.1.0"
+dependencies = [
+ "herness-core",
+ "herness-html-sync",
+ "herness-supervision",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "herness-sdd-execute-tests"
+version = "0.1.0"
+dependencies = [
+ "herness-assessment",
+ "herness-core",
+ "herness-desktop",
+ "herness-engine-pi",
+ "herness-html-sync",
+ "herness-sdd-execute",
+ "herness-store",
+ "herness-supervision",
+ "herness-supervision-tests",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "herness-store"
 version = "0.1.0"
 dependencies = [
  "herness-core",
  "herness-html-sync",
+ "herness-sdd-execute",
  "herness-supervision",
  "rusqlite",
  "serde",
@@ -1464,6 +1499,8 @@ dependencies = [
  "herness-core",
  "herness-desktop",
  "herness-engine-pi",
+ "herness-html-sync",
+ "herness-sdd-execute",
  "herness-store",
  "herness-supervision",
  "serde_json",

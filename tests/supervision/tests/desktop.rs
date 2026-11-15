@@ -47,7 +47,7 @@ use herness_supervision::supervisor::{
 };
 use herness_supervision::{
     AdapterVersion, AssessmentOutcome, AssessmentProvenance, AssessmentRequest, AssessmentResult,
-    ChangeKind, CheckStatus, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer,
+    ChangeKind, CheckStatus, ConditionMode, ConditionVerdict, DisclosureDataKind, EvidenceAcquirer,
     EvidenceOutcome, EvidenceRecord, EvidenceScope, OwnerApprovalSource, OwnerKind,
     OwnerLaunchRejection, OwnerRef, OwnerSupersessionRejection, ProfilePurpose, ProfileThresholds,
     ProviderKind, ProviderOrigin, RubricVersion, SupervisionError, SupervisionId,
@@ -343,19 +343,29 @@ impl RequiredCheckPort for PassCheck {
     ) -> Result<CheckExecution, SupervisionError> {
         let workspace =
             herness_desktop::supervision::workspace::ProjectWorkspace::new(self.root.clone());
+        let mut read_set = request.read_set().to_vec();
+        for path in request.invocation().input_paths() {
+            if !read_set.contains(path) {
+                read_set.push(path.clone());
+            }
+        }
         let manifest = herness_supervision::freshness::capture_manifest(
             &workspace,
             request.project_id(),
             request.target_version(),
-            TargetReadSet::Declared(request.read_set().to_vec()),
+            TargetReadSet::Declared(read_set),
         )?;
         let target = manifest.target_scope()?;
+        let input_digest = herness_supervision::freshness::input_manifest_digest(
+            &manifest,
+            request.invocation().input_paths(),
+        )?;
         let evidence = EvidenceRecord::new(
             request.evidence_id(),
             request.supervision_id(),
             Some(request.condition_id()),
             Some(request.check_id()),
-            EvidenceAcquirer::ChildAgent,
+            EvidenceAcquirer::Host,
             request.operation().clone(),
             EvidenceOutcome::new(Some(0), None, false, false, "exit=0")?,
             target,
@@ -366,7 +376,11 @@ impl RequiredCheckPort for PassCheck {
             CheckStatus::Pass,
             request.sequence(),
             Timestamp::now(),
-        )?;
+        )?
+        .with_invocation(herness_supervision::EvidenceInvocation::new(
+            request.invocation().clone(),
+            input_digest,
+        ));
         let result = herness_supervision::RequiredCheckResult::from_evidence(
             &evidence,
             request.condition_version(),
@@ -511,9 +525,13 @@ fn request(project: ProjectId, connection: ConnectionId) -> CreateSupervisionReq
         conditions: vec![ConditionInput {
             title: "The check passes".to_owned(),
             rubric: "The required check must pass on the current target.".to_owned(),
+            mode: ConditionMode::Assessment,
             checks: vec![CheckInput {
                 command: "true".to_owned(),
                 description: "trivial passing command".to_owned(),
+                cwd: ".".to_owned(),
+                timeout_seconds: 60,
+                input_paths: Vec::new(),
             }],
         }],
         read_set: vec!["src/main.rs".to_owned()],
@@ -793,6 +811,7 @@ fn model_actor_and_missing_human_confirmation_cannot_change_conditions() {
         conditions: Some(vec![ConditionInput {
             title: "Changed".to_owned(),
             rubric: "Changed".to_owned(),
+            mode: ConditionMode::Assessment,
             checks: vec![],
         }]),
         condition_version: Some(2),
@@ -1237,9 +1256,13 @@ fn explicit_condition_change_updates_the_plan_contract_before_resume() {
         conditions: Some(vec![ConditionInput {
             title: "The replacement check passes".to_owned(),
             rubric: "The replacement check must pass on the current target.".to_owned(),
+            mode: ConditionMode::Assessment,
             checks: vec![CheckInput {
                 command: "true".to_owned(),
                 description: "replacement check".to_owned(),
+                cwd: ".".to_owned(),
+                timeout_seconds: 60,
+                input_paths: Vec::new(),
             }],
         }]),
         condition_version: Some(2),
@@ -1592,6 +1615,7 @@ fn stale_owner_registry_entry_is_refused_before_stop_or_generation_change() {
     supersede.conditions = Some(vec![ConditionInput {
         title: "Changed generation condition".to_owned(),
         rubric: "The changed target must be reassessed.".to_owned(),
+        mode: ConditionMode::Assessment,
         checks: vec![],
     }]);
     supersede.condition_version = Some(2);
@@ -1825,6 +1849,8 @@ fn model_actor_missing_confirmation_and_h4_never_start_a_run() {
         OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("H4 binding");
     let mut registry = ScriptedOwnerApprovalRegistry::new();
     registry.insert(h4_binding.approval().clone());
+    // The H3-shaped registry never authorizes an H4 owner, even with an entry;
+    // H4 approval is minted only from the dedicated H4 registry port.
     assert!(matches!(
         authorize_owner_launch(&registry, &h4_binding, Timestamp::now()),
         Err(SupervisionError::OwnerLaunchRejected {
@@ -2365,7 +2391,7 @@ mod permission_composition {
     };
     use herness_supervision::{
         AdapterVersion, AssessmentRequest, AssessmentResult, BudgetLedger, BudgetPolicy,
-        BudgetRequestId, CheckStatus, Condition, ConditionId, ConsentBlock, DecisionId,
+        BudgetRequestId, CheckStatus, ConditionId, ConditionMode, ConsentBlock, DecisionId,
         DisclosureDataKind, DisclosureRequest, EvidenceAcquirer, EvidenceId, EvidenceOutcome,
         EvidenceRecord, EvidenceScope, ProfileBinding, ProfilePurpose, ProfileThresholds,
         ProfileUnavailable, ProviderKind, ProviderOrigin, RequiredCheckResult, RubricVersion,
@@ -2407,10 +2433,6 @@ mod permission_composition {
     struct DeterministicAssessment;
 
     impl ConditionAssessmentPort for DeterministicAssessment {
-        fn requires_assessment(&self, _condition: &Condition) -> bool {
-            false
-        }
-
         fn profile(
             &self,
             _binding: ProfileBinding,
@@ -2869,9 +2891,13 @@ mod permission_composition {
                             title: "The real check passes".to_owned(),
                             rubric: "The failing scripted check forces one continuation."
                                 .to_owned(),
+                            mode: ConditionMode::Checks,
                             checks: vec![super::CheckInput {
                                 command: "false".to_owned(),
                                 description: "scripted failing check".to_owned(),
+                                cwd: ".".to_owned(),
+                                timeout_seconds: 60,
+                                input_paths: Vec::new(),
                             }],
                         }],
                         read_set: vec!["src/main.rs".to_owned()],
@@ -2954,9 +2980,13 @@ mod permission_composition {
                         conditions: vec![super::ConditionInput {
                             title: "The check passes".to_owned(),
                             rubric: "fixture".to_owned(),
+                            mode: ConditionMode::Checks,
                             checks: vec![super::CheckInput {
                                 command: "true".to_owned(),
                                 description: "fixture check".to_owned(),
+                                cwd: ".".to_owned(),
+                                timeout_seconds: 60,
+                                input_paths: Vec::new(),
                             }],
                         }],
                         read_set: vec!["src/main.rs".to_owned()],
@@ -3591,9 +3621,13 @@ mod permission_composition {
                     conditions: vec![super::ConditionInput {
                         title: "The check passes".to_owned(),
                         rubric: "The Html assessment fixture uses a stable target.".to_owned(),
+                        mode: ConditionMode::Assessment,
                         checks: vec![super::CheckInput {
                             command: "true".to_owned(),
                             description: "fixture check".to_owned(),
+                            cwd: ".".to_owned(),
+                            timeout_seconds: 60,
+                            input_paths: Vec::new(),
                         }],
                     }],
                     read_set: vec!["src/main.rs".to_owned()],

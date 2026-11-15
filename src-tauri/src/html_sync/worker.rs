@@ -36,7 +36,9 @@ use crate::host::DesktopRuntime;
 use crate::supervision::plan::{StoredPlan, load_plan};
 use crate::supervision::runtime::DesktopH1;
 use crate::supervision::store::StoreHandle;
-use crate::supervision::{SupersedeSupervisionRequest, SupervisionHost};
+use crate::supervision::{
+    PumpScope, SupersedeSupervisionRequest, SupervisionHost, SupervisionTarget,
+};
 
 /// Canonical workspace readers for every open project.
 ///
@@ -148,9 +150,18 @@ impl HtmlSyncWorker {
 
     /// Project with the active authoring slot, when one exists.
     pub fn active_project(&self) -> Option<ProjectId> {
-        self.coordinator
-            .active_owner()
-            .map(|owner| owner.job().project_id())
+        self.active_target().map(SupervisionTarget::project)
+    }
+
+    /// Exact supervision target with the active authoring slot, when one
+    /// exists.
+    ///
+    /// The app-wide slot is one, so this is at most one `(project,
+    /// supervision)` pair and never depends on a window or UI selection.
+    pub fn active_target(&self) -> Option<SupervisionTarget> {
+        self.coordinator.active_owner().map(|owner| {
+            SupervisionTarget::new(owner.job().project_id(), owner.job().supervision_id())
+        })
     }
 
     /// Documents in dirty notification order.
@@ -281,11 +292,16 @@ impl HtmlSyncWorker {
             // never start with native tools.
             let run_missing = runtime.run(owner.job().project_id(), owner.run()).is_err();
             if run_missing {
+                let target =
+                    SupervisionTarget::new(owner.job().project_id(), owner.job().supervision_id());
                 let plans = supervision.plans();
                 let mut adapter = DesktopH1::new(runtime, self.store.clone(), plans);
-                adapter.set_candidate_artifact(Some(owner.handle().clone()));
+                adapter.bind_candidate(target, owner.handle().clone());
+                // Only the exact H3 candidate target is ticked here. Other
+                // targets in the same project stay with the native host pump,
+                // so candidate tools cannot leak into a Task target.
                 supervision
-                    .pump(&mut adapter, &[owner.job().project_id()])
+                    .pump_scoped(&mut adapter, PumpScope::OnlyCandidate(target))
                     .map_err(|error| H3Error::Unavailable {
                         capability: "h2.pump".to_owned(),
                         detail: error.to_string(),
@@ -790,7 +806,7 @@ impl AuthoringControlPort for SupervisionAuthoringControl<'_> {
         )?;
         let plans = self.supervision.plans();
         let mut adapter = DesktopH1::new(self.runtime, self.store.clone(), plans);
-        adapter.set_candidate_artifact(Some(handle.clone()));
+        adapter.bind_candidate(SupervisionTarget::new(project, supervision), handle.clone());
         self.supervision.start_approved_owner(
             &mut adapter,
             authority,
@@ -902,7 +918,7 @@ impl AuthoringControlPort for SupervisionAuthoringControl<'_> {
         };
         let plans = self.supervision.plans();
         let mut adapter = DesktopH1::new(self.runtime, self.store.clone(), plans);
-        adapter.set_candidate_artifact(Some(handle.clone()));
+        adapter.bind_candidate(SupervisionTarget::new(project, supervision), handle.clone());
         let range_registry = RangeConsentApprovalRegistry {
             inner: self.registry,
             store: self.store.clone(),

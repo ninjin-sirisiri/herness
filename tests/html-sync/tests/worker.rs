@@ -524,6 +524,7 @@ impl Fixture {
                         rubric: "All source units, conditions, and exceptions are visible and \
                                  supported by the provenance mapping."
                             .to_owned(),
+                        mode: herness_supervision::ConditionMode::Assessment,
                         checks: Vec::new(),
                     }],
                     read_set: vec![TARGET.to_owned()],

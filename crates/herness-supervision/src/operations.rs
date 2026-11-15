@@ -497,6 +497,7 @@ pub fn ensure_owner_supersedable(record: &SupervisionRecord) -> Result<(), Super
                 SupervisionReason::WaitingHuman { action } => *action,
                 SupervisionReason::ConditionsChanged { .. } => HumanAction::ConfirmConditions,
                 SupervisionReason::TargetChanged { .. } => HumanAction::ConfirmTarget,
+                SupervisionReason::ReadinessBlocked { .. } => HumanAction::ConfirmHtmlReadiness,
                 _ => HumanAction::ReconcileRecovery,
             };
             Err(rejected_supersession(

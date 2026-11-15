@@ -42,8 +42,9 @@ use crate::tools::arguments::BashArgs;
 use crate::tools::gateway::ToolExecutor;
 use crate::tools::process::{
     CaptureHandle, DEFAULT_CAPTURE_TIMEOUT, DEFAULT_CONFIRM_TIMEOUT, DEFAULT_OUTPUT_LIMIT,
-    DEFAULT_TIMEOUT_GRACE, ManagedChild, ManagedSignal, ProcessLauncher, ProcessSupervisor,
-    SpawnRequest, SystemLauncher, signal_process_group, spawn_failure, supervise,
+    DEFAULT_TIMEOUT_GRACE, ManagedChild, ManagedOwner, ManagedSignal, ProcessLauncher,
+    ProcessSupervisor, SpawnRequest, SystemLauncher, signal_process_group, spawn_failure,
+    supervise,
 };
 use crate::tools::{ToolArguments, ToolName};
 
@@ -362,9 +363,9 @@ impl<S: StorePort, L: ProcessLauncher> ToolExecutor for BashExecutor<S, L> {
         };
         let pid = child.pid();
         let pgid = pid;
-        let _lease = self
-            .supervisor
-            .register(operation.operation_id(), pid, pgid);
+        let _lease =
+            self.supervisor
+                .register(ManagedOwner::Operation(operation.operation_id()), pid, pgid);
         drop(spawn_gate);
         if _lease.is_none() {
             // Defensive: stop began during the spawn window. Terminate

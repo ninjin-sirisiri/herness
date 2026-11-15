@@ -788,6 +788,34 @@ impl<W: WorkspaceSnapshotPort, C: ClockPort> FreshnessService<W, C> {
     }
 }
 
+/// Digest over the observed content of exactly the declared input paths.
+///
+/// A declared path the manifest does not cover is an explicit error instead of
+/// an empty or absent fingerprint, so a check input can never silently fall out
+/// of the freshness scope.
+pub fn input_manifest_digest(
+    manifest: &TargetManifest,
+    paths: &[String],
+) -> Result<ContentDigest, SupervisionError> {
+    let mut inputs = Vec::with_capacity(paths.len());
+    let mut sorted = paths.to_vec();
+    sorted.sort();
+    for path in sorted {
+        let entry = manifest
+            .entry(&path)
+            .ok_or(SupervisionError::EvidenceContractViolation {
+                field: "check.inputPaths".to_owned(),
+                detail: format!("the target manifest does not cover input path {path:?}"),
+            })?;
+        inputs.push((path, entry.present(), entry.digest().as_str().to_owned()));
+    }
+    let bytes = serde_json::to_vec(&inputs).map_err(|error| SupervisionError::InvalidValue {
+        field: "check.inputDigest".to_owned(),
+        detail: format!("could not serialize the check input manifest: {error}"),
+    })?;
+    Ok(ContentDigest::sha256(&bytes))
+}
+
 /// Captures a manifest from any workspace reader.
 pub fn capture_manifest<W: WorkspaceSnapshotPort + ?Sized>(
     workspace: &W,

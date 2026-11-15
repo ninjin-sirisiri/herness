@@ -44,9 +44,9 @@ use crate::html_sync::composition::HtmlSyncCapabilityReport;
 use crate::html_sync::observer::{ProjectFilesystemWatcher, WatchNotice};
 use crate::html_sync::publish::ObserverWriteExpectations;
 use crate::html_sync::worker::HtmlSyncWorker;
-use crate::supervision::SupervisionHost;
 use crate::supervision::runtime::DesktopH1;
 use crate::supervision::store::StoreHandle;
+use crate::supervision::{SupervisionHost, SupervisionTarget};
 
 /// One project registered for H3 recovery.
 #[derive(Debug, Clone)]
@@ -500,6 +500,14 @@ impl HtmlSyncRecoveryHost {
     /// Project with the active H3 authoring slot, when one exists.
     pub fn active_project(&self) -> Option<ProjectId> {
         self.worker.active_project()
+    }
+
+    /// Exact target with the active H3 authoring slot, when one exists.
+    ///
+    /// The host pump excludes this one target from the native pump; every
+    /// other target in the same project keeps advancing.
+    pub fn active_target(&self) -> Option<SupervisionTarget> {
+        self.worker.active_target()
     }
 
     /// Restores H3 state for every registered project.

@@ -371,12 +371,18 @@ fn schema_eight_rows_and_ids_survive_the_ordered_migration_to_nine() {
     let before = seed_schema_eight(&harness.config);
 
     let store = harness.open();
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(
+        store.schema_version().expect("version"),
+        herness_store::latest_schema_version()
+    );
     drop(store);
 
     let conn = raw(&harness.database_path());
     let after = legacy_snapshot(&conn);
-    assert_eq!(after.schema_version, 9);
+    assert_eq!(
+        after.schema_version,
+        i64::from(herness_store::latest_schema_version())
+    );
     assert_eq!(after.values, before.values);
     assert_eq!(h3_tables(&conn), 7);
     for table in [
@@ -425,7 +431,10 @@ fn migration_fault_from_schema_eight_rolls_back_to_the_exact_previous_rows() {
     drop(conn);
 
     let store = harness.open();
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(
+        store.schema_version().expect("version"),
+        herness_store::latest_schema_version()
+    );
     drop(store);
     let conn = raw(&harness.database_path());
     assert_eq!(legacy_snapshot(&conn).values, before.values);

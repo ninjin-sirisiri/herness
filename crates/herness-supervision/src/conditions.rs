@@ -9,8 +9,16 @@ use sha2::{Digest, Sha256};
 use crate::approval::{ApprovalActor, ConditionApproval};
 use crate::contract::OwnerRef;
 use crate::error::{ApprovalRejection, SupervisionError};
-use crate::evidence::VerificationOperation;
+use crate::evidence::{CheckInvocation, VerificationOperation};
 use crate::ids::{CheckId, ConditionId, verify_scoped};
+
+/// Timeout the pre-mode host applied to every required check.
+///
+/// It is no longer a hardcoded host value. It is the exact legacy meaning of
+/// one stored format-2 check, which recorded no timeout of its own, so the
+/// explicit format-2 decoder applies it. A new check always carries its own
+/// approved timeout.
+pub const LEGACY_CHECK_TIMEOUT_SECONDS: u64 = 60;
 
 /// Monotonic version of a completion-condition set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -100,6 +108,48 @@ pub enum ConditionOrigin {
     ModelProposal,
 }
 
+/// How one completion condition is decided.
+///
+/// The mode is stored with the approved condition content and is part of the
+/// condition-set digest. A condition is never decided by the other mode: a
+/// `Checks` condition is met only when every required check passes, and an
+/// `Assessment` condition uses the per-condition rubric assessment. A missing
+/// or unknown wire value is rejected by the decoder; it is never treated as
+/// either mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionMode {
+    /// Every referenced required check must pass with applicable evidence.
+    Checks,
+    /// The existing per-condition rubric assessment decides the condition.
+    Assessment,
+}
+
+impl ConditionMode {
+    /// Stable wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Checks => "checks",
+            Self::Assessment => "assessment",
+        }
+    }
+
+    /// Parses only the exact wire values. Any other value is an explicit
+    /// unsupported-contract error, never a default.
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, SupervisionError> {
+        match value.as_ref() {
+            "checks" => Ok(Self::Checks),
+            "assessment" => Ok(Self::Assessment),
+            other => Err(SupervisionError::Unsupported {
+                feature: format!(
+                    "condition mode {other:?} is not supported; expected \"checks\" or \
+                     \"assessment\""
+                ),
+            }),
+        }
+    }
+}
+
 /// One completion condition judged against a short rubric.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -107,6 +157,7 @@ pub struct Condition {
     id: ConditionId,
     title: String,
     rubric: String,
+    mode: ConditionMode,
     required_checks: Vec<CheckId>,
     origin: ConditionOrigin,
 }
@@ -117,6 +168,7 @@ impl Condition {
         id: ConditionId,
         title: impl AsRef<str>,
         rubric: impl AsRef<str>,
+        mode: ConditionMode,
         required_checks: Vec<CheckId>,
         origin: ConditionOrigin,
     ) -> Result<Self, SupervisionError> {
@@ -133,6 +185,7 @@ impl Condition {
             id,
             title,
             rubric,
+            mode,
             required_checks,
             origin,
         })
@@ -153,6 +206,11 @@ impl Condition {
         &self.rubric
     }
 
+    /// How this condition is decided.
+    pub const fn mode(&self) -> ConditionMode {
+        self.mode
+    }
+
     /// Required verification checks that must pass before completion.
     pub fn required_checks(&self) -> &[CheckId] {
         &self.required_checks
@@ -171,6 +229,7 @@ pub struct RequiredCheck {
     id: CheckId,
     condition_id: ConditionId,
     operation: VerificationOperation,
+    invocation: CheckInvocation,
     description: String,
 }
 
@@ -180,6 +239,7 @@ impl RequiredCheck {
         id: CheckId,
         condition_id: ConditionId,
         operation: VerificationOperation,
+        invocation: CheckInvocation,
         description: impl AsRef<str>,
     ) -> Result<Self, SupervisionError> {
         verify_scoped(&id, condition_id.project_id())?;
@@ -188,6 +248,7 @@ impl RequiredCheck {
             id,
             condition_id,
             operation,
+            invocation,
             description,
         })
     }
@@ -207,10 +268,88 @@ impl RequiredCheck {
         &self.operation
     }
 
+    /// Approved working directory, timeout, and input paths.
+    pub const fn invocation(&self) -> &CheckInvocation {
+        &self.invocation
+    }
+
     /// What this check verifies.
     pub fn description(&self) -> &str {
         &self.description
     }
+}
+
+/// Validates one approved check `cwd`: `.` or a bounded relative directory.
+pub fn validate_check_cwd(cwd: &str) -> Result<(), SupervisionError> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.contains('\\')
+        || trimmed
+            .split('/')
+            .any(|part| part == ".." || part.is_empty())
+        || (trimmed != "." && trimmed.split('/').any(|part| part == "."))
+    {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.cwd".to_owned(),
+            detail: "cwd must be '.' or a project-relative directory inside the project root"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates one approved check input path.
+pub fn validate_check_input_path(path: &str) -> Result<(), SupervisionError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == "*"
+        || trimmed == "/"
+        || trimmed.starts_with('/')
+        || trimmed.contains('\\')
+        || trimmed
+            .split('/')
+            .any(|part| part == ".." || part == "." || part.is_empty())
+    {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.inputPaths".to_owned(),
+            detail: "input paths must be bounded project-relative paths".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Requires every declared check input to be equal to or below one approved
+/// scope path. An input outside the approved scope is refused before a check
+/// runs, because its evidence could not be bound to an exact freshness scope.
+pub fn ensure_inputs_in_scope(
+    input_paths: &[String],
+    scope: &[String],
+) -> Result<(), SupervisionError> {
+    if input_paths.is_empty() {
+        return Ok(());
+    }
+    if scope.is_empty() {
+        return Err(SupervisionError::InvalidValue {
+            field: "check.inputPaths".to_owned(),
+            detail: "a check with input paths needs a bounded approved scope".to_owned(),
+        });
+    }
+    for input in input_paths {
+        validate_check_input_path(input)?;
+        let inside = scope.iter().any(|approved| {
+            let approved = approved.trim_end_matches('/');
+            input == approved || input.starts_with(&format!("{approved}/"))
+        });
+        if !inside {
+            return Err(SupervisionError::InvalidValue {
+                field: "check.inputPaths".to_owned(),
+                detail: format!("input path {input:?} is outside the approved scope"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Versioned, approved completion-condition set.
@@ -252,6 +391,38 @@ impl ConditionSet {
             {
                 return Err(SupervisionError::UnknownConditionReference {
                     reference: check.condition_id.to_string(),
+                });
+            }
+        }
+        for condition in &conditions {
+            let owned = checks
+                .iter()
+                .filter(|check| check.condition_id == condition.id)
+                .map(|check| check.id)
+                .collect::<Vec<_>>();
+            let mut declared = condition.required_checks.clone();
+            let mut actual = owned.clone();
+            declared.sort();
+            declared.dedup();
+            actual.sort();
+            actual.dedup();
+            if declared.len() != condition.required_checks.len() {
+                return Err(SupervisionError::InvalidValue {
+                    field: "condition.requiredChecks".to_owned(),
+                    detail: "required check identifiers must be unique".to_owned(),
+                });
+            }
+            if declared != actual {
+                return Err(SupervisionError::InvalidValue {
+                    field: "condition.requiredChecks".to_owned(),
+                    detail: "a condition's required checks must be exactly the checks that name it"
+                        .to_owned(),
+                });
+            }
+            if condition.mode == ConditionMode::Checks && declared.is_empty() {
+                return Err(SupervisionError::InvalidValue {
+                    field: "condition.mode".to_owned(),
+                    detail: "a checks-mode condition requires at least one check".to_owned(),
                 });
             }
         }

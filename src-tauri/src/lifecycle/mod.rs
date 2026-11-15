@@ -9,6 +9,7 @@
 //! substitute for a saveable stop; [`quit`] owns the coordinated stop, grace,
 //! and human choice.
 
+pub mod h4;
 pub mod quit;
 pub mod supervision_quit;
 

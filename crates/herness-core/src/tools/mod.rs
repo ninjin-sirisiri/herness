@@ -43,11 +43,12 @@ pub use gateway::{GatewayError, ToolExecutor, ToolGateway};
 pub use path::{ProjectRoot, ResolvedPath};
 #[cfg(unix)]
 pub use process::{
-    CaptureHandle, Completion, DEFAULT_CAPTURE_TIMEOUT, DEFAULT_CONFIRM_TIMEOUT,
-    DEFAULT_OUTPUT_LIMIT, DEFAULT_STOP_GRACE, DEFAULT_TIMEOUT_GRACE, GroupLease, GroupStopReport,
-    ManagedChild, ManagedGroup, ManagedSignal, ProcessLauncher, ProcessSupervisor, SpawnGate,
-    SpawnRequest, StopRequest, SupervisorStopReport, SystemChild, SystemLauncher,
-    process_group_exists, signal_process_group, spawn_failure, supervise,
+    ArgvLauncher, ArgvRequest, CaptureHandle, Completion, DEFAULT_CAPTURE_TIMEOUT,
+    DEFAULT_CONFIRM_TIMEOUT, DEFAULT_OUTPUT_LIMIT, DEFAULT_STOP_GRACE, DEFAULT_TIMEOUT_GRACE,
+    GroupLease, GroupStopReport, ManagedChild, ManagedGroup, ManagedOwner, ManagedSignal,
+    ProcessLauncher, ProcessSupervisor, SpawnGate, SpawnRequest, StopRequest, SupervisorStopReport,
+    SystemArgvLauncher, SystemChild, SystemLauncher, process_group_exists, signal_process_group,
+    spawn_failure, supervise,
 };
 pub use read::{DEFAULT_READ_LIMIT, MAX_READ_LIMIT, ReadOutput};
 pub use reason::{MAX_REASON_SCALARS, Purpose, Rationale, ReasonField, ReasonViolation};

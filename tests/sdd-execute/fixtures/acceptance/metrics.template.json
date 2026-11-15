@@ -1,0 +1,50 @@
+{
+  "schema": "h4-acceptance-metrics-v1",
+  "status": "not_run",
+  "externalRequests": 0,
+  "realProvider": {
+    "status": "not_executed",
+    "confirmed": false
+  },
+  "counts": {
+    "wrongCompletion": 0,
+    "wrongCommit": 0,
+    "wrongDispatch": 0
+  },
+  "holds": {
+    "pending": 0,
+    "humanWait": 0
+  },
+  "inheritedUnconfirmed": [
+    {
+      "id": "h1-acceptance",
+      "status": "unconfirmed",
+      "confirmed": false
+    },
+    {
+      "id": "h2-acceptance",
+      "status": "unconfirmed",
+      "confirmed": false
+    },
+    {
+      "id": "h3-image",
+      "status": "unconfirmed",
+      "confirmed": false
+    },
+    {
+      "id": "h3-residual-conditions",
+      "status": "unconfirmed",
+      "confirmed": false
+    },
+    {
+      "id": "h3-human-reading-observation",
+      "status": "unconfirmed",
+      "confirmed": false
+    },
+    {
+      "id": "h4-real-provider-acceptance",
+      "status": "unconfirmed",
+      "confirmed": false
+    }
+  ]
+}

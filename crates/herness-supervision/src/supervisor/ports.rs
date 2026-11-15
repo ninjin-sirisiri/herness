@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::assessment::{AssessmentRequest, AssessmentResult};
 use crate::budget::ledger::BudgetClockPort;
 use crate::budget::ledger::BudgetLedger;
-use crate::conditions::{Condition, ConditionVersion};
+use crate::conditions::ConditionVersion;
 use crate::consent::ConsentBinding;
 use crate::error::SupervisionError;
 use crate::evidence::{
-    CheckStatus, EvidenceRecord, RequiredCheckResult, TargetVersion, VerificationOperation,
+    CheckInvocation, CheckStatus, EvidenceRecord, RequiredCheckResult, TargetVersion,
+    VerificationOperation,
 };
 use crate::freshness::{TargetManifest, TargetReadSet, WorkspaceSnapshotPort};
 use crate::ids::{
@@ -422,6 +423,236 @@ impl TargetSnapshotRequest {
     }
 }
 
+/// Maximum characters kept for one readiness reason.
+const MAX_READINESS_REASON_CHARS: usize = 2_000;
+/// Maximum characters kept for one required human action.
+const MAX_READINESS_ACTION_CHARS: usize = 1_000;
+/// Maximum documents carried by one readiness decision.
+const MAX_READINESS_DOCUMENTS: usize = 256;
+/// Maximum characters kept for one opaque document key.
+const MAX_READINESS_DOCUMENT_CHARS: usize = 1_024;
+
+/// One verification-readiness observation at the completed-input/idle
+/// boundary.
+///
+/// The supervisor builds this only after the submitted input completed and the
+/// run became idle. The owner implementation resolves which documents are
+/// required for the current target; H2 never guesses a document set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadinessRequest {
+    project_id: ProjectId,
+    supervision_id: SupervisionId,
+    run_id: RunId,
+    input_id: InputId,
+    condition_version: ConditionVersion,
+    target_version: TargetVersion,
+    observed_at: Timestamp,
+}
+
+impl ReadinessRequest {
+    /// Creates one observation request for an already persisted run/input pair.
+    pub const fn new(
+        project_id: ProjectId,
+        supervision_id: SupervisionId,
+        run_id: RunId,
+        input_id: InputId,
+        condition_version: ConditionVersion,
+        target_version: TargetVersion,
+        observed_at: Timestamp,
+    ) -> Self {
+        Self {
+            project_id,
+            supervision_id,
+            run_id,
+            input_id,
+            condition_version,
+            target_version,
+            observed_at,
+        }
+    }
+
+    /// Project owner.
+    pub const fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    /// Supervision target.
+    pub const fn supervision_id(&self) -> SupervisionId {
+        self.supervision_id
+    }
+
+    /// Run whose input completed and became idle.
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Completed input at the gate boundary.
+    pub const fn input_id(&self) -> InputId {
+        self.input_id
+    }
+
+    /// Fixed condition version.
+    pub const fn condition_version(&self) -> ConditionVersion {
+        self.condition_version
+    }
+
+    /// Fixed target version.
+    pub const fn target_version(&self) -> TargetVersion {
+        self.target_version
+    }
+
+    /// Host clock when the gate observed the target.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+}
+
+/// What one verification-readiness observation means.
+///
+/// `Ready` never carries completion evidence: H2 still runs the normal
+/// required checks, condition assessment, and freshness check afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReadinessDecision {
+    /// Every required document is stable for the current target.
+    Ready,
+    /// Normal synchronization is in progress. No human action is required, so
+    /// the wait neither fails verification nor counts as child stagnation.
+    Pending {
+        /// Why the gate is waiting.
+        reason: String,
+        /// Opaque document keys still awaited.
+        awaiting: Vec<String>,
+    },
+    /// Readiness cannot be established without a human action.
+    Blocked {
+        /// Why readiness is blocked.
+        reason: String,
+        /// Required human action.
+        required_action: String,
+        /// Opaque document keys covered by the block.
+        documents: Vec<String>,
+    },
+}
+
+impl ReadinessDecision {
+    /// Every required document is ready.
+    pub const fn ready() -> Self {
+        Self::Ready
+    }
+
+    /// Creates a pending decision with the documents still awaited.
+    pub fn pending(
+        reason: impl AsRef<str>,
+        awaiting: Vec<String>,
+    ) -> Result<Self, SupervisionError> {
+        let reason = bounded_readiness_text(
+            "readiness.reason",
+            reason.as_ref(),
+            MAX_READINESS_REASON_CHARS,
+        )?;
+        let awaiting = bounded_documents("readiness.awaiting", awaiting)?;
+        if awaiting.is_empty() {
+            return Err(SupervisionError::InvalidValue {
+                field: "readiness.awaiting".to_owned(),
+                detail: "a pending readiness decision must name at least one awaited document"
+                    .to_owned(),
+            });
+        }
+        Ok(Self::Pending { reason, awaiting })
+    }
+
+    /// Creates a blocked decision with the required human action.
+    pub fn blocked(
+        reason: impl AsRef<str>,
+        required_action: impl AsRef<str>,
+        documents: Vec<String>,
+    ) -> Result<Self, SupervisionError> {
+        let reason = bounded_readiness_text(
+            "readiness.reason",
+            reason.as_ref(),
+            MAX_READINESS_REASON_CHARS,
+        )?;
+        let required_action = bounded_readiness_text(
+            "readiness.requiredAction",
+            required_action.as_ref(),
+            MAX_READINESS_ACTION_CHARS,
+        )?;
+        let documents = bounded_documents("readiness.documents", documents)?;
+        Ok(Self::Blocked {
+            reason,
+            required_action,
+            documents,
+        })
+    }
+
+    /// Whether every required document is ready.
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Structured kind label.
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Pending { .. } => "pending",
+            Self::Blocked { .. } => "blocked",
+        }
+    }
+}
+
+fn bounded_readiness_text(
+    field: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<String, SupervisionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SupervisionError::InvalidValue {
+            field: field.to_owned(),
+            detail: "must not be empty".to_owned(),
+        });
+    }
+    Ok(trimmed.chars().take(max_chars).collect())
+}
+
+fn bounded_documents(field: &str, documents: Vec<String>) -> Result<Vec<String>, SupervisionError> {
+    if documents.len() > MAX_READINESS_DOCUMENTS {
+        return Err(SupervisionError::InvalidValue {
+            field: field.to_owned(),
+            detail: format!("must contain at most {MAX_READINESS_DOCUMENTS} documents"),
+        });
+    }
+    let mut bounded = Vec::new();
+    for document in documents {
+        let document = bounded_readiness_text(field, &document, MAX_READINESS_DOCUMENT_CHARS)?;
+        if !bounded.contains(&document) {
+            bounded.push(document);
+        }
+    }
+    bounded.sort();
+    Ok(bounded)
+}
+
+/// Owner-owned read-only verification-readiness observation.
+///
+/// H2 consults this exactly once at the completed-input/idle boundary and on
+/// later ticks while the wait persists. Implementations never start a Task,
+/// write a document, send a request, or decide completion; an error or unknown
+/// state must become `Blocked`, never `Ready`.
+pub trait VerificationReadinessPort {
+    /// Observes whether the required documents are stable for this target.
+    fn readiness(
+        &mut self,
+        request: &ReadinessRequest,
+    ) -> Result<ReadinessDecision, SupervisionError>;
+}
+
 /// One H1-authorized required-check execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -435,6 +666,8 @@ pub struct CheckExecutionRequest {
     evidence_id: EvidenceId,
     sequence: u64,
     operation: VerificationOperation,
+    invocation: CheckInvocation,
+    remaining_active_seconds: u64,
     read_set: Vec<String>,
 }
 
@@ -451,6 +684,8 @@ impl CheckExecutionRequest {
         evidence_id: EvidenceId,
         sequence: u64,
         operation: VerificationOperation,
+        invocation: CheckInvocation,
+        remaining_active_seconds: u64,
         read_set: Vec<String>,
     ) -> Self {
         Self {
@@ -463,6 +698,8 @@ impl CheckExecutionRequest {
             evidence_id,
             sequence,
             operation,
+            invocation,
+            remaining_active_seconds,
             read_set,
         }
     }
@@ -510,6 +747,19 @@ impl CheckExecutionRequest {
     /// Exact command or equivalent operation.
     pub const fn operation(&self) -> &VerificationOperation {
         &self.operation
+    }
+
+    /// Approved working directory, timeout, and input paths.
+    pub const fn invocation(&self) -> &CheckInvocation {
+        &self.invocation
+    }
+
+    /// Remaining supervised active seconds when the check was requested.
+    ///
+    /// The host must run the check for at most the shorter of the approved
+    /// timeout and this value.
+    pub const fn remaining_active_seconds(&self) -> u64 {
+        self.remaining_active_seconds
     }
 
     /// Approved bounded read set.
@@ -592,17 +842,6 @@ impl AssessmentProfileFacts {
 
 /// Per-condition, tool-free assessment boundary.
 pub trait ConditionAssessmentPort {
-    /// Whether a condition needs a semantic model judgment.
-    ///
-    /// The default is conservative: every condition is assessed. A host that
-    /// has an approved deterministic condition may return false; the
-    /// supervisor then requires every required check of that condition to pass
-    /// with applicable evidence and records the host-owned result without a
-    /// model request.
-    fn requires_assessment(&self, _condition: &Condition) -> bool {
-        true
-    }
-
     /// Resolves the exact facts of a fixed profile binding. No fallback exists.
     fn profile(&self, binding: ProfileBinding) -> Result<AssessmentProfileFacts, SupervisionError>;
 
@@ -760,6 +999,13 @@ pub struct SupervisorPorts<'a> {
     pub checks: &'a mut dyn RequiredCheckPort,
     /// Tool-free per-condition assessment.
     pub assessment: &'a mut dyn ConditionAssessmentPort,
+    /// Owner verification-readiness gate.
+    ///
+    /// `None` keeps the existing behaviour for Human, H3, and other owners that
+    /// do not require an HTML barrier. When present, the supervisor consults it
+    /// exactly at the completed-input/idle boundary before any required check or
+    /// assessment.
+    pub readiness: Option<&'a mut dyn VerificationReadinessPort>,
     /// Durable evidence records.
     pub evidence: &'a mut dyn EvidenceStorePort,
     /// Durable supervision records and the idempotent command journal.

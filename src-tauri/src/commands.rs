@@ -39,6 +39,11 @@ use crate::html_sync::composition::{
     HtmlSyncProjectView,
 };
 use crate::lifecycle::quit::{self as quit_flow, QuitChoice, QuitSnapshot};
+use crate::sdd_execute::views::{
+    SddCapabilityReportView, SddFailureView, SddFinishHandoffView, SddOperationView,
+    SddPreviewView, SddResumeView, SddSnapshotView, SddStartDisclosureView, SddStartView,
+    SddSubscribeView,
+};
 use crate::supervision::{
     BudgetView, ChangeSupervisionRequest, ConfirmationKind, CreateSupervisionRequest, EvidenceView,
     PlanRequestActor, PurposeStatusView, RecoveryView, SupervisionView,
@@ -1210,6 +1215,241 @@ pub fn html_sync_restore(
         command,
         H3Operation::RestoreHistory { generation },
     )
+}
+
+// ---------------------------------------------------------------------------
+// H4 SDD execution minimal trusted operations
+// ---------------------------------------------------------------------------
+
+/// Every H4 command that mutates approval, execution, or Git-intent state.
+///
+/// The command layer and the desktop regression test share this list so a newly
+/// added mutation cannot silently skip the trusted-main guard.
+pub const SDD_MUTATION_COMMANDS: &[&str] = &[
+    "sdd_approve_and_start",
+    "sdd_pause",
+    "sdd_cancel",
+    "sdd_resume",
+    "sdd_approve_plan_revision",
+];
+
+/// Every read-only H4 command. They require the same trusted-main guard: a
+/// preview webview or a remote document must not read the saved execution state.
+pub const SDD_READ_COMMANDS: &[&str] = &[
+    "sdd_capabilities",
+    "sdd_preview",
+    "sdd_disclosure",
+    "sdd_snapshot",
+    "sdd_subscribe",
+    "sdd_finish_handoff",
+];
+
+fn sdd_failure(view: SddFailureView) -> CommandFailure {
+    CommandFailure::new(view.code(), view.message().to_owned())
+}
+
+fn sdd_state(
+    window: &tauri::WebviewWindow,
+    state: &State<'_, AppState>,
+) -> Result<(crate::sdd_execute::SddTaskController, ProjectId), CommandFailure> {
+    verify_supervision_source(window)?;
+    let host = lock_host(state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let project = state
+        .selected_project
+        .lock()
+        .map_err(|_| {
+            CommandFailure::new("host_unavailable", "the selected project is unavailable")
+        })?
+        .ok_or_else(|| CommandFailure::invalid("project", "no project is selected"))?;
+    let controller = crate::sdd_execute::SddTaskController::evaluate(&host, Some(project), true);
+    Ok((controller, project))
+}
+
+/// Returns the `SddTaskController` availability report for the selected project.
+#[tauri::command(async)]
+pub fn sdd_capabilities(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<SddCapabilityReportView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let project = state
+        .selected_project
+        .lock()
+        .map_err(|_| {
+            CommandFailure::new("host_unavailable", "the selected project is unavailable")
+        })?
+        .as_ref()
+        .copied();
+    Ok(
+        crate::sdd_execute::SddTaskController::evaluate(&host, project, true)
+            .capabilities()
+            .clone(),
+    )
+}
+
+/// Runs one side-effect-free plan preview.
+#[tauri::command(async)]
+pub fn sdd_preview(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddPreviewRequest,
+) -> Result<SddPreviewView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    controller.preview(&mut host, &request).map_err(sdd_failure)
+}
+
+/// Returns the start disclosure a human confirms.
+#[tauri::command(async)]
+pub fn sdd_disclosure(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddApproveStartRequest,
+) -> Result<SddStartDisclosureView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    controller
+        .disclosure(&mut host, &request)
+        .map_err(sdd_failure)
+}
+
+/// Saves the human approval and the durable start intent.
+///
+/// The `Start` confirmation is minted here, after the trusted-main guard
+/// accepted the call. No repository string, report, environment variable,
+/// receipt, `ApprovedOwner` value, or `H4SddTask` value can mint one.
+#[tauri::command(async)]
+pub fn sdd_approve_and_start(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddApproveStartRequest,
+) -> Result<SddStartView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Start);
+    controller
+        .approve_and_start(&mut host, &request, Some(&confirmation))
+        .map_err(sdd_failure)
+}
+
+/// Returns the saved execution snapshot.
+#[tauri::command(async)]
+pub fn sdd_snapshot(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    execution: herness_sdd_execute::ExecutionId,
+) -> Result<SddSnapshotView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let controller = crate::sdd_execute::SddTaskController::evaluate(&host, Some(project), true);
+    controller
+        .snapshot(&host, project, execution)
+        .map_err(sdd_failure)
+}
+
+/// Returns the saved snapshot plus the reconnect sequence.
+///
+/// This is a polling read, not a push bus: the saved snapshot is the only
+/// progress input and the caller compares the returned sequence.
+#[tauri::command(async)]
+pub fn sdd_subscribe(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    project: ProjectId,
+    execution: herness_sdd_execute::ExecutionId,
+    sequence: Option<u64>,
+) -> Result<SddSubscribeView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let controller = crate::sdd_execute::SddTaskController::evaluate(&host, Some(project), true);
+    controller
+        .subscribe(&host, project, execution, sequence)
+        .map_err(sdd_failure)
+}
+
+/// Writes the pause hold and asks the current child to stop.
+#[tauri::command(async)]
+pub fn sdd_pause(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddOperationRequest,
+) -> Result<SddOperationView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Stop);
+    controller
+        .pause(&mut host, &request, Some(&confirmation))
+        .map_err(sdd_failure)
+}
+
+/// Cancels the execution terminally, retaining every recorded record.
+#[tauri::command(async)]
+pub fn sdd_cancel(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddOperationRequest,
+) -> Result<SddOperationView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Stop);
+    controller
+        .cancel(&mut host, &request, Some(&confirmation))
+        .map_err(sdd_failure)
+}
+
+/// Resumes after a human confirmation.
+#[tauri::command(async)]
+pub fn sdd_resume(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddResumeRequest,
+) -> Result<SddResumeView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::Resume);
+    controller
+        .resume(&mut host, &request, Some(&confirmation))
+        .map_err(sdd_failure)
+}
+
+/// Saves a new human-approved plan revision after a confirmed stop.
+#[tauri::command(async)]
+pub fn sdd_approve_plan_revision(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddPlanRevisionRequest,
+) -> Result<SddOperationView, CommandFailure> {
+    let (controller, _) = sdd_state(&window, &state)?;
+    let mut host =
+        lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let confirmation = host.confirm_supervision(ConfirmationKind::PlanRevision);
+    controller
+        .approve_plan_revision(&mut host, &request, Some(&confirmation))
+        .map_err(sdd_failure)
+}
+
+/// Returns the finish handoff inputs and the reasons it is not ready.
+#[tauri::command(async)]
+pub fn sdd_finish_handoff(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request: crate::sdd_execute::controller::SddFinishRequest,
+) -> Result<SddFinishHandoffView, CommandFailure> {
+    verify_supervision_source(&window)?;
+    let host = lock_host(&state).map_err(|error| CommandFailure::new("host_unavailable", error))?;
+    let controller =
+        crate::sdd_execute::SddTaskController::evaluate(&host, Some(request.project_id), true);
+    controller
+        .finish_handoff(&host, &request)
+        .map_err(sdd_failure)
 }
 
 // ---------------------------------------------------------------------------

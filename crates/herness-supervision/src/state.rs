@@ -20,6 +20,7 @@ use crate::evidence::{ContentDigest, TargetVersion};
 use crate::ids::{CheckId, ConditionId, EvidenceId, SupervisionId, verify_core_id, verify_scoped};
 use crate::profiles::{ProfileBinding, ProfileThresholds};
 use crate::supervisor::SupervisorState;
+use crate::supervisor::state::ReadinessWait;
 use crate::version::current_contract_version;
 
 /// State of one supervised child-agent effort.
@@ -118,6 +119,9 @@ pub enum HumanAction {
     Reauthenticate,
     /// Decide an assessment the model could not decide.
     DecideAssessment,
+    /// Resolve the HTML synchronization the verification-readiness gate is
+    /// waiting on.
+    ConfirmHtmlReadiness,
     /// Reconcile an unknown request or recovery state.
     ReconcileRecovery,
 }
@@ -224,6 +228,26 @@ pub enum SupervisionReason {
         /// New version.
         to: TargetVersion,
     },
+    /// Verification is waiting for required documents to become stable.
+    ///
+    /// This is a normal synchronization wait. It is not a verification failure,
+    /// a new run, or a stagnation cycle, and supervised active time keeps
+    /// advancing while it holds.
+    AwaitingReadiness {
+        /// Owner-provided reason.
+        reason: String,
+        /// Opaque document keys still awaited.
+        awaiting: Vec<String>,
+    },
+    /// Verification readiness needs a human action.
+    ReadinessBlocked {
+        /// Owner-provided reason.
+        reason: String,
+        /// Required human action.
+        required_action: String,
+        /// Opaque document keys covered by the block.
+        documents: Vec<String>,
+    },
 }
 
 impl SupervisionReason {
@@ -236,7 +260,9 @@ impl SupervisionReason {
             Self::Assessing { .. } => SupervisionState::Assessing,
             Self::WaitingHuman { .. }
             | Self::ConditionsChanged { .. }
-            | Self::TargetChanged { .. } => SupervisionState::WaitingHuman,
+            | Self::TargetChanged { .. }
+            | Self::ReadinessBlocked { .. } => SupervisionState::WaitingHuman,
+            Self::AwaitingReadiness { .. } => SupervisionState::Verifying,
             Self::Stopped { .. } => SupervisionState::Stopped,
             Self::Failed { .. } => SupervisionState::Failed,
             Self::Cancelled { .. } => SupervisionState::Cancelled,
@@ -258,6 +284,8 @@ impl SupervisionReason {
             Self::Completed { .. } => "completed",
             Self::ConditionsChanged { .. } => "conditions_changed",
             Self::TargetChanged { .. } => "target_changed",
+            Self::AwaitingReadiness { .. } => "awaiting_readiness",
+            Self::ReadinessBlocked { .. } => "readiness_blocked",
         }
     }
 }
@@ -895,6 +923,13 @@ impl SupervisionRecord {
         }
         self.state = state;
         self.reason = reason;
+        if !matches!(
+            self.reason,
+            SupervisionReason::AwaitingReadiness { .. }
+                | SupervisionReason::ReadinessBlocked { .. }
+        ) {
+            self.supervisor.readiness = None;
+        }
         if state != SupervisionState::Completed {
             self.completion = None;
             self.completion_stale = None;
@@ -943,6 +978,19 @@ impl SupervisionRecord {
             SupervisionState::WaitingHuman,
             SupervisionReason::WaitingHuman { action },
         )
+    }
+
+    /// Enters the persisted verification-readiness wait described by `wait`.
+    ///
+    /// A pending wait stays in `verifying`; a blocked wait enters
+    /// `waiting_human` with the owner-provided reason and required action.
+    /// Neither records a verification failure, starts a run, nor increments
+    /// stagnation.
+    pub fn await_readiness(&mut self, wait: ReadinessWait) -> Result<(), SupervisionError> {
+        let reason = wait.reason();
+        self.set_state(reason.state(), reason)?;
+        self.supervisor.readiness = Some(wait);
+        Ok(())
     }
 
     /// Stops the supervision target and clears any completion.
@@ -1366,6 +1414,12 @@ impl SupervisionRecord {
             SupervisionReason::WaitingHuman { action } => {
                 blockers.push(CompletionBlocker::State { state: self.state });
                 blockers.push(CompletionBlocker::HumanAction { action: *action });
+            }
+            SupervisionReason::ReadinessBlocked { .. } => {
+                blockers.push(CompletionBlocker::State { state: self.state });
+                blockers.push(CompletionBlocker::HumanAction {
+                    action: HumanAction::ConfirmHtmlReadiness,
+                });
             }
             SupervisionReason::Stopped { cause } => {
                 blockers.push(CompletionBlocker::State { state: self.state });

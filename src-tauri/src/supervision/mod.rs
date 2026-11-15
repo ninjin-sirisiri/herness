@@ -9,6 +9,7 @@
 pub mod assessment;
 pub mod checks;
 pub mod gate;
+pub mod h4_launch;
 pub mod permission;
 pub mod plan;
 pub mod runtime;
@@ -35,7 +36,7 @@ use herness_supervision::ports::{
 use herness_supervision::recovery::RecoveryService;
 use herness_supervision::supervisor::{
     ConditionAssessmentPort, OwnerNotificationPort, RequiredCheckPort, Supervisor,
-    SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest,
+    SupervisorNotification, SupervisorPorts, TickOutcome, TickRequest, VerificationReadinessPort,
 };
 use herness_supervision::{
     ApprovalActor, ApprovalBasis, BudgetUsage, ConditionApproval, ConditionVersion, ConsentBinding,
@@ -364,6 +365,144 @@ pub struct SupersedeSupervisionRequest {
     pub packet_instruction: Option<String>,
 }
 
+/// One supervision target, keyed by the exact `(project, supervision)` pair.
+///
+/// Every pump decision and every candidate-tool binding uses this identity, so
+/// a project-wide set can never silently widen or narrow to a different target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SupervisionTarget {
+    project: ProjectId,
+    supervision: SupervisionId,
+}
+
+impl SupervisionTarget {
+    /// Creates one target identity.
+    pub const fn new(project: ProjectId, supervision: SupervisionId) -> Self {
+        Self {
+            project,
+            supervision,
+        }
+    }
+
+    /// Project that owns the target.
+    pub const fn project(self) -> ProjectId {
+        self.project
+    }
+
+    /// Supervision target inside that project.
+    pub const fn supervision(self) -> SupervisionId {
+        self.supervision
+    }
+}
+
+impl std::fmt::Display for SupervisionTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.project, self.supervision)
+    }
+}
+
+/// The exact set of targets one bounded pump cycle may advance.
+///
+/// `OnlyCandidate` is the only scope that may run with a candidate-handle
+/// adapter and names exactly one target. The other scopes run with the native
+/// adapter and refuse a runtime that reports a candidate boundary, so the
+/// candidate tools cannot widen past the H3 target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpScope {
+    /// Every active target in the listed projects.
+    Projects(Vec<ProjectId>),
+    /// Every active target in the listed projects except one exact target.
+    ///
+    /// The host pump uses this while an H3 authoring slot is active: the H3
+    /// candidate target is advanced only by the H3 worker with its candidate
+    /// handle, and every other target in the same project stays on the native
+    /// boundary.
+    AllExcept {
+        /// Projects the cycle may advance.
+        projects: Vec<ProjectId>,
+        /// Exact target the cycle must not advance.
+        excluded: SupervisionTarget,
+    },
+    /// Exactly one target, advanced with the caller's candidate-handle adapter.
+    ///
+    /// The runtime adapter must report this exact target from
+    /// [`DesktopSupervisionRuntime::candidate_target`]; any other pairing is
+    /// refused before a single target is advanced.
+    OnlyCandidate(SupervisionTarget),
+}
+
+impl PumpScope {
+    /// Builds the host pump's native scope.
+    ///
+    /// With an active H3 candidate target, exactly that target is excluded and
+    /// every other target in the listed projects keeps advancing. Without one,
+    /// every target in the projects advances. This is the only place the host
+    /// decides that exclusion, and it never sees a project-wide skip.
+    pub fn for_active_candidate(
+        projects: impl IntoIterator<Item = ProjectId>,
+        candidate: Option<SupervisionTarget>,
+    ) -> Self {
+        let projects = projects.into_iter().collect::<Vec<_>>();
+        match candidate {
+            Some(excluded) => Self::AllExcept { projects, excluded },
+            None => Self::Projects(projects),
+        }
+    }
+
+    fn projects(&self) -> &[ProjectId] {
+        match self {
+            Self::Projects(projects) | Self::AllExcept { projects, .. } => projects,
+            Self::OnlyCandidate(_) => &[],
+        }
+    }
+
+    fn exclusion(&self) -> Option<SupervisionTarget> {
+        match self {
+            Self::Projects(_) | Self::OnlyCandidate(_) => None,
+            Self::AllExcept { excluded, .. } => Some(*excluded),
+        }
+    }
+
+    fn only(&self) -> Option<SupervisionTarget> {
+        match self {
+            Self::OnlyCandidate(target) => Some(*target),
+            Self::Projects(_) | Self::AllExcept { .. } => None,
+        }
+    }
+}
+
+/// Result of one bounded pump cycle.
+///
+/// `processed` contains each advanced target exactly once, in
+/// `(project, supervision)` order. A target skipped by the bounded interval or
+/// already terminal is not counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PumpReport {
+    processed: Vec<SupervisionTarget>,
+}
+
+impl PumpReport {
+    /// Targets this cycle advanced, each exactly once.
+    pub fn processed(&self) -> &[SupervisionTarget] {
+        &self.processed
+    }
+
+    /// Number of advanced targets.
+    pub fn len(&self) -> usize {
+        self.processed.len()
+    }
+
+    /// Whether this cycle advanced nothing.
+    pub fn is_empty(&self) -> bool {
+        self.processed.is_empty()
+    }
+
+    /// Whether the cycle advanced this exact target.
+    pub fn contains(&self, target: SupervisionTarget) -> bool {
+        self.processed.contains(&target)
+    }
+}
+
 /// One host-owned supervision composition.
 pub struct SupervisionHost {
     store: StoreHandle,
@@ -372,6 +511,7 @@ pub struct SupervisionHost {
     connections: AssessmentHost,
     assessment: Box<dyn ConditionAssessmentPort + Send>,
     checks: CheckMode,
+    readiness: Option<Box<dyn VerificationReadinessPort + Send>>,
     permission: PermissionRuntime,
     active: Mutex<BTreeSet<(ProjectId, SupervisionId)>>,
     last_tick: Mutex<BTreeMap<(ProjectId, SupervisionId), Instant>>,
@@ -444,6 +584,7 @@ impl SupervisionHost {
             connections,
             assessment,
             checks,
+            readiness: None,
             permission,
             active: Mutex::new(BTreeSet::new()),
             last_tick: Mutex::new(BTreeMap::new()),
@@ -496,6 +637,19 @@ impl SupervisionHost {
     /// Shared configuration registry.
     pub fn config(&self) -> ConfigStore {
         self.config.clone()
+    }
+
+    /// Installs the owner verification-readiness gate.
+    ///
+    /// `None` keeps the existing behaviour for Human, H3, and other owners that
+    /// do not require an HTML barrier. The H4 composition installs an adapter
+    /// over the real H3 barrier; the supervisor then consults it exactly at the
+    /// completed-input/idle boundary.
+    pub fn set_readiness_port(
+        &mut self,
+        readiness: Option<Box<dyn VerificationReadinessPort + Send>>,
+    ) {
+        self.readiness = readiness;
     }
 
     /// Shared dynamic permission evaluator installed into H1.
@@ -1667,23 +1821,78 @@ impl SupervisionHost {
 
     /// Host-owned pump: advances only explicitly started/resumed targets, for
     /// every project, at a bounded interval.
+    ///
+    /// This is the native, multi-target form. It delegates to
+    /// [`Self::pump_scoped`] with [`PumpScope::Projects`] and refuses a runtime
+    /// that reports a candidate tool boundary.
     pub fn pump(
         &mut self,
         runtime: &mut dyn DesktopSupervisionRuntime,
         projects: &[ProjectId],
     ) -> Result<usize, SupervisionError> {
+        self.pump_scoped(runtime, PumpScope::Projects(projects.to_vec()))
+            .map(|report| report.len())
+    }
+
+    /// Target-scoped pump: advances exactly the targets the scope names, each
+    /// at most once per cycle, at the bounded interval.
+    ///
+    /// The candidate-handle adapter may only be paired with
+    /// [`PumpScope::OnlyCandidate`] naming the same target it was issued for;
+    /// a native adapter may not report a candidate boundary. Both checks run
+    /// before any target is loaded or advanced.
+    pub fn pump_scoped(
+        &mut self,
+        runtime: &mut dyn DesktopSupervisionRuntime,
+        scope: PumpScope,
+    ) -> Result<PumpReport, SupervisionError> {
+        let candidate = runtime.candidate_target();
+        let only = scope.only();
+        match (only, candidate) {
+            (Some(target), Some(bound)) if target == bound => {}
+            (Some(target), other) => {
+                return Err(SupervisionError::InvalidValue {
+                    field: "pump.scope".to_owned(),
+                    detail: format!("candidate tools {other:?} cannot pump only {target}"),
+                });
+            }
+            (None, Some(target)) => {
+                return Err(SupervisionError::InvalidValue {
+                    field: "pump.scope".to_owned(),
+                    detail: format!(
+                        "candidate tools bound to {target} cannot pump a multi-target scope"
+                    ),
+                });
+            }
+            (None, None) => {}
+        }
+        let projects = scope.projects().to_vec();
+        let excluded = scope.exclusion();
         let keys = {
             let active = self
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            active
-                .iter()
-                .filter(|(project, _)| projects.contains(project))
-                .copied()
-                .collect::<Vec<_>>()
+            let mut keys = match only {
+                Some(target) => active
+                    .iter()
+                    .filter(|(project, supervision)| {
+                        SupervisionTarget::new(*project, *supervision) == target
+                    })
+                    .copied()
+                    .collect::<Vec<_>>(),
+                None => active
+                    .iter()
+                    .filter(|(project, _)| projects.contains(project))
+                    .copied()
+                    .collect::<Vec<_>>(),
+            };
+            keys.retain(|(project, supervision)| {
+                excluded != Some(SupervisionTarget::new(*project, *supervision))
+            });
+            keys
         };
-        let mut advanced = 0;
+        let mut processed = Vec::with_capacity(keys.len());
         for (project, supervision) in keys {
             let last = self
                 .last_tick
@@ -1715,7 +1924,7 @@ impl SupervisionHost {
             let request_id = SupervisionRequestId::new(project);
             match self.tick_one(runtime, project, supervision, request_id) {
                 Ok(()) => {
-                    advanced += 1;
+                    processed.push(SupervisionTarget::new(project, supervision));
                     self.last_tick
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1728,7 +1937,7 @@ impl SupervisionHost {
                 }
             }
         }
-        Ok(advanced)
+        Ok(PumpReport { processed })
     }
 
     fn tick_one(
@@ -1788,6 +1997,10 @@ impl SupervisionHost {
         let mut notifications = HostNotifications {
             queue: Arc::clone(&self.notifications),
         };
+        let readiness: Option<&mut dyn VerificationReadinessPort> = self
+            .readiness
+            .as_deref_mut()
+            .map(|port| port as &mut dyn VerificationReadinessPort);
         let result = match &mut self.checks {
             CheckMode::Real => {
                 let root = runtime.project_path(project)?;
@@ -1804,6 +2017,7 @@ impl SupervisionHost {
                     runtime,
                     checks: &mut check_port,
                     assessment: &mut *self.assessment,
+                    readiness,
                     evidence: &mut evidence,
                     store: &mut store,
                     budget: &mut ledger,
@@ -1816,6 +2030,7 @@ impl SupervisionHost {
                 runtime,
                 checks: &mut **checks,
                 assessment: &mut *self.assessment,
+                readiness,
                 evidence: &mut evidence,
                 store: &mut store,
                 budget: &mut ledger,

@@ -243,7 +243,8 @@ pub enum WorkPacketRejection {
 pub enum OwnerLaunchRejection {
     /// The owner kind is not an approved H3/H4 owner.
     OwnerNotApproved,
-    /// H4 approval is not implemented in this build.
+    /// H4 approval is unavailable: no H4 plan-approval registry is composed, or
+    /// the launch used the H3-shaped registry.
     H4ApprovalUnavailable,
     /// The owner's registry has no current approval entry.
     MissingRegistryEntry,
@@ -255,6 +256,30 @@ pub enum OwnerLaunchRejection {
     OwnerMismatch,
     /// The owner kind and approval source disagree.
     SourceMismatch,
+    /// The registry entry covers another H4 execution.
+    ExecutionMismatch,
+    /// The registry entry covers another H4 Task.
+    TaskMismatch,
+    /// The launch requests an older or newer approved plan revision.
+    StalePlanRevision {
+        /// Plan revision the launch requested.
+        requested: u64,
+        /// Plan revision currently registered.
+        registered: u64,
+    },
+    /// The exact approved plan bytes digest differs from the registry.
+    PlanDigestMismatch,
+    /// One immutable packet digest differs from the current approval.
+    PacketMismatch {
+        /// Packet field that differs.
+        field: String,
+    },
+    /// The pack execution-contract fingerprint differs from the approval.
+    PackFingerprintMismatch,
+    /// The host-commit or hook authorization differs from the approval.
+    CommitAuthorizationMismatch,
+    /// A dispatch request already reserved another supervision target or Task.
+    ReservationConflict,
     /// The target requests an older or newer settings version.
     StaleSettings {
         /// Version the launch requested.

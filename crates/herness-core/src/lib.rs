@@ -35,6 +35,15 @@ pub use permissions::{
     RunControl, RunPermissionContext, SharedPolicy, SimpleCommand,
 };
 pub use ports::*;
+pub use runtime::host_git::{
+    GitObjectId, HOST_COMMIT_TIMEOUT, HOST_GIT_ACTIVITY_KIND, HOST_GIT_FINISHED_EVENT_KIND,
+    HOST_GIT_STARTED_EVENT_KIND, HostCommitApproval, HostGitActor, HostGitApprover,
+    HostGitAuditPort, HostGitAuthorization, HostGitBoundary, HostGitCommitObservation,
+    HostGitError, HostGitGate, HostGitGateOutcome, HostGitIndexState, HostGitIntent,
+    HostGitMessage, HostGitOutcome, HostGitPath, HostGitRefusal, HostGitReport, HostGitStage,
+    HostGitTermination, HostGitTrailer, HostGitUnknown, MAX_HOST_GIT_GATE_ARG_BYTES,
+    MAX_HOST_GIT_PATHS, RecordingHostGitAudit, StoreHostGitAudit, hooks_configuration_digest,
+};
 pub use skills::{
     CapabilityStatus, CapabilityUnavailableReason, HostCapabilities, HostCapability, HostOverlay,
     MINIMUM_PYTHON_VERSION, OverlayProvenance, PythonVersion, SkillChange, SkillContextEntry,
@@ -58,11 +67,11 @@ pub use tools::{
 };
 #[cfg(unix)]
 pub use tools::{
-    BashExecutor, BashOutput, Completion, DEFAULT_CAPTURE_TIMEOUT, DEFAULT_CONFIRM_TIMEOUT,
-    DEFAULT_OUTPUT_LIMIT, DEFAULT_STOP_GRACE, DEFAULT_TIMEOUT_GRACE, GroupLease, GroupStopReport,
-    ManagedChild, ManagedGroup, ManagedSignal, ProcessLauncher, ProcessSupervisor,
-    SHELL_FINISHED_EVENT_KIND, SHELL_SPAWNED_EVENT_KIND, SHELL_STARTED_EVENT_KIND,
-    ShellReconciliation, SpawnGate, SpawnRequest, StopRequest, SupervisorStopReport, SystemChild,
-    SystemLauncher, process_group_exists, reconcile_shell_operation, signal_process_group,
-    spawn_failure, supervise,
+    ArgvLauncher, ArgvRequest, BashExecutor, BashOutput, Completion, DEFAULT_CAPTURE_TIMEOUT,
+    DEFAULT_CONFIRM_TIMEOUT, DEFAULT_OUTPUT_LIMIT, DEFAULT_STOP_GRACE, DEFAULT_TIMEOUT_GRACE,
+    GroupLease, GroupStopReport, ManagedChild, ManagedGroup, ManagedOwner, ManagedSignal,
+    ProcessLauncher, ProcessSupervisor, SHELL_FINISHED_EVENT_KIND, SHELL_SPAWNED_EVENT_KIND,
+    SHELL_STARTED_EVENT_KIND, ShellReconciliation, SpawnGate, SpawnRequest, StopRequest,
+    SupervisorStopReport, SystemArgvLauncher, SystemChild, SystemLauncher, process_group_exists,
+    reconcile_shell_operation, signal_process_group, spawn_failure, supervise,
 };

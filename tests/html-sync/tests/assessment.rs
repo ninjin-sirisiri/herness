@@ -430,6 +430,7 @@ impl AssessmentHarness {
                         .map(|condition| ConditionInput {
                             title: condition.as_str().to_owned(),
                             rubric: format!("H3 {} condition fixture rubric", condition.as_str()),
+                            mode: herness_supervision::ConditionMode::Assessment,
                             checks: Vec::new(),
                         })
                         .collect(),

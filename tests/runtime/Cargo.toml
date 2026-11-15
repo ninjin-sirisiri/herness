@@ -18,6 +18,7 @@ herness-assessment = { path = "../../crates/herness-assessment" }
 herness-desktop = { path = "../../src-tauri" }
 herness-engine-pi = { path = "../../crates/herness-engine-pi" }
 herness-store = { path = "../../crates/herness-store", features = ["test-support"] }
+herness-sdd-execute = { path = "../../crates/herness-sdd-execute" }
 herness-supervision = { path = "../../crates/herness-supervision" }
 ring = "0.17.14"
 rusqlite.workspace = true

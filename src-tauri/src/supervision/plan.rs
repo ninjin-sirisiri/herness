@@ -11,12 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use herness_core::contracts::{AgentId, ModelId, ProjectId, SessionId};
 use herness_core::{CoreError, Timestamp};
 use herness_supervision::{
-    ApprovalActor, AssessmentProfile, BudgetPolicy, Condition, ConditionId, ConditionSet,
-    ConditionVersion, ConsentId, ConsentState, DisclosureConsent, DisclosureDataKind,
-    DisclosureScope, ExecutionScope, Money, MoneyCap, OwnerApprovalSource, OwnerRef, PriceVersion,
-    ProfilePurpose, ProviderOrigin, RequiredCheck, RunGroup, SupervisionContract, SupervisionError,
-    SupervisionId, SupervisionRecord, SupervisionRequestId, SupervisionSubject, TargetScope,
-    TargetVersion, VerificationOperation, WorkPacket, WorkPacketRejection,
+    ApprovalActor, AssessmentProfile, BudgetPolicy, CheckInvocation, Condition, ConditionId,
+    ConditionMode, ConditionSet, ConditionVersion, ConsentId, ConsentState, DisclosureConsent,
+    DisclosureDataKind, DisclosureScope, ExecutionScope, Money, MoneyCap, OwnerApprovalSource,
+    OwnerRef, PriceVersion, ProfilePurpose, ProviderOrigin, RequiredCheck, RunGroup,
+    SupervisionContract, SupervisionError, SupervisionId, SupervisionRecord, SupervisionRequestId,
+    SupervisionSubject, TargetScope, TargetVersion, VerificationOperation, WorkPacket,
+    WorkPacketRejection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,16 @@ use crate::supervision::store::StoreHandle;
 /// Format 1 stored the contract without an immutable work packet and cannot be
 /// restarted: the owner instruction was not persisted, so a packet must not be
 /// fabricated from the remaining fields.
-pub const PLAN_FORMAT_VERSION: u32 = 2;
+///
+/// Format 2 stored condition sets and checks without their explicit mode and
+/// execution details. [`decode_plan`] reads it with an explicit decoder that
+/// keeps the exact old meaning (assessment mode, project root, the 60-second
+/// host bound, no separately declared inputs) and then writes format 3 on the
+/// next save.
+///
+/// Format 3 stores each condition's mode and each check's approved `cwd`,
+/// explicit `timeoutSeconds`, and `inputPaths`.
+pub const PLAN_FORMAT_VERSION: u32 = 3;
 
 /// One host-minted confirmation of a human action.
 ///
@@ -64,6 +74,8 @@ pub enum ConfirmationKind {
     ApproveHtmlSync,
     /// Apply one explicit H3 document operation.
     H3DocumentOperation,
+    /// Approve a changed plan revision after a confirmed stop.
+    PlanRevision,
 }
 
 impl HumanConfirmation {
@@ -119,10 +131,35 @@ impl RequestActor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckInput {
-    /// Exact command run in the project root.
+    /// Exact command run in the approved working directory.
     pub command: String,
     /// What the check verifies.
     pub description: String,
+    /// Approved working directory: `.` or a project-relative directory.
+    pub cwd: String,
+    /// Approved explicit timeout in seconds.
+    pub timeout_seconds: u64,
+    /// Approved inputs whose content must be bound to the evidence.
+    pub input_paths: Vec<String>,
+}
+
+impl CheckInput {
+    /// Creates a check input with the two pre-mode defaults preserved
+    /// explicitly: project root and no separately declared inputs. The timeout
+    /// is still required, so no caller inherits the former host value silently.
+    pub fn at_project_root(
+        command: impl Into<String>,
+        description: impl Into<String>,
+        timeout_seconds: u64,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            description: description.into(),
+            cwd: ".".to_owned(),
+            timeout_seconds,
+            input_paths: Vec::new(),
+        }
+    }
 }
 
 /// One completion condition proposed by a human or approved owner.
@@ -133,6 +170,8 @@ pub struct ConditionInput {
     pub title: String,
     /// Per-condition rubric used by a semantic assessment.
     pub rubric: String,
+    /// How this condition is decided.
+    pub mode: ConditionMode,
     /// Required checks for this condition.
     #[serde(default)]
     pub checks: Vec<CheckInput>,
@@ -705,12 +744,16 @@ pub fn decode_plan(bytes: &[u8]) -> Result<StoredPlan, SupervisionError> {
         Some(PLAN_FORMAT_VERSION) => {
             let plan: StoredPlan = serde_json::from_value(value).map_err(|error| {
                 SupervisionError::StorageFailure {
-                    detail: format!("could not decode the supervision plan format 2: {error}"),
+                    detail: format!(
+                        "could not decode the supervision plan format {PLAN_FORMAT_VERSION}: \
+                         {error}"
+                    ),
                 }
             })?;
             plan.verify()?;
             Ok(plan)
         }
+        Some(2) => decode_format2_plan(value),
         Some(found) => Err(SupervisionError::Unsupported {
             feature: format!(
                 "supervision plan format {found} is not supported; this build reads format \
@@ -731,6 +774,85 @@ pub fn decode_plan(bytes: &[u8]) -> Result<StoredPlan, SupervisionError> {
             })
         }
     }
+}
+
+/// Decodes a stored format-2 plan with its exact pre-mode meaning.
+///
+/// Format 2 did not record a condition mode or check execution details. The
+/// decoder inserts the values the host actually used then — every condition was
+/// decided by the per-condition assessment, and every check ran in the project
+/// root with the host's 60-second bound and no separately declared inputs — and
+/// only then deserializes the current shape. A value that already carries any
+/// format-3 field is refused instead of being reinterpreted as format 2.
+fn decode_format2_plan(mut value: serde_json::Value) -> Result<StoredPlan, SupervisionError> {
+    let conditions = value
+        .get_mut("conditions")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| SupervisionError::StorageFailure {
+            detail: "a format 2 plan needs a condition set object".to_owned(),
+        })?;
+
+    let condition_items = conditions
+        .get_mut("conditions")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| SupervisionError::StorageFailure {
+            detail: "a format 2 plan needs a condition array".to_owned(),
+        })?;
+    for condition in condition_items {
+        let object = condition
+            .as_object_mut()
+            .ok_or_else(|| SupervisionError::StorageFailure {
+                detail: "a format 2 condition must be an object".to_owned(),
+            })?;
+        if object.contains_key("mode") {
+            return Err(SupervisionError::Unsupported {
+                feature: "a supervision plan labelled format 2 carries a condition mode; a newer \
+                          value is never read as format 2"
+                    .to_owned(),
+            });
+        }
+        object.insert(
+            "mode".to_owned(),
+            serde_json::Value::String(ConditionMode::Assessment.as_str().to_owned()),
+        );
+    }
+
+    let check_items = conditions
+        .get_mut("checks")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| SupervisionError::StorageFailure {
+            detail: "a format 2 plan needs a check array".to_owned(),
+        })?;
+    for check in check_items {
+        let object = check
+            .as_object_mut()
+            .ok_or_else(|| SupervisionError::StorageFailure {
+                detail: "a format 2 check must be an object".to_owned(),
+            })?;
+        if object.contains_key("invocation") {
+            return Err(SupervisionError::Unsupported {
+                feature: "a supervision plan labelled format 2 carries a check invocation; a \
+                          newer value is never read as format 2"
+                    .to_owned(),
+            });
+        }
+        object.insert(
+            "invocation".to_owned(),
+            serde_json::json!({
+                "cwd": ".",
+                "timeoutSeconds": herness_supervision::LEGACY_CHECK_TIMEOUT_SECONDS,
+                "inputPaths": [],
+            }),
+        );
+    }
+
+    value["formatVersion"] = serde_json::Value::from(PLAN_FORMAT_VERSION);
+    let plan: StoredPlan =
+        serde_json::from_value(value).map_err(|error| SupervisionError::StorageFailure {
+            detail: format!("could not decode the supervision plan format 2: {error}"),
+        })?;
+    plan.verify()?;
+    Ok(plan)
 }
 
 #[derive(Deserialize)]
@@ -809,10 +931,13 @@ pub fn build_conditions(
         for check in &input.checks {
             let check_id = herness_supervision::CheckId::new(project);
             let operation = VerificationOperation::command(&check.command)?;
+            let invocation =
+                CheckInvocation::new(&check.cwd, check.timeout_seconds, check.input_paths.clone())?;
             checks.push(RequiredCheck::new(
                 check_id,
                 condition_id,
                 operation,
+                invocation,
                 &check.description,
             )?);
             check_ids.push(check_id);
@@ -821,6 +946,7 @@ pub fn build_conditions(
             condition_id,
             &input.title,
             &input.rubric,
+            input.mode,
             check_ids,
             herness_supervision::ConditionOrigin::Human,
         )?);

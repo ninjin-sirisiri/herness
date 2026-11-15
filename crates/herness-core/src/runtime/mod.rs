@@ -10,6 +10,7 @@
 
 pub mod error;
 mod host;
+pub mod host_git;
 #[cfg(feature = "test-support")]
 pub mod host_state_test_support;
 pub mod publication;
@@ -22,6 +23,15 @@ pub mod views;
 
 pub use error::RuntimeError;
 pub use host::{AgentSpec, Runtime, RuntimeDependencies};
+pub use host_git::{
+    GitObjectId, HOST_COMMIT_TIMEOUT, HOST_GIT_ACTIVITY_KIND, HOST_GIT_FINISHED_EVENT_KIND,
+    HOST_GIT_STARTED_EVENT_KIND, HostCommitApproval, HostGitActor, HostGitApprover,
+    HostGitAuditPort, HostGitAuthorization, HostGitBoundary, HostGitCommitObservation,
+    HostGitError, HostGitGate, HostGitGateOutcome, HostGitIndexState, HostGitIntent,
+    HostGitMessage, HostGitOutcome, HostGitPath, HostGitRefusal, HostGitReport, HostGitStage,
+    HostGitTermination, HostGitTrailer, HostGitUnknown, MAX_HOST_GIT_GATE_ARG_BYTES,
+    MAX_HOST_GIT_PATHS, RecordingHostGitAudit, StoreHostGitAudit, hooks_configuration_digest,
+};
 pub use publication::{PrivateAppArchive, PublicationWriter};
 pub use reconcile::{
     OperationReconciliation, PermissionReconciliation, ProjectReconciliation, ReconciliationReport,

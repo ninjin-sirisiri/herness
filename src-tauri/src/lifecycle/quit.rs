@@ -413,7 +413,7 @@ pub fn choose(app: &AppHandle, choice: QuitChoice) -> Result<QuitSnapshot, Strin
 
 fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
     let state = app.state::<AppState>();
-    let (sync_failure, begin_failure, stop_result) = match state.host.lock() {
+    let (sync_failure, begin_failure, h4_begin_failure, stop_result) = match state.host.lock() {
         Ok(mut host) => {
             let sync_failure = host
                 .persist_connection_settings()
@@ -423,12 +423,18 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
                 .begin_shutdown()
                 .err()
                 .map(|error| format!("shutdown state was not saved: {error}"));
+            // H4 closes new dispatch, sends, and commits before the coordinated
+            // stops begin, so a crash during the stop leaves an execution the
+            // coordinator refuses to advance. A failed H4 save is a reason quit
+            // did not complete.
+            let h4_begin_failure = host.begin_sdd_quit().obstacle();
             // Even when the initial record could not be written, attempt the
             // coordinated stops so checkpoints that can be saved are saved.
             let stop_result = host.stop_all_for_shutdown();
-            (sync_failure, begin_failure, stop_result)
+            (sync_failure, begin_failure, h4_begin_failure, stop_result)
         }
         Err(_) => (
+            None,
             None,
             None,
             Err("the host lock was poisoned during quit".to_owned()),
@@ -436,6 +442,7 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
     };
 
     let mut h3_save_failure = None;
+    let mut h4_save_failure = None;
     let mut snapshot = match &stop_result {
         Ok(report) => {
             // Mark H2 supervision state and H3 document latches with the real
@@ -455,6 +462,16 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
                     );
                     h3_save_failure = Some(error);
                 }
+                // H4 writes the confirmed or unconfirmed stop from the same H1
+                // facts. A failed H4 save is a reason quit did not complete.
+                let h4 = host.mark_sdd_for_quit(report);
+                if let Some(obstacle) = h4.obstacle() {
+                    eprintln!(
+                        "QUIT_INCOMPLETE: pid={} h4-save-failed=true detail={obstacle}",
+                        std::process::id()
+                    );
+                    h4_save_failure = Some(obstacle);
+                }
             }
             coordinator.note_stopped(report.clone())
         }
@@ -463,10 +480,16 @@ fn stop_worker(app: AppHandle, coordinator: Arc<QuitCoordinator<SystemClock>>) {
     if let Some(error) = begin_failure {
         snapshot = coordinator.note_save_failure(error);
     }
+    if let Some(error) = h4_begin_failure {
+        snapshot = coordinator.note_save_failure(error);
+    }
     if let Some(error) = sync_failure {
         snapshot = coordinator.note_save_failure(error);
     }
     if let Some(error) = h3_save_failure {
+        snapshot = coordinator.note_save_failure(error);
+    }
+    if let Some(error) = h4_save_failure {
         snapshot = coordinator.note_save_failure(error);
     }
 

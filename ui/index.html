@@ -200,6 +200,61 @@
       </section>
 
       <section>
+        <h2>SDD execution (H4, minimal)</h2>
+        <p class="muted">
+          This is the minimal H4 connection only, not the finished H5 screen. Preview reads the
+          plan without side effects. Start saves a human approval revision and the durable start
+          intent; the host dispatches the first Task from that saved snapshot. Every update needs
+          project, execution, request, and expected revision. Missing ports are shown as
+          unavailable; nothing here declares success on its own.
+        </p>
+        <div class="row">
+          <label for="sdd-plan-path">Plan path</label>
+          <input id="sdd-plan-path" type="text" autocomplete="off"
+                 placeholder="docs/sdd/plans/2026-11-13-h4-sdd-execute.md" />
+          <button id="sdd-preview" type="button">Preview plan</button>
+          <button id="sdd-capabilities" type="button">Check capabilities</button>
+        </div>
+        <div class="row">
+          <label for="sdd-execution">Execution ID</label>
+          <input id="sdd-execution" type="text" autocomplete="off"
+                 placeholder="execution:&lt;project-uuid&gt;:&lt;uuid&gt;" />
+          <label for="sdd-sequence">Sequence</label>
+          <input id="sdd-sequence" type="number" min="0" value="0" />
+          <button id="sdd-subscribe" type="button">Refresh state</button>
+        </div>
+        <div class="row">
+          <label for="sdd-checkout">Checkout root</label>
+          <input id="sdd-checkout" type="text" autocomplete="off" placeholder="/absolute/checkout" />
+          <label for="sdd-branch">Branch</label>
+          <input id="sdd-branch" type="text" autocomplete="off" placeholder="h4-execute" />
+          <label for="sdd-base-branch">Base branch</label>
+          <input id="sdd-base-branch" type="text" autocomplete="off" placeholder="main" />
+        </div>
+        <div class="row">
+          <label for="sdd-active-seconds">Seconds per Task</label>
+          <input id="sdd-active-seconds" type="number" min="1" value="7200" />
+          <label for="sdd-additional-runs">Additional runs per Task</label>
+          <input id="sdd-additional-runs" type="number" min="0" value="30" />
+          <button id="sdd-disclose" type="button">Show start disclosure</button>
+          <button id="sdd-start" type="button">Approve and start</button>
+        </div>
+        <div class="row">
+          <label for="sdd-state-action">Update</label>
+          <select id="sdd-state-action">
+            <option value="pause">pause</option>
+            <option value="cancel">cancel</option>
+            <option value="resume">resume</option>
+          </select>
+          <button id="sdd-update" type="button">Apply update</button>
+          <button id="sdd-finish" type="button">Finish handoff</button>
+        </div>
+        <p id="sdd-status" class="muted"></p>
+        <p id="sdd-failure" class="error" role="alert"></p>
+        <pre id="sdd-state" class="history"></pre>
+      </section>
+
+      <section>
         <h2>Quit</h2>
         <p id="quit-status" class="muted">No quit has been requested.</p>
         <div id="quit-actions" class="row" hidden>

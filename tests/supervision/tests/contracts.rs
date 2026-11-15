@@ -93,6 +93,7 @@ fn fake_foreign_expired_and_stale_approvals_are_rejected() {
             fixture_ids.condition_a,
             "changed fixture condition",
             "Different content with the same version.",
+            herness_supervision::ConditionMode::Assessment,
             vec![fixture_ids.check_a],
             ConditionOrigin::Human,
         )
@@ -173,6 +174,7 @@ fn model_origin_conditions_cannot_be_approved_or_changed_by_a_model() {
         fixture_ids.condition_a,
         "model-proposed condition",
         "A model proposed this and a human must confirm it.",
+        herness_supervision::ConditionMode::Assessment,
         vec![fixture_ids.check_a],
         ConditionOrigin::ModelProposal,
     )
@@ -1384,6 +1386,9 @@ fn approved_owner_launch_requires_the_current_registry_entry_and_rejects_h4() {
     let h4_contract = owner_contract(project, h4_owner, OwnerApprovalSource::H4ApprovedPlan);
     let h4_binding =
         OwnerLaunchBinding::from_contract(&h4_contract, 1, 1, "task-6").expect("binding");
+    // The H3-shaped registry never authorizes an H4 owner, even with an entry.
+    // H4 approval is minted only from the dedicated H4 registry port
+    // (`authorize_h4_owner_launch`), so this blanket refusal stays intact.
     assert_eq!(
         rejected_reason(&ScriptedOwnerApprovalRegistry::new(), &h4_binding),
         OwnerLaunchRejection::H4ApprovalUnavailable
