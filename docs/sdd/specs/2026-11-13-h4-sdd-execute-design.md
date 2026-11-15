@@ -194,6 +194,17 @@ packとherness両方の開発変更を必要とするが、このspec保存は�
 
 実providerでの実装・完了評価・HTML評価の一連の受入は、接続、fixtureと送信bytes種別、有限要求数/retry、料金または枠を提示し、別途人間の許可を得てから行う。H3の画像・残条件、H1/H2接続の未確認は継承し、必要能力を確認できなければ実運用の受入は保留する。限定受入は実行時gateの迂回ではない。
 
+## H5 integration additions
+
+2026-11-15の[H5設計案](2026-11-15-h5-desktop-design.md)に必要なdesktop接続の追加契約。保存範囲は確認済みだが本節のレビュー承認・実装は未了である。既存のTask進行・権限・再承認・停止・予算・finish条件を緩めない。
+
+1. **保存済み実行の発見:** 信頼されたmainへproject指定のexecution一覧と、再接続に必要な非secretの承認ID/版を返す。version付きviewでexecution ID・現在revision・plan・checkout・状態・理由・最終sequenceを返し、一覧は更新sequence降順の安定cursor、既定100件・上限500件とする。別projectの承認を流用せず、UIでIDを記憶していないことを新規開始の理由にしない。
+2. **停止照合の操作:** project・execution ID・request ID・expected revisionを指定する人間操作から、保存済み停止要求、H1/H2の子・管理下process、未確定Git等を照合できるようにする。結果はstopped・pending・recovery_requiredを区別する。人間の入力だけで停止済みを設定せず、未確認のままreadyへ遷移しない。pause後のconfirm_stopをこの操作へ接続し、取消し後も子の停止確認とは別に表示する。照合は新しい子・送信・commitの許可ではなく、再開は既存承認ID/版と残予算を使う別操作とする。
+3. **最終証拠を伴う引継ぎ:** desktopのfinish_handoffをcoreの最終状態・finalChecks証拠・正本反映・台帳の照合へ接続する。ready_for_finishという表示だけでreadyを作らず、現内容の五項目の証拠と参照を返す。現行compositionが常に残すfinal_evidence_not_verifiedは、実照合が成立したときだけ解消する。不足・staleは具体的blockerを返し、no_changeのstacked PR非互換と未確認を保持する。read-onlyな引継ぎ取得から統合・push・公開を起動しない。
+4. **診断と表示の忠実性:** IPCは既存10種のerror codeとsanitizedな詳細参照・必要操作を保持し、全失敗をunavailableへ潰さない。開始応答の保存済みreadyとchildStarted=false、current_approvalのない初回承認、全Taskの上限・実Git identity、plan新版の差分と継承制限を完成版UIから操作できるようにする。固定Task 1や新しく作った承認IDでresumeしない。H4のcheckout所有開始前には同じ実checkoutで編集可能な通常runの停止を照合し、未停止なら開始を拒否する。以降の通常会話の実scope制限はH1が所有する。
+
+受入では一覧からの別process再接続、停止未確認/確認済み/結果不明、同じ要求の重複と古いrevision、現在の最終証拠の成立/不足/失効、finish取得時の副作用0を実store・Git・H1/H2/H3 compositionで検証する。既存Phase Aやこの補修を実providerのPhase B受入へ流用しない。
+
 ## Open items and approval
 
 未決定の製品動作を実装者へ委ねない。parser schema・host Git・owner/readiness接続は本specと各正本の追加案をレビューしてから実装planに落とす。OS・配布・完成版画面はH5、実provider能力・実接続の受入は有効化前に別途確認する。未確認を理由に条件や送信同意を黙って緩めない。

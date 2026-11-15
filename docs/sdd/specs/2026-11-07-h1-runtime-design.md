@@ -233,6 +233,19 @@ H2は評価器・継続実行、H3は文書の自動更新と再構成、H4はTa
 
 受入では実Gitの通常hook・共通HTML gate、stage対象限定、意図/結果保存fault・要求重複・復旧、同projectでの実Pi/loopback TaskとH3候補のtool分離を検証する。許可済み任意shellや外部processの強制隔離は追加しない。
 
+## H5 integration additions
+
+2026-11-15の[H5設計案](2026-11-15-h5-desktop-design.md)に必要な追加契約。利用者は保存範囲を確認したが、本節の契約承認と実装はレビュー待ちである。H1のrun状態・許可優先順位・secret境界・復旧規則は変更しない。
+
+1. **通常会話と入力:** projectに束縛した通常会話の一覧・取得・作成・明示追加入力を公開する。会話は既存agent/sessionとrun群へ対応し、H2/H3/H4所有の子を通常会話への入力対象にしない。安定した前runからの続行は同じ会話で新run/inputを作り、既存continue_runの停止・許可・入力完結gateを使う。応答中の入力を自動queueせず、停止未確認・復旧待ちは再開照合を先に行う。接続/model変更は新しい通常会話とし、旧会話を別providerへ無断転送しない。
+2. **正規化本文と送信の永続化:** SDK型を漏らさないversion 1の会話viewを提供する。message ID、project、会話、agent/session、run/input参照、role、本文、確定/未完了、順序、最終sequenceを返し、user本文は送信意図とともに送信前に保存する。assistantの公開本文は既存完結eventと対応付け、重複記録・表示を防ぐ。操作はrequest IDと現在revisionへ束縛し、同じID・別内容は拒否、同じ要求は保存結果を返す。送信結果不明を未送信へ戻して自動再送しない。入力は空白だけを拒否し、UTF-8で256 KiBを上限に切り捨てず拒否する。
+3. **表示streamと履歴:** 表示用deltaを安定したmessage参照と順序へ束縛し、確定本文を正本に再接続できるようにする。中断した部分は未完了と区別し、内部思考を要求・公開しない。会話一覧・本文ページはproject指定・安定cursorで取得し、既定100件・上限500件とする。会話一覧は更新sequence降順、本文は固定した取得境界内のmessage順序昇順で返す。監査の降順historyもcursor付きでdesktopへ公開し、昇順live購読と混同しない。古いuser本文が存在しない場合は欠落を明示する。SDK checkpointを読む必要がある互換投影はadapter内だけで行い、架空の本文を補わない。
+4. **skillと通常会話のscope:** 信頼された人間操作からSDD skillを選択し、正確なpack本文・参照・指紋・host overlay・能力を初回と継続へ束縛する。packの相対参照を通常projectへの無制限grantに変換しない。SDD文書の書込みにはH3承認と有効なhost-delegated契約を確認し、親のHTML著作へfallbackしない。H4が同じcheckoutを所有する間の相談はhost側でread/searchだけに制限し、write/edit/bash・Git変更を拒否する。この制約はproject IDだけでなく実checkoutで照合し、各副作用直前にも検査する。子への直接入力や停止要求だけでの編集解禁を認めず、編集再開は停止確認・所有照合と利用者の新しいscope選択を必要とする。
+5. **設定の接続:** toolchainの明示path・検出directory・検出結果、許可モード/ルール・実grantを信頼されたmainから設定・取得できるようにする。設定の版を保存し、未実行の古い許可判断は失効させる。FinderのPATHだけに依存せず、明示pathの不正を別toolで黙って代用しない。OSのpackage manager・sudo・任意shell profileを自動実行しない。
+6. **同梱pack:** 個人用macOS buildは本体と版固定のpack全体の必要資源を同梱し、source revision・内容とH3/H4契約の指紋をmanifestへ保存する。これは正本repoからの配布artifactであり、独立した正本やアプリが編集する場所にしない。bundle外へのsymlink・資源欠落・指紋不一致は能力不足として拒否し、絶対開発pathやSDD_PACK_ROOTを必須にしない。Git・Python 3.11+等は外部導入を案内し、勝手にinstallしない。更新時は既存のDB/Keychain識別を保持し、pack契約変更を各ownerの再承認・照合へ反映する。
+
+受入では実Pi＋loopbackとstoreで会話保持・request重複/結果不明・本文復元・stream再接続・旧データ欠落・migrationを確認する。H4活動中の読取り専用grant、project/子の分離、履歴cursor、Finder起動の資源解決、未知pack・tool不足、UI再表示・再起動時送信0を検証する。今回の個人用buildは認証のlocal/unpublished gateを公開・配布用へ変更する許可ではない。
+
 ## Open items and resolution
 
 - **実ChatGPT認証と利用条件:** spikeはmockだけである。H1の接続実装前に現行の公式認可フローを再確認し、実ログイン・実要求には別途利用者の許可を得る。満たせなければ当該接続は未確認・利用不可とし、方式を再検討する。
